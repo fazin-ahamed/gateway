@@ -2318,6 +2318,43 @@ var PLAYGROUND_HTML = `<!doctype html>
   @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
   @media (max-width:980px){nav{position:sticky;top:64px;bottom:auto;width:100%;height:auto;flex-direction:row;overflow:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px 14px}nav:before{display:none}nav button{flex:0 0 auto}nav button.active:before{left:10px;right:10px;top:auto;bottom:-8px;width:auto;height:2px}main{margin-left:0;padding:24px}.grid.s4{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media (max-width:620px){header{padding:0 14px}.base{display:none}header .clock{margin-left:auto}.grid.s4,.grid.s3,.grid.s2{grid-template-columns:1fr}.row>*{min-width:100%}main{padding:18px 14px}.card{padding:16px}.toolbar{align-items:flex-start;flex-wrap:wrap}.toolbar .spacer{display:none}.modal{padding:16px}.toast{right:14px;left:14px;bottom:14px;max-width:none}}
+  .pg-shell{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px;align-items:start}
+  .pg-config{position:sticky;top:88px}
+  .pg-check{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12px;color:var(--text)}
+  .pg-check input{width:auto;accent-color:var(--accent)}
+  .pg-advanced{margin-top:16px;border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;background:var(--surface-deep)}
+  .pg-advanced summary{cursor:pointer;font-size:12px;color:var(--muted);font-weight:620}
+  .pg-advanced textarea{margin-top:10px;min-height:140px}
+  .pg-main{display:grid;gap:18px;min-width:0}
+  .pg-chat{display:flex;flex-direction:column;min-height:560px;overflow:hidden;padding:0}
+  .pg-chat-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 20px;border-bottom:1px solid var(--line)}
+  .pg-messages{flex:1;min-height:360px;max-height:520px;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:14px;background:var(--surface-deep)}
+  .pg-msg{max-width:78%;padding:12px 14px;border-radius:14px;line-height:1.55}
+  .pg-msg.user{align-self:flex-end;background:rgba(119,167,255,.14);border:1px solid rgba(119,167,255,.28);border-bottom-right-radius:4px}
+  .pg-msg.assistant{align-self:flex-start;background:var(--surface-hi);border:1px solid var(--line);border-bottom-left-radius:4px}
+  .pg-msg.streaming{border-style:dashed}
+  .pg-msg .who{font:10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+  .pg-msg.user .who{color:var(--accent)}
+  .pg-msg.assistant .who{color:var(--good)}
+  .pg-body{white-space:pre-wrap;word-break:break-word}
+  .pg-meta{margin-top:8px;font:10px/1.4 var(--mono);color:var(--muted)}
+  .pg-composer{display:flex;gap:10px;align-items:flex-end;padding:16px 20px;border-top:1px solid var(--line);background:var(--surface)}
+  .pg-composer textarea{flex:1;min-height:44px;max-height:160px;resize:vertical}
+  .pg-composer button{flex:0 0 auto;margin-top:0}
+  .pg-trace{overflow:hidden}
+  .pg-trace-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+  .pg-trace-tabs{display:flex;gap:6px;padding:12px 20px 0;flex-wrap:wrap}
+  .seg-btn{background:var(--surface-deep);border:1px solid var(--line);color:var(--muted);border-radius:999px;padding:6px 12px;font-size:11px;font-weight:620;cursor:pointer}
+  .seg-btn.on{background:rgba(119,167,255,.16);border-color:var(--accent);color:var(--text)}
+  .pg-trace-body{padding:16px 20px 20px}
+  .pg-trace-body pre{max-height:320px}
+  .pg-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  .pg-summary .stat{min-height:86px;padding:12px}
+  .pg-summary .stat .v{font-size:19px;margin-top:8px}
+  .pg-kv{display:grid;grid-template-columns:110px 1fr;gap:8px 14px;font-size:12px;margin:14px 0 0}
+  .pg-kv dt{color:var(--muted)}
+  .pg-kv dd{margin:0;word-break:break-word}
+  @media (max-width:980px){.pg-shell{grid-template-columns:1fr}.pg-config{position:static}.pg-messages{max-height:420px}.pg-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.pg-msg{max-width:100%}}
 </style>
 </head>
 <body>
@@ -2416,21 +2453,53 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-chat">
-    <div class="card">
-      <h2 class="sec" style="margin-top:0">Admin Playground</h2>
-      <p class="hint">Uses your authenticated admin session directly. No virtual API key is required or charged.</p>
-      <div class="row">
-        <div><label>Model slug</label><select id="c-model"><option value="">Loading enabled models\u2026</option></select></div>
+    <div class="pg-shell">
+      <aside class="pg-config card">
+        <h2 class="sec" style="margin-top:0">Playground</h2>
+        <p class="hint">Run a model through the gateway with your admin session.</p>
+        <label for="c-model">Model slug</label>
+        <select id="c-model"><option value="">Loading enabled models...</option></select>
+        <label class="pg-check" for="c-stream"><input type="checkbox" id="c-stream"> Stream responses</label>
+        <button class="act" id="c-clear" style="margin-top:18px">Clear chat</button>
+        <details class="pg-advanced">
+          <summary>Request JSON</summary>
+          <textarea id="c-messages">[{"role":"user","content":"Say hello in one sentence."}]</textarea>
+        </details>
+      </aside>
+      <div class="pg-main">
+        <section class="pg-chat card">
+          <header class="pg-chat-head">
+            <div>
+              <h2 class="sec" style="margin:0">Conversation</h2>
+              <div class="small" id="c-status">Ready when you are.</div>
+            </div>
+            <button class="ghost" id="c-copy-trace">Copy trace</button>
+          </header>
+          <div class="pg-messages" id="c-chat">
+            <div class="empty">Send a message to start a run.</div>
+          </div>
+          <div class="pg-composer">
+            <textarea id="c-prompt" placeholder="Ask anything..."></textarea>
+            <button class="act" id="c-send">Send</button>
+          </div>
+        </section>
+        <section class="pg-trace card" id="c-trace-panel" hidden>
+          <header class="pg-trace-head">
+            <div>
+              <h2 class="sec" style="margin:0">Run trace</h2>
+              <div class="small" id="c-trace-meta"></div>
+            </div>
+            <button class="ghost" id="c-close-trace">Close</button>
+          </header>
+          <div class="pg-trace-tabs" role="tablist">
+            <button class="seg-btn on" data-trace-tab="summary" role="tab" aria-selected="true">Summary</button>
+            <button class="seg-btn" data-trace-tab="request" role="tab" aria-selected="false">Request</button>
+            <button class="seg-btn" data-trace-tab="response" role="tab" aria-selected="false">Response</button>
+            <button class="seg-btn" data-trace-tab="events" role="tab" aria-selected="false">Events</button>
+          </div>
+          <div class="pg-trace-body" id="c-trace-body"></div>
+        </section>
       </div>
-      <label>Messages (JSON array)</label>
-      <textarea id="c-messages">[{"role":"user","content":"Say hello in one sentence."}]</textarea>
-      <div class="row" style="align-items:center">
-        <label style="margin:10px 0 0"><input type="checkbox" id="c-stream" style="width:auto;margin-right:6px;vertical-align:middle"> Stream</label>
-        <button class="act" id="c-send" style="margin-top:18px;flex:0 0 auto">Send</button>
-      </div>
-      <div class="hint">Trace ID: <span id="c-trace" class="mono">\u2014</span></div>
-      <div id="c-chat" style="margin-top:10px"></div>
-      <label>Raw response</label><pre id="c-raw">\u2014</pre>
     </div>
   </section>
 
@@ -2439,7 +2508,7 @@ var PLAYGROUND_HTML = `<!doctype html>
       <div class="toolbar"><h2 class="sec" style="margin:0">Traces</h2><span class="spacer"></span><button class="ghost" id="t-export-json">Export JSON</button><button class="ghost" id="t-export-csv">Export CSV</button></div>
       <p class="hint">Exports include stored prompts and completions. Treat downloads as sensitive.</p>
       <div class="row" style="align-items:end">
-        <div><label>Key ID</label><input id="t-key" placeholder="sk-\u2026"></div>
+        <div><label>Key ID</label><input id="t-key" placeholder="sk-…"></div>
         <div><label>Search</label><input id="t-query" placeholder="trace, key, slug, provider"></div>
         <div><label>Model slug</label><input id="t-slug" placeholder="z-ai/glm-5.2"></div>
         <div><label>HTTP status</label><select id="t-status"><option value="all">All outcomes</option><option value="200">200 - success</option><option value="400">400 - request issue</option><option value="401">401 - auth issue</option><option value="403">403 - blocked</option><option value="429">429 - limited</option><option value="500">500 - gateway error</option><option value="503">503 - upstream unavailable</option></select></div>
@@ -2797,37 +2866,90 @@ document.getElementById('k-create').onclick=async function(){
 };
 
 // ---------- CHAT ----------
+let pgMessages=[], pgTrace=null, pgTraceTab='summary', pgLastTraceId='';
+function playgroundDefaultMessages(){ return [{role:'user',content:'Say hello in one sentence.'}]; }
+function setPlaygroundStatus(text){ const el=document.getElementById('c-status'); if(el) el.textContent=text; }
+function renderPlaygroundMessages(messages){
+  const el=document.getElementById('c-chat'); if(!el) return; el.innerHTML='';
+  if(!messages.length){ el.innerHTML='<div class="empty">Send a message to start a run.</div>'; return; }
+  messages.forEach(function(m){ appendPlaygroundMessage(m.role, m.content, m.meta); });
+}
+function appendPlaygroundMessage(role, text, meta){
+  const el=document.getElementById('c-chat'); if(!el) return;
+  const empty=el.querySelector('.empty'); if(empty) empty.remove();
+  const d=document.createElement('div'); d.className='pg-msg '+(role==='user'?'user':'assistant');
+  const who=document.createElement('div'); who.className='who'; who.textContent=role==='user'?'You':'Assistant';
+  const body=document.createElement('div'); body.className='pg-body'; body.textContent=text||'(no content)';
+  d.appendChild(who); d.appendChild(body);
+  if(meta){ const me=document.createElement('div'); me.className='pg-meta'; me.textContent=meta; d.appendChild(me); }
+  el.appendChild(d); el.scrollTop=el.scrollHeight;
+  return d;
+}
+function appendStreamingMessage(){
+  const d=appendPlaygroundMessage('assistant','',null); d.classList.add('streaming');
+  const body=d.querySelector('.pg-body'); body.textContent='…';
+  return { el:d, append:function(chunk){ if(body.textContent==='…') body.textContent=''; body.textContent+=chunk; const box=document.getElementById('c-chat'); box.scrollTop=box.scrollHeight; }, done:function(){ d.classList.remove('streaming'); } };
+}
 async function refreshPlaygroundModels(){
   const select=document.getElementById('c-model'); if(!select)return;
   const selected=select.value; const opts=await publicModelOptions();
   select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===selected?' selected':'')+'>'+esc(o.label)+'</option>';}).join('') || '<option value="">No enabled public models</option>';
+  if(!select.value&&select.options.length&&select.options[0].value) select.value=select.options[0].value;
 }
-// ---------- CHAT ----------
-document.getElementById('c-send').onclick=async function(){
-  const model=document.getElementById('c-model').value.trim();
-  const stream=document.getElementById('c-stream').checked;
-  let messages; try{ messages=JSON.parse(document.getElementById('c-messages').value); }catch(e){ toast('messages not valid JSON','err'); return; }
-  document.getElementById('c-chat').innerHTML=''; document.getElementById('c-raw').textContent='\u2026';
-  const trace=Math.random().toString(36).slice(2);
-  document.getElementById('c-trace').textContent=trace;
+document.getElementById('c-send').onclick=async function(){ await sendPlaygroundMessage(); };
+document.getElementById('c-prompt').addEventListener('keydown',function(e){ if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){ e.preventDefault(); sendPlaygroundMessage(); } });
+document.getElementById('c-clear').onclick=function(){
+  pgMessages=[]; pgTrace=null; pgLastTraceId='';
+  document.getElementById('c-messages').value=JSON.stringify(playgroundDefaultMessages(),null,2);
+  document.getElementById('c-prompt').value='';
+  document.getElementById('c-trace-panel').hidden=true;
+  renderPlaygroundMessages([]); setPlaygroundStatus('Ready when you are.');
+};
+document.getElementById('c-copy-trace').onclick=function(){
+  const id=pgLastTraceId||((pgTrace&&pgTrace.trace_id)||'');
+  if(!id){ toast('no trace yet','err'); return; }
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(id).then(function(){toast('trace copied','ok');}); }
+  else toast(id,'ok');
+};
+document.getElementById('c-close-trace').onclick=function(){ document.getElementById('c-trace-panel').hidden=true; };
+async function sendPlaygroundMessage(){
+  const modelEl=document.getElementById('c-model'); const model=modelEl?modelEl.value.trim():'';
+  const streamBox=document.getElementById('c-stream'); const stream=streamBox?streamBox.checked:false;
+  const promptEl=document.getElementById('c-prompt'); const prompt=(promptEl?promptEl.value:'').trim();
+  if(!model){ toast('choose a model','err'); return; }
+  if(!prompt){ toast('write a prompt first','err'); return; }
+  let history; try{ history=JSON.parse(document.getElementById('c-messages').value); if(!Array.isArray(history)) throw new Error('array'); }
+  catch(e){ toast('Request JSON must be a messages array','err'); return; }
+  const messages=history.concat([{role:'user',content:prompt}]);
+  document.getElementById('c-messages').value=JSON.stringify(messages,null,2);
+  if(promptEl) promptEl.value='';
+  pgMessages=messages; renderPlaygroundMessages(messages);
+  const trace=Math.random().toString(36).slice(2); pgLastTraceId=trace;
+  setPlaygroundStatus('Running '+model+(stream?' (streaming)':'')+'…');
   try{
     const r=await fetch(API+'/admin/playground/completions',{method:'POST',headers:{'Content-Type':'application/json','x-trace-id':trace},credentials:'same-origin',body:JSON.stringify({model:model,messages:messages,stream:stream})});
-    document.getElementById('c-raw').textContent='HTTP '+r.status+NL+'Trace: '+(r.headers.get('x-trace-id')||'')+NL+NL+(r.headers.get('x-gateway-used-usd')?'used_usd='+r.headers.get('x-gateway-used-usd')+' used_tokens='+r.headers.get('x-gateway-used-tokens'):'');
-    if(!r.ok){ const t=await r.text(); document.getElementById('c-raw').textContent+=NL+NL+t; return; }
+    const traceId=r.headers.get('x-trace-id')||trace; pgLastTraceId=traceId;
+    const usage=r.headers.get('x-gateway-used-usd')?('used '+r.headers.get('x-gateway-used-tokens')+' tokens / '+r.headers.get('x-gateway-used-usd')+' USD'):null;
+    if(!r.ok){ const t=await r.text(); appendPlaygroundMessage('assistant','Request failed (HTTP '+r.status+'): '+t.slice(0,1200),'trace '+traceId); setPlaygroundStatus('Failed: HTTP '+r.status); renderPlaygroundTraceError(traceId,t); return; }
     if(stream){
-      const reader=r.body.getReader(); const dec=new TextDecoder(); let buf=''; let out='';
+      const handle=appendStreamingMessage();
+      const reader=r.body.getReader(); const dec=new TextDecoder(); let buf='', out='';
       while(true){ const res=await reader.read(); if(res.done)break; buf+=dec.decode(res.value,{stream:true});
         let i; while((i=buf.indexOf(NL))>=0){ const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
-          if(line.indexOf('data:')===0){ const d=line.slice(5).trim(); if(d==='[DONE]')continue; try{ const o=JSON.parse(d); out+=(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); }catch(e){} } } }
-      addMsg('assistant', out);
+          if(line.indexOf('data:')===0){ const d=line.slice(5).trim(); if(d==='[DONE]')continue; try{ const o=JSON.parse(d); out+=(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); handle.append(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); }catch(e){} } } }
+      handle.done(); pgMessages=messages.concat([{role:'assistant',content:out||'(no content)',meta:usage}]);
+      document.getElementById('c-messages').value=JSON.stringify(pgMessages,null,2);
     } else {
-      const j=await r.json(); addMsg('assistant', (j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||'(no content)');
-      document.getElementById('c-raw').textContent+=NL+NL+JSON.stringify(j,null,2);
+      const j=await r.json(); const content=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||'(no content)';
+      pgMessages=messages.concat([{role:'assistant',content:content,meta:usage}]);
+      appendPlaygroundMessage('assistant',content,usage);
+      document.getElementById('c-messages').value=JSON.stringify(pgMessages,null,2);
     }
-  }catch(e){ toast('error: '+e.message,'err'); }
-  setTimeout(function(){ loadTraceBy(trace); }, 1200);
+    setPlaygroundStatus('Complete. Loading trace…');
+    await loadTraceIntoPlayground(traceId);
+  }catch(e){ toast('error: '+e.message,'err'); setPlaygroundStatus('Error: '+e.message); }
 };
-function addMsg(who,text){ const d=document.createElement('div'); d.className='msg '+who; d.innerHTML='<div class="who">'+who+'</div><div>'+esc(text)+'</div>'; document.getElementById('c-chat').appendChild(d); }
+function addMsg(who,text){ appendPlaygroundMessage(who==='user'?'user':'assistant',text,null); }
 
 // ---------- TRACES ----------
 function traceQuery(limitCap){
@@ -2845,6 +2967,67 @@ async function loadTraces(){
   }).join('') || '<tr><td colspan="9"><div class="empty">No traces match these filters.</div></td></tr>';
   document.getElementById('t-list').innerHTML='<table><tr><th>Trace</th><th>Key</th><th>Model</th><th>Source</th><th>Tokens</th><th>Cost</th><th>Time</th><th>Status</th><th></th></tr>'+rows+'</table>';
 }
+function tracePanelHtml(t){
+  const evts=(t.stream_events||[]);
+  const summary='<div class="pg-summary">'
+    +'<div class="stat"><div class="k">Status</div><div class="v">'+esc(t.status)+'</div></div>'
+    +'<div class="stat"><div class="k">Tokens</div><div class="v">'+esc(fmt(t.total_tokens))+'</div></div>'
+    +'<div class="stat"><div class="k">Cost</div><div class="v ok">'+esc(money(t.cost_usd))+'</div></div>'
+    +'<div class="stat"><div class="k">Duration</div><div class="v acc">'+esc((t.duration_ms||0)+'ms')+'</div></div></div>'
+    +'<dl class="pg-kv"><dt>Provider</dt><dd>'+esc(t.provider_name||'—')+' <span class="mono small">'+esc(t.upstream_model||'')+'</span></dd>'
+    +'<dt>Source</dt><dd>'+(t.cache_hit?'cache hit':'live upstream')+'</dd>'
+    +(t.error?'<dt>Error</dt><dd>'+esc(String(t.error).slice(0,600))+'</dd>':'')+'</dl>';
+  const req=t.request_body?traceJsonText(t.request_body):'(none)';
+  const resp=t.error?String(t.error):(t.response_body?traceJsonText(t.response_body):'(none)');
+  const ev=t.stream?(evts.length?JSON.stringify(evts,null,2):'(no stream events recorded)'):'(not a streamed run)';
+  return {summary:summary,request:req,response:resp,events:ev};
+}
+function traceJsonText(s){ try{ const o=JSON.parse(s); return JSON.stringify(o,null,2); }catch(e){ return String(s); } }
+function paintTraceBody(body,t,tab){
+  const parts=tracePanelHtml(t);
+  if(tab==='request'||tab==='response'||tab==='events'){ body.innerHTML='<pre>'+esc(parts[tab])+'</pre>'; return; }
+  body.innerHTML=parts.summary;
+}
+function setTraceTabs(root,tab){
+  root.querySelectorAll('[data-trace-tab]').forEach(function(b){
+    const on=b.getAttribute('data-trace-tab')===tab;
+    b.classList.toggle('on',on); b.setAttribute('aria-selected',on?'true':'false');
+  });
+}
+function wireTraceTabs(root,getTrace){
+  root.querySelectorAll('[data-trace-tab]').forEach(function(b){
+    b.onclick=function(){ const t=getTrace(); if(!t) return; pgTraceTab=b.getAttribute('data-trace-tab'); setTraceTabs(root,pgTraceTab); paintTraceBody(root.querySelector('.pg-trace-body')||root, t, pgTraceTab); };
+  });
+}
+function renderPlaygroundTrace(t){
+  pgTrace=t; pgTraceTab='summary';
+  const panel=document.getElementById('c-trace-panel'); if(!panel) return;
+  panel.hidden=false;
+  const meta=document.getElementById('c-trace-meta');
+  if(meta) meta.textContent='trace '+t.trace_id+' | status '+t.status+' | '+(t.cache_hit?'cache hit':'live upstream')+' | '+(t.duration_ms||0)+'ms | '+fmt(t.total_tokens)+' tokens | '+money(t.cost_usd);
+  setTraceTabs(panel,'summary');
+  paintTraceBody(document.getElementById('c-trace-body'),t,'summary');
+  wireTraceTabs(panel,function(){return pgTrace;});
+  setPlaygroundStatus('Complete. Trace loaded inline.');
+}
+function renderPlaygroundTraceError(traceId,errText){
+  const panel=document.getElementById('c-trace-panel'); if(!panel) return;
+  panel.hidden=false;
+  const meta=document.getElementById('c-trace-meta');
+  if(meta) meta.textContent='trace '+traceId+' | failed before a trace was stored';
+  setTraceTabs(panel,'response');
+  document.getElementById('c-trace-body').innerHTML='<pre>'+esc(String(errText||'unknown error').slice(0,3000))+'</pre>';
+  wireTraceTabs(panel,function(){return null;});
+}
+async function loadTraceIntoPlayground(id){
+  setPlaygroundStatus('Complete. Loading trace…');
+  try{
+    const {status,data}=await api('/admin/traces/'+encodeURIComponent(id));
+    const t=data&&data.trace;
+    if(status!==200||!t){ renderPlaygroundTraceError(id,'Trace not stored yet. Open Traces and retry in a few seconds.'); return; }
+    renderPlaygroundTrace(t);
+  }catch(e){ renderPlaygroundTraceError(id,e.message); }
+}
 function appendTraceBlock(parent,label,value){
   const l=document.createElement('label'); l.textContent=label; parent.appendChild(l);
   const pre=document.createElement('pre'); pre.textContent=typeof value==='string'?value:JSON.stringify(value,null,2); parent.appendChild(pre);
@@ -2855,16 +3038,20 @@ async function viewTrace(id){
     const t=data&&data.trace; if(status!==200||!t){ toast('trace not found','err'); return; }
     modalSubmit=null; document.querySelector('.modal').classList.add('trace-modal'); document.getElementById('modal-title').textContent='Trace '+t.trace_id;
     document.getElementById('modal-save').style.display='none';
-    const body=document.getElementById('modal-body'); body.textContent='';
-    const meta=document.createElement('div'); meta.className='small'; meta.textContent='status '+t.status+' \xB7 '+(t.cache_hit?'cache hit':'live upstream')+' \xB7 '+(t.duration_ms||0)+'ms \xB7 '+fmt(t.total_tokens)+' tokens'; body.appendChild(meta);
-    appendTraceBlock(body,'Request (sensitive input)',t.request_body?tryJson(t.request_body):'(none)');
-    appendTraceBlock(body,'Response (sensitive output)',t.response_body?tryJson(t.response_body):'(none)');
-    if(t.stream) appendTraceBlock(body,'Complete streamed trajectory ('+((t.stream_events||[]).length)+' events)',t.stream_events||[]);
-    if(t.error) appendTraceBlock(body,'Error',t.error);
+    const body=document.getElementById('modal-body'); body.innerHTML='';
+    const meta=document.createElement('div'); meta.className='small'; meta.textContent='status '+t.status+' | '+(t.cache_hit?'cache hit':'live upstream')+' | '+(t.duration_ms||0)+'ms | '+fmt(t.total_tokens)+' tokens | '+money(t.cost_usd); body.appendChild(meta);
+    const host=document.createElement('div'); host.className='pg-trace-tabs'; host.setAttribute('role','tablist');
+    host.innerHTML='<button class="seg-btn on" data-trace-tab="summary" role="tab">Summary</button><button class="seg-btn" data-trace-tab="request" role="tab">Request</button><button class="seg-btn" data-trace-tab="response" role="tab">Response</button><button class="seg-btn" data-trace-tab="events" role="tab">Events</button>';
+    body.appendChild(host);
+    const content=document.createElement('div'); content.className='pg-trace-body'; content.style.padding='14px 0 0'; body.appendChild(content);
+    let tab='summary';
+    const paint=function(){ paintTraceBody(content,t,tab); };
+    host.querySelectorAll('[data-trace-tab]').forEach(function(b){ b.onclick=function(){ tab=b.getAttribute('data-trace-tab'); setTraceTabs(host,tab); paint(); }; });
+    paint();
     document.getElementById('overlay').classList.add('show');
   }catch(e){toast('trace load failed: '+e.message,'err');}
 }
-async function loadTraceBy(id){ await selectTab('traces'); await viewTrace(id); }
+async function loadTraceBy(id){ await loadTraceIntoPlayground(id); }
 function tryJson(s){ try{ return JSON.parse(s); }catch(e){ return s; } }
 async function exportTraces(format){
   if(!confirm('This download includes sensitive prompts and completions. Continue?')) return;
