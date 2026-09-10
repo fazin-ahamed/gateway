@@ -2355,6 +2355,46 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-kv dt{color:var(--muted)}
   .pg-kv dd{margin:0;word-break:break-word}
   @media (max-width:980px){.pg-shell{grid-template-columns:1fr}.pg-config{position:static}.pg-messages{max-height:420px}.pg-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.pg-msg{max-width:100%}}
+  /* Console refresh: operator layout, one accent, cards 14px, controls 9px, pills full. */
+  .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:0 0 18px}
+  .pagehead h2.sec{font-size:22px;letter-spacing:-.03em;margin:0}
+  .pagehead h2.sec:after{content:"";display:block;width:30px;height:2px;margin-top:10px;background:var(--accent)}
+  .pagehead .sub{color:var(--muted);font-size:12.5px;margin:8px 0 0;max-width:62ch}
+  .pagehead .actions{display:flex;gap:8px;flex:0 0 auto}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:14px;margin-bottom:16px;overflow:hidden}
+  .panel-h{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+  .panel-h h2.sec{margin:0;font-size:14px}
+  .panel-b{padding:20px}
+  .panel-b.flush{padding:0}
+  .hero-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+  .hero-stats .stat{min-height:118px;padding:18px}
+  .hero-stats .stat .v{font-size:32px}
+  .hero-stats .stat .sub2{color:var(--muted);font-size:11px;margin-top:6px}
+  .cols2{display:grid;grid-template-columns:1.4fr 1fr;gap:16px;align-items:start}
+  table tr th:first-child,table tr td:first-child{padding-left:20px}
+  table tr th:last-child,table tr td:last-child{padding-right:20px}
+  td.rowact{white-space:nowrap;text-align:right}
+  .kvrow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}
+  .kvrow:last-child{border-bottom:0}
+  .kvrow .grow{min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .kvrow .right{margin-left:auto;flex:0 0 auto}
+  .empty{border-style:solid;background:var(--surface-deep)}
+  .empty .act{margin-top:12px}
+  .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .form-grid .full{grid-column:1/-1}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}
+  .modal-head h3{margin:0}
+  .modal-x{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:9px;width:30px;height:30px;cursor:pointer;font-size:14px;line-height:1}
+  .modal-x:hover{color:var(--text);border-color:var(--line-hi)}
+  .modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+  .modal-foot .act{margin-top:0}
+  #modal-body input,#modal-body select{margin-bottom:12px}
+  #modal-body label{margin-top:2px}
+  .trace-filters{display:grid;grid-template-columns:1.2fr 1.4fr 1.2fr 1.2fr .8fr auto;gap:12px;align-items:end}
+  .pill{border-radius:999px}
+  .toast{border-radius:10px}
+  @media (max-width:1100px){.hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.cols2{grid-template-columns:1fr}.trace-filters{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media (max-width:620px){.hero-stats{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.trace-filters{grid-template-columns:1fr}.pagehead{flex-direction:column;align-items:flex-start}}
 </style>
 </head>
 <body>
@@ -2376,80 +2416,57 @@ var PLAYGROUND_HTML = `<!doctype html>
 </nav>
 <main>
   <section class="tab active" id="tab-overview">
-    <h2 class="sec">At a glance</h2>
-    <div class="grid s4" id="stats"></div>
-    <div class="row" style="align-items:flex-start">
-      <div class="card" style="flex:1.4">
-        <h2 class="sec" style="margin-top:0">Recent activity</h2>
-        <div id="recent"></div>
-      </div>
-      <div class="card" style="flex:1">
-        <h2 class="sec" style="margin-top:0">Provider health</h2>
-        <div id="ov-providers"></div>
-      </div>
+    <div class="pagehead"><div><h2 class="sec">At a glance</h2><p class="sub">Live totals, recent runs, and the health of every upstream behind this gateway.</p></div></div>
+    <div class="hero-stats" id="stats"></div>
+    <div class="cols2">
+      <div class="panel"><div class="panel-h"><h2 class="sec">Recent activity</h2></div><div class="panel-b flush" id="recent"></div></div>
+      <div class="panel"><div class="panel-h"><h2 class="sec">Provider health</h2></div><div class="panel-b" id="ov-providers"></div></div>
     </div>
-    <div class="card">
-      <div class="toolbar" style="margin-bottom:8px">
-        <h2 class="sec" style="margin:0">Egress Proxy Health</h2>
-        <span class="spacer"></span>
-        <button class="ghost" id="ph-refresh">Refresh</button>
-      </div>
-      <div id="proxy-health"><span class="small">click Refresh to ping each provider's egress proxy</span></div>
+    <div class="panel">
+      <div class="panel-h"><h2 class="sec">Egress health</h2><button class="ghost" id="ph-refresh">Refresh</button></div>
+      <div class="panel-b" id="proxy-health"><span class="small">Loading egress status…</span></div>
     </div>
   </section>
 
   <section class="tab" id="tab-providers">
-    <div class="toolbar">
-      <h2 class="sec" style="margin:0">Providers</h2>
-      <span class="spacer"></span>
-      <button class="act" id="p-add" style="margin-top:0">+ Add provider</button>
-    </div>
-    <div class="card" style="padding:0"><div id="providers-list"></div></div>
-    <p class="hint">A provider is an upstream OpenAI-compatible (or Anthropic) backend. Its API key is stored in the database (set it below). Transport <span class="mono">auto</span> sends direct egress from the Worker and uses the Koyeb WebSocket relay only where a separate egress is required; <span class="mono">proxy_url</span> keeps the legacy OCI relay for rollback.</p>
+    <div class="pagehead"><div><h2 class="sec">Providers</h2><p class="sub">Upstream backends. Keys stay in the database. <span class="mono">auto</span> uses direct egress and the Koyeb relay only where separate egress is required; <span class="mono">proxy_url</span> keeps the legacy OCI path for rollback.</p></div><div class="actions"><button class="act" id="p-add" style="margin-top:0">Add provider</button></div></div>
+    <div class="panel"><div class="panel-b flush" id="providers-list"></div></div>
   </section>
 
   <section class="tab" id="tab-routes">
-    <div class="toolbar">
-      <h2 class="sec" style="margin:0">Model Routes</h2>
-      <span class="spacer"></span>
-      <button class="act" id="r-add" style="margin-top:0">+ Add route</button>
-    </div>
-    <p class="small">Each public slug maps to one or more upstream models. Rank 0 is primary; higher ranks are failover. Clients only ever see the slug.</p>
-    <div class="card" style="padding:0"><div id="routes-list"></div></div>
+    <div class="pagehead"><div><h2 class="sec">Model Routes</h2><p class="sub">Each public slug maps to one or more upstream models. Rank 0 is primary; higher ranks are failover. Clients only ever see the slug.</p></div><div class="actions"><button class="act" id="r-add" style="margin-top:0">Add route</button></div></div>
+    <div class="panel"><div class="panel-b flush" id="routes-list"></div></div>
   </section>
 
   <section class="tab" id="tab-tiers">
-    <div class="card">
-      <h2 class="sec" style="margin-top:0">Create Model Tier</h2>
-      <p class="hint">A tier is a reusable bundle of public model slugs. Assign one or more tiers to a key; per-key exclusions always win.</p>
-      <div class="row">
+    <div class="pagehead"><div><h2 class="sec">Model Tiers</h2><p class="sub">A tier is a reusable bundle of public model slugs. Assign one or more tiers to a key; per-key exclusions always win.</p></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Create tier</h2></div><div class="panel-b">
+      <div class="form-grid">
         <div><label>Tier name</label><input id="tier-name" placeholder="Builder"></div>
-        <div style="flex:2"><label>Public model slugs</label><select id="tier-slugs" multiple size="5"></select><small>Choose one or more currently enabled public models.</small></div>
-        <button class="act" id="tier-create" style="flex:0 0 auto;margin-top:22px">Create tier</button>
+        <div><label>Public model slugs</label><select id="tier-slugs" multiple size="5"></select><small>Choose one or more currently enabled public models.</small></div>
+        <div class="full"><button class="act" id="tier-create">Create tier</button></div>
       </div>
-    </div>
-    <div class="card" style="padding:0"><div id="tiers-list"></div></div>
+    </div></div>
+    <div class="panel"><div class="panel-b flush" id="tiers-list"></div></div>
   </section>
 
   <section class="tab" id="tab-keys">
-    <div class="card">
-      <h2 class="sec" style="margin-top:0">Create API Key</h2>
-      <div class="row">
+    <div class="pagehead"><div><h2 class="sec">API Keys</h2><p class="sub">Client credentials with budgets, rate limits, tier access, and model overrides.</p></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Create key</h2></div><div class="panel-b">
+      <div class="form-grid">
         <div><label>Name</label><input id="k-name" placeholder="my-app"></div>
         <div><label>Budget mode</label><select id="k-mode"><option value="usd">USD ($)</option><option value="tokens">Tokens</option></select></div>
         <div><label>Budget limit</label><input id="k-limit" type="number" step="any" placeholder="5.00"></div>
         <div><label>Request limit / minute</label><input id="k-rpm" type="number" min="1" step="1" placeholder="Unlimited"></div>
         <div><label>Expires at (UAE / GST)</label><input id="k-expiry" type="datetime-local"><small>UAE time (UTC+4). Blank means the key never expires.</small></div>
         <div><label>Model tiers</label><select id="k-tiers" multiple size="3"></select><small>Optional; choose one or more.</small></div>
+        <div><label>Extra allowed models (comma list)</label><input id="k-models" placeholder="z-ai/glm-5.2"></div>
+        <div><label>Excluded models (always override tiers and extra allows)</label><input id="k-excludes" placeholder="minimax/minimax-m3"></div>
       </div>
-      <label>Extra allowed models (comma list)</label>
-      <input id="k-models" placeholder="z-ai/glm-5.2">
-      <label>Excluded models (always override tiers and extra allows)</label>
-      <input id="k-excludes" placeholder="minimax/minimax-m3">
       <button class="act" id="k-create">Create Key</button>
       <div class="hint" id="k-out"></div>
-    </div>
-    <div class="card" style="padding:0"><div id="keys-list"></div></div>
+    </div></div>
+    <div class="panel"><div class="panel-b flush" id="keys-list"></div></div>
   </section>
 
   <section class="tab" id="tab-chat">
@@ -2480,6 +2497,7 @@ var PLAYGROUND_HTML = `<!doctype html>
           </div>
           <div class="pg-composer">
             <textarea id="c-prompt" placeholder="Ask anything..."></textarea>
+            <button class="ghost" id="c-redo" title="Regenerate the last response">Regenerate</button>
             <button class="act" id="c-send">Send</button>
           </div>
         </section>
@@ -2504,19 +2522,18 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-traces">
-    <div class="card">
-      <div class="toolbar"><h2 class="sec" style="margin:0">Traces</h2><span class="spacer"></span><button class="ghost" id="t-export-json">Export JSON</button><button class="ghost" id="t-export-csv">Export CSV</button></div>
-      <p class="hint">Exports include stored prompts and completions. Treat downloads as sensitive.</p>
-      <div class="row" style="align-items:end">
+    <div class="pagehead"><div><h2 class="sec">Traces</h2><p class="sub">Every stored run. Exports include prompts and completions; treat downloads as sensitive.</p></div><div class="actions"><button class="ghost" id="t-export-json">Export JSON</button><button class="ghost" id="t-export-csv">Export CSV</button></div></div>
+    <div class="panel"><div class="panel-b">
+      <div class="trace-filters">
         <div><label>Key ID</label><input id="t-key" placeholder="sk-…"></div>
         <div><label>Search</label><input id="t-query" placeholder="trace, key, slug, provider"></div>
         <div><label>Model slug</label><input id="t-slug" placeholder="z-ai/glm-5.2"></div>
         <div><label>HTTP status</label><select id="t-status"><option value="all">All outcomes</option><option value="200">200 - success</option><option value="400">400 - request issue</option><option value="401">401 - auth issue</option><option value="403">403 - blocked</option><option value="429">429 - limited</option><option value="500">500 - gateway error</option><option value="503">503 - upstream unavailable</option></select></div>
         <div><label>Rows</label><input id="t-limit" type="number" value="100" min="1" max="500"></div>
-        <button class="act" id="t-load" style="flex:0 0 auto;margin-top:0">Apply filters</button>
+        <div><button class="act" id="t-load" style="margin-top:0">Apply filters</button></div>
       </div>
-      <div id="t-list" style="margin-top:12px"></div>
-    </div>
+    </div></div>
+    <div class="panel"><div class="panel-b flush" id="t-list" style="margin-top:0"></div></div>
   </section>
 
   <section class="tab" id="tab-cache">
@@ -2544,11 +2561,10 @@ var PLAYGROUND_HTML = `<!doctype html>
 </main>
 
 <div class="overlay" id="overlay">
-  <div class="modal">
-    <h3 id="modal-title">Modal</h3>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head"><h3 id="modal-title">Modal</h3><button class="modal-x" id="modal-x" aria-label="Close">×</button></div>
     <div id="modal-body"></div>
-    <div class="row" style="margin-top:14px">
-      <span class="spacer"></span>
+    <div class="modal-foot">
       <button class="ghost" id="modal-cancel">Cancel</button>
       <button class="act" id="modal-save" style="margin-top:0">Save</button>
     </div>
@@ -2599,70 +2615,81 @@ function openModal(title, fields, onSubmit, saveLabel){
     const lab=document.createElement('label'); lab.textContent=f.label; body.appendChild(lab);
     let inp;
     if(f.type==='select'||f.type==='multiselect'){ inp=document.createElement('select'); if(f.type==='multiselect') inp.multiple=true; (f.options||[]).forEach(function(o){ const op=document.createElement('option'); op.value=o.value; op.textContent=o.label; if(f.type==='multiselect'&&Array.isArray(f.value)&&f.value.map(String).includes(String(o.value))) op.selected=true; inp.appendChild(op); }); }
+    else if(f.type==='textarea'){ inp=document.createElement('textarea'); inp.rows=f.rows||4; }
     else { inp=document.createElement('input'); inp.type=f.type||'text'; }
     if(f.value!=null&&f.type!=='multiselect') inp.value=f.value;
     if(f.placeholder) inp.placeholder=f.placeholder;
+    if(f.hint){ const h=document.createElement('div'); h.className='small'; h.style.margin='-6px 0 12px'; h.textContent=f.hint; body.appendChild(inp); body.appendChild(h); vals[f.key]=inp; return; }
     inp.dataset.key=f.key; body.appendChild(inp); vals[f.key]=inp;
   });
   modalSubmit=function(){ const out={}; fields.forEach(function(f){ out[f.key]=f.type==='multiselect'?Array.from(vals[f.key].selectedOptions).map(function(o){return o.value;}):vals[f.key].value; }); onSubmit(out); };
   document.getElementById('modal-save').textContent=saveLabel||'Save';
   document.getElementById('modal-save').style.display='';
   document.getElementById('overlay').classList.add('show');
+  const first=body.querySelector('input,select,textarea'); if(first) setTimeout(function(){ try{first.focus();}catch(e){} },30);
 }
 function closeModal(){ document.getElementById('overlay').classList.remove('show'); modalSubmit=null; }
 document.getElementById('modal-cancel').onclick=closeModal;
+document.getElementById('modal-x').onclick=closeModal;
 document.getElementById('modal-save').onclick=function(){ if(modalSubmit) modalSubmit(); };
 document.getElementById('overlay').addEventListener('click',function(e){ if(e.target.id==='overlay') closeModal(); });
-
-// ---------- OVERVIEW ----------
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'&&document.getElementById('overlay').classList.contains('show')) closeModal();
+  if(e.key==='Enter'&&document.getElementById('overlay').classList.contains('show')&&modalSubmit&&/^(INPUT|SELECT)$/.test((document.activeElement||{}).tagName||'')){ e.preventDefault(); modalSubmit(); }
+});
 async function loadOverview(){
-  document.getElementById('stats').innerHTML='<div class="stat"><div class="k">loading</div><div class="v skeleton">----</div></div>';
-  const {data}=await api('/admin/overview'); if(!data) return;
+  const statsEl=document.getElementById('stats');
+  statsEl.innerHTML='<div class="stat"><div class="k">loading</div><div class="v skeleton">----</div></div>';
+  let data; try{ const res=await api('/admin/overview'); data=res.data; }catch(e){ statsEl.innerHTML='<div class="empty">Could not load overview: '+esc(e.message)+'</div>'; return; }
+  if(!data) return;
   const ts=data.trace_stats||{}; const tot=data.totals||{};
   const stats=[
-    {k:'API keys', v:fmt((data.keys||[]).length), c:''},
-    {k:'Providers', v:fmt((data.providers||[]).length), c:''},
-    {k:'Model routes', v:fmt((data.routes||[]).length), c:''},
-    {k:'Total requests', v:fmt(tot.requests), c:'acc'},
-    {k:'Tokens used', v:fmt(tot.used_tokens), c:''},
-    {k:'Spend (USD)', v:money(tot.used_usd), c:'ok'},
-    {k:'Traces', v:fmt(ts.total_traces), c:''},
-    {k:'Errors', v:fmt(ts.errors), c:ts.errors>0?'bad':''}
+    {k:'Total requests', v:fmt(tot.requests), c:'acc', s:'all time'},
+    {k:'Tokens used', v:fmt(tot.used_tokens), c:'', s:'all time'},
+    {k:'Spend (USD)', v:money(tot.used_usd), c:'ok', s:'all time'},
+    {k:'Errors', v:fmt(ts.errors), c:ts.errors>0?'bad':'', s:fmt(ts.total_traces)+' traces'},
+    {k:'API keys', v:fmt((data.keys||[]).length), c:'', s:'configured'},
+    {k:'Providers', v:fmt((data.providers||[]).length), c:'', s:'configured'},
+    {k:'Model routes', v:fmt((data.routes||[]).length), c:'', s:'enabled paths'},
+    {k:'Traces', v:fmt(ts.total_traces), c:'', s:'stored'}
   ];
-  document.getElementById('stats').innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div></div>';}).join('');
+  statsEl.innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div><div class="sub2">'+esc(s.s||'')+'</div></div>';}).join('');
   const rec=(data.recent_traces||[]);
-  document.getElementById('recent').innerHTML = rec.length ? '<table><tr><th>When</th><th>Slug</th><th>Provider</th><th>Tokens</th><th>Status</th></tr>'+rec.map(function(t){return '<tr><td class="mono">'+esc((t.created_at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(t.slug||'')+'</td><td>'+esc(t.provider_name||'')+'</td><td>'+fmt(t.total_tokens)+'</td><td>'+statusPill(t.status)+'</td></tr>';}).join('')+'</table>' : '<div class="empty">No traces yet. Send a request through the gateway.</div>';
+  document.getElementById('recent').innerHTML = rec.length ? '<table><tr><th>When</th><th>Slug</th><th>Provider</th><th>Tokens</th><th>Status</th></tr>'+rec.map(function(t){return '<tr><td class="mono">'+esc((t.created_at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(t.slug||'')+'</td><td>'+esc(t.provider_name||'')+'</td><td>'+fmt(t.total_tokens)+'</td><td>'+statusPill(t.status)+'</td></tr>';}).join('')+'</table>' : '<div class="empty" style="margin:20px">No traces yet. Send a request through the gateway.</div>';
   const ps=(data.providers||[]);
   document.getElementById('ov-providers').innerHTML = ps.length ? ps.map(function(p){
     const ok=(p.healthy&&p.last_status&&p.last_status>=200&&p.last_status<400); const cls=ok?'ok':(p.healthy?'warn':'bad');
-    const label=ok?'healthy':(!p.healthy?'disabled':('HTTP '+(p.last_status||'\u2014')));
-    return '<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--line)"><span class="pill '+cls+'">'+label+'</span><span>'+esc(p.name)+'</span><span class="mono small" style="margin-left:auto">'+esc(p.route_count||0)+' routes</span></div>';
+    const label=ok?'healthy':(!p.healthy?'disabled':('HTTP '+(p.last_status||'—')));
+    return '<div class="kvrow"><span class="pill '+cls+'">'+label+'</span><span class="grow">'+esc(p.name)+'</span><span class="mono small right">'+esc(p.route_count||0)+' routes</span></div>';
   }).join('') : '<div class="empty">No providers.</div>';
   loadProxyHealth();
 }
 async function loadProxyHealth(){
-  const el=document.getElementById('proxy-health'); el.innerHTML='<span class="small">checking\u2026</span>';
-  const {data}=await api('/admin/proxy-health'); if(!data){ el.innerHTML='<span class="small">failed to load</span>'; return; }
+  const el=document.getElementById('proxy-health'); el.innerHTML='<span class="small">Checking…</span>';
+  let data; try{ const res=await api('/admin/proxy-health'); data=res.data; }catch(e){ el.innerHTML='<span class="small">Egress check failed: '+esc(e.message)+'</span>'; return; }
+  if(!data){ el.innerHTML='<span class="small">Failed to load.</span>'; return; }
   const h=data.health||[];
   el.innerHTML = h.length ? h.map(function(p){
-    if(p.transport==='koyeb'){ const ok=p.relay_reachable; return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)"><span class="pill '+(ok?'ok':'bad')+'">'+(ok?'koyeb ok':'koyeb down')+'</span><span>'+esc(p.name)+'</span><span class="mono small" style="margin-left:auto">'+esc(p.relay_status||p.reason||'')+'</span></div>'; }
-    if(!p.proxy) return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)"><span class="pill mut">direct</span><span>'+esc(p.name)+'</span><span class="mono small" style="margin-left:auto">'+esc(p.reason||'')+'</span></div>';
+    if(p.transport==='koyeb'){ const ok=p.relay_reachable; return '<div class="kvrow"><span class="pill '+(ok?'ok':'bad')+'">'+(ok?'koyeb ok':'koyeb down')+'</span><span class="grow">'+esc(p.name)+'</span><span class="mono small right">'+esc(p.relay_status||p.reason||'')+'</span></div>'; }
+    if(!p.proxy) return '<div class="kvrow"><span class="pill mut">direct</span><span class="grow">'+esc(p.name)+'</span><span class="mono small right">'+esc(p.reason||'')+'</span></div>';
     const ok=p.upstream_status && p.upstream_status>=200 && p.upstream_status<500;
-    return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)"><span class="pill '+(ok?'ok':'warn')+'">'+(ok?'proxy ok':'proxy reachable')+'</span><span>'+esc(p.name)+'</span><span class="mono small" style="margin-left:auto">upstream '+p.upstream_status+'</span></div>';
+    return '<div class="kvrow"><span class="pill '+(ok?'ok':'warn')+'">'+(ok?'proxy ok':'proxy reachable')+'</span><span class="grow">'+esc(p.name)+'</span><span class="mono small right">upstream '+p.upstream_status+'</span></div>';
   }).join('') : '<div class="empty">No providers configured.</div>';
 }
-
-// ---------- PROVIDERS ----------
-async function loadProviders(){
-  const {data}=await api('/admin/providers'); if(!data) return;
-  const rows=(data.providers||[]).map(function(p){
-    return '<tr><td><b>'+esc(p.name)+'</b></td><td class="mono small">'+esc(p.base_url)+'</td><td>'+(p.fmt||'openai')+'</td><td>'+(p.transport==='koyeb'?'<span class="pill acc">koyeb</span>':p.transport==='oci'?'<span class="pill acc">proxy</span>':p.transport==='direct'?'<span class="pill mut">direct</span>':(p.proxy_url?'<span class="pill acc">auto:proxy</span>':'<span class="pill mut">auto:direct</span>'))+'</td><td>'+(p.api_key_set?'<span class="pill ok">key set</span>':'<span class="pill bad">no key</span>')+'</td><td><span class="pill '+hc+'">'+hlabel+'</span></td><td>'+statusPill(p.last_status)+'</td>'+
-      '<td><button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+p.healthy+'">'+(p.healthy?'disable':'enable')+'</button> <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="7"><div class="empty">No providers yet.</div></td></tr>';
-  document.getElementById('providers-list').innerHTML='<table><tr><th>Name</th><th>Base URL</th><th>Format</th><th>Egress</th><th>Key</th><th>State</th><th>Last</th><th></th></tr>'+rows+'</table>';
+var HEADER_PRESETS={
+  none:'',
+  openrouter:'HTTP-Referer: https://fsquarelabs.com\nX-Title: FSquare AI Gateway',
+  claudecode:'anthropic-beta: claude-code-20250219',
+  anthropicbeta:'anthropic-beta: prompt-caching-2024-07-31'
+};
+function headersToLines(json){
+  try{ const o=typeof json==='string'?JSON.parse(json||'{}'):json||{}; return Object.keys(o).map(function(k){return k+': '+o[k];}).join('\n'); }catch(e){ return ''; }
 }
-document.getElementById('ph-refresh').onclick=function(){ loadProxyHealth(); };
-document.getElementById('p-add').onclick=function(){
+function applyHeaderPreset(v){
+  if(v.header_preset&&v.header_preset!=='custom'&&!(v.extra_headers||'').trim()) v.extra_headers=HEADER_PRESETS[v.header_preset]||'';
+  delete v.header_preset; return v;
+}
+var HEADER_PRESET_OPTIONS=[{value:'none',label:'No preset'},{value:'openrouter',label:'OpenRouter app headers'},{value:'claudecode',label:'Claude Code beta'},{value:'anthropicbeta',label:'Anthropic prompt-caching beta'},{value:'custom',label:'Custom only'}];
   openModal('Add provider',[
     {key:'name',label:'Name',placeholder:'OpenRouter'},
     {key:'base_url',label:'Base URL',placeholder:'https://api.example.com/v1'},
@@ -2671,8 +2698,10 @@ document.getElementById('p-add').onclick=function(){
     {key:'priority',label:'Priority (lower = first)',type:'number',value:'0'},
     {key:'proxy_url',label:'OCI proxy URL (rollback only)',placeholder:'http://user:pass@host:8080'},
     {key:'transport',label:'Transport',type:'select',value:'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
-    {key:'notes',label:'Notes',placeholder:'optional'}
+    {key:'header_preset',label:'Header preset',type:'select',value:'none',options:HEADER_PRESET_OPTIONS},
+    {key:'extra_headers',label:'Extra upstream headers',type:'textarea',placeholder:'HTTP-Referer: https://example.com\nX-Title: My app',hint:'One Name: value per line. Sent to this provider on every request. Auth and content headers are managed automatically.'},
   ], async function(v){
+    applyHeaderPreset(v);
     const {status,data}=await api('/admin/providers',{method:'POST',body:JSON.stringify(v)});
     if(status===201){ toast('provider created (id '+data.id+')','ok'); closeModal(); loadProviders(); }
     else toast('create failed: '+(data&&data.error&&data.error.message||status),'err');
@@ -2688,10 +2717,12 @@ async function editProvider(id){
     {key:'priority',label:'Priority',type:'number',value:p.priority},
     {key:'proxy_url',label:'OCI proxy URL (rollback only)',value:p.proxy_url||''},
     {key:'transport',label:'Transport',type:'select',value:p.transport||'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
+    {key:'header_preset',label:'Header preset',type:'select',value:'none',options:HEADER_PRESET_OPTIONS},
+    {key:'extra_headers',label:'Extra upstream headers',type:'textarea',value:headersToLines(p.extra_headers),placeholder:'HTTP-Referer: https://example.com\nX-Title: My app',hint:'One Name: value per line. Sent to this provider on every request. Auth and content headers are managed automatically.'},
     {key:'notes',label:'Notes',value:p.notes||''},
     {key:'healthy',label:'State',type:'select',value:p.healthy?'1':'0',options:[{value:'1',label:'enabled'},{value:'0',label:'disabled'}]}
   ], async function(v){
-    v.healthy = v.healthy==='1';
+    v.healthy = v.healthy==='1'; applyHeaderPreset(v);
     const {status,data:r}=await api('/admin/providers/'+id,{method:'PATCH',body:JSON.stringify(v)});
     if(status===200){ toast('provider updated','ok'); closeModal(); loadProviders(); }
     else toast('update failed: '+(r&&r.error&&r.error.message||status),'err');
@@ -2911,38 +2942,57 @@ document.getElementById('c-copy-trace').onclick=function(){
   if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(id).then(function(){toast('trace copied','ok');}); }
   else toast(id,'ok');
 };
-document.getElementById('c-close-trace').onclick=function(){ document.getElementById('c-trace-panel').hidden=true; };
-async function sendPlaygroundMessage(){
+let pgLastRun=null;
+function pgRateMeta(elapsedMs, totalTokens){
+  const s=elapsedMs/1000; const tps=s>0&&totalTokens?Math.round(totalTokens/s):null;
+  return s.toFixed(1)+'s'+(tps!=null?' · '+tps+' tok/s':'');
+}
+document.getElementById('c-redo').onclick=async function(){
+  if(!pgLastRun){ toast('nothing to redo yet','err'); return; }
+  await sendPlaygroundMessage(pgLastRun.prompt, pgLastRun.history);
+};
+async function sendPlaygroundMessage(promptOverride, historyOverride){
   const modelEl=document.getElementById('c-model'); const model=modelEl?modelEl.value.trim():'';
   const streamBox=document.getElementById('c-stream'); const stream=streamBox?streamBox.checked:false;
-  const promptEl=document.getElementById('c-prompt'); const prompt=(promptEl?promptEl.value:'').trim();
+  const promptEl=document.getElementById('c-prompt'); const prompt=String(promptOverride!=null?promptOverride:(promptEl?promptEl.value:'')).trim();
   if(!model){ toast('choose a model','err'); return; }
   if(!prompt){ toast('write a prompt first','err'); return; }
-  let history; try{ history=JSON.parse(document.getElementById('c-messages').value); if(!Array.isArray(history)) throw new Error('array'); }
-  catch(e){ toast('Request JSON must be a messages array','err'); return; }
+  let history;
+  if(historyOverride) history=historyOverride;
+  else { try{ history=JSON.parse(document.getElementById('c-messages').value); if(!Array.isArray(history)) throw new Error('array'); }
+  catch(e){ toast('Request JSON must be a messages array','err'); return; } }
   const messages=history.concat([{role:'user',content:prompt}]);
   document.getElementById('c-messages').value=JSON.stringify(messages,null,2);
   if(promptEl) promptEl.value='';
   pgMessages=messages; renderPlaygroundMessages(messages);
+  pgLastRun={prompt:prompt,history:history.slice(),model:model,stream:stream};
   const trace=Math.random().toString(36).slice(2); pgLastTraceId=trace;
   setPlaygroundStatus('Running '+model+(stream?' (streaming)':'')+'…');
+  const startedAt=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
+  const elapsed=function(){ return (((typeof performance!=='undefined'&&performance.now)?performance.now():Date.now())-startedAt)/1000; };
   try{
     const r=await fetch(API+'/admin/playground/completions',{method:'POST',headers:{'Content-Type':'application/json','x-trace-id':trace},credentials:'same-origin',body:JSON.stringify({model:model,messages:messages,stream:stream})});
     const traceId=r.headers.get('x-trace-id')||trace; pgLastTraceId=traceId;
     const usage=r.headers.get('x-gateway-used-usd')?('used '+r.headers.get('x-gateway-used-tokens')+' tokens / '+r.headers.get('x-gateway-used-usd')+' USD'):null;
-    if(!r.ok){ const t=await r.text(); appendPlaygroundMessage('assistant','Request failed (HTTP '+r.status+'): '+t.slice(0,1200),'trace '+traceId); setPlaygroundStatus('Failed: HTTP '+r.status); renderPlaygroundTraceError(traceId,t); return; }
+    if(!r.ok){ const t=await r.text(); appendPlaygroundMessage('assistant','Request failed (HTTP '+r.status+'): '+t.slice(0,1200),'trace '+traceId+' · '+elapsed().toFixed(1)+'s'); setPlaygroundStatus('Failed: HTTP '+r.status); renderPlaygroundTraceError(traceId,t); return; }
     if(stream){
       const handle=appendStreamingMessage();
-      const reader=r.body.getReader(); const dec=new TextDecoder(); let buf='', out='';
+      const reader=r.body.getReader(); const dec=new TextDecoder(); let buf='', out='', su=null;
       while(true){ const res=await reader.read(); if(res.done)break; buf+=dec.decode(res.value,{stream:true});
         let i; while((i=buf.indexOf(NL))>=0){ const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
-          if(line.indexOf('data:')===0){ const d=line.slice(5).trim(); if(d==='[DONE]')continue; try{ const o=JSON.parse(d); out+=(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); handle.append(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); }catch(e){} } } }
-      handle.done(); pgMessages=messages.concat([{role:'assistant',content:out||'(no content)',meta:usage}]);
+          if(line.indexOf('data:')===0){ const d=line.slice(5).trim(); if(d==='[DONE]')continue; try{ const o=JSON.parse(d); out+=(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); handle.append(o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content||''); if(o.usage) su=o.usage; }catch(e){} } } }
+      handle.done();
+      const toks=su?(su.total_tokens||((su.prompt_tokens||0)+(su.completion_tokens||0)))||null:null;
+      const meta=pgRateMeta(elapsed()*1000,toks)+(usage?' · '+usage:'');
+      pgMessages=messages.concat([{role:'assistant',content:out||'(no content)',meta:meta}]);
+      appendPlaygroundMessage('assistant',out||'(no content)',meta);
       document.getElementById('c-messages').value=JSON.stringify(pgMessages,null,2);
     } else {
       const j=await r.json(); const content=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||'(no content)';
-      pgMessages=messages.concat([{role:'assistant',content:content,meta:usage}]);
-      appendPlaygroundMessage('assistant',content,usage);
+      const ju=j.usage||{}; const jt=(ju.total_tokens||((ju.prompt_tokens||0)+(ju.completion_tokens||0)))||null;
+      const meta=pgRateMeta(elapsed()*1000,jt)+(usage?' · '+usage:'');
+      pgMessages=messages.concat([{role:'assistant',content:content,meta:meta}]);
+      appendPlaygroundMessage('assistant',content,meta);
       document.getElementById('c-messages').value=JSON.stringify(pgMessages,null,2);
     }
     setPlaygroundStatus('Complete. Loading trace…');
@@ -2967,15 +3017,21 @@ async function loadTraces(){
   }).join('') || '<tr><td colspan="9"><div class="empty">No traces match these filters.</div></td></tr>';
   document.getElementById('t-list').innerHTML='<table><tr><th>Trace</th><th>Key</th><th>Model</th><th>Source</th><th>Tokens</th><th>Cost</th><th>Time</th><th>Status</th><th></th></tr>'+rows+'</table>';
 }
+function traceTps(t){
+  const s=(Number(t.duration_ms)||0)/1000; const n=Number(t.total_tokens)||0;
+  if(!(s>0)||!n) return '—';
+  return Math.round(n/s)+' tok/s';
+}
 function tracePanelHtml(t){
   const evts=(t.stream_events||[]);
   const summary='<div class="pg-summary">'
     +'<div class="stat"><div class="k">Status</div><div class="v">'+esc(t.status)+'</div></div>'
     +'<div class="stat"><div class="k">Tokens</div><div class="v">'+esc(fmt(t.total_tokens))+'</div></div>'
-    +'<div class="stat"><div class="k">Cost</div><div class="v ok">'+esc(money(t.cost_usd))+'</div></div>'
+    +'<div class="stat"><div class="k">Rate</div><div class="v">'+esc(traceTps(t))+'</div></div>'
     +'<div class="stat"><div class="k">Duration</div><div class="v acc">'+esc((t.duration_ms||0)+'ms')+'</div></div></div>'
     +'<dl class="pg-kv"><dt>Provider</dt><dd>'+esc(t.provider_name||'—')+' <span class="mono small">'+esc(t.upstream_model||'')+'</span></dd>'
     +'<dt>Source</dt><dd>'+(t.cache_hit?'cache hit':'live upstream')+'</dd>'
+    +'<dt>Cost</dt><dd>'+esc(money(t.cost_usd))+'</dd>'
     +(t.error?'<dt>Error</dt><dd>'+esc(String(t.error).slice(0,600))+'</dd>':'')+'</dl>';
   const req=t.request_body?traceJsonText(t.request_body):'(none)';
   const resp=t.error?String(t.error):(t.response_body?traceJsonText(t.response_body):'(none)');
@@ -3524,7 +3580,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
   const routes = await c.env.DB.prepare(
-    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.fmt, p.proxy_url, p.transport FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
+    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
   ).bind(slug).all();
   if (!routes.results || !routes.results.length) {
     return c.json({ error: { message: 'No healthy route for model "' + slug + '"', type: "no_route" } }, 503);
@@ -3659,7 +3715,7 @@ async function forwardToProvider(c, route, apiKey, payload, isStream, traceId) {
     console.log("FWD proxy_url present len=" + route.proxy_url.length);
     const reqBody = JSON.stringify({ ...payload, model: route.upstream_model });
     const target = fmt2 === "anthropic" ? route.base_url + "/messages" : route.base_url + "/chat/completions";
-    const headers = fmt2 === "anthropic" ? { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION } : { "Content-Type": "application/json", Authorization: "Bearer " + apiKey };
+    const headers = withExtraHeaders(fmt2 === "anthropic" ? { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION } : { "Content-Type": "application/json", Authorization: "Bearer " + apiKey }, route);
     return fetchViaProxy(route.proxy_url, target, "POST", headers, reqBody);
   }
   if (transport === "koyeb") {
@@ -3757,6 +3813,83 @@ function normalizeTransport(value) {
   throw new Error("transport must be auto, direct, koyeb, or oci");
 }
 __name(normalizeTransport, "normalizeTransport");
+var EXTRA_HEADER_FORBIDDEN = ["authorization", "x-api-key", "content-type", "content-length", "host", "connection", "transfer-encoding", "cookie", "set-cookie", "proxy-authenticate", "proxy-authorization", "keep-alive", "upgrade", "te", "trailer"];
+function normalizeExtraHeaders(value) {
+  let obj = {};
+  if (value == null || value === "")
+    return "{}";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text.startsWith("{")) {
+      try {
+        obj = JSON.parse(text);
+      } catch {
+        throw new Error("extra_headers must be valid JSON or Name: value lines");
+      }
+    } else {
+      for (const line of text.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t || t.startsWith("#"))
+          continue;
+        const i = t.indexOf(":");
+        if (i < 1)
+          throw new Error("extra_headers line needs Name: value (" + t.slice(0, 40) + ")");
+        obj[t.slice(0, i).trim()] = t.slice(i + 1).trim();
+      }
+    }
+  } else if (typeof value === "object") {
+    obj = value;
+  } else {
+    throw new Error("extra_headers must be an object or Name: value lines");
+  }
+  const out = {};
+  const names = Object.keys(obj);
+  if (names.length > 16)
+    throw new Error("extra_headers allows at most 16 headers");
+  for (const raw of names) {
+    const name = String(raw).trim();
+    if (!/^[A-Za-z0-9-]+$/.test(name) || name.length > 64)
+      throw new Error("bad extra header name: " + name.slice(0, 40));
+    if (EXTRA_HEADER_FORBIDDEN.includes(name.toLowerCase()))
+      throw new Error("extra header not allowed: " + name);
+    const val = String(obj[raw] == null ? "" : obj[raw]);
+    if (val.length > 512)
+      throw new Error("extra header value too long: " + name);
+    out[name] = val;
+  }
+  return JSON.stringify(out);
+}
+__name(normalizeExtraHeaders, "normalizeExtraHeaders");
+function providerExtraHeaders(route) {
+  try {
+    const raw = route && route.extra_headers;
+    if (!raw)
+      return {};
+    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!obj || typeof obj !== "object")
+      return {};
+    const out = {};
+    for (const k of Object.keys(obj)) {
+      if (!EXTRA_HEADER_FORBIDDEN.includes(String(k).toLowerCase()))
+        out[k] = String(obj[k]);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+__name(providerExtraHeaders, "providerExtraHeaders");
+function withExtraHeaders(headers, route) {
+  const out = { ...headers };
+  const extra = providerExtraHeaders(route);
+  for (const k of Object.keys(extra)) {
+    if (["content-type", "authorization", "x-api-key"].includes(k.toLowerCase()))
+      continue;
+    out[k] = extra[k];
+  }
+  return out;
+}
+__name(withExtraHeaders, "withExtraHeaders");
 async function hmacHex(secret, message) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
@@ -3897,7 +4030,6 @@ async function koyebExchange(c, opts) {
           continue;
         if (frame.type === "response") {
           status = Number(frame.status) || 0;
-          respHeaders = frame.headers || {};
           continue;
         }
         if (frame.type === "response_end")
@@ -3974,7 +4106,7 @@ async function fetchViaKoyeb(c, route, apiKey, payload, isStream, traceId) {
     basePath = "";
   }
   const targetPath = basePath + (fmt2 === "anthropic" ? "/messages" : "/chat/completions");
-  const headers = fmt2 === "anthropic" ? { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION } : { "Content-Type": "application/json", Authorization: "Bearer " + apiKey };
+  const headers = withExtraHeaders(fmt2 === "anthropic" ? { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION } : { "Content-Type": "application/json", Authorization: "Bearer " + apiKey }, route);
   const reqBody = fmt2 === "anthropic" ? JSON.stringify(anthropicRequestBody(route, payload)) : JSON.stringify({ ...payload, model: route.upstream_model });
   const res = await koyebExchange(c, { provider, method: "POST", path: targetPath, headers, body: encoder.encode(reqBody), isStream, traceId });
   const upHeaders = { "content-type": res.headers["content-type"] || (isStream ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8") };
@@ -4009,12 +4141,12 @@ __name(fetchViaKoyeb, "fetchViaKoyeb");
 async function forwardOpenAI(c, route, apiKey, payload) {
   const up = await fetch(route.base_url + "/chat/completions", {
     method: "POST",
-    headers: {
+    headers: withExtraHeaders({
       "Content-Type": "application/json",
       Authorization: "Bearer " + apiKey,
       ...c.env.UPSTREAM_HTTP_REFERER ? { "HTTP-Referer": c.env.UPSTREAM_HTTP_REFERER } : {},
       ...c.env.UPSTREAM_APP_TITLE ? { "X-Title": c.env.UPSTREAM_APP_TITLE } : {}
-    },
+    }, route),
     body: JSON.stringify({ ...payload, model: route.upstream_model })
   });
   let usage = null;
@@ -4116,12 +4248,12 @@ async function forwardAnthropic(c, route, apiKey, payload) {
   const reqBody = anthropicRequestBody(route, payload);
   const up = await fetch(route.base_url + "/messages", {
     method: "POST",
-    headers: {
+    headers: withExtraHeaders({
       "Content-Type": "application/json",
       "x-api-key": apiKey,
       "anthropic-version": ANTHROPIC_VERSION,
       ...c.env.UPSTREAM_APP_TITLE ? { "anthropic-title": c.env.UPSTREAM_APP_TITLE } : {}
-    },
+    }, route),
     body: JSON.stringify(reqBody)
   });
   if (up.ok && up.body) {
@@ -4353,6 +4485,7 @@ function normalizeStreamTraceEvents(events) {
 __name(normalizeStreamTraceEvents, "normalizeStreamTraceEvents");
 var TRACE_EVENT_D1_BATCH_SIZE = 100;
 async function recordTraceEvents(c, traceId, events) {
+  try {
   const createdAt = nowIso();
   for (let start = 0; start < events.length; start += TRACE_EVENT_D1_BATCH_SIZE) {
     const batch = events.slice(start, start + TRACE_EVENT_D1_BATCH_SIZE).map((eventData, offset) => c.env.DB.prepare(
@@ -4361,9 +4494,11 @@ async function recordTraceEvents(c, traceId, events) {
     if (batch.length)
       await c.env.DB.batch(batch);
   }
+  } catch (e) { console.log("TRACE_EVENTS store unavailable id=" + traceId); }
 }
 __name(recordTraceEvents, "recordTraceEvents");
 async function attachTraceEvents(c, traces) {
+  try {
   const ids = [...new Set((traces || []).filter((trace) => trace.stream).map((trace) => trace.trace_id))];
   const byTrace = new Map(ids.map((id) => [id, []]));
   for (let start = 0; start < ids.length; start += 50) {
@@ -4375,6 +4510,7 @@ async function attachTraceEvents(c, traces) {
   for (const trace of traces || [])
     trace.stream_events = byTrace.get(trace.trace_id) || [];
   return traces || [];
+  } catch (e) { console.log("TRACE_EVENTS attach unavailable"); return traces || []; }
 }
 __name(attachTraceEvents, "attachTraceEvents");
 function normalizeTraceFilters(input) {
@@ -4967,7 +5103,7 @@ app.get("/admin/providers", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const rows = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, last_status, last_checked, notes, fmt, proxy_url, transport, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers ORDER BY priority").all();
+  const rows = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, last_status, last_checked, notes, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers ORDER BY priority").all();
   return c.json({ providers: rows.results || [] });
 });
 app.get("/admin/proxy-health", async (c) => {
@@ -5042,7 +5178,10 @@ app.post("/admin/providers", async (c) => {
     return c.json({ error: { message: e.message } }, 400);
   }
   const sealedKey = b.api_key ? await sealProviderKey(c.env, String(b.api_key)) : null;
-  const info = await c.env.DB.prepare("INSERT INTO providers (name, base_url, priority, healthy, notes, fmt, proxy_url, transport, api_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id").bind(b.name, b.base_url, Number(b.priority) || 0, b.healthy === false ? 0 : 1, b.notes || null, fmt2, b.proxy_url || null, transport, sealedKey, nowIso()).all();
+  let extraHeaders = "{}";
+  try { extraHeaders = normalizeExtraHeaders(b.extra_headers); }
+  catch (e) { return c.json({ error: { message: e.message } }, 400); }
+  const info = await c.env.DB.prepare("INSERT INTO providers (name, base_url, priority, healthy, notes, fmt, proxy_url, transport, extra_headers, api_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id").bind(b.name, b.base_url, Number(b.priority) || 0, b.healthy === false ? 0 : 1, b.notes || null, fmt2, b.proxy_url || null, transport, extraHeaders, sealedKey, nowIso()).all();
   const pid = info.results && info.results[0] && info.results[0].id;
   return c.json({ id: pid, name: b.name, fmt: fmt2, proxy_url: b.proxy_url || null, transport, api_key_set: !!b.api_key }, 201);
 });
@@ -5088,10 +5227,18 @@ app.patch("/admin/providers/:id", async (c) => {
       return c.json({ error: { message: e.message } }, 400);
     }
   }
+  if (b.extra_headers !== void 0) {
+    try {
+      sets.push("extra_headers=?");
+      binds.push(normalizeExtraHeaders(b.extra_headers));
+    } catch (e) {
+      return c.json({ error: { message: e.message } }, 400);
+    }
+  }
   if (!sets.length)
     return c.json({ id });
   await c.env.DB.prepare("UPDATE providers SET " + sets.join(", ") + ", updated_at=? WHERE id=?").bind(...binds, nowIso(), id).run();
-  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, fmt, proxy_url, transport, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers WHERE id=?").bind(id).first();
+  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers WHERE id=?").bind(id).first();
   return c.json({ provider: p });
 });
 app.post("/admin/providers/:id/toggle", async (c) => {

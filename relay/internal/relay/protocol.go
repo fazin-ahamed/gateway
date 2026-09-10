@@ -58,6 +58,7 @@ var forwardRequestHeaders = map[string]bool{
 	"authorization":     true,
 	"x-api-key":         true,
 	"anthropic-version": true,
+	"anthropic-beta":    true,
 	"anthropic-title":   true,
 	"http-referer":      true,
 	"x-title":           true,
