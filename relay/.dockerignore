@@ -1,0 +1,7 @@
+.git
+.wrangler
+graphify-out
+*.log
+Dockerfile
+.dockerignore
+README.md

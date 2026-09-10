@@ -1,0 +1,25 @@
+# Local and editor files
+.DS_Store
+*.log
+*.tmp
+*.swp
+.idea/
+.vscode/
+
+# Wrangler build and account cache
+**/.wrangler/
+**/wrangler-account.json
+
+# Generated Graphify output
+graphify-out/
+
+# Relay binaries
+/relay/relay
+/relay/cmd/relay/relay
+
+# Environment and credential files
+.env
+.env.*
+!.env.example
+*.pem
+*.key

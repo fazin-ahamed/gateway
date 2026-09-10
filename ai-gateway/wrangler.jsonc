@@ -1,0 +1,35 @@
+{
+  "name": "ai-gateway",
+  "main": "src/index.js",
+  "workers_dev": true,
+  "preview_urls": true,
+  "compatibility_date": "2024-11-01",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_id": "ba43d1dc-0351-4f55-acf9-ea4a5602b2d1"
+    }
+  ],
+  "vars": {
+    "UPSTREAM_APP_TITLE": "FSquare AI Gateway",
+    "UPSTREAM_HTTP_REFERER": "https://fsquarelabs.com",
+    "RELAY_BACKEND": "koyeb",
+    "KOYEB_RELAY_URL": ""
+  }
+}
