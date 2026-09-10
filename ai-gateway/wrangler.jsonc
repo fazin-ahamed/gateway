@@ -30,6 +30,6 @@
     "UPSTREAM_APP_TITLE": "FSquare AI Gateway",
     "UPSTREAM_HTTP_REFERER": "https://fsquarelabs.com",
     "RELAY_BACKEND": "koyeb",
-    "KOYEB_RELAY_URL": ""
+    "KOYEB_RELAY_URL": "wss://secure-mackerel-tecnivo-4108d6a4.koyeb.app/tunnel"
   }
 }
