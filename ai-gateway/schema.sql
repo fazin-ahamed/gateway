@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
   request_count INTEGER NOT NULL DEFAULT 0,
   request_limit_per_minute INTEGER,
   expires_at TEXT,
-  allowed_models TEXT NOT NULL DEFAULT '',
-  excluded_models TEXT NOT NULL DEFAULT '',
+  allowed_models TEXT,
+  excluded_models TEXT,
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
