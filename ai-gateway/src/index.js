@@ -2116,7 +2116,7 @@ app.post(ADMIN_UI_PATH + "/auth", async (c) => {
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1e3).toISOString();
   await c.env.DB.prepare("DELETE FROM admin_sessions WHERE expires_at <= ?").bind(nowIso()).run();
   await c.env.DB.prepare("INSERT INTO admin_sessions (token_hash, expires_at, created_at) VALUES (?,?,?)").bind(await sha256hex(session), expiresAt, nowIso()).run();
-  const cookie = "gw_adm=" + encodeURIComponent(session) + "; Path=/; Max-Age=43200; SameSite=Strict; Secure; HttpOnly";
+  const cookie = "gw_adm=" + encodeURIComponent(session) + "; Path=/; Max-Age=43200; SameSite=Lax; HttpOnly";
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store", "Set-Cookie": cookie } });
 });
 app.get(ADMIN_UI_PATH, async (c) => {
