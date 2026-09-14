@@ -127,6 +127,6 @@ Then set `KOYEB_RELAY_URL=wss://<app>.koyeb.app/tunnel` in
 4. In `/_gw` Providers tab, confirm transport pills read `koyeb`;
    proxy-health shows `koyeb ok`.
 5. Send one non-stream + one stream chat per relayed provider; check
-   traces carry `[via-koyeb]` only on failures and usage/cost account.
+   failure errors name the provider with `[via-koyeb]` and usage/cost account.
 6. After a stable soak, clear each `proxy_url` (OCI references) and,
    finally, remove the OCI branch when no row references it.

@@ -441,8 +441,6 @@ func TestResolveURLUnit(t *testing.T) {
 		{"openai", "/v1/chat/completions"},
 		{"openrouter", "/api/v1/chat/completions"},
 		{"anthropic", "/v1/messages"},
-		{"gentrouter", "/messages"},
-		{"opencode", "/zen/v1/chat/completions"},
 	}
 	for _, c := range ok {
 		if _, err := ResolveURL(providers, c.provider, "POST", c.path, ""); err != nil {

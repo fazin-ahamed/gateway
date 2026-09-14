@@ -22,17 +22,11 @@ type Provider struct {
 	PathPrefixes []string `json:"path_prefixes"`
 }
 
-// DefaultProviders covers the providers currently configured in the gateway
-// plus common first-party AI endpoints. Unknown providers are rejected.
+// DefaultProviders covers common first-party AI endpoints. Unknown providers
+// are rejected. Add private gateways via RELAY_PROVIDERS_JSON instead of
+// committing their hostnames here.
 func DefaultProviders() []Provider {
 	return []Provider{
-		{ID: "relbackend", Scheme: "https", Host: "api.futureppo.top", PathPrefixes: []string{"/v1/"}},
-		{ID: "grok", Scheme: "https", Host: "api.futureppo.top", PathPrefixes: []string{"/v1/"}},
-		{ID: "ze", Scheme: "https", Host: "ai.kscsnkli.site", PathPrefixes: []string{"/v1/"}},
-		{ID: "cnhc", Scheme: "https", Host: "api.hcnsec.cn", PathPrefixes: []string{"/v1/"}},
-		{ID: "seeker", Scheme: "https", Host: "seekai.cc", PathPrefixes: []string{"/v1/"}},
-		{ID: "opencode", Scheme: "https", Host: "opencode.ai", PathPrefixes: []string{"/zen/v1/"}},
-		{ID: "gentrouter", Scheme: "https", Host: "agentrouter.org", PathPrefixes: []string{"/"}},
 		{ID: "openai", Scheme: "https", Host: "api.openai.com", PathPrefixes: []string{"/v1/"}},
 		{ID: "anthropic", Scheme: "https", Host: "api.anthropic.com", PathPrefixes: []string{"/v1/"}},
 		{ID: "openrouter", Scheme: "https", Host: "openrouter.ai", PathPrefixes: []string{"/api/v1/"}},

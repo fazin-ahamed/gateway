@@ -1,0 +1,13 @@
+{
+  "name": "ai-gateway-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.6.0"
+  }
+}

@@ -1,0 +1,8 @@
+version: "3"
+services:
+  relay:
+    build: ./relay
+    ports:
+      - "8000:8000"
+    environment:
+      KOYEB_RELAY_SECRET: ${KOYEB_RELAY_SECRET:?set KOYEB_RELAY_SECRET}

@@ -23,13 +23,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_id": "ba43d1dc-0351-4f55-acf9-ea4a5602b2d1"
+      "database_name": "ai-gateway",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
     }
   ],
   "vars": {
-    "UPSTREAM_APP_TITLE": "FSquare AI Gateway",
-    "UPSTREAM_HTTP_REFERER": "https://fsquarelabs.com",
+    "UPSTREAM_APP_TITLE": "AI Gateway",
+    "UPSTREAM_HTTP_REFERER": "https://example.com",
     "RELAY_BACKEND": "koyeb",
-    "KOYEB_RELAY_URL": "wss://secure-mackerel-tecnivo-4108d6a4.koyeb.app/tunnel"
+    "KOYEB_RELAY_URL": ""
   }
 }

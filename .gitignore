@@ -23,3 +23,13 @@ graphify-out/
 !.env.example
 *.pem
 *.key
+.dev.vars
+.dev.vars.*
+# Local SQLite data (created at runtime, never commit)
+server/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Node dependencies (installed via npm in ai-gateway/)
+node_modules/

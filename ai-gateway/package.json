@@ -1,0 +1,16 @@
+{
+  "name": "ai-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dry-run": "wrangler deploy --dry-run",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

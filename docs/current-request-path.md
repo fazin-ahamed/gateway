@@ -17,8 +17,8 @@ Reader: gateway maintainer. Post-read action: implement the Koyeb relay without 
    - Provider without `proxy_url`: direct Worker-to-provider HTTPS fetch.
    - Provider with `proxy_url`: Worker sends the provider request through an OCI-hosted HTTP relay using `?url=<encoded-target>`.
 6. Worker tries routes in rank order until one returns a usable response.
-7. Non-streaming responses are parsed for usage, priced, sanitized, cached when eligible, traced, and returned with gateway headers.
-8. Streaming responses are normalized to OpenAI-style SSE, traced by event, priced, and returned to the client.
+7. Non-streaming responses are parsed for usage, priced, sanitized, cached when eligible, and returned with gateway headers.
+8. Streaming responses are normalized to OpenAI-style SSE, priced, and returned to the client.
 9. Provider credentials remain in the gateway database or Worker secrets; OCI only receives the already-authorized provider request.
 10. No repository tests, relay source, Docker files, or package manifest are currently present; only the Worker bundle and Wrangler config are checked in.
 
