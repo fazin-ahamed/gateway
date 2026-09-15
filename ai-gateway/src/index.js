@@ -1843,9 +1843,12 @@ function promptComplexity(payload) {
 function qualityPrior(entry) {
   if (!entry)
     return 1;
-  const input = Number(entry.prompt_per_1m) || 0;
   const reasoning = !!(entry.reasoning);
   const ctx = Number(entry.limit && entry.limit.context) || 0;
+  const id = String(entry.id || "").toLowerCase();
+  // Capability signals only. Price is deliberately NOT a quality proxy
+  // (OpenRouter-style decoupling): a genuinely strong cheap model must not
+  // score low just because it is affordable.
   let q = 1;
   if (reasoning)
     q += 1.5;
@@ -1853,11 +1856,12 @@ function qualityPrior(entry) {
     q += 1;
   else if (ctx >= 128000)
     q += 0.5;
-  if (input >= 3)
-    q += 1.5;
-  else if (input >= 1)
+  // Naming conventions carry tier information across vendors.
+  if (/(flash|lite|mini|small|air|nano|tiny|instant)/.test(id))
+    q -= 0.75;
+  if (/(pro|max|ultra|opus|flagship|thinking|reasoning|frontier)/.test(id))
     q += 0.75;
-  return q;
+  return Math.max(0.25, q);
 }
 async function autoSettings(c) {
   const enabled = (await settingValue(c, "auto_enabled", "on")) !== "off";
@@ -1891,8 +1895,14 @@ async function pickAutoModel(c, payload) {
   const healthBySlug = new Map(health.map((h) => [h.slug, h]));
   const { score } = promptComplexity(payload);
   // Complexity is unbounded; compress it into the quality-prior scale
-  // (priors land between 1 and ~6). need in [1, 6].
-  const need = Math.min(6, 1 + Math.max(0, score) / 2.5);
+  // (priors land between ~0.5 and ~5). need in [1, 6].
+  let need = Math.min(6, 1 + Math.max(0, score) / 2.5);
+  const hasTools = !!(payload.tools || payload.functions);
+  // Auto-Exacto pattern: tool calls are capability-bound, so they raise the
+  // quality floor hard (+2.5) - small-tier models (flash/lite/mini) sit
+  // below it and are skipped for tool traffic entirely.
+  if (hasTools)
+    need = Math.min(6, need + 2.5);
   const candidates = [];
   let strongest = null;
   for (const r of enabled) {
@@ -1912,7 +1922,8 @@ async function pickAutoModel(c, payload) {
   }
   // Preference blend: 0 = highest quality among eligible, 100 = cheapest.
   // Health and latency always matter: a cheap-but-slow flaky model loses
-  // to a slightly pricier reliable fast one at any preference.
+  // to a slightly pricier reliable fast one at any preference. With tools,
+  // the blend shifts 30 points toward quality (capability first).
   const eligibleList = candidates.filter((x) => x.eligible);
   let picked;
   if (!eligibleList.length) {
@@ -1920,13 +1931,21 @@ async function pickAutoModel(c, payload) {
   } else {
     const maxCost = Math.max(...eligibleList.map((x) => x.cost), 1e-9);
     const maxMs = Math.max(...eligibleList.map((x) => x.avgMs || 0), 1);
-    const w = cfg.preference / 100;
+    const rawW = cfg.preference / 100;
+    const w = hasTools ? Math.max(0, rawW - 0.3) : rawW;
     let bestScore = -Infinity;
     for (const cand of eligibleList) {
       const reliability = cand.samples >= 3 ? cand.okRate : 1;
       const relPenalty = (1 - reliability) * 6;
       const slowPenalty = ((cand.avgMs || 0) / maxMs) * 2;
-      const s = (1 - w) * cand.quality - w * (cand.cost / maxCost) * 6 - relPenalty - slowPenalty;
+      // Half-open circuits (recent failures, not yet tripped) get pushed
+      // back like OpenRouter's 30s outage deprioritization.
+      const cs = circuitState.get(cand.slug);
+      const wobbling = cs && cs.fails > 0 && !circuitOpen(cand.slug) ? (cs.fails >= 2 ? 1.2 : 0.5) : 0;
+      // Inverse-square price weighting: among eligible models, cheap wins
+      // hard; quality still gates via the floor above.
+      const costTerm = Math.pow(cand.cost / maxCost, 2) * 6;
+      const s = (1 - w) * cand.quality - w * costTerm - relPenalty - slowPenalty - wobbling;
       if (s > bestScore) {
         bestScore = s;
         picked = cand;

@@ -729,6 +729,7 @@ document.addEventListener('click', function(e){
   else if(act==='raddfb') addFallbackRoute(btn);
   else if(act==='rtoggle') toggleRoute(id, btn.getAttribute('data-e')==='1'?0:1);
   else if(act==='rdel') delRoute(id);
+  else if(act==='tieredit') editTier(id);
   else if(act==='tierdel') delTier(id);
   else if(act==='copy') copyKey(id);
   else if(act==='kedit') editKey(id);
