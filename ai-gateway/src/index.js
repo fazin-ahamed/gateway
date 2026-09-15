@@ -31,7 +31,9 @@ function stableJson(value) {
 function isCacheableRequest(payload, isStream, mode) {
   if (mode !== "true" && mode !== "refresh")
     return false;
-  if (isStream || !payload || Number(payload.temperature) !== 0)
+  if (isStream || !payload)
+    return false;
+  if (payload.temperature != null && Number(payload.temperature) !== 0)
     return false;
   if (payload.tools || payload.functions || payload.tool_choice || payload.parallel_tool_calls)
     return false;
@@ -375,13 +377,17 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
   const isStream = !!payload.stream;
-  const cacheMode = String(c.req.header("x-gateway-cache") || "").toLowerCase();
+  const cacheModeHeader = String(c.req.header("x-gateway-cache") || "true").toLowerCase();
+  const cacheMode = (cacheModeHeader === "off" || cacheModeHeader === "false" || cacheModeHeader === "0") ? "off" : cacheModeHeader;
   const cacheable = !!key && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
+  console.log("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));
   if (cacheKey && cacheMode !== "refresh") {
     const cached = await lookupResponseCache(c, cacheKey);
-    if (cached)
+    if (cached) {
+      console.log("TRACE id=" + requestId + " cache=HIT ms=" + (Date.now() - started));
       return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "HIT" });
+    }
   }
   let cacheLeaseId = null;
   if (cacheKey && cacheMode === "true") {
@@ -397,8 +403,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         break;
       await sleep(cacheCoalesceDelayMs(attempt++));
       const cached = await lookupResponseCache(c, cacheKey);
-      if (cached)
+      if (cached) {
+        console.log("TRACE id=" + requestId + " cache=COALESCED ms=" + (Date.now() - started));
         return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "COALESCED" });
+      }
     }
   }
   if (isStream)
@@ -452,8 +460,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           hdrs["x-gateway-attempts"] = String(attempts + 1);
           if (cacheKey)
             hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
+          console.log("TRACE id=" + requestId + " ok provider=" + route.provider_name + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
           return new Response(clientTxt, { status: up.status, headers: hdrs });
         }
+        console.log("TRACE id=" + requestId + " stream provider=" + route.provider_name + " rank=" + route.rank);
         const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage);
         return result;
       } catch (e) {
@@ -462,6 +472,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         attempts++;
       }
     }
+    console.log("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
     const errBody = lastErr
       ? { error: { message: lastErr, type: "upstream_error" } }
       : genericUpstreamError();

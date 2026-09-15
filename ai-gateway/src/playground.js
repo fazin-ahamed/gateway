@@ -248,7 +248,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-cache">
-    <div class="pagehead"><div><h2 class="sec">Response cache</h2><p class="sub">Exact deterministic responses only. Clients opt in with <span class="mono">x-gateway-cache: true</span>. Cache entries are scoped to each API key.</p></div><div class="actions"><button class="ghost" id="cache-refresh">Refresh</button><button class="danger" id="cache-purge">Purge all</button></div></div>
+    <div class="pagehead"><div><h2 class="sec">Response cache</h2><p class="sub">Cache is always on for deterministic requests. Send <span class="mono">x-gateway-cache: off</span> to bypass, or <span class="mono">x-gateway-cache: refresh</span> to force a new fetch. Entries are scoped to each API key.</p></div><div class="actions"><button class="ghost" id="cache-refresh">Refresh</button><button class="danger" id="cache-purge">Purge all</button></div></div>
     <div class="panel"><div class="panel-b flush" id="cache-stats"></div></div>
     <div class="panel"><div class="panel-b"><pre id="cache-policy" style="margin:0"></pre></div></div>
   </section>
