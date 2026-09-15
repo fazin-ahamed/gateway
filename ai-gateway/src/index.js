@@ -1783,43 +1783,62 @@ async function routerHealth(c) {
 }
 function promptComplexity(payload) {
   const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  // Coding agents (omp, opencode, Claude Code) attach a large static system
+  // prompt full of heavy words ("refactor", "architecture", "security") and
+  // tool schemas to EVERY request - even "hi". Scoring that boilerplate
+  // makes trivial chats look like hard engineering. Score only the live
+  // conversation (user + assistant turns); skip system/developer entirely.
+  const isBoilerplate = (m) => m && (m.role === "system" || m.role === "developer");
   let text = "";
+  let lastUserText = "";
   for (const m of msgs) {
-    if (!m)
+    if (!m || isBoilerplate(m))
       continue;
+    let piece = "";
     if (typeof m.content === "string")
-      text += " " + m.content;
+      piece = m.content;
     else if (Array.isArray(m.content))
       for (const part of m.content)
         if (part && typeof part.text === "string")
-          text += " " + part.text;
+          piece += " " + part.text;
+    text += " " + piece;
+    if (m.role === "user")
+      lastUserText = piece;
   }
+  // Keyword scan runs on the latest user turn only: that is the actual ask.
+  const ask = lastUserText.toLowerCase();
+  // Conversation length (sans boilerplate) still signals harder work.
   const t = text.toLowerCase();
   const chars = t.length;
-  const words = t.split(/\s+/).filter(Boolean).length;
   let score = 0;
-  if (payload.tools || payload.functions || payload.tool_choice)
-    score += 2;
+  // Tools are always present for agents; not a per-request difficulty signal.
+  if (payload.tools || payload.functions)
+    score += 0.5;
   if (payload.response_format)
-    score += 1;
-  const heavyWords = ["refactor", "architecture", "optimize", "debug", "migrate", "implement", "algorithm", "prove", "derive", "theorem", "complex", "security", "race condition", "memory leak", "regression", "benchmark", "compile", "runtime error", "stack trace", "root cause"];
-  const midWords = ["write", "explain", "summarize", "compare", "convert", "review", "fix", "why", "how", "difference", "example"];
+    score += 0.5;
+  const heavyWords = ["refactor", "architecture", "optimize", "debug", "migrate", "implement", "algorithm", "prove", "derive", "theorem", "race condition", "memory leak", "regression", "benchmark", "stack trace", "root cause"];
+  const midWords = ["write", "explain", "summarize", "compare", "convert", "review", "fix", "why", "how", "difference"];
   for (const w of heavyWords)
-    if (t.includes(w))
+    if (ask.includes(w))
       score += 1.5;
   for (const w of midWords)
-    if (t.includes(w))
+    if (ask.includes(w))
       score += 0.5;
-  if (chars > 4000)
-    score += 1.5;
+  if (chars > 12000)
+    score += 2;
+  else if (chars > 4000)
+    score += 1;
   else if (chars > 800)
     score += 0.5;
-  if (words < 4)
+  const askWords = ask.split(/\s+/).filter(Boolean).length;
+  if (askWords > 0 && askWords < 4)
     score -= 1.5;
   const turns = msgs.filter((m) => m && m.role === "user").length;
-  if (turns >= 4)
+  if (turns >= 6)
+    score += 1;
+  else if (turns >= 3)
     score += 0.5;
-  return { score, chars, words };
+  return { score, chars, words: askWords };
 }
 function qualityPrior(entry) {
   if (!entry)
