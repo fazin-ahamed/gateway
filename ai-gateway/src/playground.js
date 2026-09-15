@@ -873,7 +873,7 @@ async function loadLogs(){
   const out=document.getElementById('lg-out'); if(!out) return;
   let data; try{ const res=await api('/admin/logs'); data=res.data; }catch(e){ out.textContent='Could not load logs: '+e.message; return; }
   const lines=(data&&data.logs||[]).map(function(l){ return escLogLine(l.m,l.t); });
-  out.innerHTML=lines.length?lines.join('\n'):'<span class="small">No log entries yet.</span>';
+  out.innerHTML=lines.length?lines.join('\\n'):'<span class="small">No log entries yet.</span>';
   out.scrollTop=out.scrollHeight;
 }
 document.getElementById('lg-refresh').onclick=function(){ loadLogs(); };
