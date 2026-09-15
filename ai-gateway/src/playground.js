@@ -749,8 +749,8 @@ async function sendPlaygroundMessage(promptOverride, historyOverride){
       const j=await r.json(); const content=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||'(no content)';
       const ju=j.usage||{}; const jt=(ju.total_tokens||((ju.prompt_tokens||0)+(ju.completion_tokens||0)))||null;
       const meta=pgRateMeta(elapsed()*1000,jt)+(usage?' · '+usage:'');
-      pgMessages=messages.concat([{role:'assistant',content:out||'(no content)',meta:meta}]);
-      appendPlaygroundMessage('assistant',out||'(no content)',meta);
+      pgMessages=messages.concat([{role:'assistant',content:content,meta:meta}]);
+      appendPlaygroundMessage('assistant',content,meta);
       document.getElementById('c-messages').value=JSON.stringify(pgMessages,null,2);
     }
     setPlaygroundStatus('Complete.');
