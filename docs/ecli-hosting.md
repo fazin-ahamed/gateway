@@ -40,9 +40,18 @@ DB_PATH=./data/gateway.db
 
 ```sh
 cd server && npm install
-node --env-file=../.env server.mjs
-# production: pm2 start server.mjs --name gateway -- --env-file ../.env
+PORT=30012 node --env-file=../.env server.mjs
 ```
+
+Or leave a watcher running so each push to `main` pulls and restarts:
+
+```sh
+pkill -f server.mjs; sleep 2
+cd ~/gateway && nohup sh server/auto-update.sh >> /tmp/gateway-update.log 2>&1 &
+tail -20 /tmp/gateway-update.log
+```
+
+The watcher polls `origin/main` every 30s, fast-forwards, then restarts Node on `PORT` (default `30012`). Logs: `/tmp/gateway.log` (app), `/tmp/gateway-update.log` (watcher).
 
 First boot creates `./data/gateway.db` (SQLite). Apply the schema once:
 
@@ -50,8 +59,7 @@ First boot creates `./data/gateway.db` (SQLite). Apply the schema once:
 sqlite3 ./data/gateway.db < ../ai-gateway/schema.sql
 ```
 
-The console lives at `http://<server-ip>:3000/_gw` (sign in with
-`ADMIN_TOKEN`). Add providers, routes, and API keys there — D1 is not used.
+The console lives at `http://n1.eclipsesystems.org:30012/_gw` (or `http://<allocation-host>:30012/_gw`). Sign in with `ADMIN_TOKEN`. Add providers, routes, and API keys there — D1 is not used.
 
 ## 4. Optional: relay on the same VM
 

@@ -20,7 +20,9 @@ To run it:
 
 1. `cp .env.example .env` (local only, never commit) and generate values.
 2. `cd server && npm install && node --env-file=../.env server.mjs`
-3. Open `http://<host>:3000/_gw`, sign in with `ADMIN_TOKEN`, add providers, routes, and API keys.
+3. Open `http://<host>:3000/_gw` (ecli: `http://n1.eclipsesystems.org:30012/_gw`), sign in with `ADMIN_TOKEN`, add providers, routes, and API keys.
+
+On ecli, leave `sh server/auto-update.sh` running so each push to `main` pulls and restarts (see `docs/ecli-hosting.md`).
 
 First boot applies `ai-gateway/schema.sql` to `./data/gateway.db` automatically.
 
