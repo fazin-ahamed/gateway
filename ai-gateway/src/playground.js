@@ -164,6 +164,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="prices">Prices</button>
   <button type="button" data-tab="limits">Limits</button>
   <button type="button" data-tab="trajectories">Trajectories</button>
+  <button type="button" data-tab="auto">Auto</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -304,6 +305,26 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-b flush" id="lm-list"></div></div>
   </section>
 
+  <section class="tab" id="tab-auto">
+    <div class="pagehead"><div><h2 class="sec">Auto router</h2><p class="sub">The virtual <span class="mono">auto</span> model picks per request: prompt complexity sets a quality floor, then your preference blends cheapest vs best among models that clear it. Health comes from live success rates.</p></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Settings</h2></div><div class="panel-b">
+      <label class="pg-check" style="margin:0 0 14px"><input type="checkbox" id="ar-enabled"> Enable auto routing</label>
+      <label>Preference: <span id="ar-pref-val" class="mono">70</span> (0 = best quality, 100 = cheapest)</label>
+      <input type="range" id="ar-pref" min="0" max="100" step="5" value="70" style="margin-bottom:14px">
+      <div class="form-grid">
+        <div><label>Excluded slugs (comma list)</label><input id="ar-excluded" placeholder="z-ai/glm-5.3"></div>
+        <div><label>Quality overrides (slug: multiplier per line)</label><textarea id="ar-overrides" placeholder="z-ai/glm-5.3: 1.5"></textarea></div>
+      </div>
+      <div class="form-actions"><button class="act" id="ar-save">Save settings</button></div>
+    </div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Preview</h2></div><div class="panel-b">
+      <label>Test prompt</label>
+      <textarea id="ar-test" placeholder="Paste a prompt to see which model auto would pick and why"></textarea>
+      <div class="form-actions"><button class="act" id="ar-run">Run preview</button></div>
+      <div id="ar-result" style="margin-top:14px"></div>
+    </div></div>
+  </section>
+
   <section class="tab" id="tab-trajectories">
     <div class="pagehead"><div><h2 class="sec">Trajectories</h2><p class="sub">Structured record of every request: route chain, provider outcome, tokens, cost, and full request/response bodies for RL and SFT export.</p></div><div class="actions"><button class="ghost" id="tj-export-sft">Export SFT</button><button class="ghost" id="tj-export-full">Export full</button><button class="ghost" id="tj-refresh">Refresh</button><button class="danger" id="tj-purge">Purge</button></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Settings</h2></div><div class="panel-b">
@@ -346,8 +367,6 @@ function money(n){ return '$'+(Number(n)||0).toFixed(4); }
 function statusPill(s){ s=Number(s)||0; if(s>=200&&s<400) return '<span class="pill ok">'+s+'</span>'; if(s===0) return '<span class="pill warn">err</span>'; return '<span class="pill bad">'+s+'</span>'; }
 
 document.getElementById('base').textContent = API;
-function tick(){ const el=document.getElementById('clock'); el.textContent=new Intl.DateTimeFormat('en-GB',{timeZone:UAE_TIME_ZONE,hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(new Date())+' GST'; }
-tick(); setInterval(tick,1000);
 
 // tabs
 const navButtons=Array.from(document.querySelectorAll('nav button[data-tab]'));
@@ -372,6 +391,7 @@ async function selectTab(t){
     if(t==='cache') await loadCache();
     if(t==='prices') await loadPrices();
     if(t==='limits') await loadLimits();
+    if(t==='auto') await loadAutoSettings();
     if(t==='trajectories') await loadTrajectories();
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
@@ -1060,6 +1080,58 @@ document.addEventListener('click',function(e){
   const b=e.target.closest('[data-act="tjview"]'); if(!b) return;
   viewTrajectory(b.getAttribute('data-id'));
 });
+
+// ---------- AUTO ROUTER ----------
+async function loadAutoSettings(){
+  let s; try{ s=(await api('/admin/auto-settings')).data; }catch(e){ toast('Could not load auto settings: '+e.message,'err'); return; }
+  if(!s) return;
+  document.getElementById('ar-enabled').checked=!!s.enabled;
+  document.getElementById('ar-pref').value=s.preference;
+  document.getElementById('ar-pref-val').textContent=s.preference;
+  document.getElementById('ar-excluded').value=(s.excluded||[]).join(',');
+  const ov=s.overrides||{};
+  document.getElementById('ar-overrides').value=Object.keys(ov).map(function(k){return k+': '+ov[k];}).join('\\n');
+}
+document.getElementById('ar-pref').addEventListener('input',function(e){
+  document.getElementById('ar-pref-val').textContent=e.target.value;
+});
+function parseOverrides(text){
+  const out={};
+  String(text||'').split('\\n').forEach(function(line){
+    const t=line.trim(); if(!t) return;
+    const i=t.lastIndexOf(':'); if(i<1) return;
+    const slug=t.slice(0,i).trim(); const n=Number(t.slice(i+1).trim());
+    if(slug&&Number.isFinite(n)&&n>0) out[slug]=n;
+  });
+  return out;
+}
+document.getElementById('ar-save').onclick=async function(){
+  const body={
+    enabled: document.getElementById('ar-enabled').checked,
+    preference: Number(document.getElementById('ar-pref').value),
+    excluded: document.getElementById('ar-excluded').value,
+    overrides: parseOverrides(document.getElementById('ar-overrides').value)
+  };
+  const {status,data}=await api('/admin/auto-settings',{method:'POST',body:JSON.stringify(body)});
+  if(status===200) toast('auto settings saved','ok');
+  else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
+};
+document.getElementById('ar-run').onclick=async function(){
+  const out=document.getElementById('ar-result');
+  const prompt=document.getElementById('ar-test').value.trim();
+  if(!prompt){ out.innerHTML='<div class="empty">Write a prompt first.</div>'; return; }
+  out.innerHTML='<span class="small">Running preview…</span>';
+  let d; try{ d=(await api('/admin/auto-preview',{method:'POST',body:JSON.stringify({prompt})})).data; }catch(e){ out.innerHTML='<div class="empty">Preview failed: '+esc(e.message)+'</div>'; return; }
+  if(!d||!d.picked){ out.innerHTML='<div class="empty">'+esc((d&&d.error&&d.error.message)||'unavailable')+'</div>'; return; }
+  const rows=(d.candidates||[]).map(function(c){
+    const pill=c.eligible?'<span class="pill ok">eligible</span>':'<span class="pill mut">below floor</span>';
+    const picked=c.slug===d.picked?' <span class="pill acc">PICKED</span>':'';
+    const h=c.samples>0?' · '+Math.round(c.okRate*100)+'% ok ('+c.samples+')':' · no data';
+    return '<tr><td class="mono">'+esc(c.slug)+picked+'</td><td>'+pill+'</td><td class="mono">'+c.quality.toFixed(2)+'</td><td class="mono">'+money(c.cost)+'/1M</td><td class="mono small">'+esc(String(Math.round(c.avgMs))+'ms'+h)+'</td></tr>';
+  }).join('');
+  out.innerHTML='<div class="kvrow"><span class="pill '+(d.fallback?'warn':'acc')+'">'+(d.fallback?'fallback (nothing eligible)':'picked')+'</span><span class="grow"><b>'+esc(d.picked)+'</b> · complexity '+esc(String(d.complexity))+' → quality floor '+d.need.toFixed(2)+' · preference '+d.preference+'</span></div>'+
+    '<table style="margin-top:10px"><tr><th>Model</th><th>Status</th><th>Quality</th><th>Cost</th><th>Health</th></tr>'+rows+'</table>';
+};
 document.getElementById('tj-refresh').onclick=function(){ loadTrajectories(); };
 document.getElementById('tj-purge').onclick=function(){ confirmAction('Purge trajectories','Delete every captured trajectory? This cannot be undone.','Purge',async function(){ await api('/admin/trajectories/purge',{method:'POST'}); loadTrajectories(); }); };
 document.getElementById('tj-capture').addEventListener('change',async function(e){

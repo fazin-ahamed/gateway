@@ -558,12 +558,15 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   if (String(slug).toLowerCase() === AUTO_SLUG) {
     autoDecision = await pickAutoModel(c, payload);
     if (!autoDecision) {
-      const requestId0 = c.req.header("x-request-id") || uuid();
-      return c.json({ error: { message: 'No healthy routed models available for auto routing', type: "no_route" } }, 503);
+      const cfg = await autoSettings(c);
+      const msg = cfg.enabled
+        ? 'No healthy routed models available for auto routing'
+        : 'Auto routing is disabled. Enable it in the Auto tab or pick a specific model.';
+      return c.json({ error: { message: msg, type: cfg.enabled ? "no_route" : "auto_disabled" } }, cfg.enabled ? 503 : 400);
     }
     slug = autoDecision.slug;
     payload = { ...payload, model: slug };
-    blog("AUTO picked " + slug + " complexity=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + (autoDecision.fallback ? " fallback" : ""));
+    blog("AUTO picked " + slug + " quality=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + " need=" + (autoDecision.need || 0).toFixed(2) + " pref=" + (autoDecision.preference ?? "-") + (autoDecision.fallback ? " fallback" : ""));
   }
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
@@ -1837,17 +1840,32 @@ function qualityPrior(entry) {
     q += 0.75;
   return q;
 }
+async function autoSettings(c) {
+  const enabled = (await settingValue(c, "auto_enabled", "on")) !== "off";
+  const pref = Math.min(100, Math.max(0, Number(await settingValue(c, "auto_preference", "70")) || 70));
+  const excluded = splitModelSlugs(await settingValue(c, "auto_excluded", ""));
+  let overrides = {};
+  try {
+    overrides = JSON.parse(await settingValue(c, "auto_overrides", "{}")) || {};
+  } catch {
+    overrides = {};
+  }
+  return { enabled, preference: pref, excluded, overrides };
+}
 async function pickAutoModel(c, payload) {
+  const cfg = await autoSettings(c);
+  if (!cfg.enabled)
+    return null;
   if (!modelsDevCache.catalog)
     await fetchModelsDevCatalog().catch(() => {});
   const catalog = modelsDevCache.catalog;
   const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
   const routes = await c.env.DB.prepare(
-    `SELECT mr.slug, MIN(mr.rank) AS best_rank, COUNT(*) AS ranks,
+    `SELECT mr.slug,
             COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1),0) AS healthy
      FROM model_routes mr WHERE mr.enabled=1 GROUP BY mr.slug`
   ).all();
-  const enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1);
+  const enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1 && !cfg.excluded.includes(r.slug));
   if (!enabled.length)
     return null;
   const health = await routerHealth(c);
@@ -1856,31 +1874,43 @@ async function pickAutoModel(c, payload) {
   // Complexity is unbounded; compress it into the quality-prior scale
   // (priors land between 1 and ~6). need in [1, 6].
   const need = Math.min(6, 1 + Math.max(0, score) / 2.5);
-  let best = null;
+  const candidates = [];
+  let strongest = null;
   for (const r of enabled) {
     const entry = byId ? matchModelsDevPrice(byId, r.slug) : null;
-    const q = qualityPrior(entry) + (entry ? 0 : 1.5);
+    const mult = Number(cfg.overrides[r.slug]);
+    let q = qualityPrior(entry) + (entry ? 0 : 1.5);
+    if (Number.isFinite(mult) && mult > 0)
+      q *= mult;
     const h = healthBySlug.get(r.slug);
     const okRate = h ? Number(h.ok_rate) : 1;
     const eligible = q + 0.5 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
     const cost = entry ? (Number(entry.prompt_per_1m) + Number(entry.completion_per_1m)) : 0.5;
-    const cand = { slug: r.slug, cost, quality: q, okRate, avgMs: h ? Number(h.avg_ms) || 0 : 0 };
-    // Track strongest overall for the fallback path.
-    if (!best || cand.quality > best.quality || (cand.quality === best.quality && cand.cost < best.cost))
-      best = cand;
-    if (!eligible)
-      continue;
-    if (!best.eligible || cand.cost < best.cost - 1e-9 || (Math.abs(cand.cost - best.cost) < 1e-9 && cand.quality > best.quality))
-      best = { ...cand, eligible: true };
+    const cand = { slug: r.slug, cost, quality: q, okRate, avgMs: h ? Number(h.avg_ms) || 0 : 0, eligible, samples: h ? Number(h.n) : 0 };
+    candidates.push(cand);
+    if (!strongest || cand.quality > strongest.quality || (cand.quality === strongest.quality && cand.cost < strongest.cost))
+      strongest = cand;
   }
-  if (!best || !best.eligible) {
-    // Prompt exceeds every prior: use the strongest model we route to.
-    if (best)
-      best.fallback = true;
-    else
-      best = { slug: enabled[0].slug, cost: 0, quality: 0, okRate: 1, avgMs: 0, fallback: true };
+  // Preference blend: 0 = highest quality among eligible, 100 = cheapest.
+  const eligibleList = candidates.filter((x) => x.eligible);
+  let picked;
+  if (!eligibleList.length) {
+    picked = strongest ? { ...strongest, fallback: true } : null;
+  } else {
+    const maxCost = Math.max(...eligibleList.map((x) => x.cost), 1e-9);
+    const w = cfg.preference / 100;
+    let bestScore = -Infinity;
+    for (const cand of eligibleList) {
+      const s = (1 - w) * cand.quality - w * (cand.cost / maxCost) * 6;
+      if (s > bestScore) {
+        bestScore = s;
+        picked = cand;
+      }
+    }
   }
-  return best;
+  if (!picked)
+    return null;
+  return { ...picked, candidates, need, complexity: score, preference: cfg.preference };
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -2924,6 +2954,61 @@ app.post("/admin/trajectory-settings", async (c) => {
   const v = b.capture === "off" ? "off" : "on";
   await c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('trajectory_capture', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(v, nowIso()).run();
   return c.json({ capture: v });
+});
+app.get("/admin/auto-settings", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return c.json(await autoSettings(c));
+});
+app.post("/admin/auto-settings", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  const enabled = b.enabled === false || b.enabled === "off" ? "off" : "on";
+  const pref = Math.min(100, Math.max(0, Number(b.preference)));
+  const excluded = splitModelSlugs(Array.isArray(b.excluded) ? b.excluded.join(",") : String(b.excluded || "")).join(",");
+  let overrides = {};
+  if (b.overrides !== void 0) {
+    if (typeof b.overrides !== "object" || Array.isArray(b.overrides) || b.overrides === null)
+      return c.json({ error: { message: "overrides must be an object of slug -> multiplier" } }, 400);
+    for (const [k, v] of Object.entries(b.overrides)) {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0)
+        return c.json({ error: { message: "override for " + k + " must be a positive number" } }, 400);
+      overrides[k] = n;
+    }
+  } else {
+    try { overrides = JSON.parse(await settingValue(c, "auto_overrides", "{}")) || {}; } catch { overrides = {}; }
+  }
+  const set = async (k, v) => c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(k, v, nowIso()).run();
+  await set("auto_enabled", enabled);
+  if (Number.isFinite(pref))
+    await set("auto_preference", String(Math.round(pref)));
+  await set("auto_excluded", excluded);
+  await set("auto_overrides", JSON.stringify(overrides));
+  return c.json({ enabled: enabled === "on", preference: Number.isFinite(pref) ? Math.round(pref) : 70, excluded: excluded ? excluded.split(",") : [], overrides });
+});
+app.post("/admin/auto-preview", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  const messages = Array.isArray(b.messages) ? b.messages : [{ role: "user", content: String(b.prompt || "") }];
+  const decision = await pickAutoModel(c, { messages, tools: b.tools || undefined });
+  if (!decision)
+    return c.json({ error: { message: "auto routing unavailable (disabled or no routed models)" } }, 503);
+  return c.json({
+    picked: decision.slug,
+    fallback: !!decision.fallback,
+    need: decision.need,
+    complexity: decision.complexity,
+    preference: decision.preference,
+    candidates: decision.candidates
+  });
 });
 app.get("/admin/cache", async (c) => {
   const denied = await requireAdmin(c);
