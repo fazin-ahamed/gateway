@@ -16,6 +16,7 @@ const db = createDb(dbPath);
 const require = createRequire(import.meta.url);
 const schemaPath = require.resolve("../ai-gateway/schema.sql");
 db.exec(readFileSync(schemaPath, "utf8"));
+const sql = readFileSync(file, "utf8");
 db.exec("BEGIN;");
 try {
   db.exec(sql);
