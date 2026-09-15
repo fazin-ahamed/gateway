@@ -32,6 +32,34 @@ try {
 } catch (e) {
   console.warn("[gateway] schema auto-apply skipped:", e.message);
 }
+// Migrations for DBs created before the (slug, kind, period) limit shape.
+// The pre-1fea6d1 table had slug PRIMARY KEY + rpm/token columns; rebuild it
+// into the new shape (preserving old rows as requests/minute + tokens/day).
+try {
+  const cols = db.prepare("PRAGMA table_info(model_limits)").all();
+  if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "kind")) {
+    const old = db.prepare("SELECT slug, requests_per_minute, max_total_tokens, updated_at FROM model_limits").all().results || [];
+    db.exec("DROP TABLE model_limits");
+    db.exec("CREATE TABLE model_limits (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL, kind TEXT NOT NULL, period TEXT NOT NULL, limit_value REAL NOT NULL, updated_at TEXT NOT NULL, UNIQUE(slug, kind, period))");
+    for (const row of old) {
+      if (row.requests_per_minute) db.prepare("INSERT OR IGNORE INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)").bind(row.slug, "requests", "minute", row.requests_per_minute, row.updated_at).run();
+      if (row.max_total_tokens) db.prepare("INSERT OR IGNORE INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)").bind(row.slug, "tokens", "day", row.max_total_tokens, row.updated_at).run();
+    }
+    console.warn("[gateway] migrated model_limits to (slug,kind,period):", old.length, "rows");
+  }
+} catch (e) {
+  console.warn("[gateway] model_limits migration skipped:", e.message);
+}
+try {
+  // model_usage replaced model_token_usage (day bucket -> kind-aware rows).
+  const old = db.prepare("SELECT slug, day, tokens FROM model_token_usage").all().results || [];
+  for (const row of old) {
+    db.prepare("INSERT OR IGNORE INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)").bind(row.slug, "tokens", row.day, row.tokens).run();
+  }
+  if (old.length) db.exec("DROP TABLE model_token_usage");
+} catch (e) {
+  // table absent on fresh DBs; nothing to do
+}
 const env = {
   DB: db,
   ADMIN_TOKEN,
