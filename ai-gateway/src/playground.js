@@ -128,6 +128,8 @@ var PLAYGROUND_HTML = `<!doctype html>
   .toast{border-radius:10px}
   @media (max-width:1100px){.hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.cols2{grid-template-columns:1fr}.filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media (max-width:620px){.hero-stats{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.filter-grid{grid-template-columns:1fr}.pagehead{flex-direction:column;align-items:flex-start}}
+</style>
+</head>
 <body>
 <header>
   <div class="brand"><span class="dot">G</span><span>Gateway</span><span style="color:var(--muted);font-weight:400">Control</span></div>
