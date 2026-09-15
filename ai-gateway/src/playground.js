@@ -175,6 +175,10 @@ var PLAYGROUND_HTML = `<!doctype html>
       <div class="panel"><div class="panel-h"><h2 class="sec">Provider health</h2></div><div class="panel-b" id="ov-providers"></div></div>
     </div>
     <div class="panel">
+      <div class="panel-h"><h2 class="sec">Active model limits</h2><button class="ghost" onclick="selectTab('limits')">Edit</button></div>
+      <div class="panel-b" id="ov-limits"><span class="small">Loading…</span></div>
+    </div>
+    <div class="panel">
       <div class="panel-h"><h2 class="sec">Egress health</h2><button class="ghost" id="ph-refresh">Refresh</button></div>
       <div class="panel-b" id="proxy-health"><span class="small">Loading egress status…</span></div>
     </div>
@@ -449,9 +453,9 @@ async function loadOverview(){
     {k:'Total requests', v:fmt(tot.requests), c:'acc', s:'all time'},
     {k:'Tokens used', v:fmt(tot.used_tokens), c:'', s:'all time'},
     {k:'Spend (USD)', v:money(tot.used_usd), c:'ok', s:'all time'},
+    {k:'Cache hits', v:fmt((data.cache||{}).hits||0), c:'', s:fmt((data.cache||{}).entries||0)+' entries · '+money((data.cache||{}).saved_usd||0)+' saved'},
     {k:'API keys', v:fmt((data.keys||[]).length), c:'', s:'configured'},
-    {k:'Providers', v:fmt((data.providers||[]).length), c:'', s:'configured'},
-    {k:'Model routes', v:fmt((data.routes||[]).length), c:'', s:'enabled paths'}
+    {k:'Providers', v:fmt((data.providers||[]).length), c:'', s:'configured'}
   ];
   statsEl.innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div><div class="sub2">'+esc(s.s||'')+'</div></div>';}).join('');
   document.getElementById('recent').innerHTML='<div class="empty" style="margin:20px">Usage totals update after each request. Provider health is live.</div>';
@@ -461,6 +465,17 @@ async function loadOverview(){
     const label=ok?'healthy':(!p.healthy?'disabled':('HTTP '+(p.last_status||'-')));
     return '<div class="kvrow"><span class="pill '+cls+'">'+label+'</span><span class="grow">'+esc(p.name)+'</span><span class="mono small right">'+esc(p.route_count||0)+' routes</span></div>';
   }).join('') : '<div class="empty">No providers.</div>';
+  const limEl=document.getElementById('ov-limits');
+  const lims=(data.limits||[]); const usageToday=data.usage_today||[];
+  limEl.innerHTML = lims.length ? lims.map(function(l){
+    const used=(usageToday.find(function(u){return u.slug===l.slug&&u.kind===l.kind;})||{}).used||0;
+    const pct=l.limit_value>0?Math.min(100,Math.round(100*used/l.limit_value)):0;
+    const near=pct>=80;
+    const val=l.kind==='usd'?money(l.limit_value):fmt(l.limit_value);
+    const usedStr=l.kind==='usd'?money(used):fmt(used);
+    const period=l.period==='minute'?'min':l.period;
+    return '<div class="kvrow"><span class="pill '+(near?'warn':'acc')+'">'+esc(l.slug)+'</span><span class="grow small">'+esc(l.kind)+' / '+esc(period)+' · cap '+esc(val)+'</span><span class="mono small right">'+esc(usedStr)+(l.limit_value>0?' ('+pct+'%)':'')+'</span></div>';
+  }).join('') : '<div class="empty">No model limits configured. Set them in Limits.</div>';
   loadProxyHealth();
 }
 async function loadProxyHealth(){

@@ -2462,11 +2462,21 @@ app.get("/admin/overview", async (c) => {
   const totals = await c.env.DB.prepare(
     "SELECT COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(used_tokens),0) AS used_tokens, COALESCE(SUM(used_usd),0) AS used_usd FROM api_keys"
   ).first();
+  const limits = await c.env.DB.prepare("SELECT slug, kind, period, limit_value, updated_at FROM model_limits ORDER BY slug, kind, period").all();
+  const usageToday = await c.env.DB.prepare(
+    "SELECT slug, kind, COALESCE(SUM(value),0) AS used FROM model_usage WHERE bucket >= ? GROUP BY slug, kind"
+  ).bind(gatewayLocalDate().toISOString().slice(0, 10)).all();
+  const cacheRow = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS entries, COALESCE(SUM(hits),0) AS hits, COALESCE(SUM(hits * source_cost_usd),0) AS saved_usd, COALESCE(SUM(hits * source_tokens),0) AS saved_tokens FROM response_cache WHERE expires_at > ?"
+  ).bind(nowIso()).first();
   return c.json({
     providers: providers.results || [],
     routes: routes.results || [],
     keys: keys.results || [],
     totals: totals || { requests: 0, used_tokens: 0, used_usd: 0 },
+    limits: limits.results || [],
+    usage_today: usageToday.results || [],
+    cache: cacheRow || { entries: 0, hits: 0, saved_usd: 0, saved_tokens: 0 },
     generated_at: nowIso()
   });
 });
