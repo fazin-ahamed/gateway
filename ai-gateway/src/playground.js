@@ -343,6 +343,7 @@ function openModal(title, fields, onSubmit, saveLabel){
     inp.dataset.key=f.key; body.appendChild(inp); vals[f.key]=inp;
   });
   modalSubmit=function(){ const out={}; fields.forEach(function(f){ out[f.key]=f.type==='multiselect'?Array.from(vals[f.key].selectedOptions).map(function(o){return o.value;}):vals[f.key].value; }); onSubmit(out); };
+  const saveBtn=document.getElementById('modal-save');
   saveBtn.textContent=saveLabel||'Save';
   document.getElementById('modal-title').style.color='';
   saveBtn.style.display='';
