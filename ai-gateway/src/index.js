@@ -1892,16 +1892,22 @@ async function pickAutoModel(c, payload) {
       strongest = cand;
   }
   // Preference blend: 0 = highest quality among eligible, 100 = cheapest.
+  // Health and latency always matter: a cheap-but-slow flaky model loses
+  // to a slightly pricier reliable fast one at any preference.
   const eligibleList = candidates.filter((x) => x.eligible);
   let picked;
   if (!eligibleList.length) {
     picked = strongest ? { ...strongest, fallback: true } : null;
   } else {
     const maxCost = Math.max(...eligibleList.map((x) => x.cost), 1e-9);
+    const maxMs = Math.max(...eligibleList.map((x) => x.avgMs || 0), 1);
     const w = cfg.preference / 100;
     let bestScore = -Infinity;
     for (const cand of eligibleList) {
-      const s = (1 - w) * cand.quality - w * (cand.cost / maxCost) * 6;
+      const reliability = cand.samples >= 3 ? cand.okRate : 1;
+      const relPenalty = (1 - reliability) * 6;
+      const slowPenalty = ((cand.avgMs || 0) / maxMs) * 2;
+      const s = (1 - w) * cand.quality - w * (cand.cost / maxCost) * 6 - relPenalty - slowPenalty;
       if (s > bestScore) {
         bestScore = s;
         picked = cand;
