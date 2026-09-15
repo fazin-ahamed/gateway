@@ -228,8 +228,9 @@ async function providerKey(c, id) {
     }
   } catch (e) {
     console.log("PROVIDER_KEY unavailable id=" + id + ": " + String(e.message || e));
+    return null;
   }
-  return c.env["PROVIDER_" + id + "_KEY"] || c.env["PROVIDER_" + (id - 1) + "_KEY"] || c.env.PROVIDER_KEY || c.env.UPSTREAM_API_KEY || null;
+  return null;
 }
 function adminToken(c) {
   const a = c.req.header("authorization");
@@ -413,7 +414,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       try {
         const res = await forwardToProvider(c, route, key2, payload, isStream, requestId);
         const up = res.response;
-        c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
+        await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
         if (!up.ok || !up.body) {
           const txt = await up.text();
           console.log("FWD FAIL " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] " + String(txt).slice(0, 300));
@@ -426,7 +427,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const costUsd = await computeCost(c, slug, usage);
           const clientTxt = sanitizeClientResponse(txt, slug);
           if (isGenericUpstreamErrorResponse(clientTxt)) {
-            console.log("FWD MALFORMED " + route.provider_name + " -> " + String(clientTxt).slice(0, 300));
+            console.log("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
             lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
             attempts++;
             continue;
@@ -443,7 +444,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               ttl: cacheTtlSeconds(c)
             });
           }
-          const hdrs = withGatewayHeaders(up.headers, key, usage);
+          const hdrs = clientResponseHeaders(up.headers, false);
           hdrs["x-request-id"] = requestId;
           hdrs["x-gateway-route"] = String(route.rank);
           hdrs["x-gateway-attempts"] = String(attempts + 1);
@@ -454,6 +455,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage);
         return result;
       } catch (e) {
+        console.log("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
         lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
         attempts++;
       }
