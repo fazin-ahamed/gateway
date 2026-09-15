@@ -38,19 +38,55 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 function isCacheableRequest(payload, isStream, mode) {
-  if (mode !== "true" && mode !== "refresh")
+  if (mode !== "true" && mode !== "refresh" && mode !== "loose")
     return false;
-  if (isStream || !payload)
+  if (!payload)
     return false;
-  if (payload.temperature != null && Number(payload.temperature) !== 0)
-    return false;
-  if (payload.tools || payload.functions || payload.tool_choice || payload.parallel_tool_calls)
+  if (mode !== "loose" && payload.temperature != null && Number(payload.temperature) !== 0)
     return false;
   return true;
 }
+function synthesizeStreamCompletion(chunks) {
+  return "data: " + chunks.join("\n\ndata: ") + "\n\ndata: [DONE]\n\n";
+}
+async function serveCachedCompletion(c, { cached, key, slug, payload, started, state }) {
+  const isStream = !!payload.stream;
+  if (isStream) {
+    try {
+      const obj = JSON.parse(cached.response_body);
+      const msg = obj && obj.choices && obj.choices[0] && obj.choices[0].message;
+      const content = msg && (typeof msg.content === "string" ? msg.content : "") || "";
+      const toolCalls = msg && msg.tool_calls;
+      const usage = obj.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
+      const chunk1 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: { role: "assistant", ...(toolCalls ? { tool_calls: toolCalls } : {}) } }] };
+      const chunk2 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: { content } }] };
+      const chunk3 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage };
+      const sse = synthesizeStreamCompletion([JSON.stringify(chunk1), JSON.stringify(chunk2), JSON.stringify(chunk3)]);
+      const hdrs = clientResponseHeaders(new Headers(), true);
+      hdrs["x-gateway-cache"] = state || "HIT";
+      return new Response(sse, { status: 200, headers: hdrs });
+    } catch {
+      // fall through to non-stream rendering
+    }
+  }
+  const hdrs = clientResponseHeaders(new Headers({ "content-type": "application/json; charset=utf-8" }), false);
+  hdrs["x-gateway-cache"] = state || "HIT";
+  return new Response(cached.response_body, { status: 200, headers: hdrs });
+}
 async function responseCacheKey(key, slug, payload) {
-  const normalized = { ...payload, stream: false };
-  return "rc:v1:" + await sha256hex(String(key.key_id) + "\n" + String(slug) + "\n" + stableJson(normalized));
+  const p = payload || {};
+  const trimmed = {
+    messages: p.messages ?? p.input ?? [],
+    temperature: p.temperature ?? 0,
+    max_tokens: p.max_tokens ?? null,
+    top_p: p.top_p ?? null,
+    stop: p.stop ?? null,
+    seed: p.seed ?? null,
+    response_format: p.response_format ?? null,
+    tools: p.tools ?? null,
+    tool_choice: p.tool_choice ?? null
+  };
+  return "rc:c2:" + await sha256hex(String(key.key_id) + "\n" + String(slug) + "\n" + stableJson(trimmed));
 }
 function isCacheableResponse(text) {
   try {
@@ -59,11 +95,6 @@ function isCacheableResponse(text) {
   } catch {
     return false;
   }
-}
-async function serveCachedCompletion(c, { cached, key, slug, payload, started, state }) {
-  const hdrs = clientResponseHeaders(new Headers({ "content-type": "application/json; charset=utf-8" }), false);
-  hdrs["x-gateway-cache"] = state || "HIT";
-  return new Response(cached.response_body, { status: 200, headers: hdrs });
 }
 function cacheTtlSeconds(c) {
   const requested = Number(c.req.header("x-gateway-cache-ttl") || 3600);
@@ -414,28 +445,34 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     return c.json({ error: { message: "Invalid JSON body" } }, 400);
   }
   const slug = payload.model;
-  if (!slug)
+  const requestId = c.req.header("x-request-id") || uuid();
+  const started = Date.now();
+  const isStream = !!payload.stream;
+  const traj = trajectorySeed(c, payload, key, slug || "unknown", isStream, requestId);
+  if (!slug) {
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model is required" });
     return c.json({ error: { message: "model is required" } }, 400);
+  }
   if (!isAdminPlayground && !await slugAllowed(c, key, slug)) {
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 403, attempts: 0, latencyMs: Date.now() - started, error: "model not enabled for this key" });
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
   const routes = await c.env.DB.prepare(
     "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
   ).bind(slug).all();
   if (!routes.results || !routes.results.length) {
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 503, attempts: 0, latencyMs: Date.now() - started, error: "no healthy route" });
     return c.json({ error: { message: 'No healthy route for model "' + slug + '"', type: "no_route" } }, 503);
   }
   const modelDenied = await enforceModelLimits(c, slug);
-  if (modelDenied)
+  if (modelDenied) {
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 429, attempts: 0, latencyMs: Date.now() - started, error: "model limit exceeded" });
     return modelDenied;
-  const requestId = c.req.header("x-request-id") || uuid();
-  const started = Date.now();
-  const isStream = !!payload.stream;
+  }
   const cacheModeHeader = String(c.req.header("x-gateway-cache") || "true").toLowerCase();
   const cacheMode = (cacheModeHeader === "off" || cacheModeHeader === "false" || cacheModeHeader === "0") ? "off" : cacheModeHeader;
   const cacheable = !!key && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
-  const traj = trajectorySeed(c, payload, key, slug, isStream, requestId);
   blog("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));
   if (cacheKey && cacheMode !== "refresh") {
     const cached = await lookupResponseCache(c, cacheKey);
@@ -530,7 +567,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         }
         blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " rank=" + route.rank);
         traj.steps.push({ ...baseStep, http: up.status, ok: true, ms: Date.now() - stepStart, streaming: true });
-        const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1 });
+        const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c) });
         return result;
       } catch (e) {
         blog("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
@@ -1222,6 +1259,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   let lastUsage = usageHint || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
   let malformedSseSent = false;
   let contentBuf = "";
+  let reasoningBuf = "";
+  let toolCallsBuf = [];
   const keepAlive = ((promise) => {
     const ctx = c.executionCtx;
     if (ctx && typeof ctx.waitUntil === "function")
@@ -1232,6 +1271,12 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
     await recordModelTokens(c, slug, lastUsage.total_tokens);
     if (extra && extra.traj) {
+      const msg = {
+        role: "assistant",
+        content: contentBuf || null,
+        ...(reasoningBuf ? { reasoning_content: reasoningBuf } : {}),
+        ...(toolCallsBuf.length ? { tool_calls: toolCallsBuf } : {})
+      };
       await recordTrajectory(c, {
         ...extra.traj,
         status: streamError ? "fail" : "ok",
@@ -1245,8 +1290,20 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
         costUsd,
         latencyMs: Date.now() - started,
         error: streamError || null,
-        responseJson: contentBuf ? JSON.stringify({ choices: [{ message: { role: "assistant", content: contentBuf } }], usage: lastUsage }) : null
+        responseJson: (contentBuf || reasoningBuf || toolCallsBuf.length) ? JSON.stringify({ choices: [{ message: msg }], usage: lastUsage }) : null
       });
+      if (!streamError && extra.cacheKey && (contentBuf || toolCallsBuf.length)) {
+        const replayBody = JSON.stringify({ id: "cached-" + requestId, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: extra.traj.slug, choices: [{ index: 0, message: msg, finish_reason: "stop" }], usage: lastUsage });
+        await storeResponseCache(c, {
+          cacheKey: extra.cacheKey,
+          keyId: extra.traj.keyId || "admin",
+          slug: extra.traj.slug,
+          responseBody: replayBody,
+          sourceCostUsd: costUsd,
+          sourceTokens: lastUsage.total_tokens,
+          ttl: extra.cacheTtlSeconds || 3600
+        });
+      }
     }
   });
   const safeEnqueue = ((text) => {
@@ -1280,8 +1337,26 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             if (u && (u.total_tokens || u.completion_tokens || u.prompt_tokens))
               lastUsage = u;
             const dc = obj && obj.choices && obj.choices[0] && obj.choices[0].delta;
-            if (dc && typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
-              contentBuf += dc.content;
+            if (dc) {
+              if (typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
+                contentBuf += dc.content;
+              const rc = dc.reasoning_content ?? dc.reasoning ?? dc.thinking;
+              if (typeof rc === "string" && reasoningBuf.length < TRAJ_BODY_CAP)
+                reasoningBuf += rc;
+              if (Array.isArray(dc.tool_calls)) {
+                for (const tc of dc.tool_calls) {
+                  if (!tc || typeof tc.index !== "number")
+                    continue;
+                  const slot = toolCallsBuf[tc.index] || (toolCallsBuf[tc.index] = { id: tc.id || null, type: "function", function: { name: "", arguments: "" } });
+                  if (tc.id)
+                    slot.id = tc.id;
+                  if (tc.function && tc.function.name)
+                    slot.function.name += tc.function.name;
+                  if (tc.function && typeof tc.function.arguments === "string")
+                    slot.function.arguments += tc.function.arguments;
+                }
+              }
+            }
             if (obj && obj.model && slug)
               obj.model = slug;
             sanitizeClientObject(obj);
@@ -1430,14 +1505,16 @@ async function computeCost(c, slug, usage) {
     }
   } catch {
   }
-  try {
-    const catalog = await fetchModelsDevCatalog();
-    const hit = matchModelsDevPrice(flattenModelsDevCatalog(catalog), slug);
-    if (hit)
-      return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * hit.prompt_per_1m + (Number(usage && usage.completion_tokens) || 0) / 1e6 * hit.completion_per_1m;
-  } catch (e) {
-    blog("MODELS_DEV cost lookup failed: " + String(e.message || e));
+  // Fallback: the models.dev catalog if it is already loaded in memory. Never
+  // block a completion on a live fetch; a background refresh keeps it warm.
+  const catalog = modelsDevCache.catalog;
+  if (!catalog) {
+    fetchModelsDevCatalog().catch((e) => blog("MODELS_DEV warm failed: " + String(e.message || e)));
+    return 0;
   }
+  const hit = matchModelsDevPrice(flattenModelsDevCatalog(catalog), slug);
+  if (hit)
+    return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * hit.prompt_per_1m + (Number(usage && usage.completion_tokens) || 0) / 1e6 * hit.completion_per_1m;
   return 0;
 }
 async function lookupResponseCache(c, cacheKey) {
