@@ -426,6 +426,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const costUsd = await computeCost(c, slug, usage);
           const clientTxt = sanitizeClientResponse(txt, slug);
           if (isGenericUpstreamErrorResponse(clientTxt)) {
+            console.log("FWD MALFORMED " + route.provider_name + " -> " + String(clientTxt).slice(0, 300));
             lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
             attempts++;
             continue;
