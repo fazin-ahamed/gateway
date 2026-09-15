@@ -1240,6 +1240,75 @@ function usageFrom(obj) {
     cost_usd: Number(u.cost) || 0
   };
 }
+var MODELS_DEV_API = "https://models.dev/api.json";
+function flattenModelsDevCatalog(catalog) {
+  const byId = new Map();
+  if (!catalog || typeof catalog !== "object")
+    return byId;
+  for (const provider of Object.values(catalog)) {
+    const models = provider && provider.models;
+    if (!models || typeof models !== "object")
+      continue;
+    for (const [key, model] of Object.entries(models)) {
+      const id = String((model && model.id) || key || "").trim();
+      if (!id)
+        continue;
+      const cost = model && model.cost;
+      const input = Number(cost && cost.input);
+      const output = Number(cost && cost.output);
+      if (!Number.isFinite(input) && !Number.isFinite(output))
+        continue;
+      const entry = {
+        id,
+        prompt_per_1m: Number.isFinite(input) ? input : 0,
+        completion_per_1m: Number.isFinite(output) ? output : 0
+      };
+      if (!byId.has(id) || provider && provider.id && id.startsWith(provider.id + "/"))
+        byId.set(id, entry);
+      const slash = id.lastIndexOf("/");
+      if (slash >= 0) {
+        const bare = id.slice(slash + 1);
+        if (bare && !byId.has(bare))
+          byId.set(bare, entry);
+      }
+    }
+  }
+  return byId;
+}
+function matchModelsDevPrice(byId, slug) {
+  const want = String(slug || "").trim();
+  if (!want || !byId || !byId.size)
+    return null;
+  if (byId.has(want))
+    return byId.get(want);
+  const lower = want.toLowerCase();
+  for (const [id, entry] of byId) {
+    if (id.toLowerCase() === lower)
+      return entry;
+  }
+  const bare = want.includes("/") ? want.slice(want.lastIndexOf("/") + 1) : want;
+  if (bare && byId.has(bare))
+    return byId.get(bare);
+  const bareLower = bare.toLowerCase();
+  for (const [id, entry] of byId) {
+    if (id.toLowerCase() === bareLower || id.toLowerCase().endsWith("/" + bareLower))
+      return entry;
+  }
+  return null;
+}
+var MODELS_DEV_CACHE_MS = 3600000;
+var modelsDevCache = { at: 0, catalog: null };
+async function fetchModelsDevCatalog() {
+  const now = Date.now();
+  if (modelsDevCache.catalog && now - modelsDevCache.at < MODELS_DEV_CACHE_MS)
+    return modelsDevCache.catalog;
+  const r = await fetch(MODELS_DEV_API, { headers: { accept: "application/json" } });
+  if (!r.ok)
+    throw new Error("models.dev HTTP " + r.status);
+  const catalog = await r.json();
+  modelsDevCache = { at: now, catalog };
+  return catalog;
+}
 async function computeCost(c, slug, usage) {
   const pt = Number(usage && usage.cost_usd) || 0;
   if (pt > 0)
@@ -1251,10 +1320,17 @@ async function computeCost(c, slug, usage) {
     if (row) {
       const p = Number(row.prompt_per_1m) || 0;
       const ct = Number(row.completion_per_1m) || 0;
-      const cost = (Number(usage && usage.prompt_tokens) || 0) / 1e6 * p + (Number(usage && usage.completion_tokens) || 0) / 1e6 * ct;
-      return cost;
+      return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * p + (Number(usage && usage.completion_tokens) || 0) / 1e6 * ct;
     }
   } catch {
+  }
+  try {
+    const catalog = await fetchModelsDevCatalog();
+    const hit = matchModelsDevPrice(flattenModelsDevCatalog(catalog), slug);
+    if (hit)
+      return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * hit.prompt_per_1m + (Number(usage && usage.completion_tokens) || 0) / 1e6 * hit.completion_per_1m;
+  } catch (e) {
+    console.log("MODELS_DEV cost lookup failed: " + String(e.message || e));
   }
   return 0;
 }
@@ -2066,6 +2142,38 @@ app.get("/admin/prices", async (c) => {
   const rows = await c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug").all();
   return c.json({ prices: rows.results || [] });
 });
+app.post("/admin/prices/sync-models-dev", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let catalog;
+  try {
+    catalog = await fetchModelsDevCatalog();
+  } catch (e) {
+    return c.json({ error: { message: "models.dev fetch failed: " + String(e.message || e) } }, 502);
+  }
+  const byId = flattenModelsDevCatalog(catalog);
+  const slugs = await c.env.DB.prepare("SELECT DISTINCT slug FROM model_routes").all();
+  const list = slugs.results || [];
+  let matched = 0, unmatched = 0;
+  const missing = [];
+  const updated = [];
+  const ts = nowIso();
+  for (const row of list) {
+    const slug = row.slug;
+    const hit = matchModelsDevPrice(byId, slug);
+    if (!hit) {
+      unmatched++;
+      if (missing.length < 50)
+        missing.push(slug);
+      continue;
+    }
+    await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(slug, hit.prompt_per_1m, hit.completion_per_1m, "USD", ts).run();
+    matched++;
+    updated.push({ slug, prompt_per_1m: hit.prompt_per_1m, completion_per_1m: hit.completion_per_1m, source: hit.id });
+  }
+  return c.json({ ok: true, source: MODELS_DEV_API, matched, unmatched, updated, missing });
+});
 app.post("/admin/prices", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
@@ -2142,7 +2250,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

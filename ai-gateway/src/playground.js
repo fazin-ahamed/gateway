@@ -254,14 +254,14 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-prices">
-    <div class="pagehead"><div><h2 class="sec">Custom model prices (USD / 1M tokens)</h2><p class="sub">Used to compute cost_usd for usage when the upstream doesn't return a cost. Leave 0 for free. Keyed by model slug (e.g. <span class="mono">z-ai/glm-5.2</span>).</p></div></div>
+    <div class="pagehead"><div><h2 class="sec">Model prices (USD / 1M tokens)</h2><p class="sub">Used to compute cost_usd when the upstream doesn't return a cost. Sync pulls <span class="mono">models.dev</span> rates for every routed slug. Manual rows override the catalog.</p></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Save price</h2></div><div class="panel-b">
       <div class="form-grid">
-        <div><label>Slug</label><input id="pr-slug" placeholder="z-ai/glm-5.2"></div>
+        <div><label>Slug</label><input id="pr-slug" placeholder="z-ai/glm-5.3"></div>
         <div><label>Prompt $/1M</label><input id="pr-prompt" type="number" step="0.0001" placeholder="0"></div>
         <div><label>Completion $/1M</label><input id="pr-completion" type="number" step="0.0001" placeholder="0"></div>
       </div>
-      <div class="form-actions"><button class="act" id="pr-save">Save price</button></div>
+      <div class="form-actions"><button class="act" id="pr-save">Save price</button><button class="ghost" id="pr-sync">Sync from models.dev</button></div>
     </div></div>
     <div class="panel"><div class="panel-b flush" id="pr-list"></div></div>
   </section>
@@ -832,6 +832,16 @@ document.getElementById('pr-save').onclick=async function(){
   const {status,data}=await api('/admin/prices',{method:'POST',body});
   if(status===200){ toast('price saved','ok'); loadPrices(); }
   else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
+};
+document.getElementById('pr-sync').onclick=async function(){
+  const btn=document.getElementById('pr-sync');
+  btn.disabled=true;
+  try{
+    const {status,data}=await api('/admin/prices/sync-models-dev',{method:'POST'});
+    if(status===200){ toast('synced '+(data.matched||0)+' prices'+(data.unmatched?' · '+data.unmatched+' unmatched':''),'ok'); loadPrices(); }
+    else toast('sync failed: '+(data&&data.error&&data.error.message||status),'err');
+  }catch(e){ toast('sync failed: '+e.message,'err'); }
+  finally{ btn.disabled=false; }
 };
 async function loadPrices(){
   const el=document.getElementById('pr-list');
