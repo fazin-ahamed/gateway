@@ -454,12 +454,9 @@ app.get("/v1/models", async (c) => {
   const routes = await c.env.DB.prepare(
     "SELECT DISTINCT slug FROM model_routes WHERE enabled=1 AND slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY slug"
   ).bind(...allowed).all();
-  const data = (routes.results || []).map((r) => ({
-    id: r.slug,
-    object: "model",
-    created: 0,
-    owned_by: "gateway"
-  }));
+  const data = [{ id: AUTO_SLUG, object: "model", created: 0, owned_by: "gateway" }];
+  for (const r of routes.results || [])
+    data.push({ id: r.slug, object: "model", created: 0, owned_by: "gateway" });
   return c.json({ object: "list", data });
 });
 app.get("/status", async (c) => {
@@ -523,16 +520,29 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   } catch {
     return c.json({ error: { message: "Invalid JSON body" } }, 400);
   }
-  const slug = payload.model;
+  let slug = payload.model;
+  let autoDecision = null;
+  if (String(slug).toLowerCase() === AUTO_SLUG) {
+    autoDecision = await pickAutoModel(c, payload);
+    if (!autoDecision) {
+      const requestId0 = c.req.header("x-request-id") || uuid();
+      return c.json({ error: { message: 'No healthy routed models available for auto routing', type: "no_route" } }, 503);
+    }
+    slug = autoDecision.slug;
+    payload = { ...payload, model: slug };
+    blog("AUTO picked " + slug + " complexity=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + (autoDecision.fallback ? " fallback" : ""));
+  }
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
   const isStream = !!payload.stream;
   const traj = trajectorySeed(c, payload, key, slug || "unknown", isStream, requestId);
+  if (autoDecision)
+    traj.steps.push({ provider: "auto-router", rank: 0, ok: true, picked: slug, costPer1M: autoDecision.cost, quality: autoDecision.quality, fallback: !!autoDecision.fallback });
   if (!slug) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model is required" });
     return c.json({ error: { message: "model is required" } }, 400);
   }
-  if (!isAdminPlayground && !await slugAllowed(c, key, slug)) {
+  if (!isAdminPlayground && slug !== AUTO_SLUG && !await slugAllowed(c, key, slug)) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 403, attempts: 0, latencyMs: Date.now() - started, error: "model not enabled for this key" });
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
@@ -1634,7 +1644,9 @@ function flattenModelsDevCatalog(catalog) {
       const entry = {
         id,
         prompt_per_1m: Number.isFinite(input) ? input : 0,
-        completion_per_1m: Number.isFinite(output) ? output : 0
+        completion_per_1m: Number.isFinite(output) ? output : 0,
+        reasoning: !!(model && model.reasoning),
+        limit: model && model.limit || null
       };
       if (!byId.has(id) || provider && provider.id && id.startsWith(provider.id + "/"))
         byId.set(id, entry);
@@ -1659,15 +1671,137 @@ function matchModelsDevPrice(byId, slug) {
     if (id.toLowerCase() === lower)
       return entry;
   }
-  const bare = want.includes("/") ? want.slice(want.lastIndexOf("/") + 1) : want;
-  if (bare && byId.has(bare))
-    return byId.get(bare);
-  const bareLower = bare.toLowerCase();
+  const bareLower = want.includes("/") ? want.slice(want.lastIndexOf("/") + 1).toLowerCase() : want.toLowerCase();
   for (const [id, entry] of byId) {
     if (id.toLowerCase() === bareLower || id.toLowerCase().endsWith("/" + bareLower))
       return entry;
   }
   return null;
+}
+var AUTO_SLUG = "auto";
+var routerHealthCache = { at: 0, rows: [] };
+async function routerHealth(c) {
+  const now = Date.now();
+  if (now - routerHealthCache.at < 30000)
+    return routerHealthCache.rows;
+  try {
+    const rows = await c.env.DB.prepare(
+      `SELECT slug,
+              COUNT(*) AS n,
+              AVG(CASE WHEN status='ok' THEN 1.0 ELSE 0.0 END) AS ok_rate,
+              AVG(latency_ms) AS avg_ms
+       FROM (SELECT slug, status, latency_ms, created_at FROM trajectories WHERE created_at >= ?)
+       GROUP BY slug`
+    ).bind(new Date(now - 24 * 3600000).toISOString()).all();
+    routerHealthCache = { at: now, rows: rows.results || [] };
+  } catch {
+    routerHealthCache = { at: now, rows: [] };
+  }
+  return routerHealthCache.rows;
+}
+function promptComplexity(payload) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  let text = "";
+  for (const m of msgs) {
+    if (!m)
+      continue;
+    if (typeof m.content === "string")
+      text += " " + m.content;
+    else if (Array.isArray(m.content))
+      for (const part of m.content)
+        if (part && typeof part.text === "string")
+          text += " " + part.text;
+  }
+  const t = text.toLowerCase();
+  const chars = t.length;
+  const words = t.split(/\s+/).filter(Boolean).length;
+  let score = 0;
+  if (payload.tools || payload.functions || payload.tool_choice)
+    score += 2;
+  if (payload.response_format)
+    score += 1;
+  const heavyWords = ["refactor", "architecture", "optimize", "debug", "migrate", "implement", "algorithm", "prove", "derive", "theorem", "complex", "security", "race condition", "memory leak", "regression", "benchmark", "compile", "runtime error", "stack trace", "root cause"];
+  const midWords = ["write", "explain", "summarize", "compare", "convert", "review", "fix", "why", "how", "difference", "example"];
+  for (const w of heavyWords)
+    if (t.includes(w))
+      score += 1.5;
+  for (const w of midWords)
+    if (t.includes(w))
+      score += 0.5;
+  if (chars > 4000)
+    score += 1.5;
+  else if (chars > 800)
+    score += 0.5;
+  if (words < 4)
+    score -= 1.5;
+  const turns = msgs.filter((m) => m && m.role === "user").length;
+  if (turns >= 4)
+    score += 0.5;
+  return { score, chars, words };
+}
+function qualityPrior(entry) {
+  if (!entry)
+    return 1;
+  const input = Number(entry.prompt_per_1m) || 0;
+  const reasoning = !!(entry.reasoning);
+  const ctx = Number(entry.limit && entry.limit.context) || 0;
+  let q = 1;
+  if (reasoning)
+    q += 1.5;
+  if (ctx >= 400000)
+    q += 1;
+  else if (ctx >= 128000)
+    q += 0.5;
+  if (input >= 3)
+    q += 1.5;
+  else if (input >= 1)
+    q += 0.75;
+  return q;
+}
+async function pickAutoModel(c, payload) {
+  if (!modelsDevCache.catalog)
+    await fetchModelsDevCatalog().catch(() => {});
+  const catalog = modelsDevCache.catalog;
+  const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
+  const routes = await c.env.DB.prepare(
+    `SELECT mr.slug, MIN(mr.rank) AS best_rank, COUNT(*) AS ranks,
+            COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1),0) AS healthy
+     FROM model_routes mr WHERE mr.enabled=1 GROUP BY mr.slug`
+  ).all();
+  const enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1);
+  if (!enabled.length)
+    return null;
+  const health = await routerHealth(c);
+  const healthBySlug = new Map(health.map((h) => [h.slug, h]));
+  const { score } = promptComplexity(payload);
+  // Complexity is unbounded; compress it into the quality-prior scale
+  // (priors land between 1 and ~6). need in [1, 6].
+  const need = Math.min(6, 1 + Math.max(0, score) / 2.5);
+  let best = null;
+  for (const r of enabled) {
+    const entry = byId ? matchModelsDevPrice(byId, r.slug) : null;
+    const q = qualityPrior(entry) + (entry ? 0 : 1.5);
+    const h = healthBySlug.get(r.slug);
+    const okRate = h ? Number(h.ok_rate) : 1;
+    const eligible = q + 0.5 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
+    const cost = entry ? (Number(entry.prompt_per_1m) + Number(entry.completion_per_1m)) : 0.5;
+    const cand = { slug: r.slug, cost, quality: q, okRate, avgMs: h ? Number(h.avg_ms) || 0 : 0 };
+    // Track strongest overall for the fallback path.
+    if (!best || cand.quality > best.quality || (cand.quality === best.quality && cand.cost < best.cost))
+      best = cand;
+    if (!eligible)
+      continue;
+    if (!best.eligible || cand.cost < best.cost - 1e-9 || (Math.abs(cand.cost - best.cost) < 1e-9 && cand.quality > best.quality))
+      best = { ...cand, eligible: true };
+  }
+  if (!best || !best.eligible) {
+    // Prompt exceeds every prior: use the strongest model we route to.
+    if (best)
+      best.fallback = true;
+    else
+      best = { slug: enabled[0].slug, cost: 0, quality: 0, okRate: 1, avgMs: 0, fallback: true };
+  }
+  return best;
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -2832,7 +2966,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
