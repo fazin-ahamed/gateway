@@ -312,8 +312,16 @@ var PLAYGROUND_HTML = `<!doctype html>
       <label>Preference: <span id="ar-pref-val" class="mono">70</span> (0 = best quality, 100 = cheapest)</label>
       <input type="range" id="ar-pref" min="0" max="100" step="5" value="70" style="margin-bottom:14px">
       <div class="form-grid">
-        <div><label>Excluded slugs (comma list)</label><input id="ar-excluded" placeholder="z-ai/glm-5.3"></div>
-        <div><label>Quality overrides (slug: multiplier per line)</label><textarea id="ar-overrides" placeholder="z-ai/glm-5.3: 1.5"></textarea></div>
+        <div><label>Excluded models</label><select id="ar-excluded" multiple size="6"></select><small>Hold Ctrl/Cmd to pick several. Selected models never receive auto traffic.</small></div>
+        <div><label>Quality override</label>
+          <div class="form-grid" style="grid-template-columns:1fr 100px;gap:8px">
+            <select id="ar-ov-slug"></select>
+            <input id="ar-ov-mult" type="number" step="0.1" min="0.1" placeholder="1.5">
+          </div>
+          <small>Multiplier for the picked model (1 = catalog score). Applied instantly on save.</small>
+          <div class="form-actions"><button class="ghost" id="ar-ov-add">Add / update override</button></div>
+          <div id="ar-ov-list" style="margin-top:10px"></div>
+        </div>
       </div>
       <div class="form-actions"><button class="act" id="ar-save">Save settings</button></div>
     </div></div>
@@ -720,7 +728,7 @@ document.addEventListener('click', function(e){
   else if(act==='redit') editRoute(id);
   else if(act==='raddfb') addFallbackRoute(btn);
   else if(act==='rtoggle') toggleRoute(id, btn.getAttribute('data-e')==='1'?0:1);
-  else if(act==='tieredit') editTier(id);
+  else if(act==='rdel') delRoute(id);
   else if(act==='tierdel') delTier(id);
   else if(act==='copy') copyKey(id);
   else if(act==='kedit') editKey(id);
@@ -1082,35 +1090,58 @@ document.addEventListener('click',function(e){
 });
 
 // ---------- AUTO ROUTER ----------
+var arOverrides={};
+async function refreshAutoSlugSelects(){
+  const opts=await publicModelOptions();
+  const ex=document.getElementById('ar-excluded');
+  const ov=document.getElementById('ar-ov-slug');
+  if(ex) ex.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';}).join('')||'<option disabled>No enabled public models</option>';
+  if(ov) ov.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';}).join('')||'<option disabled>No enabled public models</option>';
+}
+function renderOverrideList(){
+  const el=document.getElementById('ar-ov-list'); if(!el) return;
+  const keys=Object.keys(arOverrides);
+  el.innerHTML=keys.length?keys.map(function(k){
+    return '<div class="kvrow"><span class="grow mono">'+esc(k)+'</span><span class="mono small right">x'+arOverrides[k]+'</span><span class="right"><button class="danger" data-act="arovdel" data-slug="'+esc(k)+'">remove</button></span></div>';
+  }).join(''):'<div class="small">No overrides set.</div>';
+}
 async function loadAutoSettings(){
+  await refreshAutoSlugSelects();
   let s; try{ s=(await api('/admin/auto-settings')).data; }catch(e){ toast('Could not load auto settings: '+e.message,'err'); return; }
   if(!s) return;
   document.getElementById('ar-enabled').checked=!!s.enabled;
   document.getElementById('ar-pref').value=s.preference;
   document.getElementById('ar-pref-val').textContent=s.preference;
-  document.getElementById('ar-excluded').value=(s.excluded||[]).join(',');
-  const ov=s.overrides||{};
-  document.getElementById('ar-overrides').value=Object.keys(ov).map(function(k){return k+': '+ov[k];}).join('\\n');
+  arOverrides=s.overrides||{};
+  renderOverrideList();
+  const ex=document.getElementById('ar-excluded');
+  const excluded=s.excluded||[];
+  Array.from(ex.options).forEach(function(o){ o.selected=excluded.includes(o.value); });
 }
 document.getElementById('ar-pref').addEventListener('input',function(e){
   document.getElementById('ar-pref-val').textContent=e.target.value;
 });
-function parseOverrides(text){
-  const out={};
-  String(text||'').split('\\n').forEach(function(line){
-    const t=line.trim(); if(!t) return;
-    const i=t.lastIndexOf(':'); if(i<1) return;
-    const slug=t.slice(0,i).trim(); const n=Number(t.slice(i+1).trim());
-    if(slug&&Number.isFinite(n)&&n>0) out[slug]=n;
-  });
-  return out;
-}
+document.getElementById('ar-ov-add').onclick=function(){
+  const slug=document.getElementById('ar-ov-slug').value;
+  const mult=Number(document.getElementById('ar-ov-mult').value);
+  if(!slug){ toast('pick a model','err'); return; }
+  if(!Number.isFinite(mult)||mult<=0){ toast('multiplier must be positive','err'); return; }
+  arOverrides[slug]=mult;
+  document.getElementById('ar-ov-mult').value='';
+  renderOverrideList();
+  toast('override staged: '+slug+' x'+mult+' (save to apply)','ok');
+};
+document.addEventListener('click',function(e){
+  const b=e.target.closest('button[data-act="arovdel"]'); if(!b) return;
+  delete arOverrides[b.getAttribute('data-slug')];
+  renderOverrideList();
+});
 document.getElementById('ar-save').onclick=async function(){
   const body={
     enabled: document.getElementById('ar-enabled').checked,
     preference: Number(document.getElementById('ar-pref').value),
-    excluded: document.getElementById('ar-excluded').value,
-    overrides: parseOverrides(document.getElementById('ar-overrides').value)
+    excluded: Array.from(document.getElementById('ar-excluded').selectedOptions).map(function(o){return o.value;}),
+    overrides: arOverrides
   };
   const {status,data}=await api('/admin/auto-settings',{method:'POST',body:JSON.stringify(body)});
   if(status===200) toast('auto settings saved','ok');
