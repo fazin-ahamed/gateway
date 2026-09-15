@@ -257,26 +257,39 @@ async function enforceModelLimits(c, slug) {
         return c.json({ error: { message: 'Model "' + slug + '" is rate limited (' + cap + " req/min). Retry shortly.", type: "model_rate_limited" } }, 429, { "retry-after": String(60 - now.getUTCSeconds()) });
       continue;
     }
-    const kindCol = kind === "requests" ? "requests" : kind === "tokens" ? "tokens" : "usd";
-    const start = periodStartIso(lim.period);
-    const row = await c.env.DB.prepare(
-      "SELECT COALESCE(SUM(value),0) AS used FROM model_usage WHERE slug=? AND kind=? AND bucket>=?"
-    ).bind(slug, kindCol, start).first();
-    const used = Number(row && row.used) || 0;
+    const used = await periodUsage(c, slug, kind, lim.period);
     if (used >= cap)
-      return c.json({ error: { message: 'Model "' + slug + '" hit its ' + kind + " limit for this " + lim.period + " (" + used + " / " + cap + ").", type: "model_budget_exceeded" } }, 429);
+      return c.json({ error: { message: 'Model "' + slug + '" hit its ' + kind + " limit for this " + lim.period + " (" + Math.round(used * 10000) / 10000 + " / " + cap + "). Resets " + lim.period + "ly at midnight GST.", type: "model_budget_exceeded" } }, 429);
   }
   return null;
 }
-function periodStartIso(period, now = /* @__PURE__ */ new Date()) {
-  const d = gatewayLocalDate(now);
-  if (period === "week") {
-    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
-    return d.toISOString().slice(0, 10);
-  }
+// UTC instant of the period start in Dubai local time (caps reset at
+// Dubai midnight, weeks Monday GST, months on the 1st GST).
+function periodStartUtcIso(period, now = /* @__PURE__ */ new Date()) {
+  const local = gatewayLocalDate(now);
+  let y = local.getUTCFullYear(), m = local.getUTCMonth(), d = local.getUTCDate();
+  if (period === "week")
+    d -= (local.getUTCDay() + 6) % 7;
   if (period === "month")
-    return d.toISOString().slice(0, 7);
-  return d.toISOString().slice(0, 10);
+    d = 1;
+  return new Date(Date.UTC(y, m, d) - GATEWAY_TZ_OFFSET_MIN * 60000).toISOString();
+}
+// Live usage for a slug/kind/period straight from per-request trajectories,
+// so caps count everything captured this period - including spend from
+// before the limit was set. Cache hits are free and excluded.
+async function periodUsage(c, slug, kind, period) {
+  const start = periodStartUtcIso(period);
+  if (kind === "requests") {
+    const row = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM trajectories WHERE slug=? AND created_at>=? AND cache_state IS NULL"
+    ).bind(slug, start).first();
+    return Number(row && row.n) || 0;
+  }
+  const col = kind === "tokens" ? "total_tokens" : "cost_usd";
+  const row = await c.env.DB.prepare(
+    "SELECT COALESCE(SUM(" + col + "),0) AS v FROM trajectories WHERE slug=? AND created_at>=? AND cache_state IS NULL"
+  ).bind(slug, start).first();
+  return Number(row && row.v) || 0;
 }
 async function recordModelUsage(c, slug, tokens, costUsd) {
   if (!slug)
@@ -2486,9 +2499,17 @@ app.get("/admin/overview", async (c) => {
     "SELECT COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(used_tokens),0) AS used_tokens, COALESCE(SUM(used_usd),0) AS used_usd FROM api_keys"
   ).first();
   const limits = await c.env.DB.prepare("SELECT slug, kind, period, limit_value, updated_at FROM model_limits ORDER BY slug, kind, period").all();
-  const usageToday = await c.env.DB.prepare(
-    "SELECT slug, kind, COALESCE(SUM(value),0) AS used FROM model_usage WHERE bucket >= ? GROUP BY slug, kind"
-  ).bind(gatewayLocalDate().toISOString().slice(0, 10)).all();
+  // Per-limit live usage from trajectories (cache hits excluded) so the
+  // overview matches what enforcement actually counts, pre/post limit-set.
+  const seen = new Set();
+  const limitUsage = [];
+  for (const l of limits.results || []) {
+    const k = l.slug + "|" + l.kind + "|" + l.period;
+    if (seen.has(k))
+      continue;
+    seen.add(k);
+    limitUsage.push({ slug: l.slug, kind: l.kind, period: l.period, used: await periodUsage(c, l.slug, l.kind, l.period) });
+  }
   const cacheRow = await c.env.DB.prepare(
     "SELECT COUNT(*) AS entries, COALESCE(SUM(hits),0) AS hits, COALESCE(SUM(hits * source_cost_usd),0) AS saved_usd, COALESCE(SUM(hits * source_tokens),0) AS saved_tokens FROM response_cache WHERE expires_at > ?"
   ).bind(nowIso()).first();
@@ -2498,7 +2519,7 @@ app.get("/admin/overview", async (c) => {
     keys: keys.results || [],
     totals: totals || { requests: 0, used_tokens: 0, used_usd: 0 },
     limits: limits.results || [],
-    usage_today: usageToday.results || [],
+    limit_usage: limitUsage,
     cache: cacheRow || { entries: 0, hits: 0, saved_usd: 0, saved_tokens: 0 },
     generated_at: nowIso()
   });

@@ -466,9 +466,9 @@ async function loadOverview(){
     return '<div class="kvrow"><span class="pill '+cls+'">'+label+'</span><span class="grow">'+esc(p.name)+'</span><span class="mono small right">'+esc(p.route_count||0)+' routes</span></div>';
   }).join('') : '<div class="empty">No providers.</div>';
   const limEl=document.getElementById('ov-limits');
-  const lims=(data.limits||[]); const usageToday=data.usage_today||[];
+  const lims=(data.limits||[]); const usageList=data.limit_usage||[];
   limEl.innerHTML = lims.length ? lims.map(function(l){
-    const used=(usageToday.find(function(u){return u.slug===l.slug&&u.kind===l.kind;})||{}).used||0;
+    const used=(usageList.find(function(u){return u.slug===l.slug&&u.kind===l.kind&&u.period===l.period;})||{}).used||0;
     const pct=l.limit_value>0?Math.min(100,Math.round(100*used/l.limit_value)):0;
     const near=pct>=80;
     const val=l.kind==='usd'?money(l.limit_value):fmt(l.limit_value);
