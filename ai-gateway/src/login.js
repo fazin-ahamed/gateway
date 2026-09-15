@@ -62,7 +62,7 @@ var LOGIN_HTML = `<!doctype html>
       <p class="lede">Secure access to providers, routes, keys, and live egress from a single control plane.</p>
     </div>
   </div>
-  <div class="brand-footer"><span class="status-dot"></span><span>Cloudflare edge · D1 state · Encrypted session</span></div>
+  <div class="brand-footer"><span class="status-dot"></span><span>Private edge · SQLite state · Encrypted session</span></div>
 </section>
 <main class="login-form-wrap">
   <form class="login-card" id="f">

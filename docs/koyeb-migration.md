@@ -29,9 +29,9 @@ switch production traffic from OCI to Koyeb, with rollback available.
   `koyebExchange` / `fetchViaKoyeb`, transport-aware dispatch, failure
   labels (`via-koyeb`), transport-aware `/admin/proxy-health`, provider
   `transport` CRUD, UI transport controls, `/status` await fix.
-- `ai-gateway/wrangler.jsonc`: `RELAY_BACKEND=koyeb`, `KOYEB_RELAY_URL`
+- `.env`: `RELAY_BACKEND=koyeb`, `KOYEB_RELAY_URL`
   (empty until the relay hostname exists).
-- Production D1: `ALTER TABLE providers ADD COLUMN transport
+- Production SQLite: `ALTER TABLE providers ADD COLUMN transport
   TEXT NOT NULL DEFAULT 'auto'` (already applied; all rows `auto`).
 - `docs/current-request-path.md`, `docs/koyeb-migration.md` (this file).
 
@@ -72,14 +72,17 @@ exists. Retries happen only for the initial socket connect; never after
 3. Set `KOYEB_RELAY_SECRET` (long random value).
 4. Note `https://<app>.koyeb.app`.
 
-## Worker config
+## Gateway config
+
+Set in `.env` (same value as the relay):
 
 ```sh
-wrangler secret put KOYEB_RELAY_SECRET   # same value as the relay
+KOYEB_RELAY_SECRET=<long-random-value>
+KOYEB_RELAY_URL=wss://<app>.koyeb.app/tunnel
+RELAY_BACKEND=koyeb
 ```
 
-Then set `KOYEB_RELAY_URL=wss://<app>.koyeb.app/tunnel` in
-`wrangler.jsonc` vars and redeploy. `RELAY_BACKEND=koyeb` is already set.
+Then restart the gateway.
 
 ## Test results
 
@@ -94,8 +97,7 @@ Then set `KOYEB_RELAY_URL=wss://<app>.koyeb.app/tunnel` in
   chunks intact through the tunnel.
 - Throughput benchmark (loopback, i5-12400F): 323.89 MB/s per stream;
   relay overhead is noise next to model token rates.
-- Worker `wrangler deploy --dry-run`: clean; production v63 live with
-  `/` 200, `/health` 200, `/v1/models` 401 without key.
+- Gateway smoke test: `/` 200, `/health` 200, `/v1/models` 401 without key.
 - No Docker daemon on this machine, so the image build is unverified
   here; the Dockerfile uses only standard multi-stage + distroless
   constructs. No Koyeb account here, so relay deployment and the live
@@ -112,20 +114,17 @@ Then set `KOYEB_RELAY_URL=wss://<app>.koyeb.app/tunnel` in
   sent, then surfaces a clear error.
 
 ## Rollback
-
 - Instant: set a provider's transport to `oci` (or `RELAY_BACKEND=oci`
   globally); traffic returns to the existing `proxy_url` path, which is
   untouched. `direct` removes the relay hop entirely.
-- Code rollback: `wrangler rollback` / redeploy the previous version
-  (v62 or earlier); the `transport` column is ignored by old code.
+- Code rollback: redeploy the previous release; the `transport` column is ignored by old code.
 
 ## Switch production OCI → Koyeb
 
 1. Deploy the relay; confirm `https://<app>.koyeb.app/healthz`.
-2. `wrangler secret put KOYEB_RELAY_SECRET` (same value).
-3. Set `KOYEB_RELAY_URL` in `wrangler.jsonc`, redeploy.
+2. Set `KOYEB_RELAY_SECRET` in `.env` (same value).
+3. Set `KOYEB_RELAY_URL` in `.env`, restart the gateway.
 4. In `/_gw` Providers tab, confirm transport pills read `koyeb`;
-   proxy-health shows `koyeb ok`.
 5. Send one non-stream + one stream chat per relayed provider; check
    failure errors name the provider with `[via-koyeb]` and usage/cost account.
 6. After a stable soak, clear each `proxy_url` (OCI references) and,

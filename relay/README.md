@@ -24,7 +24,7 @@ Never set it in production.
 
 | Variable              | Required | Purpose                                            |
 | --------------------- | -------- | -------------------------------------------------- |
-| `KOYEB_RELAY_SECRET`  | yes      | HMAC secret shared with the Cloudflare Worker      |
+| `KOYEB_RELAY_SECRET`  | yes      | HMAC secret shared with the gateway server       |
 | `PORT`                | no       | listen port, default `8000` (Koyeb injects this)   |
 | `LOG_LEVEL`           | no       | reserved, default empty                            |
 | `RELAY_PROVIDERS_JSON`| no       | extra `[{id,scheme,host,path_prefixes}]`, https only |
@@ -77,6 +77,6 @@ go test ./internal/relay/ -run TestLongStreamOver100Seconds -count=1 -v
 2. Create a **Web Service**, region **Frankfurt (FRA)**, instance **Free**.
 3. Expose the service port mapped to `$PORT`.
 4. Set `KOYEB_RELAY_SECRET` to a long random value (same value goes into
-   the Worker via `wrangler secret put KOYEB_RELAY_SECRET`).
-5. Note the `https://<app>.koyeb.app` hostname; the Worker uses
+   the gateway `.env`).
+5. Note the `https://<app>.koyeb.app` hostname; the gateway uses
    `wss://<app>.koyeb.app/tunnel`.

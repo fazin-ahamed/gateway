@@ -105,9 +105,7 @@ Nginx must set it (above). If ecli.app later offers a managed-domain proxy
 on your plan, use its hostname/DNS target instead of the A record.
 
 ## Notes
-
-- Worker deploys (`wrangler deploy`) and ecli.app deploys share
-  `ai-gateway/src/*` — no fork. `wrangler.jsonc` is only for Cloudflare.
+- Node deploys serve `ai-gateway/src/*` directly — no build step, no fork.
 - Free ELO plan: 1 server, 1 port, ~1 GB RAM — enough for the gateway;
   run the relay on the same VM over loopback to save the port.
 - Back up `./data/gateway.db` — it holds providers, keys, and usage.

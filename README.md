@@ -1,43 +1,41 @@
 # AI Gateway
 
-OpenAI-compatible AI gateway on Cloudflare Workers (direct egress, Koyeb WebSocket relay, OCI rollback path) with an operator console, usage accounting, and tracing.
+OpenAI-compatible AI gateway on Node + SQLite (direct egress, Koyeb WebSocket relay, OCI rollback path) with an operator console and usage accounting. No request or response bodies are ever stored.
 
 ## Layout
 
-- `ai-gateway/` — Worker source (`src/index.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), Wrangler config, D1 schema, admin console UI
+- `ai-gateway/` — app source (`src/index.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), SQLite schema, admin console UI
+- `server/` — Node entrypoint (`server.mjs`, `db.mjs`, `import.mjs`), the only deploy target
 - `relay/` — small Go relay for providers that need non-Cloudflare egress
-- `docs/` — request-path and migration runbooks
+- `docs/` — request-path and hosting runbooks
 
-## Quickstart (fresh fork, no secrets needed to read/build)
+## Quickstart
 
 ```sh
 cd relay && go test ./... -short -count=1
-cd ../ai-gateway && npm install && npx wrangler deploy --dry-run
+cd ../server && npm install && node --check server.mjs
 ```
 
-To run it for real you need your own Cloudflare account + D1 database:
+To run it:
 
-1. `cp ../.env.example ../.env` (local only, never commit) and generate values.
-2. Create a D1 database: `wrangler d1 create ai-gateway`, then put the id in `ai-gateway/wrangler.jsonc`.
-3. Apply the schema: `wrangler d1 execute DB --file ai-gateway/schema.sql`.
-4. Set secrets (never in git):
-   - `wrangler secret put ADMIN_TOKEN` (admin console password)
-   - `wrangler secret put PROVIDER_CRYPTO_KEY` (provider-key encryption)
-   - `wrangler secret put KOYEB_RELAY_SECRET` (only if you deploy the relay)
-5. `npx wrangler deploy` from `ai-gateway/`.
+1. `cp .env.example .env` (local only, never commit) and generate values.
+2. `cd server && npm install && node --env-file=../.env server.mjs`
+3. Open `http://<host>:3000/_gw`, sign in with `ADMIN_TOKEN`, add providers, routes, and API keys.
+
+First boot applies `ai-gateway/schema.sql` to `./data/gateway.db` automatically.
 
 ## Secrets model
 
 | Secret                | Where            | Purpose                              |
 | --------------------- | ---------------- | ------------------------------------ |
-| `ADMIN_TOKEN`         | Worker secret    | Admin console password               |
-| `PROVIDER_CRYPTO_KEY` | Worker secret    | AES-GCM envelope for provider keys   |
-| `KOYEB_RELAY_SECRET`  | Worker + relay   | HMAC auth for the relay tunnel       |
-| Provider API keys     | D1 (encrypted)   | Sealed `enc:v1:` envelopes in the DB |
+| `ADMIN_TOKEN`         | env              | Admin console password               |
+| `PROVIDER_CRYPTO_KEY` | env              | AES-GCM envelope for provider keys   |
+| `KOYEB_RELAY_SECRET`  | env (both sides) | HMAC auth for the relay tunnel       |
+| Provider API keys     | SQLite (sealed)  | Sealed `enc:v1:` envelopes in the DB |
 
-Public `vars` in `wrangler.jsonc` contain only non-secret routing defaults
+Public defaults live in `.env.example`
 (`UPSTREAM_APP_TITLE`, `UPSTREAM_HTTP_REFERER`, `RELAY_BACKEND`,
-`KOYEB_RELAY_URL`). Private provider hostnames live in your D1 rows or
+`KOYEB_RELAY_URL`). Private provider hostnames live in your DB rows or
 `RELAY_PROVIDERS_JSON`, never in this repo.
 
 ## API
