@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS providers (
   fmt TEXT NOT NULL DEFAULT 'openai',
   proxy_url TEXT,
   transport TEXT NOT NULL DEFAULT 'auto',
+  key_strategy TEXT NOT NULL DEFAULT 'round_robin',
   extra_headers TEXT NOT NULL DEFAULT '{}',
   api_key TEXT,
   last_status INTEGER,
@@ -156,6 +157,20 @@ CREATE TABLE IF NOT EXISTS gateway_settings (
   updated_at TEXT NOT NULL
 );
 
+-- Multiple API keys per provider. provider.api_key stays as the legacy
+-- single-key column (migrated into this table on boot); new keys live here.
+-- Rotation strategy lives on providers.key_strategy:
+--   round_robin | failover | random
+CREATE TABLE IF NOT EXISTS provider_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  api_key TEXT NOT NULL,
+  label TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_keys_provider
+  ON provider_keys(provider_id);
 -- Global per-model limits. One row per (slug, kind, period):
 --   kind   = requests | tokens | usd
 --   period = minute | day | week | month

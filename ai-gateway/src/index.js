@@ -363,35 +363,68 @@ async function openProviderKey(env, value, legacyAdminKey = false) {
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64urlToBytes(pair[0]) }, await providerCryptoKey(env, legacyAdminKey), b64urlToBytes(pair[1]));
   return new TextDecoder().decode(plain);
 }
-async function providerKey(c, id) {
-  try {
-    const row = await c.env.DB.prepare("SELECT api_key FROM providers WHERE id=?").bind(id).first();
-    if (row && row.api_key) {
-      const stored = String(row.api_key);
-      if (stored.startsWith("enc:v1:")) {
-        try {
-          return await openProviderKey(c.env, stored);
-        } catch (e) {
-          if (!c.env.PROVIDER_CRYPTO_KEY || !c.env.ADMIN_TOKEN) {
-            blog("PROVIDER_KEY decrypt failed id=" + id + ": " + String(e.message || e));
-            throw e;
-          }
-          const legacyPlain = await openProviderKey(c.env, stored, true);
-          await c.env.DB.prepare("UPDATE providers SET api_key=?, updated_at=? WHERE id=?").bind(await sealProviderKey(c.env, legacyPlain), nowIso(), id).run();
-          blog("PROVIDER_KEY re-encrypted id=" + id);
-          return legacyPlain;
-        }
-      }
-      const sealed = await sealProviderKey(c.env, stored);
-      await c.env.DB.prepare("UPDATE providers SET api_key=?, updated_at=? WHERE id=?").bind(sealed, nowIso(), id).run();
-      blog("PROVIDER_KEY migrated id=" + id);
-      return stored;
+// ---- Provider keys: multiple per provider with rotation ----
+var KEY_STRATEGIES = ["round_robin", "failover", "random"];
+var rrCounters = new Map();
+async function openProviderEnvelope(c, env2, stored, rowId) {
+  if (String(stored).startsWith("enc:v1:")) {
+    try {
+      return await openProviderKey(env2, stored);
+    } catch (e) {
+      if (!env2.PROVIDER_CRYPTO_KEY || !env2.ADMIN_TOKEN)
+        throw e;
+      const legacyPlain = await openProviderKey(env2, stored, true);
+      await c.env.DB.prepare("UPDATE provider_keys SET api_key=? WHERE id=?").bind(await sealProviderKey(env2, legacyPlain), rowId).run();
+      return legacyPlain;
     }
-  } catch (e) {
-    blog("PROVIDER_KEY unavailable id=" + id + ": " + String(e.message || e));
-    return null;
   }
-  return null;
+  const plain = String(stored);
+  await c.env.DB.prepare("UPDATE provider_keys SET api_key=? WHERE id=?").bind(await sealProviderKey(env2, plain), rowId).run();
+  return plain;
+}
+async function providerKeys(c, providerId) {
+  try {
+    const rows = await c.env.DB.prepare("SELECT id, api_key, label FROM provider_keys WHERE provider_id=? AND enabled=1 ORDER BY id").bind(providerId).all();
+    const out = [];
+    for (const r of rows.results || []) {
+      if (!r.api_key)
+        continue;
+      try {
+        out.push({ keyId: r.id, label: r.label || "key-" + r.id, key: await openProviderEnvelope(c, c.env, r.api_key, r.id) });
+      } catch (e) {
+        blog("PROVIDER_KEY unavailable provider=" + providerId + " row=" + r.id + ": " + String(e.message || e));
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+function orderKeys(keys, strategy, providerId) {
+  if (!keys.length)
+    return [];
+  if (strategy === "random")
+    return [keys[Math.floor(Math.random() * keys.length)]];
+  if (strategy === "round_robin") {
+    const n = rrCounters.get(providerId) || 0;
+    rrCounters.set(providerId, n + 1);
+    return [keys[n % keys.length]];
+  }
+  return keys; // failover: all keys in order
+}
+async function providerKey(c, id) {
+  const keys = await providerKeys(c, id);
+  if (!keys.length)
+    return null;
+  let strategy = "round_robin";
+  try {
+    const row = await c.env.DB.prepare("SELECT key_strategy FROM providers WHERE id=?").bind(id).first();
+    if (row && row.key_strategy)
+      strategy = String(row.key_strategy);
+  } catch {
+  }
+  const ordered = orderKeys(keys, strategy, id);
+  return ordered.length ? ordered[0].key : null;
 }
 function adminToken(c) {
   const a = c.req.header("authorization");
@@ -599,73 +632,97 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     let lastErrStatus = null;
     let attempts = 0;
     for (const route of routes.results) {
+      if (circuitOpen(route.provider_name)) {
+        blog("ROUTE skip provider=" + route.provider_name + " circuit-open");
+        traj.steps.push({ provider: route.provider_name, rank: route.rank, error: "circuit open", ms: 0 });
+        lastErr = "provider " + route.provider_name + " circuit open (recent failures)";
+        attempts++;
+        continue;
+      }
       const stepStart = Date.now();
       const baseStep = { provider: route.provider_name, rank: route.rank };
-      const key2 = await providerKey(c, route.provider_id);
-      if (!key2) {
+      let strategy = "round_robin";
+      try {
+        const prow = await c.env.DB.prepare("SELECT key_strategy FROM providers WHERE id=?").bind(route.provider_id).first();
+        if (prow && prow.key_strategy)
+          strategy = String(prow.key_strategy);
+      } catch {
+      }
+      const allKeys = await providerKeys(c, route.provider_id);
+      if (!allKeys.length) {
         lastErr = "provider " + route.provider_name + " has no key";
         traj.steps.push({ ...baseStep, error: "no key", ms: Date.now() - stepStart });
         attempts++;
         continue;
       }
-      try {
-        const res = await forwardToProvider(c, route, key2, payload, isStream, requestId);
-        const up = res.response;
-        await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
-        if (!up.ok || !up.body) {
-          const txt = await up.text();
-          blog("FWD FAIL " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] " + String(txt).slice(0, 300));
-          traj.steps.push({ ...baseStep, http: up.status, error: classifyUpstreamFailure(txt), ms: Date.now() - stepStart });
-          attempts++;
-          continue;
-        }
-        if (!isStream) {
-          const txt = await up.text();
-          const usage = res.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
-          const costUsd = await computeCost(c, slug, usage);
-          const clientTxt = sanitizeClientResponse(txt, slug);
-          if (isGenericUpstreamErrorResponse(clientTxt)) {
-            blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
-            lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
-            traj.steps.push({ ...baseStep, http: up.status, error: "malformed envelope", ms: Date.now() - stepStart });
+      const orderedKeys = orderKeys(allKeys, strategy, route.provider_id);
+      for (const k of orderedKeys) {
+        try {
+          const res = await forwardToProvider(c, route, k.key, payload, isStream, requestId);
+          const up = res.response;
+          await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
+          if (!up.ok || !up.body) {
+            const txt = await up.text();
+            const why = classifyUpstreamFailure(txt);
+            blog("FWD FAIL " + route.provider_name + " key=" + k.label + " -> HTTP " + up.status + " [" + why + "] " + String(txt).slice(0, 300));
+            circuitRecord(route.provider_name, false);
+            lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + why + "]";
             attempts++;
-            continue;
+            if (why === "auth" && orderedKeys.indexOf(k) < orderedKeys.length - 1)
+              continue; // next key on this provider
+            break; // next route
           }
-          await recordUsage(c, key, { ...usage, cost_usd: costUsd });
-          await recordModelUsage(c, slug, usage.total_tokens, costUsd);
-          if (cacheKey && isCacheableResponse(clientTxt)) {
-            await storeResponseCache(c, {
-              cacheKey,
-              keyId: key.key_id,
-              slug,
-              responseBody: clientTxt,
-              sourceCostUsd: costUsd,
-              sourceTokens: usage.total_tokens,
-              ttl: cacheTtlSeconds(c)
-            });
+          if (!isStream) {
+            const txt = await up.text();
+            const usage = res.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
+            const costUsd = await computeCost(c, slug, usage);
+            const clientTxt = sanitizeClientResponse(txt, slug);
+            if (isGenericUpstreamErrorResponse(clientTxt)) {
+              blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
+              lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
+              traj.steps.push({ ...baseStep, http: up.status, error: "malformed envelope", ms: Date.now() - stepStart });
+              attempts++;
+              break; // next route
+            }
+            await recordUsage(c, key, { ...usage, cost_usd: costUsd });
+            await recordModelUsage(c, slug, usage.total_tokens, costUsd);
+            if (cacheKey && isCacheableResponse(clientTxt)) {
+              await storeResponseCache(c, {
+                cacheKey,
+                keyId: key.key_id,
+                slug,
+                responseBody: clientTxt,
+                sourceCostUsd: costUsd,
+                sourceTokens: usage.total_tokens,
+                ttl: cacheTtlSeconds(c)
+              });
+            }
+            const hdrs = clientResponseHeaders(up.headers, false);
+            hdrs["x-request-id"] = requestId;
+            hdrs["x-gateway-route"] = String(route.rank);
+            hdrs["x-gateway-attempts"] = String(attempts + 1);
+            if (cacheKey)
+              hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
+            blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " key=" + k.label + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
+            circuitRecord(route.provider_name, true);
+            traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart });
+            await recordTrajectory(c, { ...traj, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
+            return new Response(clientTxt, { status: up.status, headers: hdrs });
           }
-          const hdrs = clientResponseHeaders(up.headers, false);
-          hdrs["x-request-id"] = requestId;
-          hdrs["x-gateway-route"] = String(route.rank);
-          hdrs["x-gateway-attempts"] = String(attempts + 1);
-          if (cacheKey)
-            hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
-          blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
-          traj.steps.push({ ...baseStep, http: up.status, ok: true, ms: Date.now() - stepStart });
-          await recordTrajectory(c, { ...traj, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
-          return new Response(clientTxt, { status: up.status, headers: hdrs });
+          circuitRecord(route.provider_name, true);
+          blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " key=" + k.label + " rank=" + route.rank);
+          traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
+          const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c) });
+          return result;
+        } catch (e) {
+          circuitRecord(route.provider_name, false);
+          blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
+          lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
+          if (e && e.status)
+            lastErrStatus = e.status;
+          traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), key: k.label, ms: Date.now() - stepStart });
+          attempts++;
         }
-        blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " rank=" + route.rank);
-        traj.steps.push({ ...baseStep, http: up.status, ok: true, ms: Date.now() - stepStart, streaming: true });
-        const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c) });
-        return result;
-      } catch (e) {
-        blog("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
-        lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
-        if (e && e.status)
-          lastErrStatus = e.status;
-        traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), ms: Date.now() - stepStart });
-        attempts++;
       }
     }
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
@@ -1678,6 +1735,28 @@ function matchModelsDevPrice(byId, slug) {
   }
   return null;
 }
+// Circuit-breaker: three provider failures within a minute opens the
+// circuit for 60s; the auto router and route loop skip open providers.
+var circuitState = new Map();
+function circuitOpen(providerName) {
+  const s = circuitState.get(providerName);
+  return !!(s && s.openUntil && Date.now() < s.openUntil);
+}
+function circuitRecord(providerName, ok) {
+  const now = Date.now();
+  const s = circuitState.get(providerName) || { fails: 0, firstFail: 0, openUntil: 0 };
+  if (ok) {
+    s.fails = 0;
+    s.openUntil = 0;
+  } else {
+    if (now - s.firstFail > 60000)
+      s.firstFail = now;
+    s.fails++;
+    if (s.fails >= 3)
+      s.openUntil = now + 60000;
+  }
+  circuitState.set(providerName, s);
+}
 var AUTO_SLUG = "auto";
 var routerHealthCache = { at: 0, rows: [] };
 async function routerHealth(c) {
@@ -2378,8 +2457,46 @@ app.get("/admin/providers", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const rows = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, last_status, last_checked, notes, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers ORDER BY priority").all();
+  const rows = await c.env.DB.prepare(
+    `SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.last_status, p.last_checked, p.notes, p.fmt, p.proxy_url, p.transport, p.extra_headers, p.key_strategy,
+            (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id=p.id AND pk.enabled=1) AS key_count
+     FROM providers p ORDER BY p.priority`
+  ).all();
   return c.json({ providers: rows.results || [] });
+});
+app.get("/admin/providers/:id/keys", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  const rows = await c.env.DB.prepare("SELECT id, label, enabled, created_at FROM provider_keys WHERE provider_id=? ORDER BY id").bind(id).all();
+  return c.json({ keys: rows.results || [] });
+});
+app.post("/admin/providers/:id/keys", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  let b;
+  try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  if (!b.api_key)
+    return c.json({ error: { message: "api_key required" } }, 400);
+  const sealed = await sealProviderKey(c.env, String(b.api_key));
+  const r = await c.env.DB.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?) RETURNING id").bind(id, sealed, b.label || null, nowIso()).all();
+  const kid = r.results && r.results[0] && r.results[0].id;
+  return c.json({ id: kid, label: b.label || null }, 201);
+});
+app.delete("/admin/providers/:id/keys/:keyId", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  const keyId = Number(c.req.param("keyId"));
+  const remaining = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM provider_keys WHERE provider_id=? AND enabled=1 AND id<>?").bind(id, keyId).first();
+  if (Number(remaining && remaining.n) < 1)
+    return c.json({ error: { message: "cannot remove the last enabled key" } }, 400);
+  await c.env.DB.prepare("DELETE FROM provider_keys WHERE id=? AND provider_id=?").bind(keyId, id).run();
+  return c.json({ ok: true });
 });
 app.get("/admin/proxy-health", async (c) => {
   const denied = await requireAdmin(c);
@@ -2456,9 +2573,12 @@ app.post("/admin/providers", async (c) => {
   let extraHeaders = "{}";
   try { extraHeaders = normalizeExtraHeaders(b.extra_headers); }
   catch (e) { return c.json({ error: { message: e.message } }, 400); }
-  const info = await c.env.DB.prepare("INSERT INTO providers (name, base_url, priority, healthy, notes, fmt, proxy_url, transport, extra_headers, api_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id").bind(b.name, b.base_url, Number(b.priority) || 0, b.healthy === false ? 0 : 1, b.notes || null, fmt2, b.proxy_url || null, transport, extraHeaders, sealedKey, nowIso()).all();
+  const strategy = KEY_STRATEGIES.includes(b.key_strategy) ? b.key_strategy : "round_robin";
+  const info = await c.env.DB.prepare("INSERT INTO providers (name, base_url, priority, healthy, notes, fmt, proxy_url, transport, extra_headers, api_key, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id").bind(b.name, b.base_url, Number(b.priority) || 0, b.healthy === false ? 0 : 1, b.notes || null, fmt2, b.proxy_url || null, transport, extraHeaders, sealedKey, strategy, nowIso()).all();
   const pid = info.results && info.results[0] && info.results[0].id;
-  return c.json({ id: pid, name: b.name, fmt: fmt2, proxy_url: b.proxy_url || null, transport, api_key_set: !!b.api_key }, 201);
+  if (sealedKey)
+    await c.env.DB.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(pid, sealedKey, "primary", nowIso()).run();
+  return c.json({ id: pid, name: b.name, fmt: fmt2, proxy_url: b.proxy_url || null, transport, api_key_set: !!b.api_key, key_strategy: strategy }, 201);
 });
 app.patch("/admin/providers/:id", async (c) => {
   const denied = await requireAdmin(c);
@@ -2473,18 +2593,21 @@ app.patch("/admin/providers/:id", async (c) => {
   }
   const sets = [];
   const binds = [];
-  for (const f of ["name", "base_url", "notes", "fmt", "proxy_url", "api_key"]) {
+  for (const f of ["name", "base_url", "notes", "fmt", "proxy_url"]) {
     if (b[f] === void 0)
       continue;
-    if (f === "api_key") {
-      if (!b.api_key)
-        continue;
-      sets.push("api_key=?");
-      binds.push(await sealProviderKey(c.env, String(b.api_key)));
-      continue;
-    }
     sets.push(f + "=?");
     binds.push(f === "fmt" ? b.fmt === "anthropic" ? "anthropic" : "openai" : b[f]);
+  }
+  if (b.api_key) {
+    const sealedNew = await sealProviderKey(c.env, String(b.api_key));
+    sets.push("api_key=?");
+    binds.push(sealedNew);
+    const primary = await c.env.DB.prepare("SELECT id FROM provider_keys WHERE provider_id=? ORDER BY id LIMIT 1").bind(id).first();
+    if (primary)
+      await c.env.DB.prepare("UPDATE provider_keys SET api_key=?, label='primary' WHERE id=?").bind(sealedNew, primary.id).run();
+    else
+      await c.env.DB.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(id, sealedNew, "primary", nowIso()).run();
   }
   if (b.priority !== void 0) {
     sets.push("priority=?");
@@ -2510,10 +2633,16 @@ app.patch("/admin/providers/:id", async (c) => {
       return c.json({ error: { message: e.message } }, 400);
     }
   }
+  if (b.key_strategy !== void 0) {
+    if (!KEY_STRATEGIES.includes(b.key_strategy))
+      return c.json({ error: { message: "key_strategy must be one of " + KEY_STRATEGIES.join(", ") } }, 400);
+    sets.push("key_strategy=?");
+    binds.push(b.key_strategy);
+  }
   if (!sets.length)
     return c.json({ id });
   await c.env.DB.prepare("UPDATE providers SET " + sets.join(", ") + ", updated_at=? WHERE id=?").bind(...binds, nowIso(), id).run();
-  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers WHERE id=?").bind(id).first();
+  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, fmt, proxy_url, transport, extra_headers, key_strategy, (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id=providers.id AND pk.enabled=1) AS key_count FROM providers WHERE id=?").bind(id).first();
   return c.json({ provider: p });
 });
 app.post("/admin/providers/:id/toggle", async (c) => {

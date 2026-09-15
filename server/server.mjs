@@ -33,7 +33,6 @@ try {
   console.warn("[gateway] schema auto-apply skipped:", e.message);
 }
 // Migrations for DBs created before the (slug, kind, period) limit shape.
-// The pre-1fea6d1 table had slug PRIMARY KEY + rpm/token columns; rebuild it
 // into the new shape (preserving old rows as requests/minute + tokens/day).
 try {
   const cols = db.prepare("PRAGMA table_info(model_limits)").all();
@@ -50,15 +49,22 @@ try {
 } catch (e) {
   console.warn("[gateway] model_limits migration skipped:", e.message);
 }
+// Multi-key providers: add key_strategy column and seed provider_keys
+// from the legacy single api_key column when the pool is empty.
 try {
-  // model_usage replaced model_token_usage (day bucket -> kind-aware rows).
-  const old = db.prepare("SELECT slug, day, tokens FROM model_token_usage").all().results || [];
-  for (const row of old) {
-    db.prepare("INSERT OR IGNORE INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)").bind(row.slug, "tokens", row.day, row.tokens).run();
+  const cols = db.prepare("PRAGMA table_info(providers)").all();
+  if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "key_strategy")) {
+    db.exec("ALTER TABLE providers ADD COLUMN key_strategy TEXT NOT NULL DEFAULT 'round_robin'");
+    console.warn("[gateway] added providers.key_strategy");
   }
-  if (old.length) db.exec("DROP TABLE model_token_usage");
+  const seeded = db.prepare("SELECT p.id, p.api_key FROM providers p WHERE p.api_key IS NOT NULL AND p.api_key <> '' AND NOT EXISTS (SELECT 1 FROM provider_keys pk WHERE pk.provider_id=p.id)").all().results || [];
+  for (const row of seeded) {
+    db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(row.id, row.api_key, "primary", new Date().toISOString().replace(".000", "")).run();
+  }
+  if (seeded.length)
+    console.warn("[gateway] seeded provider_keys from legacy api_key:", seeded.length, "providers");
 } catch (e) {
-  // table absent on fresh DBs; nothing to do
+  console.warn("[gateway] provider_keys migration skipped:", e.message);
 }
 const env = {
   DB: db,

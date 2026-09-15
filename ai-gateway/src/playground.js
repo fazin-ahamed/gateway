@@ -558,11 +558,63 @@ async function loadProviders(){
     const ok=p.healthy&&p.last_status&&p.last_status>=200&&p.last_status<400;
     const cls=ok?'ok':(p.healthy?'warn':'bad');
     const state=!p.healthy?'disabled':(p.last_status?('HTTP '+p.last_status):'unprobed');
-    return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td><span class="pill '+cls+'">'+state+'</span></td>'+
-      '<td class="rowact"><button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'disable':'enable')+'</button> <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
-  }).join('')||'<tr><td colspan="5"><div class="empty">No providers yet.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>State</th><th></th></tr>'+rows+'</table>';
+    const keys=p.key_count>0?'<span class="pill acc">'+p.key_count+' key'+(p.key_count>1?'s':'')+'</span>':'<span class="pill bad">no key</span>';
+    return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td>'+keys+'</td><td>'+esc(p.key_strategy||'round_robin')+'</td><td><span class="pill '+cls+'">'+state+'</span></td>'+
+      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'disable':'enable')+'</button> <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
+  }).join('')||'<tr><td colspan="7"><div class="empty">No providers yet.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>Keys</th><th>Strategy</th><th>State</th><th></th></tr>'+rows+'</table>';
 }
+async function manageProviderKeys(id){
+  const provs=(await api('/admin/providers')).data.providers||[];
+  const prov=provs.find(function(p){return String(p.id)===String(id);});
+  if(!prov){ toast('provider not found','err'); return; }
+  let keys=[]; try{ keys=(await api('/admin/providers/'+id+'/keys')).data.keys||[]; }catch(e){}
+  document.querySelector('.modal').classList.add('wide');
+  document.getElementById('modal-title').textContent='Keys: '+prov.name;
+  document.getElementById('modal-title').style.color='';
+  const body=document.getElementById('modal-body');
+  const keyRows=keys.length?keys.map(function(k){
+    return '<div class="kvrow"><span class="pill '+(k.enabled?'ok':'mut')+'">'+(k.label||('key '+k.id))+'</span><span class="grow small mono">id '+k.id+' · added '+(k.created_at||'').slice(0,10)+'</span><span class="right"><button class="danger" data-act="pkdel" data-id="'+id+'" data-key="'+k.id+'">remove</button></span></div>';
+  }).join(''):'<div class="empty">No keys. Add one below.</div>';
+  body.innerHTML=
+    '<label>Rotation strategy</label><select id="pk-strategy">'+
+      '<option value="round_robin"'+(prov.key_strategy==='round_robin'?' selected':'')+'>Round robin</option>'+
+      '<option value="failover"'+(prov.key_strategy==='failover'?' selected':'')+'>Failover (first key, then next on auth error)</option>'+
+      '<option value="random"'+(prov.key_strategy==='random'?' selected':'')+'>Random</option>'+
+    '</select>'+
+    '<h3 class="sec" style="margin:16px 0 8px;font-size:12px">Keys</h3>'+keyRows+
+    '<h3 class="sec" style="margin:16px 0 8px;font-size:12px">Add key</h3>'+
+    '<div class="form-grid"><div><label>API key</label><input id="pk-new-key" type="password" placeholder="sk-..."></div><div><label>Label</label><input id="pk-new-label" placeholder="backup"></div></div>';
+  const save=document.getElementById('modal-save');
+  save.textContent='Save key';
+  save.style.display='';
+  save.classList.remove('danger'); save.classList.add('act');
+  modalSubmit=async function(){
+    const newKey=document.getElementById('pk-new-key').value.trim();
+    const newLabel=document.getElementById('pk-new-label').value.trim();
+    const strategy=document.getElementById('pk-strategy').value;
+    if(!newKey){ toast('enter a key','err'); return; }
+    const {status,data}=await api('/admin/providers/'+id+'/keys',{method:'POST',body:JSON.stringify({api_key:newKey,label:newLabel||null})});
+    if(status!==201){ toast('add failed: '+(data&&data.error&&data.error.message||status),'err'); return; }
+    await api('/admin/providers/'+id,{method:'PATCH',body:JSON.stringify({key_strategy:strategy})});
+    toast('key added, strategy '+strategy,'ok');
+    closeModal(); loadProviders();
+  };
+  document.getElementById('overlay').classList.add('show');
+}
+document.addEventListener('click',function(e){
+  const b=e.target.closest('button[data-act]'); if(!b) return;
+  const act=b.getAttribute('data-act');
+  if(act==='pkeys'){ manageProviderKeys(b.getAttribute('data-id')); return; }
+  if(act==='pkdel'){
+    const pid=b.getAttribute('data-id'), kid=b.getAttribute('data-key');
+    confirmAction('Remove key','Remove this key from the pool? The provider keeps its other keys.','Remove',async function(){
+      const {status,data}=await api('/admin/providers/'+pid+'/keys/'+kid,{method:'DELETE'});
+      if(status===200){ toast('key removed','ok'); closeModal(); manageProviderKeys(pid); }
+      else toast('remove failed: '+(data&&data.error&&data.error.message||status),'err');
+    });
+  }
+});
 document.getElementById('p-add').onclick=function(){ addProvider(); };
 
 // ---------- ROUTES ----------
@@ -1045,14 +1097,14 @@ document.getElementById('lm-save').onclick=async function(){
   else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
 };
 document.addEventListener('click',function(e){
-  const b=e.target.closest('button[data-act]'); if(!b) return;
-  const act=b.getAttribute('data-act');
-  if(act==='lmdel'){
-    confirmAction('Remove model limit','Remove the '+b.getAttribute('data-kind')+'/'+b.getAttribute('data-period')+' cap on '+b.getAttribute('data-slug')+'?','Remove',async function(){
-      await api('/admin/model-limits/'+encodeURIComponent(b.getAttribute('data-slug'))+'/'+b.getAttribute('data-kind')+'/'+b.getAttribute('data-period'),{method:'DELETE'});
-      loadLimits();
-    });
-  }
+  const b=e.target.closest('button[data-act="lmdel"]'); if(!b) return;
+  confirmAction('Remove model limit','Remove the '+b.getAttribute('data-kind')+'/'+b.getAttribute('data-period')+' cap on '+b.getAttribute('data-slug')+'?','Remove',async function(){
+    const slug=b.getAttribute('data-slug'), kind=b.getAttribute('data-kind'), period=b.getAttribute('data-period');
+    const {status,data}=await api('/admin/model-limits/'+encodeURIComponent(slug)+'/'+kind+'/'+period,{method:'DELETE'});
+    if(status===200){ toast('limit removed','ok'); }
+    else toast('remove failed ('+status+'): '+(data&&data.error&&data.error.message||''),'err');
+    loadLimits();
+  });
 });
 
 // init
