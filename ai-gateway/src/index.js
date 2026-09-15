@@ -416,7 +416,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
         if (!up.ok || !up.body) {
           const txt = await up.text();
-          lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] [" + transportLabel(routeTransport(route, c.env)) + "]";
+          console.log("FWD FAIL " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] " + String(txt).slice(0, 300));
           attempts++;
           continue;
         }
