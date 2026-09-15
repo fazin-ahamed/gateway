@@ -126,6 +126,8 @@ var PLAYGROUND_HTML = `<!doctype html>
   .form-actions{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
   #modal-body label{margin-top:2px}
   .filter-grid{display:grid;grid-template-columns:1.2fr 1.4fr 1.2fr 1.2fr .8fr auto;gap:12px;align-items:end}
+  .lg-pre{max-height:60vh;font:11px/1.6 var(--mono);background:var(--surface-deep)}
+  .lg-ts{color:var(--muted);margin-right:8px;font-size:10px}
   @media (max-width:1100px){.hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.cols2{grid-template-columns:1fr}.filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media (max-width:620px){.hero-stats{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.filter-grid{grid-template-columns:1fr}.pagehead{flex-direction:column;align-items:flex-start}}
 </style>
@@ -145,6 +147,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="chat">Playground</button>
   <button type="button" data-tab="cache">Cache</button>
   <button type="button" data-tab="prices">Prices</button>
+  <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
   <section class="tab active" id="tab-overview">
@@ -265,6 +268,11 @@ var PLAYGROUND_HTML = `<!doctype html>
     </div></div>
     <div class="panel"><div class="panel-b flush" id="pr-list"></div></div>
   </section>
+
+  <section class="tab" id="tab-logs">
+    <div class="pagehead"><div><h2 class="sec">Logs</h2><p class="sub">Live request and provider events from this process. In memory only; the ring holds the last 500 lines and resets on restart.</p></div><div class="actions"><label class="pg-check" style="margin:0"><input type="checkbox" id="lg-auto"> Auto</label><button class="ghost" id="lg-refresh">Refresh</button><button class="ghost" id="lg-copy">Copy</button></div></div>
+    <div class="panel"><div class="panel-b"><pre id="lg-out" class="lg-pre" style="margin:0"></pre></div></div>
+  </section>
 </main>
 
 <div class="overlay" id="overlay">
@@ -317,6 +325,7 @@ async function selectTab(t){
     if(t==='chat') await refreshPlaygroundModels();
     if(t==='cache') await loadCache();
     if(t==='prices') await loadPrices();
+    if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
 document.querySelector('nav').addEventListener('click',function(e){
@@ -855,6 +864,26 @@ async function loadPrices(){
 document.getElementById('pr-list').addEventListener('click',function(e){
   const b=e.target.closest('[data-act="prdel"]'); if(!b) return;
   api('/admin/prices/'+encodeURIComponent(b.dataset.slug),{method:'DELETE'}).then(function(){ loadPrices(); });
+});
+
+// ---------- LOGS ----------
+let logsAutoTimer=null;
+function escLogLine(line,t){ return '<span class="lg-ts">'+esc(t)+'</span> '+esc(line); }
+async function loadLogs(){
+  const out=document.getElementById('lg-out'); if(!out) return;
+  let data; try{ const res=await api('/admin/logs'); data=res.data; }catch(e){ out.textContent='Could not load logs: '+e.message; return; }
+  const lines=(data&&data.logs||[]).map(function(l){ return escLogLine(l.m,l.t); });
+  out.innerHTML=lines.length?lines.join('\n'):'<span class="small">No log entries yet.</span>';
+  out.scrollTop=out.scrollHeight;
+}
+document.getElementById('lg-refresh').onclick=function(){ loadLogs(); };
+document.getElementById('lg-copy').onclick=function(){
+  const out=document.getElementById('lg-out'); if(!out) return;
+  navigator.clipboard.writeText(out.innerText).then(function(){ toast('copied','ok'); }).catch(function(){ toast('copy failed','err'); });
+};
+document.getElementById('lg-auto').addEventListener('change',function(e){
+  clearInterval(logsAutoTimer); logsAutoTimer=null;
+  if(e.target.checked){ logsAutoTimer=setInterval(loadLogs,3000); loadLogs(); }
 });
 
 // init

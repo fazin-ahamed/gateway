@@ -16,6 +16,15 @@ app.use("/v1/*", cors({
   exposeHeaders: ["x-request-id", "x-gateway-cache", "x-gateway-used-usd", "x-gateway-used-tokens", "x-gateway-route", "x-gateway-attempts"]
 }));
 var encoder = new TextEncoder();
+var LOG_BUFFER_MAX = 500;
+var logBuffer = [];
+function blog(line) {
+  const text = String(line);
+  console.log(text);
+  logBuffer.push({ t: nowIso(), m: text.slice(0, 1000) });
+  if (logBuffer.length > LOG_BUFFER_MAX)
+    logBuffer.splice(0, logBuffer.length - LOG_BUFFER_MAX);
+}
 async function sha256hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", encoder.encode(str));
   return [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -214,22 +223,22 @@ async function providerKey(c, id) {
           return await openProviderKey(c.env, stored);
         } catch (e) {
           if (!c.env.PROVIDER_CRYPTO_KEY || !c.env.ADMIN_TOKEN) {
-            console.log("PROVIDER_KEY decrypt failed id=" + id + ": " + String(e.message || e));
+            blog("PROVIDER_KEY decrypt failed id=" + id + ": " + String(e.message || e));
             throw e;
           }
           const legacyPlain = await openProviderKey(c.env, stored, true);
           await c.env.DB.prepare("UPDATE providers SET api_key=?, updated_at=? WHERE id=?").bind(await sealProviderKey(c.env, legacyPlain), nowIso(), id).run();
-          console.log("PROVIDER_KEY re-encrypted id=" + id);
+          blog("PROVIDER_KEY re-encrypted id=" + id);
           return legacyPlain;
         }
       }
       const sealed = await sealProviderKey(c.env, stored);
       await c.env.DB.prepare("UPDATE providers SET api_key=?, updated_at=? WHERE id=?").bind(sealed, nowIso(), id).run();
-      console.log("PROVIDER_KEY migrated id=" + id);
+      blog("PROVIDER_KEY migrated id=" + id);
       return stored;
     }
   } catch (e) {
-    console.log("PROVIDER_KEY unavailable id=" + id + ": " + String(e.message || e));
+    blog("PROVIDER_KEY unavailable id=" + id + ": " + String(e.message || e));
     return null;
   }
   return null;
@@ -381,11 +390,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   const cacheMode = (cacheModeHeader === "off" || cacheModeHeader === "false" || cacheModeHeader === "0") ? "off" : cacheModeHeader;
   const cacheable = !!key && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
-  console.log("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));
+  blog("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));
   if (cacheKey && cacheMode !== "refresh") {
     const cached = await lookupResponseCache(c, cacheKey);
     if (cached) {
-      console.log("TRACE id=" + requestId + " cache=HIT ms=" + (Date.now() - started));
+      blog("TRACE id=" + requestId + " cache=HIT ms=" + (Date.now() - started));
       return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "HIT" });
     }
   }
@@ -404,7 +413,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       await sleep(cacheCoalesceDelayMs(attempt++));
       const cached = await lookupResponseCache(c, cacheKey);
       if (cached) {
-        console.log("TRACE id=" + requestId + " cache=COALESCED ms=" + (Date.now() - started));
+        blog("TRACE id=" + requestId + " cache=COALESCED ms=" + (Date.now() - started));
         return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "COALESCED" });
       }
     }
@@ -427,7 +436,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
         if (!up.ok || !up.body) {
           const txt = await up.text();
-          console.log("FWD FAIL " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] " + String(txt).slice(0, 300));
+          blog("FWD FAIL " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] " + String(txt).slice(0, 300));
           attempts++;
           continue;
         }
@@ -437,7 +446,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const costUsd = await computeCost(c, slug, usage);
           const clientTxt = sanitizeClientResponse(txt, slug);
           if (isGenericUpstreamErrorResponse(clientTxt)) {
-            console.log("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
+            blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
             lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
             attempts++;
             continue;
@@ -460,19 +469,19 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           hdrs["x-gateway-attempts"] = String(attempts + 1);
           if (cacheKey)
             hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
-          console.log("TRACE id=" + requestId + " ok provider=" + route.provider_name + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
+          blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
           return new Response(clientTxt, { status: up.status, headers: hdrs });
         }
-        console.log("TRACE id=" + requestId + " stream provider=" + route.provider_name + " rank=" + route.rank);
+        blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " rank=" + route.rank);
         const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage);
         return result;
       } catch (e) {
-        console.log("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
+        blog("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
         lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
         attempts++;
       }
     }
-    console.log("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
+    blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
     const errBody = lastErr
       ? { error: { message: lastErr, type: "upstream_error" } }
       : genericUpstreamError();
@@ -485,17 +494,17 @@ async function forwardToProvider(c, route, apiKey, payload, isStream, requestId)
   const fmt2 = (route.fmt || "openai").toLowerCase();
   const transport = routeTransport(route, c.env);
   if (transport === "oci" && route.proxy_url) {
-    console.log("FWD proxy_url present len=" + route.proxy_url.length);
+    blog("FWD proxy_url present len=" + route.proxy_url.length);
     const reqBody = JSON.stringify({ ...payload, model: route.upstream_model });
     const target = fmt2 === "anthropic" ? route.base_url + "/messages" : route.base_url + "/chat/completions";
     const headers = withExtraHeaders(fmt2 === "anthropic" ? { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION } : { "Content-Type": "application/json", Authorization: "Bearer " + apiKey }, route);
     return fetchViaProxy(route.proxy_url, target, "POST", headers, reqBody);
   }
   if (transport === "koyeb") {
-    console.log("FWD koyeb provider=" + route.provider_name);
+    blog("FWD koyeb provider=" + route.provider_name);
     return fetchViaKoyeb(c, route, apiKey, payload, isStream, requestId);
   }
-  console.log("FWD DIRECT; route keys=" + Object.keys(route).join(",") + " proxy_url=" + route.proxy_url);
+  blog("FWD DIRECT; route keys=" + Object.keys(route).join(",") + " proxy_url=" + route.proxy_url);
   if (fmt2 === "anthropic")
     return forwardAnthropic(c, route, apiKey, payload);
   return forwardOpenAI(c, route, apiKey, payload);
@@ -1216,7 +1225,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       }
     } catch (e) {
       streamError = String(e && e.message || e).slice(0, 4e3);
-      console.log("Stream error id=" + requestId + " " + streamError);
+      blog("Stream error id=" + requestId + " " + streamError);
       if (!clientCancelled) {
         try {
           controllerRef.error(e);
@@ -1231,11 +1240,11 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     start(controller) {
       controllerRef = controller;
       const work = pump();
-      keepAlive(work.catch((e) => console.log("Stream background error=" + String(e && e.message || e))));
+      keepAlive(work.catch((e) => blog("Stream background error=" + String(e && e.message || e))));
     },
     cancel(reason) {
       clientCancelled = true;
-      console.log("Stream client cancelled id=" + requestId + " reason=" + String(reason || "unknown").slice(0, 160));
+      blog("Stream client cancelled id=" + requestId + " reason=" + String(reason || "unknown").slice(0, 160));
     }
   });
   const hdrs = clientResponseHeaders(upReq.headers, true);
@@ -1346,7 +1355,7 @@ async function computeCost(c, slug, usage) {
     if (hit)
       return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * hit.prompt_per_1m + (Number(usage && usage.completion_tokens) || 0) / 1e6 * hit.completion_per_1m;
   } catch (e) {
-    console.log("MODELS_DEV cost lookup failed: " + String(e.message || e));
+    blog("MODELS_DEV cost lookup failed: " + String(e.message || e));
   }
   return 0;
 }
@@ -1360,7 +1369,7 @@ async function lookupResponseCache(c, cacheKey) {
     await c.env.DB.prepare("UPDATE response_cache SET hits=hits+1 WHERE cache_key=?").bind(cacheKey).run();
     return row;
   } catch (e) {
-    console.log("RESPONSE_CACHE lookup unavailable");
+    blog("RESPONSE_CACHE lookup unavailable");
     return null;
   }
 }
@@ -1371,7 +1380,7 @@ async function storeResponseCache(c, entry) {
        VALUES (?,?,?,?,?,?,?,?,?)`
     ).bind(entry.cacheKey, entry.keyId, entry.slug, entry.responseBody, entry.sourceCostUsd || 0, entry.sourceTokens || 0, 0, nowIso(), cacheExpiry(entry.ttl)).run();
   } catch (e) {
-    console.log("RESPONSE_CACHE store unavailable");
+    blog("RESPONSE_CACHE store unavailable");
   }
 }
 async function recordUsage(c, key, usage) {
@@ -2095,6 +2104,12 @@ app.get("/admin/overview", async (c) => {
     totals: totals || { requests: 0, used_tokens: 0, used_usd: 0 },
     generated_at: nowIso()
   });
+});
+app.get("/admin/logs", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return c.json({ logs: logBuffer });
 });
 app.get("/admin/cache", async (c) => {
   const denied = await requireAdmin(c);
