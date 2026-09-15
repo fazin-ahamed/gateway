@@ -1092,9 +1092,10 @@ async function viewTrajectory(id){
     const label=s.ok?(s.http||'ok'):(s.error||s.http||'fail');
     return (i>0?'<span class="tj-arrow">-&gt;</span>':'')+'<div class="tj-step '+cls+'"><div class="k mono">'+esc(s.provider)+' r'+s.rank+'</div><div class="v">'+esc(label)+' '+(s.ms?' '+s.ms+'ms':'')+'</div></div>';
   }).join('')+'</div>':'<div class="empty">No step chain.</div>';
-  const reqHtml=reqs?'<pre>'+esc(JSON.stringify(reqs.messages||reqs,null,2).slice(0,4000))+'</pre>':'<div class="empty">No request body.</div>';
+  const reqText=reqs?JSON.stringify(reqs.messages||reqs,null,2):'';
+  const reqHtml=reqText?'<div class="rowact" style="margin-bottom:6px"><button class="ghost" data-act="tjcopy" data-copy="req">Copy full request</button><span class="small">'+reqText.length+' chars</span></div><pre>'+esc(reqText)+'</pre>':'<div class="empty">No request body.</div>';
   const content=resps&&resps.choices&&resps.choices[0]&&resps.choices[0].message?resps.choices[0].message.content:null;
-  const respHtml=content!=null?'<pre>'+esc(String(content).slice(0,4000))+'</pre>':'<div class="empty">No response content.</div>';
+  const respHtml=content!=null?'<div class="rowact" style="margin-bottom:6px"><button class="ghost" data-act="tjcopy" data-copy="resp">Copy full response</button><span class="small">'+String(content).length+' chars</span></div><pre>'+esc(String(content))+'</pre>':'<div class="empty">No response content.</div>';
   document.querySelector('.modal').classList.add('wide');
   document.getElementById('modal-title').textContent='Trajectory '+t.slug;
   document.getElementById('modal-title').style.color='';
@@ -1107,6 +1108,13 @@ async function viewTrajectory(id){
   document.getElementById('modal-save').style.display='none';
   document.getElementById('overlay').classList.add('show');
 }
+document.addEventListener('click',function(e){
+  const b=e.target.closest('[data-act="tjcopy"]'); if(!b) return;
+  const which=b.getAttribute('data-copy');
+  const pre=document.querySelector('#modal-body pre');
+  if(!pre){ toast('nothing to copy','err'); return; }
+  navigator.clipboard.writeText(pre.textContent).then(function(){ toast(which==='req'?'request copied':'response copied','ok'); },function(){ toast('copy failed','err'); });
+});
 document.addEventListener('click',function(e){
   const b=e.target.closest('[data-act="tjview"]'); if(!b) return;
   viewTrajectory(b.getAttribute('data-id'));

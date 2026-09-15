@@ -2010,7 +2010,7 @@ async function recordUsage(c, key, usage) {
 }
 
 // ---- Trajectory capture (RL / SFT) ----
-var TRAJ_BODY_CAP = 131072;
+var TRAJ_BODY_CAP = 524288;
 async function settingValue(c, key, dflt) {
   try {
     const row = await c.env.DB.prepare("SELECT value FROM gateway_settings WHERE key=?").bind(key).first();
