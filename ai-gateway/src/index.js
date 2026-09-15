@@ -37,12 +37,35 @@ function stableJson(value) {
   }
   return JSON.stringify(value);
 }
+function cacheablePromptLength(payload) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  let n = 0;
+  for (const m of msgs) {
+    if (!m)
+      continue;
+    if (typeof m.content === "string")
+      n += m.content.length;
+    else if (Array.isArray(m.content))
+      for (const part of m.content)
+        if (part && typeof part.text === "string")
+          n += part.text.length;
+  }
+  return n;
+}
+var CACHE_MIN_PROMPT_CHARS = 16;
+var CACHE_MAX_PROBE_TOKENS = 8;
 function isCacheableRequest(payload, isStream, mode) {
   if (mode !== "true" && mode !== "refresh" && mode !== "loose")
     return false;
   if (!payload)
     return false;
   if (mode !== "loose" && payload.temperature != null && Number(payload.temperature) !== 0)
+    return false;
+  // Availability probes ("ping", "hi", max_tokens=1) are noise: never cache
+  // them, and never serve a cached answer for them.
+  if (cacheablePromptLength(payload) < CACHE_MIN_PROMPT_CHARS)
+    return false;
+  if (payload.max_tokens != null && Number(payload.max_tokens) > 0 && Number(payload.max_tokens) <= CACHE_MAX_PROBE_TOKENS)
     return false;
   return true;
 }

@@ -975,9 +975,9 @@ async function loadTrajectories(){
   const rows=list.map(function(t){
     const pill=t.status==='ok'?'<span class="pill ok">ok</span>':'<span class="pill bad">fail</span>';
     const cache=t.cache_state?'<span class="pill mut">'+esc(t.cache_state)+'</span>':'';
-    return '<tr><td class="mono small">'+esc((t.created_at||'').slice(5,19).replace('T',' '))+'</td><td>'+esc(t.slug)+'</td><td>'+esc(t.provider||'-')+'</td><td>'+pill+' '+cache+'</td><td class="mono">'+fmt(t.total_tokens||0)+'</td><td class="mono">'+fmt(t.latency_ms||0)+'ms</td><td class="mono">'+money(t.cost_usd||0)+'</td><td><button class="ghost" data-act="tjview" data-id="'+esc(t.id)+'">view</button></td></tr>';
-  }).join('') || '<tr><td colspan="8"><div class="empty">No trajectories captured yet.</div></td></tr>';
-  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Provider</th><th>Status</th><th>Tokens</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>';
+    return '<tr><td class="mono small">'+esc((t.created_at||'').slice(5,19).replace('T',' '))+'</td><td>'+esc(t.slug)+'</td><td>'+esc(t.provider||'-')+'</td><td>'+pill+' '+cache+'</td><td class="mono" title="input tokens">'+fmt(t.prompt_tokens||0)+'&nbsp;in</td><td class="mono" title="output tokens">'+fmt(t.completion_tokens||0)+'&nbsp;out</td><td class="mono" title="latency">'+fmt(t.latency_ms||0)+'ms</td><td class="mono" title="cost">'+money(t.cost_usd||0)+'</td><td><button class="ghost" data-act="tjview" data-id="'+esc(t.id)+'">view</button></td></tr>';
+  }).join('') || '<tr><td colspan="9"><div class="empty">No trajectories captured yet.</div></td></tr>';
+  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Provider</th><th>Status</th><th>In tok</th><th>Out tok</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>';
 }
 async function viewTrajectory(id){
   const {data}=await api('/admin/trajectories/'+id); const t=data&&data.trajectory; if(!t){ toast('not found','err'); return; }
