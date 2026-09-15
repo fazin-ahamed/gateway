@@ -191,46 +191,81 @@ function normalizeKeyExpiry(value, nowMs = Date.now()) {
 function isKeyExpired(key, at = nowIso()) {
   return !!(key && key.expires_at && String(key.expires_at) <= at);
 }
-async function enforceModelLimits(c, slug) {
-  const lim = await c.env.DB.prepare("SELECT requests_per_minute, max_total_tokens FROM model_limits WHERE slug=?").bind(slug).first();
-  if (!lim)
-    return null;
-  const rpm = Number(lim.requests_per_minute) || 0;
-  if (rpm > 0) {
-    const now = /* @__PURE__ */ new Date();
-    const bucket = now.toISOString().slice(0, 16);
-    const expiresAt = new Date(now.getTime() + 2 * 60 * 1e3).toISOString().replace(".000", "");
-    const row = await c.env.DB.prepare(
-      `INSERT INTO model_rate_windows (slug, bucket, request_count, expires_at) VALUES (?,?,1,?)
-       ON CONFLICT(slug,bucket) DO UPDATE SET request_count=request_count+1
-       RETURNING request_count`
-    ).bind(slug, bucket, expiresAt).first();
-    if (Number(row && row.request_count) > rpm)
-      return c.json({ error: { message: 'Model "' + slug + '" is rate limited (' + rpm + " req/min). Retry shortly.", type: "model_rate_limited" } }, 429, { "retry-after": String(60 - now.getUTCSeconds()) });
+var MODEL_LIMIT_KINDS = ["requests", "tokens", "usd"];
+var MODEL_LIMIT_PERIODS = ["minute", "day", "week", "month"];
+function periodBucket(period, now = /* @__PURE__ */ new Date()) {
+  const iso = now.toISOString();
+  if (period === "minute")
+    return iso.slice(0, 16);
+  if (period === "week") {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    return d.toISOString().slice(0, 10);
   }
-  const cap = Number(lim.max_total_tokens) || 0;
-  if (cap > 0) {
-    const day = nowIso().slice(0, 10);
-    const row = await c.env.DB.prepare("SELECT tokens FROM model_token_usage WHERE slug=? AND day=?").bind(slug, day).first();
-    if (Number(row && row.tokens) >= cap)
-      return c.json({ error: { message: 'Model "' + slug + '" has used its daily token budget (' + cap + "). Resets at midnight UTC.", type: "model_budget_exceeded" } }, 429);
+  if (period === "month")
+    return iso.slice(0, 7);
+  return iso.slice(0, 10);
+}
+async function enforceModelLimits(c, slug) {
+  const limits = await c.env.DB.prepare("SELECT kind, period, limit_value FROM model_limits WHERE slug=?").bind(slug).all();
+  if (!limits.results || !limits.results.length)
+    return null;
+  for (const lim of limits.results) {
+    const cap = Number(lim.limit_value) || 0;
+    if (cap <= 0)
+      continue;
+    const kind = lim.kind;
+    if (kind === "requests" && lim.period === "minute") {
+      const now = /* @__PURE__ */ new Date();
+      const bucket = periodBucket("minute", now);
+      const expiresAt = new Date(now.getTime() + 2 * 60 * 1e3).toISOString().replace(".000", "");
+      const row = await c.env.DB.prepare(
+        `INSERT INTO model_rate_windows (slug, bucket, request_count, expires_at) VALUES (?,?,1,?)
+         ON CONFLICT(slug,bucket) DO UPDATE SET request_count=request_count+1
+         RETURNING request_count`
+      ).bind(slug, bucket, expiresAt).first();
+      if (Number(row && row.request_count) > cap)
+        return c.json({ error: { message: 'Model "' + slug + '" is rate limited (' + cap + " req/min). Retry shortly.", type: "model_rate_limited" } }, 429, { "retry-after": String(60 - now.getUTCSeconds()) });
+      continue;
+    }
+    const kindCol = kind === "requests" ? "requests" : kind === "tokens" ? "tokens" : "usd";
+    const start = periodStartIso(lim.period);
+    const row = await c.env.DB.prepare(
+      "SELECT COALESCE(SUM(value),0) AS used FROM model_usage WHERE slug=? AND kind=? AND bucket>=?"
+    ).bind(slug, kindCol, start).first();
+    const used = Number(row && row.used) || 0;
+    if (used >= cap)
+      return c.json({ error: { message: 'Model "' + slug + '" hit its ' + kind + " limit for this " + lim.period + " (" + used + " / " + cap + ").", type: "model_budget_exceeded" } }, 429);
   }
   return null;
 }
-async function recordModelTokens(c, slug, tokens) {
+function periodStartIso(period, now = /* @__PURE__ */ new Date()) {
+  const d = new Date(now.getTime());
+  if (period === "week") {
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    return d.toISOString().slice(0, 10);
+  }
+  if (period === "month")
+    return d.toISOString().slice(0, 7);
+  return d.toISOString().slice(0, 10);
+}
+async function recordModelUsage(c, slug, tokens, costUsd) {
   if (!slug)
     return;
-  const t = Number(tokens) || 0;
-  if (t <= 0)
-    return;
-  const day = nowIso().slice(0, 10);
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO model_token_usage (slug, day, tokens) VALUES (?,?,?)
-       ON CONFLICT(slug,day) DO UPDATE SET tokens=tokens+excluded.tokens`
-    ).bind(slug, day, t).run();
-  } catch (e) {
-    blog("MODEL_TOKEN usage record failed: " + String(e.message || e));
+  const now = /* @__PURE__ */ new Date();
+  const entries = [["tokens", tokens || 0], ["usd", costUsd || 0]];
+  for (const [kind, value] of entries) {
+    if (!(value > 0))
+      continue;
+    const bucket = periodBucket("day", now);
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)
+         ON CONFLICT(slug,kind,bucket) DO UPDATE SET value=value+excluded.value`
+      ).bind(slug, kind, bucket, value).run();
+    } catch (e) {
+      blog("MODEL_USAGE record failed: " + String(e.message || e));
+    }
   }
 }
 async function enforceRequestLimit(c, key) {
@@ -545,7 +580,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             continue;
           }
           await recordUsage(c, key, { ...usage, cost_usd: costUsd });
-          await recordModelTokens(c, slug, usage.total_tokens);
+          await recordModelUsage(c, slug, usage.total_tokens, costUsd);
           if (cacheKey && isCacheableResponse(clientTxt)) {
             await storeResponseCache(c, {
               cacheKey,
@@ -1353,7 +1388,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   const persistOnce = (async () => {
     const costUsd = await computeCost(c, slug, lastUsage);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
-    await recordModelTokens(c, slug, lastUsage.total_tokens);
+    await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
     if (extra && extra.traj) {
       const msg = {
         role: "assistant",
@@ -2516,11 +2551,8 @@ app.get("/admin/model-limits", async (c) => {
   if (denied)
     return denied;
   const rows = await c.env.DB.prepare(
-    `SELECT ml.slug, ml.requests_per_minute, ml.max_total_tokens, ml.updated_at,
-            COALESCE((SELECT tokens FROM model_token_usage mtu WHERE mtu.slug=ml.slug AND mtu.day=?),0) AS today_tokens,
-            (SELECT GROUP_CONCAT(bucket || ':' || request_count) FROM (SELECT bucket, request_count FROM model_rate_windows mrw WHERE mrw.slug=ml.slug AND mrw.expires_at > ? ORDER BY bucket DESC LIMIT 3)) AS recent_windows
-     FROM model_limits ml ORDER BY ml.slug`
-  ).bind(nowIso().slice(0, 10), nowIso()).all();
+    "SELECT slug, kind, period, limit_value, updated_at FROM model_limits ORDER BY slug, kind, period"
+  ).all();
   return c.json({ limits: rows.results || [] });
 });
 app.post("/admin/model-limits", async (c) => {
@@ -2529,26 +2561,36 @@ app.post("/admin/model-limits", async (c) => {
     return denied;
   let b;
   try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
-  if (!b.slug)
+  const slug = String(b.slug || "").trim();
+  const kind = String(b.kind || "").toLowerCase();
+  const period = String(b.period || "").toLowerCase();
+  if (!slug)
     return c.json({ error: { message: "slug required" } }, 400);
-  const rpm = b.requests_per_minute === "" || b.requests_per_minute == null ? null : Number(b.requests_per_minute);
-  const cap = b.max_total_tokens === "" || b.max_total_tokens == null ? null : Number(b.max_total_tokens);
-  if (rpm != null && (!Number.isFinite(rpm) || rpm < 0))
-    return c.json({ error: { message: "requests_per_minute must be 0 or positive (0 = unlimited)" } }, 400);
-  if (cap != null && (!Number.isFinite(cap) || cap < 0))
-    return c.json({ error: { message: "max_total_tokens must be 0 or positive (0 = unlimited)" } }, 400);
-  await c.env.DB.prepare("INSERT INTO model_limits (slug, requests_per_minute, max_total_tokens, updated_at) VALUES (?,?,?,?) ON CONFLICT(slug) DO UPDATE SET requests_per_minute=excluded.requests_per_minute, max_total_tokens=excluded.max_total_tokens, updated_at=excluded.updated_at")
-    .bind(String(b.slug), rpm && rpm > 0 ? Math.floor(rpm) : null, cap && cap > 0 ? Math.floor(cap) : null, nowIso()).run();
-  return c.json({ slug: String(b.slug), requests_per_minute: rpm, max_total_tokens: cap });
+  if (!MODEL_LIMIT_KINDS.includes(kind))
+    return c.json({ error: { message: "kind must be one of " + MODEL_LIMIT_KINDS.join(", ") } }, 400);
+  if (!MODEL_LIMIT_PERIODS.includes(period))
+    return c.json({ error: { message: "period must be one of " + MODEL_LIMIT_PERIODS.join(", ") } }, 400);
+  const value = Number(b.limit_value);
+  if (!Number.isFinite(value) || value < 0)
+    return c.json({ error: { message: "limit_value must be 0 or positive (0 = unlimited)" } }, 400);
+  if (value === 0) {
+    await c.env.DB.prepare("DELETE FROM model_limits WHERE slug=? AND kind=? AND period=?").bind(slug, kind, period).run();
+    return c.json({ slug, kind, period, limit_value: 0, removed: true });
+  }
+  await c.env.DB.prepare(
+    `INSERT INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)
+     ON CONFLICT(slug,kind,period) DO UPDATE SET limit_value=excluded.limit_value, updated_at=excluded.updated_at`
+  ).bind(slug, kind, period, value, nowIso()).run();
+  return c.json({ slug, kind, period, limit_value: value });
 });
-app.delete("/admin/model-limits/:slug", async (c) => {
+app.delete("/admin/model-limits/:slug/:kind/:period", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
   const slug = decodeURIComponent(c.req.param("slug"));
-  await c.env.DB.prepare("DELETE FROM model_limits WHERE slug=?").bind(slug).run();
-  await c.env.DB.prepare("DELETE FROM model_rate_windows WHERE slug=?").bind(slug).run();
-  await c.env.DB.prepare("DELETE FROM model_token_usage WHERE slug=?").bind(slug).run();
+  const kind = c.req.param("kind");
+  const period = c.req.param("period");
+  await c.env.DB.prepare("DELETE FROM model_limits WHERE slug=? AND kind=? AND period=?").bind(slug, kind, period).run();
   return c.json({ ok: true });
 });
 app.post("/admin/trajectory-settings", async (c) => {

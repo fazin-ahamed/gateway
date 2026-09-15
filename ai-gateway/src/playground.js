@@ -287,12 +287,13 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-limits">
-    <div class="pagehead"><div><h2 class="sec">Model limits</h2><p class="sub">Per-model global caps. Requests/min applies instantly; daily token budget counts every recorded request and resets at midnight UTC. 0 or blank means unlimited.</p></div></div>
+    <div class="pagehead"><div><h2 class="sec">Model limits</h2><p class="sub">Per-model caps by kind (requests, tokens, USD) and period (minute, day, week, month). Combine freely; each combo enforces independently and 0 removes the cap.</p></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Set limit</h2></div><div class="panel-b">
       <div class="form-grid">
         <div><label>Model slug</label><select id="lm-slug"></select></div>
-        <div><label>Requests / minute</label><input id="lm-rpm" type="number" min="0" placeholder="0 = unlimited"></div>
-        <div><label>Max tokens / day</label><input id="lm-tokens" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div><label>Kind</label><select id="lm-kind"><option value="requests">Requests</option><option value="tokens">Tokens</option><option value="usd">USD spend</option></select></div>
+        <div><label>Period</label><select id="lm-period"><option value="minute">Per minute</option><option value="day" selected>Per day</option><option value="week">Per week</option><option value="month">Per month</option></select></div>
+        <div><label>Limit value</label><input id="lm-value" type="number" step="any" min="0" placeholder="0 removes"></div>
         <div class="full"><button class="act" id="lm-save">Save limit</button></div>
       </div>
     </div></div>
@@ -1009,13 +1010,11 @@ async function loadLimits(){
   await refreshLimitSlugSelect();
   let data; try{ const res=await api('/admin/model-limits'); data=res.data; }catch(e){ paintLoadError(el,'Could not load limits: '+e.message,loadLimits); return; }
   const rows=(data&&data.limits||[]).map(function(l){
-    const rpm=l.requests_per_minute?l.requests_per_minute+'/min':'<span class="pill mut">unlimited</span>';
-    const cap=l.max_total_tokens?fmt(l.max_total_tokens)+'/day':'<span class="pill mut">unlimited</span>';
-    const used=l.today_tokens?fmt(l.today_tokens)+' today':'<span class="pill mut">0 today</span>';
-    const win=l.recent_windows?('<div class="small">'+esc(l.recent_windows)+'</div>'):'';
-    return '<tr><td class="mono">'+esc(l.slug)+'</td><td>'+rpm+'</td><td>'+cap+'</td><td>'+used+win+'</td><td><button class="ghost" data-act="lmedit" data-slug="'+esc(l.slug)+'" data-rpm="'+(l.requests_per_minute||'')+'" data-cap="'+(l.max_total_tokens||'')+'">edit</button> <button class="danger" data-act="lmdel" data-slug="'+esc(l.slug)+'">remove</button></td></tr>';
-  }).join('') || '<tr><td colspan="5"><div class="empty">No model limits set.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Requests/min</th><th>Tokens/day</th><th>Used today</th><th></th></tr>'+rows+'</table>';
+    const value=l.limit_value>0?(l.kind==='usd'?money(l.limit_value):fmt(l.limit_value)):'-';
+    const label=l.kind==='usd'?('$'+value+' / '+l.period):(value+' / '+l.period);
+    return '<tr><td class="mono">'+esc(l.slug)+'</td><td><span class="pill acc">'+esc(l.kind)+'</span></td><td class="mono">'+esc(label)+'</td><td><button class="danger" data-act="lmdel" data-slug="'+esc(l.slug)+'" data-kind="'+esc(l.kind)+'" data-period="'+esc(l.period)+'">remove</button></td></tr>';
+  }).join('') || '<tr><td colspan="4"><div class="empty">No model limits set.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Slug</th><th>Kind</th><th>Cap</th><th></th></tr>'+rows+'</table>';
 }
 async function refreshLimitSlugSelect(){
   const sel=document.getElementById('lm-slug'); if(!sel) return;
@@ -1025,24 +1024,17 @@ async function refreshLimitSlugSelect(){
 document.getElementById('lm-save').onclick=async function(){
   const slug=document.getElementById('lm-slug').value;
   if(!slug){ toast('pick a slug','err'); return; }
-  const body={ slug, requests_per_minute: document.getElementById('lm-rpm').value, max_total_tokens: document.getElementById('lm-tokens').value };
+  const body={ slug, kind: document.getElementById('lm-kind').value, period: document.getElementById('lm-period').value, limit_value: document.getElementById('lm-value').value };
   const {status,data}=await api('/admin/model-limits',{method:'POST',body:JSON.stringify(body)});
-  if(status===200){ toast('limit saved for '+slug,'ok'); document.getElementById('lm-rpm').value=''; document.getElementById('lm-tokens').value=''; loadLimits(); }
+  if(status===200){ toast('limit saved for '+slug,'ok'); document.getElementById('lm-value').value=''; loadLimits(); }
   else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
 };
 document.addEventListener('click',function(e){
   const b=e.target.closest('button[data-act]'); if(!b) return;
   const act=b.getAttribute('data-act');
-  if(act==='lmedit'){
-    document.getElementById('lm-slug').value=b.getAttribute('data-slug');
-    document.getElementById('lm-rpm').value=b.getAttribute('data-rpm');
-    document.getElementById('lm-tokens').value=b.getAttribute('data-cap');
-    toast('editing '+b.getAttribute('data-slug'),'ok');
-    return;
-  }
   if(act==='lmdel'){
-    confirmAction('Remove model limit','Remove the limit on '+b.getAttribute('data-slug')+'?','Remove',async function(){
-      await api('/admin/model-limits/'+encodeURIComponent(b.getAttribute('data-slug')),{method:'DELETE'});
+    confirmAction('Remove model limit','Remove the '+b.getAttribute('data-kind')+'/'+b.getAttribute('data-period')+' cap on '+b.getAttribute('data-slug')+'?','Remove',async function(){
+      await api('/admin/model-limits/'+encodeURIComponent(b.getAttribute('data-slug'))+'/'+b.getAttribute('data-kind')+'/'+b.getAttribute('data-period'),{method:'DELETE'});
       loadLimits();
     });
   }

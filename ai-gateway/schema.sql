@@ -156,13 +156,18 @@ CREATE TABLE IF NOT EXISTS gateway_settings (
   updated_at TEXT NOT NULL
 );
 
--- Global per-model limits: request rate (per minute, sliding bucket) and
--- total token budget. A 0/NULL in either means "unlimited".
+-- Global per-model limits. One row per (slug, kind, period):
+--   kind   = requests | tokens | usd
+--   period = minute | day | week | month
+-- No row for a combo means unlimited for it.
 CREATE TABLE IF NOT EXISTS model_limits (
-  slug TEXT PRIMARY KEY,
-  requests_per_minute INTEGER,
-  max_total_tokens INTEGER,
-  updated_at TEXT NOT NULL
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  period TEXT NOT NULL,
+  limit_value REAL NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(slug, kind, period)
 );
 CREATE TABLE IF NOT EXISTS model_rate_windows (
   slug TEXT NOT NULL,
@@ -171,9 +176,12 @@ CREATE TABLE IF NOT EXISTS model_rate_windows (
   expires_at TEXT NOT NULL,
   PRIMARY KEY (slug, bucket)
 );
-CREATE TABLE IF NOT EXISTS model_token_usage (
+-- Counters per (slug, kind, bucket). Minute buckets are ISO minute stamps,
+-- day/month are ISO date prefixes; week rows are rolled up on write.
+CREATE TABLE IF NOT EXISTS model_usage (
   slug TEXT NOT NULL,
-  day TEXT NOT NULL,
-  tokens INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (slug, day)
+  kind TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  value REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (slug, kind, bucket)
 );
