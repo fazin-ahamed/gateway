@@ -791,7 +791,30 @@ async function loadKeys(){
   el.innerHTML='<table><tr><th>Key</th><th>Budget</th><th>Rate</th><th>Reqs</th><th>Tiers</th><th>Extra allow</th><th>Excludes</th><th>Expiry</th><th>State</th><th></th></tr>'+rows+'</table>';
 }
 async function toggleKey(id, active){ await api('/admin/keys/'+id+'/'+(active?'activate':'deactivate'),{method:'POST'}); loadKeys(); }
-async function delKey(id){ confirmAction('Delete API key','Delete '+id+'? Clients using it stop working immediately.','Delete',async function(){ await api('/admin/keys/'+id,{method:'DELETE'}); loadKeys(); }); return; }
+function copyKey(id){ try{ navigator.clipboard.writeText(id).then(function(){ toast('key copied','ok'); }); }catch(e){ toast('copy failed','err'); } }
+async function editKey(id){
+  const {data}=await api('/admin/keys/'+id); const k=data&&data.key; if(!k){ toast('key not found','err'); return; }
+  const tierIds=((data&&data.tiers)||[]).map(function(t){return String(t.id);});
+  const opts=await tierOptions();
+  openModal('Edit key '+k.name,[
+    {key:'name',label:'Name',value:k.name},
+    {key:'budget_mode',label:'Budget mode',type:'select',value:k.budget_mode,options:[{value:'usd',label:'USD ($)'},{value:'tokens',label:'Tokens'}]},
+    {key:'budget_limit',label:'Budget limit',type:'number',value:k.budget_limit},
+    {key:'request_limit_per_minute',label:'Request limit / minute (0 = unlimited)',type:'number',value:k.request_limit_per_minute||0},
+    {key:'expires_at',label:'Expires at (UAE / GST, blank = never)',value:localExpiryValue(k.expires_at),hint:'UAE time (UTC+4). Clear to make the key never expire.'},
+    {key:'tier_ids',label:'Model tiers',type:'multiselect',value:tierIds,options:opts},
+    {key:'allowed_models',label:'Extra allowed models (comma list)',value:k.allowed_models||''},
+    {key:'excluded_models',label:'Excluded models',value:k.excluded_models||''},
+    {key:'active',label:'State',type:'select',value:k.active?'1':'0',options:[{value:'1',label:'active'},{value:'0',label:'deactivated'}]}
+  ], async function(v){
+    let expires_at=null;
+    if(v.expires_at){ try { expires_at=uaeLocalInputToIso(v.expires_at); } catch(e) { return toast('invalid UAE expiry','err'); } }
+    const body={name:v.name,budget_mode:v.budget_mode,budget_limit:Number(v.budget_limit),request_limit_per_minute:Number(v.request_limit_per_minute)||0,expires_at,tier_ids:v.tier_ids.map(Number),allowed_models:v.allowed_models,excluded_models:v.excluded_models,active:v.active==='1'};
+    const {status,data:r}=await api('/admin/keys/'+id,{method:'PATCH',body:JSON.stringify(body)});
+    if(status===200){ toast('key updated','ok'); closeModal(); loadKeys(); }
+    else toast('update failed: '+(r&&r.error&&r.error.message||status),'err');
+  });
+}
 document.getElementById('k-create').onclick=async function(){
   const rpm=document.getElementById('k-rpm').value;
   const rawExpiry=document.getElementById('k-expiry').value;
