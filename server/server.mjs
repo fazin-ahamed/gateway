@@ -51,4 +51,16 @@ const app = createApp(env);
 const handler = async (req) => app.fetch(req, env, { waitUntil: () => {} });
 
 console.log(`[gateway] listening on http://${HOST}:${PORT} (db=${DB_PATH})`);
-serve({ fetch: handler, port: PORT, hostname: HOST });
+// Huge-context requests upload megabytes of JSON and slow models take
+// minutes before first byte. Node's defaults (requestTimeout 300s,
+// headersTimeout 60s) kill the socket mid-stream — the "socket closed
+// unexpectedly" error. Raise them; errors still surface eventually.
+serve({
+  fetch: handler,
+  port: PORT,
+  hostname: HOST,
+  requestTimeout: 3600000,
+  headersTimeout: 120000,
+  keepAliveTimeout: 7200000,
+  maxRequestBodySize: 512 * 1024 * 1024,
+});

@@ -426,12 +426,14 @@ app.get("/status", async (c) => {
   return c.json({ providers: status, routes: routes.results || [] });
 });
 app.post("/v1/chat/completions", async (c) => {
+  await ensureUpstreamDispatcher();
   const auth = await authClient(c);
   if (auth instanceof Response)
     return auth;
   return runChatCompletion(c, auth.key, false);
 });
 app.post("/admin/playground/completions", async (c) => {
+  await ensureUpstreamDispatcher();
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
@@ -606,6 +608,28 @@ async function forwardToProvider(c, route, apiKey, payload, isStream, requestId)
   return forwardOpenAI(c, route, apiKey, payload);
 }
 var PROXY_TIMEOUT_MS = 20000;
+// undici (Node's fetch) kills responses whose headers take >300s and has a
+// small default body timeout; slow large-context generations surface as
+// "socket connection was closed unexpectedly". Raise the ceilings.
+var upstreamDispatcherReady = false;
+async function ensureUpstreamDispatcher() {
+  if (upstreamDispatcherReady)
+    return;
+  upstreamDispatcherReady = true;
+  try {
+    const undici = await import("undici").catch(() => null);
+    if (undici && undici.setGlobalDispatcher && undici.Agent) {
+      undici.setGlobalDispatcher(new undici.Agent({
+        headersTimeout: 600000,
+        bodyTimeout: 0,
+        connectTimeout: 30000
+      }));
+      blog("UPSTREAM dispatcher timeouts raised (headers 600s, body unlimited)");
+    }
+  } catch (e) {
+    blog("UPSTREAM dispatcher setup failed: " + String(e.message || e));
+  }
+}
 async function fetchViaProxy(proxyUrl, targetUrl, method, headers, body) {
   const sep = proxyUrl.includes("?") ? "&" : "?";
   const fwd = proxyUrl + sep + "url=" + encodeURIComponent(targetUrl);
