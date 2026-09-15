@@ -462,7 +462,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         attempts++;
       }
     }
-    return c.json(genericUpstreamError(), 503, { "x-gateway-attempts": String(attempts || routes.results.length) });
+    const errBody = lastErr
+      ? { error: { message: lastErr, type: "upstream_error" } }
+      : genericUpstreamError();
+    return c.json(errBody, 503, { "x-gateway-attempts": String(attempts || routes.results.length) });
   } finally {
     await releaseResponseCacheLease(c, cacheKey, cacheLeaseId);
   }
