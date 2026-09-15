@@ -211,8 +211,10 @@ async function providerKey(c, id) {
         try {
           return await openProviderKey(c.env, stored);
         } catch (e) {
-          if (!c.env.PROVIDER_CRYPTO_KEY || !c.env.ADMIN_TOKEN)
+          if (!c.env.PROVIDER_CRYPTO_KEY || !c.env.ADMIN_TOKEN) {
+            console.log("PROVIDER_KEY decrypt failed id=" + id + ": " + String(e.message || e));
             throw e;
+          }
           const legacyPlain = await openProviderKey(c.env, stored, true);
           await c.env.DB.prepare("UPDATE providers SET api_key=?, updated_at=? WHERE id=?").bind(await sealProviderKey(c.env, legacyPlain), nowIso(), id).run();
           console.log("PROVIDER_KEY re-encrypted id=" + id);
@@ -225,7 +227,7 @@ async function providerKey(c, id) {
       return stored;
     }
   } catch (e) {
-    console.log("PROVIDER_KEY unavailable id=" + id);
+    console.log("PROVIDER_KEY unavailable id=" + id + ": " + String(e.message || e));
   }
   return c.env["PROVIDER_" + id + "_KEY"] || c.env["PROVIDER_" + (id - 1) + "_KEY"] || c.env.PROVIDER_KEY || c.env.UPSTREAM_API_KEY || null;
 }
@@ -400,6 +402,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     payload.stream_options = { ...payload.stream_options || {}, include_usage: true };
   try {
     let lastErr = null;
+    let attempts = 0;
     for (const route of routes.results) {
       const key2 = await providerKey(c, route.provider_id);
       if (!key2) {
