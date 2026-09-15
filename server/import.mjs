@@ -3,6 +3,7 @@
 //   node --env-file=.env server/import.mjs ~/ecli-import.sql
 // Applies the file inside a transaction. Exits non-zero on any error.
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createDb } from "./db.mjs";
 
 const file = process.argv[2];
@@ -12,7 +13,9 @@ if (!file) {
 }
 const dbPath = process.env.DB_PATH || "./server/data/gateway.db";
 const db = createDb(dbPath);
-const sql = readFileSync(file, "utf8");
+const require = createRequire(import.meta.url);
+const schemaPath = require.resolve("../ai-gateway/schema.sql");
+db.exec(readFileSync(schemaPath, "utf8"));
 db.exec("BEGIN;");
 try {
   db.exec(sql);
