@@ -509,6 +509,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     payload.stream_options = { ...payload.stream_options || {}, include_usage: true };
   try {
     let lastErr = null;
+    let lastErrStatus = null;
     let attempts = 0;
     for (const route of routes.results) {
       const stepStart = Date.now();
@@ -574,16 +575,19 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       } catch (e) {
         blog("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
         lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
+        if (e && e.status)
+          lastErrStatus = e.status;
         traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), ms: Date.now() - stepStart });
         attempts++;
       }
     }
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
-    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 503, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
+    const finalStatus = lastErrStatus || 503;
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
     const errBody = lastErr
-      ? { error: { message: lastErr, type: "upstream_error" } }
+      ? { error: { message: lastErr, type: "upstream_error", ...(lastErrStatus === 504 ? { code: "upstream_timeout" } : {}) } }
       : genericUpstreamError();
-    return c.json(errBody, 503, { "x-gateway-attempts": String(attempts || routes.results.length) });
+    return c.json(errBody, finalStatus, { "x-gateway-attempts": String(attempts || routes.results.length) });
   } finally {
     await releaseResponseCacheLease(c, cacheKey, cacheLeaseId);
   }
@@ -596,7 +600,7 @@ async function forwardToProvider(c, route, apiKey, payload, isStream, requestId)
     const reqBody = JSON.stringify({ ...payload, model: route.upstream_model });
     const target = fmt2 === "anthropic" ? route.base_url + "/messages" : route.base_url + "/chat/completions";
     const headers = withExtraHeaders(fmt2 === "anthropic" ? { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION } : { "Content-Type": "application/json", Authorization: "Bearer " + apiKey }, route);
-    return fetchViaProxy(route.proxy_url, target, "POST", headers, reqBody);
+    return fetchViaProxy(c, route.proxy_url, target, "POST", headers, reqBody);
   }
   if (transport === "koyeb") {
     blog("FWD koyeb provider=" + route.provider_name);
@@ -630,7 +634,36 @@ async function ensureUpstreamDispatcher() {
     blog("UPSTREAM dispatcher setup failed: " + String(e.message || e));
   }
 }
-async function fetchViaProxy(proxyUrl, targetUrl, method, headers, body) {
+// Direct upstream calls: big-context agentic turns (100KB+ bodies) legitimately
+// take minutes to process before the first byte. The timeout covers ONLY the
+// window until response headers arrive — once the upstream starts streaming,
+// the body is unbounded so long generations are never cut mid-stream. Tune via
+// env UPSTREAM_TIMEOUT_MS (default 10 min).
+var UPSTREAM_TIMEOUT_MS = 600000;
+function upstreamFetch(c, url, init) {
+  const ctrl = new AbortController();
+  const ms = Number(c && c.env && c.env.UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS;
+  let timer = null;
+  const clear = () => { if (timer) clearTimeout(timer); };
+  try {
+    const p = fetch(url, { ...init, signal: ctrl.signal });
+    // Arm the abort AFTER fetch() is issued; clear the moment headers land.
+    timer = setTimeout(() => ctrl.abort(), ms);
+    return p.then((r) => { clear(); return r; }).catch((e) => {
+      if (e && e.name === "AbortError") {
+        const err = new Error("upstream did not respond within " + ms + "ms");
+        err.status = 504;
+        err.code = "upstream_timeout";
+        throw err;
+      }
+      throw e;
+    }).finally(clear);
+  } catch (e) {
+    clear();
+    throw e;
+  }
+}
+async function fetchViaProxy(c, proxyUrl, targetUrl, method, headers, body) {
   const sep = proxyUrl.includes("?") ? "&" : "?";
   const fwd = proxyUrl + sep + "url=" + encodeURIComponent(targetUrl);
   const fwdHeaders = { ...headers };
@@ -639,32 +672,42 @@ async function fetchViaProxy(proxyUrl, targetUrl, method, headers, body) {
   delete fwdHeaders["connection"];
   delete fwdHeaders["transfer-encoding"];
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), PROXY_TIMEOUT_MS);
+  // Header-window cap like upstreamFetch: slow big-context first bytes get
+  // their minutes; once headers land the body streams unbounded.
+  const ms = Math.max(PROXY_TIMEOUT_MS, Number(c && c.env && c.env.UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS);
+  let timer = null;
+  const clear = () => { if (timer) clearTimeout(timer); };
   try {
-    const r = await fetch(fwd, {
+    const p = fetch(fwd, {
       method: method || "POST",
       headers: fwdHeaders,
       body: body || void 0,
       signal: ctrl.signal
     });
+    timer = setTimeout(() => ctrl.abort(), ms);
+    const r = await p.then((resp) => { clear(); return resp; });
     let usage = null;
     const ct = r.headers.get("content-type") || "";
     if (!ct.includes("text/event-stream")) {
       try {
         const txt = await r.clone().text();
-        const p = JSON.parse(txt);
-        if (p && p.usage)
-          usage = usageFrom(p);
+        const p2 = JSON.parse(txt);
+        if (p2 && p2.usage)
+          usage = usageFrom(p2);
       } catch {
       }
     }
     return { response: r, usage };
   } catch (e) {
-    if (e && e.name === "AbortError")
-      throw new Error("proxy timeout after " + PROXY_TIMEOUT_MS + "ms");
+    if (e && e.name === "AbortError") {
+      const err = new Error("proxy did not respond within " + ms + "ms");
+      err.status = 504;
+      err.code = "upstream_timeout";
+      throw err;
+    }
     throw e;
   } finally {
-    clearTimeout(timer);
+    clear();
   }
 }
 var KOYEB_TUNNEL_VERSION = 1;
@@ -1072,7 +1115,7 @@ async function fetchViaKoyeb(c, route, apiKey, payload, isStream, requestId) {
   return { response: up, usage };
 }
 async function forwardOpenAI(c, route, apiKey, payload) {
-  const up = await fetch(route.base_url + "/chat/completions", {
+  const up = await upstreamFetch(c, route.base_url + "/chat/completions", {
     method: "POST",
     headers: withExtraHeaders({
       "Content-Type": "application/json",
@@ -1202,7 +1245,7 @@ function fromAnthropicStreamChunk(obj, model) {
 }
 async function forwardAnthropic(c, route, apiKey, payload) {
   const reqBody = anthropicRequestBody(route, payload);
-  const up = await fetch(route.base_url + "/messages", {
+  const up = await upstreamFetch(c, route.base_url + "/messages", {
     method: "POST",
     headers: withExtraHeaders({
       "Content-Type": "application/json",
@@ -1234,6 +1277,7 @@ function wrapAnthropicStream(upReq, model) {
   return new Response(new ReadableStream({
     async start(controller) {
       let buf = "";
+      let finishSeen = false;
       const enc = encoder;
       try {
         for (; ; ) {
@@ -1257,9 +1301,25 @@ function wrapAnthropicStream(upReq, model) {
               continue;
             }
             const chunk = fromAnthropicStreamChunk(obj, model);
-            if (chunk)
-              controller.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"));
+            if (!chunk)
+              continue;
+            if (chunk.choices && chunk.choices[0] && chunk.choices[0].finish_reason)
+              finishSeen = true;
+            controller.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"));
           }
+        }
+        // Anthropic upstreams sometimes end with message_stop but no
+        // message_delta carrying a stop_reason — OpenAI clients hard-fail with
+        // "stream closed before a finish_reason". Synthesize the terminal stop.
+        if (!finishSeen) {
+          const finishChunk = {
+            id: "gen-anthropic",
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+          };
+          controller.enqueue(enc.encode("data: " + JSON.stringify(finishChunk) + "\n\n"));
         }
         controller.enqueue(enc.encode("data: [DONE]\n\n"));
         controller.close();
@@ -1339,6 +1399,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       clientCancelled = true;
     }
   });
+  let finishSeen = false; // a forwarded chunk carried a real finish_reason
   const pump = (async () => {
     try {
       for (; ; ) {
@@ -1360,7 +1421,17 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             const u = usageFrom(obj);
             if (u && (u.total_tokens || u.completion_tokens || u.prompt_tokens))
               lastUsage = u;
-            const dc = obj && obj.choices && obj.choices[0] && obj.choices[0].delta;
+            const choices = obj && Array.isArray(obj.choices) ? obj.choices : null;
+            // Usage-only shell (choices: []) — captures usage already; a bare
+            // "choices: []" chunk crashes strict OpenAI clients (choices[0]).
+            if (choices && choices.length === 0) {
+              // still let final usage flow on the synthesized finish chunk
+              continue;
+            }
+            const fr = choices && choices[0] && choices[0].finish_reason;
+            if (fr)
+              finishSeen = true;
+            const dc = choices && choices[0] && choices[0].delta;
             if (dc) {
               if (typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
                 contentBuf += dc.content;
@@ -1397,6 +1468,27 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
         }
       }
       if (!clientCancelled) {
+        // Many OpenAI-compatible upstreams end with [DONE] but never sent a
+        // finish_reason chunk (or died mid-reasoning). Clients hard-fail with
+        // "stream closed before a finish_reason was received" — synthesize the
+        // terminal stop chunk so the stream always completes gracefully.
+        if (!finishSeen) {
+          const finishChunk = {
+            id: "gen-" + requestId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: slug,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+          };
+          const hasUsage = lastUsage && (lastUsage.total_tokens || lastUsage.completion_tokens);
+          if (hasUsage)
+            finishChunk.usage = {
+              prompt_tokens: lastUsage.prompt_tokens || 0,
+              completion_tokens: lastUsage.completion_tokens || 0,
+              total_tokens: lastUsage.total_tokens || 0
+            };
+          safeEnqueue("data: " + JSON.stringify(finishChunk) + "\n\n");
+        }
         safeEnqueue("data: [DONE]\n\n");
         try {
           controllerRef.close();
