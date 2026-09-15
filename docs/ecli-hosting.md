@@ -46,12 +46,13 @@ PORT=30012 node --env-file=../.env server.mjs
 Or leave a watcher running so each push to `main` pulls and restarts:
 
 ```sh
-pkill -f server.mjs; sleep 2
-cd ~/gateway && nohup sh server/auto-update.sh >> /tmp/gateway-update.log 2>&1 &
+pkill -9 -f auto-update.sh; pkill -9 -f server.mjs; sleep 2
+cd ~/gateway && nohup sh server/auto-update.sh >/dev/null 2>&1 &
+sleep 2
 tail -20 /tmp/gateway-update.log
 ```
 
-The watcher polls `origin/main` every 30s, fast-forwards, then restarts Node on `PORT` (default `30012`). Logs: `/tmp/gateway.log` (app), `/tmp/gateway-update.log` (watcher).
+The watcher polls `origin/main` every 30s, fast-forwards, then restarts Node on **30012** (ignores the panel `PORT=3000`). Override with `GATEWAY_PORT` only if the allocation changes. Logs: `/tmp/gateway.log` (app), `/tmp/gateway-update.log` (watcher).
 
 First boot creates `./data/gateway.db` (SQLite). Apply the schema once:
 

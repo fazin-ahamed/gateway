@@ -6,7 +6,7 @@
 #
 # Env (optional):
 #   GATEWAY_ROOT   repo root (default: parent of this script's directory)
-#   PORT           listen port (default: 30012)
+#   GATEWAY_PORT   listen port (default: 30012). Panel PORT is ignored.
 #   POLL_SECONDS   git fetch interval (default: 30)
 #   GATEWAY_LOG    node stdout (default: /tmp/gateway.log)
 #   UPDATE_LOG     watcher stdout (default: /tmp/gateway-update.log)
@@ -15,7 +15,7 @@ set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=${GATEWAY_ROOT:-$(CDPATH= cd -- "$HERE/.." && pwd)}
-PORT=${PORT:-30012}
+PORT=${GATEWAY_PORT:-30012}
 POLL=${POLL_SECONDS:-30}
 LOG=${GATEWAY_LOG:-/tmp/gateway.log}
 UPDATE_LOG=${UPDATE_LOG:-/tmp/gateway-update.log}

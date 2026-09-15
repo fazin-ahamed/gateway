@@ -288,8 +288,10 @@ app.get("/v1/models", async (c) => {
     return auth;
   const { key } = auth;
   const allowed = await allowedSlugs(c, key);
+  if (!allowed.length)
+    return c.json({ object: "list", data: [] });
   const routes = await c.env.DB.prepare(
-    "SELECT DISTINCT slug FROM model_routes WHERE enabled=1 AND slug IN (" + (allowed.map(() => "?").join(",") || "NULL") + ") ORDER BY slug"
+    "SELECT DISTINCT slug FROM model_routes WHERE enabled=1 AND slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY slug"
   ).bind(...allowed).all();
   const data = (routes.results || []).map((r) => ({
     id: r.slug,
