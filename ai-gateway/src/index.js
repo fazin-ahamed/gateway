@@ -193,12 +193,18 @@ function isKeyExpired(key, at = nowIso()) {
 }
 var MODEL_LIMIT_KINDS = ["requests", "tokens", "usd"];
 var MODEL_LIMIT_PERIODS = ["minute", "day", "week", "month"];
+var GATEWAY_TZ = "Asia/Dubai";
+var GATEWAY_TZ_OFFSET_MIN = 240; // GST = UTC+4, fixed (no DST)
+function gatewayLocalDate(now = /* @__PURE__ */ new Date()) {
+  return new Date(now.getTime() + GATEWAY_TZ_OFFSET_MIN * 60000);
+}
 function periodBucket(period, now = /* @__PURE__ */ new Date()) {
-  const iso = now.toISOString();
+  const local = gatewayLocalDate(now);
+  const iso = local.toISOString();
   if (period === "minute")
     return iso.slice(0, 16);
   if (period === "week") {
-    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const d = new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()));
     d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
     return d.toISOString().slice(0, 10);
   }
@@ -240,7 +246,7 @@ async function enforceModelLimits(c, slug) {
   return null;
 }
 function periodStartIso(period, now = /* @__PURE__ */ new Date()) {
-  const d = new Date(now.getTime());
+  const d = gatewayLocalDate(now);
   if (period === "week") {
     d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
     return d.toISOString().slice(0, 10);
@@ -663,7 +669,6 @@ async function ensureUpstreamDispatcher() {
         bodyTimeout: 0,
         connectTimeout: 30000
       }));
-      blog("UPSTREAM dispatcher timeouts raised (headers 600s, body unlimited)");
     }
   } catch (e) {
     blog("UPSTREAM dispatcher setup failed: " + String(e.message || e));
