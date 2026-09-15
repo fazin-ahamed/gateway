@@ -390,11 +390,13 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   const cacheMode = (cacheModeHeader === "off" || cacheModeHeader === "false" || cacheModeHeader === "0") ? "off" : cacheModeHeader;
   const cacheable = !!key && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
+  const traj = trajectorySeed(c, payload, key, slug, isStream, requestId);
   blog("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));
   if (cacheKey && cacheMode !== "refresh") {
     const cached = await lookupResponseCache(c, cacheKey);
     if (cached) {
       blog("TRACE id=" + requestId + " cache=HIT ms=" + (Date.now() - started));
+      await recordTrajectory(c, { ...traj, status: "ok", httpStatus: 200, cacheState: "HIT", latencyMs: Date.now() - started, totalTokens: cached.source_tokens || 0, costUsd: cached.source_cost_usd || 0, responseJson: cached.response_body });
       return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "HIT" });
     }
   }
@@ -414,6 +416,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       const cached = await lookupResponseCache(c, cacheKey);
       if (cached) {
         blog("TRACE id=" + requestId + " cache=COALESCED ms=" + (Date.now() - started));
+        await recordTrajectory(c, { ...traj, status: "ok", httpStatus: 200, cacheState: "COALESCED", latencyMs: Date.now() - started, totalTokens: cached.source_tokens || 0, costUsd: cached.source_cost_usd || 0, responseJson: cached.response_body });
         return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "COALESCED" });
       }
     }
@@ -424,9 +427,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     let lastErr = null;
     let attempts = 0;
     for (const route of routes.results) {
+      const stepStart = Date.now();
+      const baseStep = { provider: route.provider_name, rank: route.rank };
       const key2 = await providerKey(c, route.provider_id);
       if (!key2) {
         lastErr = "provider " + route.provider_name + " has no key";
+        traj.steps.push({ ...baseStep, error: "no key", ms: Date.now() - stepStart });
         attempts++;
         continue;
       }
@@ -437,6 +443,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         if (!up.ok || !up.body) {
           const txt = await up.text();
           blog("FWD FAIL " + route.provider_name + " -> HTTP " + up.status + " [" + classifyUpstreamFailure(txt) + "] " + String(txt).slice(0, 300));
+          traj.steps.push({ ...baseStep, http: up.status, error: classifyUpstreamFailure(txt), ms: Date.now() - stepStart });
           attempts++;
           continue;
         }
@@ -448,6 +455,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           if (isGenericUpstreamErrorResponse(clientTxt)) {
             blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
             lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
+            traj.steps.push({ ...baseStep, http: up.status, error: "malformed envelope", ms: Date.now() - stepStart });
             attempts++;
             continue;
           }
@@ -470,18 +478,23 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           if (cacheKey)
             hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
           blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
+          traj.steps.push({ ...baseStep, http: up.status, ok: true, ms: Date.now() - stepStart });
+          await recordTrajectory(c, { ...traj, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
           return new Response(clientTxt, { status: up.status, headers: hdrs });
         }
         blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " rank=" + route.rank);
-        const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage);
+        traj.steps.push({ ...baseStep, http: up.status, ok: true, ms: Date.now() - stepStart, streaming: true });
+        const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1 });
         return result;
       } catch (e) {
         blog("FWD CATCH " + route.provider_name + " -> " + String(e && e.stack || e.message || e));
         lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
+        traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), ms: Date.now() - stepStart });
         attempts++;
       }
     }
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 503, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
     const errBody = lastErr
       ? { error: { message: lastErr, type: "upstream_error" } }
       : genericUpstreamError();
@@ -1152,7 +1165,7 @@ function wrapAnthropicStream(upReq, model) {
     }
   }), { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
 }
-async function handleStream(c, upReq, key, slug, route, requestId, payload, started, usageHint) {
+async function handleStream(c, upReq, key, slug, route, requestId, payload, started, usageHint, extra) {
   const reader = upReq.body.getReader();
   const dec = new TextDecoder();
   const enc = encoder;
@@ -1162,6 +1175,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   let streamError = null;
   let lastUsage = usageHint || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
   let malformedSseSent = false;
+  let contentBuf = "";
   const keepAlive = ((promise) => {
     const ctx = c.executionCtx;
     if (ctx && typeof ctx.waitUntil === "function")
@@ -1170,6 +1184,23 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   const persistOnce = (async () => {
     const costUsd = await computeCost(c, slug, lastUsage);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
+    if (extra && extra.traj) {
+      await recordTrajectory(c, {
+        ...extra.traj,
+        status: streamError ? "fail" : "ok",
+        httpStatus: streamError ? 500 : 200,
+        provider: route.provider_name,
+        rank: route.rank,
+        attempts: extra.attempts || 1,
+        promptTokens: lastUsage.prompt_tokens,
+        completionTokens: lastUsage.completion_tokens,
+        totalTokens: lastUsage.total_tokens,
+        costUsd,
+        latencyMs: Date.now() - started,
+        error: streamError || null,
+        responseJson: contentBuf ? JSON.stringify({ choices: [{ message: { role: "assistant", content: contentBuf } }], usage: lastUsage }) : null
+      });
+    }
   });
   const safeEnqueue = ((text) => {
     if (clientCancelled || !controllerRef)
@@ -1201,6 +1232,9 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             const u = usageFrom(obj);
             if (u && (u.total_tokens || u.completion_tokens || u.prompt_tokens))
               lastUsage = u;
+            const dc = obj && obj.choices && obj.choices[0] && obj.choices[0].delta;
+            if (dc && typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
+              contentBuf += dc.content;
             if (obj && obj.model && slug)
               obj.model = slug;
             sanitizeClientObject(obj);
@@ -1390,6 +1424,57 @@ async function recordUsage(c, key, usage) {
     "UPDATE api_keys SET used_tokens=used_tokens+?, used_usd=used_usd+?, request_count=request_count+1, updated_at=? WHERE key_id=?"
   ).bind(usage.total_tokens, usage.cost_usd || 0, nowIso(), key.key_id).run();
 }
+
+// ---- Trajectory capture (RL / SFT) ----
+var TRAJ_BODY_CAP = 131072;
+async function settingValue(c, key, dflt) {
+  try {
+    const row = await c.env.DB.prepare("SELECT value FROM gateway_settings WHERE key=?").bind(key).first();
+    return row && row.value != null ? String(row.value) : dflt;
+  } catch {
+    return dflt;
+  }
+}
+async function trajectoriesEnabled(c) {
+  return (await settingValue(c, "trajectory_capture", "on")) !== "off";
+}
+function capBody(text) {
+  const s = typeof text === "string" ? text : JSON.stringify(text ?? "");
+  return s.length > TRAJ_BODY_CAP ? s.slice(0, TRAJ_BODY_CAP) : s;
+}
+async function recordTrajectory(c, t) {
+  try {
+    if (!await trajectoriesEnabled(c))
+      return;
+    await c.env.DB.prepare(
+      `INSERT OR REPLACE INTO trajectories
+       (id, created_at, key_id, key_name, slug, stream, cache_state, status, http_status, provider, rank, attempts,
+        prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error, steps_json, request_json, response_json)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      t.id, nowIso(), t.keyId || null, t.keyName || null, t.slug, t.stream ? 1 : 0,
+      t.cacheState || null, t.status, t.httpStatus ?? null, t.provider || null,
+      t.rank ?? null, t.attempts || 0, t.promptTokens || 0, t.completionTokens || 0,
+      t.totalTokens || 0, t.costUsd || 0, t.latencyMs || 0, t.error ? String(t.error).slice(0, 2000) : null,
+      JSON.stringify(t.steps || []), t.requestJson ? capBody(t.requestJson) : null,
+      t.responseJson ? capBody(t.responseJson) : null
+    ).run();
+  } catch (e) {
+    blog("TRAJECTORY record failed: " + String(e.message || e));
+  }
+}
+function trajectorySeed(c, payload, key, slug, isStream, requestId) {
+  return {
+    id: requestId,
+    keyId: key && key.key_id || null,
+    keyName: key && key.name || null,
+    slug,
+    stream: isStream,
+    requestJson: JSON.stringify(sanitizeRequest(payload)),
+    steps: []
+  };
+}
+
 function sanitizeRequest(payload) {
   if (!payload || typeof payload !== "object")
     return payload;
@@ -2110,6 +2195,91 @@ app.get("/admin/logs", async (c) => {
   if (denied)
     return denied;
   return c.json({ logs: logBuffer });
+});
+app.get("/admin/trajectories", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const limit = Math.min(500, Math.max(1, Number(c.req.query("limit")) || 100));
+  const slug = String(c.req.query("slug") || "").trim();
+  const status = String(c.req.query("status") || "").trim();
+  let sql = "SELECT id, created_at, key_name, slug, stream, cache_state, status, http_status, provider, rank, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error FROM trajectories";
+  const conds = [];
+  const binds = [];
+  if (slug) { conds.push("slug=?"); binds.push(slug); }
+  if (status === "ok" || status === "fail") { conds.push("status=?"); binds.push(status); }
+  if (conds.length) sql += " WHERE " + conds.join(" AND ");
+  sql += " ORDER BY created_at DESC LIMIT ?";
+  binds.push(limit);
+  const rows = await c.env.DB.prepare(sql).bind(...binds).all();
+  const agg = await c.env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok_count, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost FROM trajectories").first();
+  return c.json({ trajectories: rows.results || [], stats: agg || { total: 0, ok_count: 0, tokens: 0, cost: 0 } });
+});
+app.get("/admin/trajectories/:id", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const row = await c.env.DB.prepare("SELECT * FROM trajectories WHERE id=?").bind(c.req.param("id")).first();
+  if (!row)
+    return c.json({ error: { message: "trajectory not found" } }, 404);
+  return c.json({ trajectory: row });
+});
+app.get("/admin/trajectories-export", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const format = String(c.req.query("format") || "sft");
+  const rows = await c.env.DB.prepare("SELECT slug, stream, status, provider, attempts, steps_json, request_json, response_json, cost_usd, total_tokens, created_at FROM trajectories WHERE status='ok' AND request_json IS NOT NULL AND response_json IS NOT NULL ORDER BY created_at").all();
+  const lines = [];
+  for (const r of rows.results || []) {
+    try {
+      const req = JSON.parse(r.request_json);
+      const resObj = JSON.parse(r.response_json);
+      const content = resObj && resObj.choices && resObj.choices[0] && resObj.choices[0].message && resObj.choices[0].message.content;
+      if (format === "sft") {
+        if (!Array.isArray(req.messages) || !content)
+          continue;
+        const messages = req.messages.concat([{ role: "assistant", content }]);
+        lines.push(JSON.stringify({ messages, model: r.slug }));
+      } else {
+        lines.push(JSON.stringify({
+          input: req, output: resObj, model: r.slug, provider: r.provider,
+          attempts: r.attempts, steps: JSON.parse(r.steps_json || "[]"),
+          tokens: r.total_tokens, cost_usd: r.cost_usd, created_at: r.created_at
+        }));
+      }
+    } catch {
+    }
+  }
+  return new Response(lines.join("\n") + "\n", {
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "content-disposition": "attachment; filename=trajectories-" + format + ".jsonl"
+    }
+  });
+});
+app.post("/admin/trajectories/purge", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const r = await c.env.DB.prepare("DELETE FROM trajectories").run();
+  return c.json({ purged: r && r.meta ? r.meta.changes : 0 });
+});
+app.get("/admin/trajectory-settings", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return c.json({ capture: await settingValue(c, "trajectory_capture", "on") });
+});
+app.post("/admin/trajectory-settings", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  const v = b.capture === "off" ? "off" : "on";
+  await c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('trajectory_capture', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(v, nowIso()).run();
+  return c.json({ capture: v });
 });
 app.get("/admin/cache", async (c) => {
   const denied = await requireAdmin(c);

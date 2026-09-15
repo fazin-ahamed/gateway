@@ -126,6 +126,21 @@ var PLAYGROUND_HTML = `<!doctype html>
   .form-actions{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
   #modal-body label{margin-top:2px}
   .filter-grid{display:grid;grid-template-columns:1.2fr 1.4fr 1.2fr 1.2fr .8fr auto;gap:12px;align-items:end}
+  .tj-chart{display:flex;flex-direction:column;gap:8px}
+  .tj-bar{display:grid;grid-template-columns:160px 1fr 80px;gap:10px;align-items:center}
+  .tj-bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--muted)}
+  .tj-bar-track{height:6px;background:var(--surface-deep);border-radius:3px;overflow:hidden}
+  .tj-bar-fill{height:100%;background:var(--accent);border-radius:3px;transition:width var(--dur) var(--ease)}
+  .tj-bar-val{text-align:right;font-size:10px;color:var(--muted)}
+  .tj-steps{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0}
+  .tj-step{padding:8px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface-deep)}
+  .tj-step.ok{border-color:rgba(62,201,140,.3)}
+  .tj-step.bad{border-color:rgba(228,91,91,.3)}
+  .tj-step.mut{border-color:var(--line)}
+  .tj-step .k{font-size:11px;font-weight:600}
+  .tj-step .v{font-size:9px;color:var(--muted);margin-top:2px}
+  .tj-arrow{color:var(--faint,#4d596a);font-size:12px}
+  @media (max-width:620px){.tj-bar{grid-template-columns:1fr;gap:4px}.tj-bar-val{text-align:left}}
   .lg-pre{max-height:60vh;font:11px/1.6 var(--mono);background:var(--surface-deep)}
   .lg-ts{color:var(--muted);margin-right:8px;font-size:10px}
   @media (max-width:1100px){.hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.cols2{grid-template-columns:1fr}.filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -147,6 +162,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="chat">Playground</button>
   <button type="button" data-tab="cache">Cache</button>
   <button type="button" data-tab="prices">Prices</button>
+  <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -269,6 +285,17 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-b flush" id="pr-list"></div></div>
   </section>
 
+  <section class="tab" id="tab-trajectories">
+    <div class="pagehead"><div><h2 class="sec">Trajectories</h2><p class="sub">Structured record of every request: route chain, provider outcome, tokens, cost, and full request/response bodies for RL and SFT export.</p></div><div class="actions"><button class="ghost" id="tj-export-sft">Export SFT</button><button class="ghost" id="tj-export-full">Export full</button><button class="ghost" id="tj-refresh">Refresh</button><button class="danger" id="tj-purge">Purge</button></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Settings</h2></div><div class="panel-b">
+      <label class="pg-check" style="margin:0"><input type="checkbox" id="tj-capture"> Capture trajectories</label>
+      <p class="hint">Bodies are capped at 128KB per side and secrets are stripped. Turn off to record nothing.</p>
+    </div></div>
+    <div class="hero-stats" id="tj-stats"></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Latency by model</h2></div><div class="panel-b" id="tj-chart"></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Recent requests</h2></div><div class="panel-b flush" id="tj-list"></div></div>
+  </section>
+
   <section class="tab" id="tab-logs">
     <div class="pagehead"><div><h2 class="sec">Logs</h2><p class="sub">Live request and provider events from this process. In memory only; the ring holds the last 500 lines and resets on restart.</p></div><div class="actions"><label class="pg-check" style="margin:0"><input type="checkbox" id="lg-auto"> Auto</label><button class="ghost" id="lg-refresh">Refresh</button><button class="ghost" id="lg-copy">Copy</button></div></div>
     <div class="panel"><div class="panel-b"><pre id="lg-out" class="lg-pre" style="margin:0"></pre></div></div>
@@ -325,6 +352,7 @@ async function selectTab(t){
     if(t==='chat') await refreshPlaygroundModels();
     if(t==='cache') await loadCache();
     if(t==='prices') await loadPrices();
+    if(t==='trajectories') await loadTrajectories();
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
@@ -885,6 +913,79 @@ document.getElementById('lg-auto').addEventListener('change',function(e){
   clearInterval(logsAutoTimer); logsAutoTimer=null;
   if(e.target.checked){ logsAutoTimer=setInterval(loadLogs,3000); loadLogs(); }
 });
+
+// ---------- TRAJECTORIES ----------
+async function loadTrajectories(){
+  const statsEl=document.getElementById('tj-stats'); const listEl=document.getElementById('tj-list'); const chartEl=document.getElementById('tj-chart');
+  paintSkeleton(statsEl);
+  let settings=null; try{ settings=(await api('/admin/trajectory-settings')).data; }catch(e){}
+  const capBox=document.getElementById('tj-capture'); if(capBox) capBox.checked=!settings||settings.capture!=='off';
+  let data; try{ data=(await api('/admin/trajectories?limit=300')).data; }catch(e){ listEl.innerHTML='<div class="empty">Could not load trajectories: '+esc(e.message)+'</div>'; return; }
+  const list=(data&&data.trajectories)||[]; const s=(data&&data.stats)||{};
+  const okRate=s.total?Math.round(100*(s.ok_count||0)/s.total)+'%':'-';
+  statsEl.innerHTML=[
+    {k:'Requests',v:fmt(s.total||0),c:''},
+    {k:'Success',v:okRate,c:'ok'},
+    {k:'Tokens',v:fmt(s.tokens||0),c:'acc'},
+    {k:'Cost',v:money(s.cost||0),c:''}
+  ].map(function(x){return '<div class="stat"><div class="k">'+x.k+'</div><div class="v '+x.c+'">'+esc(x.v)+'</div></div>';}).join('');
+  const byModel={};
+  list.forEach(function(t){ if(t.status!=='ok') return; const k=t.slug; (byModel[k]=byModel[k]||[]).push(t.latency_ms||0); });
+  const models=Object.keys(byModel).sort();
+  if(!models.length){ chartEl.innerHTML='<div class="empty">No recorded requests yet.</div>'; }
+  else{
+    chartEl.innerHTML='<div class="tj-chart">'+models.map(function(m){
+      const lat=byModel[m]; const avg=lat.reduce(function(a,b){return a+b;},0)/lat.length;
+      const max=Math.max.apply(null,models.map(function(x){const l=byModel[x];return l.reduce(function(a,b){return a+b;},0)/l.length;}));
+      const pct=max>0?Math.max(6,Math.round(100*avg/max)):6;
+      return '<div class="tj-bar"><div class="tj-bar-label mono">'+esc(m)+'</div><div class="tj-bar-track"><div class="tj-bar-fill" style="width:'+pct+'%"></div></div><div class="tj-bar-val mono">'+Math.round(avg)+'ms</div></div>';
+    }).join('')+'</div>';
+  }
+  const rows=list.map(function(t){
+    const pill=t.status==='ok'?'<span class="pill ok">ok</span>':'<span class="pill bad">fail</span>';
+    const cache=t.cache_state?'<span class="pill mut">'+esc(t.cache_state)+'</span>':'';
+    return '<tr><td class="mono small">'+esc((t.created_at||'').slice(5,19).replace('T',' '))+'</td><td>'+esc(t.slug)+'</td><td>'+esc(t.provider||'-')+'</td><td>'+pill+' '+cache+'</td><td class="mono">'+fmt(t.total_tokens||0)+'</td><td class="mono">'+fmt(t.latency_ms||0)+'ms</td><td class="mono">'+money(t.cost_usd||0)+'</td><td><button class="ghost" data-act="tjview" data-id="'+esc(t.id)+'">view</button></td></tr>';
+  }).join('') || '<tr><td colspan="8"><div class="empty">No trajectories captured yet.</div></td></tr>';
+  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Provider</th><th>Status</th><th>Tokens</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>';
+}
+async function viewTrajectory(id){
+  const {data}=await api('/admin/trajectories/'+id); const t=data&&data.trajectory; if(!t){ toast('not found','err'); return; }
+  const steps=(function(){ try{ return JSON.parse(t.steps_json||'[]'); }catch(e){ return []; } })();
+  const reqs=(function(){ try{ return JSON.parse(t.request_json||'null'); }catch(e){ return null; } })();
+  const resps=(function(){ try{ return JSON.parse(t.response_json||'null'); }catch(e){ return null; } })();
+  const stepsHtml=steps.length?'<div class="tj-steps">'+steps.map(function(s,i){
+    const cls=s.ok?'ok':(s.error?'bad':'mut');
+    const label=s.ok?(s.http||'ok'):(s.error||s.http||'fail');
+    return (i>0?'<span class="tj-arrow">-&gt;</span>':'')+'<div class="tj-step '+cls+'"><div class="k mono">'+esc(s.provider)+' r'+s.rank+'</div><div class="v">'+esc(label)+' '+(s.ms?' '+s.ms+'ms':'')+'</div></div>';
+  }).join('')+'</div>':'<div class="empty">No step chain.</div>';
+  const reqHtml=reqs?'<pre>'+esc(JSON.stringify(reqs.messages||reqs,null,2).slice(0,4000))+'</pre>':'<div class="empty">No request body.</div>';
+  const content=resps&&resps.choices&&resps.choices[0]&&resps.choices[0].message?resps.choices[0].message.content:null;
+  const respHtml=content!=null?'<pre>'+esc(String(content).slice(0,4000))+'</pre>':'<div class="empty">No response content.</div>';
+  document.querySelector('.modal').classList.add('wide');
+  document.getElementById('modal-title').textContent='Trajectory '+t.slug;
+  document.getElementById('modal-title').style.color='';
+  const body=document.getElementById('modal-body');
+  body.innerHTML='<div class="kvrow"><span class="small">'+esc(t.created_at||'')+'</span><span class="right mono small">'+esc(t.status)+' '+fmt(t.latency_ms||0)+'ms '+fmt(t.total_tokens||0)+' tok</span></div>'
+    +'<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Route chain</h3>'+stepsHtml
+    +'<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Request</h3>'+reqHtml
+    +'<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Response</h3>'+respHtml
+    +(t.error?'<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Error</h3><pre>'+esc(t.error)+'</pre>':'');
+  document.getElementById('modal-save').style.display='none';
+  document.getElementById('overlay').classList.add('show');
+}
+document.addEventListener('click',function(e){
+  const b=e.target.closest('[data-act="tjview"]'); if(!b) return;
+  viewTrajectory(b.getAttribute('data-id'));
+});
+document.getElementById('tj-refresh').onclick=function(){ loadTrajectories(); };
+document.getElementById('tj-purge').onclick=function(){ confirmAction('Purge trajectories','Delete every captured trajectory? This cannot be undone.','Purge',async function(){ await api('/admin/trajectories/purge',{method:'POST'}); loadTrajectories(); }); };
+document.getElementById('tj-capture').addEventListener('change',async function(e){
+  await api('/admin/trajectory-settings',{method:'POST',body:JSON.stringify({capture:e.target.checked?'on':'off'})});
+  toast(e.target.checked?'capture on':'capture off','ok');
+});
+function downloadTraj(fmt){ const a=document.createElement('a'); a.href=API+'/admin/trajectories-export?format='+fmt; a.download='trajectories-'+fmt+'.jsonl'; document.body.appendChild(a); a.click(); a.remove(); }
+document.getElementById('tj-export-sft').onclick=function(){ downloadTraj('sft'); };
+document.getElementById('tj-export-full').onclick=function(){ downloadTraj('full'); };
 
 // init
 loadOverview();

@@ -117,3 +117,41 @@ CREATE TABLE IF NOT EXISTS prices (
   currency TEXT NOT NULL DEFAULT 'USD',
   updated_at TEXT NOT NULL
 );
+
+-- Per-request trajectory capture for review, RL, and SFT export.
+-- steps_json holds the per-route attempt chain; bodies are capped at
+-- ~128KB on write. Capture runs only when gateway_settings row
+-- trajectory_capture is not 'off'.
+CREATE TABLE IF NOT EXISTS trajectories (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  key_id TEXT,
+  key_name TEXT,
+  slug TEXT NOT NULL,
+  stream INTEGER NOT NULL DEFAULT 0,
+  cache_state TEXT,
+  status TEXT NOT NULL,
+  http_status INTEGER,
+  provider TEXT,
+  rank INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  steps_json TEXT NOT NULL DEFAULT '[]',
+  request_json TEXT,
+  response_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trajectories_created
+  ON trajectories(created_at);
+CREATE INDEX IF NOT EXISTS idx_trajectories_slug
+  ON trajectories(slug);
+
+CREATE TABLE IF NOT EXISTS gateway_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
