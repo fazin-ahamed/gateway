@@ -2199,7 +2199,7 @@ app.delete("/admin/prices/:slug", async (c) => {
   await c.env.DB.prepare("DELETE FROM prices WHERE slug=?").bind(slug).run();
   return c.json({ ok: true });
 });
-var SHARED_THEME = ":root{--bg:#0b0d11;--surface:#11151c;--surface-deep:#0d1117;--line:#252c37;--line-hi:#364152;--text:#edf1f7;--muted:#8d98a8;--accent:#77a7ff;--good:#62d3a5;--warn:#e7bd67;--bad:#f07d7d;--w-med:600;--w-bold:700;}";
+var SHARED_THEME = ":root{--bg:#0a0c10;--surface:#12161d;--surface-deep:#0c1016;--line:#232a34;--line-hi:#3a4454;--text:#eef2f7;--muted:#8b96a6;--accent:#3dd6c6;--good:#62d3a5;--warn:#e7bd67;--bad:#f07d7d;--w-med:600;--w-bold:650;}";
 var ADMIN_UI_PATH = "/_gw";
 function adminHtml(html) {
   return new Response(html, {
