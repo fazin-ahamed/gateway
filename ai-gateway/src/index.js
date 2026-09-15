@@ -160,6 +160,48 @@ function normalizeKeyExpiry(value, nowMs = Date.now()) {
 function isKeyExpired(key, at = nowIso()) {
   return !!(key && key.expires_at && String(key.expires_at) <= at);
 }
+async function enforceModelLimits(c, slug) {
+  const lim = await c.env.DB.prepare("SELECT requests_per_minute, max_total_tokens FROM model_limits WHERE slug=?").bind(slug).first();
+  if (!lim)
+    return null;
+  const rpm = Number(lim.requests_per_minute) || 0;
+  if (rpm > 0) {
+    const now = /* @__PURE__ */ new Date();
+    const bucket = now.toISOString().slice(0, 16);
+    const expiresAt = new Date(now.getTime() + 2 * 60 * 1e3).toISOString().replace(".000", "");
+    const row = await c.env.DB.prepare(
+      `INSERT INTO model_rate_windows (slug, bucket, request_count, expires_at) VALUES (?,?,1,?)
+       ON CONFLICT(slug,bucket) DO UPDATE SET request_count=request_count+1
+       RETURNING request_count`
+    ).bind(slug, bucket, expiresAt).first();
+    if (Number(row && row.request_count) > rpm)
+      return c.json({ error: { message: 'Model "' + slug + '" is rate limited (' + rpm + " req/min). Retry shortly.", type: "model_rate_limited" } }, 429, { "retry-after": String(60 - now.getUTCSeconds()) });
+  }
+  const cap = Number(lim.max_total_tokens) || 0;
+  if (cap > 0) {
+    const day = nowIso().slice(0, 10);
+    const row = await c.env.DB.prepare("SELECT tokens FROM model_token_usage WHERE slug=? AND day=?").bind(slug, day).first();
+    if (Number(row && row.tokens) >= cap)
+      return c.json({ error: { message: 'Model "' + slug + '" has used its daily token budget (' + cap + "). Resets at midnight UTC.", type: "model_budget_exceeded" } }, 429);
+  }
+  return null;
+}
+async function recordModelTokens(c, slug, tokens) {
+  if (!slug)
+    return;
+  const t = Number(tokens) || 0;
+  if (t <= 0)
+    return;
+  const day = nowIso().slice(0, 10);
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO model_token_usage (slug, day, tokens) VALUES (?,?,?)
+       ON CONFLICT(slug,day) DO UPDATE SET tokens=tokens+excluded.tokens`
+    ).bind(slug, day, t).run();
+  } catch (e) {
+    blog("MODEL_TOKEN usage record failed: " + String(e.message || e));
+  }
+}
 async function enforceRequestLimit(c, key) {
   const limit = normalizeRequestLimit(key.request_limit_per_minute);
   if (!limit)
@@ -383,6 +425,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   if (!routes.results || !routes.results.length) {
     return c.json({ error: { message: 'No healthy route for model "' + slug + '"', type: "no_route" } }, 503);
   }
+  const modelDenied = await enforceModelLimits(c, slug);
+  if (modelDenied)
+    return modelDenied;
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
   const isStream = !!payload.stream;
@@ -460,6 +505,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             continue;
           }
           await recordUsage(c, key, { ...usage, cost_usd: costUsd });
+          await recordModelTokens(c, slug, usage.total_tokens);
           if (cacheKey && isCacheableResponse(clientTxt)) {
             await storeResponseCache(c, {
               cacheKey,
@@ -1184,6 +1230,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   const persistOnce = (async () => {
     const costUsd = await computeCost(c, slug, lastUsage);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
+    await recordModelTokens(c, slug, lastUsage.total_tokens);
     if (extra && extra.traj) {
       await recordTrajectory(c, {
         ...extra.traj,
@@ -2270,6 +2317,46 @@ app.get("/admin/trajectory-settings", async (c) => {
   if (denied)
     return denied;
   return c.json({ capture: await settingValue(c, "trajectory_capture", "on") });
+});
+app.get("/admin/model-limits", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const rows = await c.env.DB.prepare(
+    `SELECT ml.slug, ml.requests_per_minute, ml.max_total_tokens, ml.updated_at,
+            COALESCE((SELECT tokens FROM model_token_usage mtu WHERE mtu.slug=ml.slug AND mtu.day=?),0) AS today_tokens,
+            (SELECT GROUP_CONCAT(bucket || ':' || request_count) FROM (SELECT bucket, request_count FROM model_rate_windows mrw WHERE mrw.slug=ml.slug AND mrw.expires_at > ? ORDER BY bucket DESC LIMIT 3)) AS recent_windows
+     FROM model_limits ml ORDER BY ml.slug`
+  ).bind(nowIso().slice(0, 10), nowIso()).all();
+  return c.json({ limits: rows.results || [] });
+});
+app.post("/admin/model-limits", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  if (!b.slug)
+    return c.json({ error: { message: "slug required" } }, 400);
+  const rpm = b.requests_per_minute === "" || b.requests_per_minute == null ? null : Number(b.requests_per_minute);
+  const cap = b.max_total_tokens === "" || b.max_total_tokens == null ? null : Number(b.max_total_tokens);
+  if (rpm != null && (!Number.isFinite(rpm) || rpm < 0))
+    return c.json({ error: { message: "requests_per_minute must be 0 or positive (0 = unlimited)" } }, 400);
+  if (cap != null && (!Number.isFinite(cap) || cap < 0))
+    return c.json({ error: { message: "max_total_tokens must be 0 or positive (0 = unlimited)" } }, 400);
+  await c.env.DB.prepare("INSERT INTO model_limits (slug, requests_per_minute, max_total_tokens, updated_at) VALUES (?,?,?,?) ON CONFLICT(slug) DO UPDATE SET requests_per_minute=excluded.requests_per_minute, max_total_tokens=excluded.max_total_tokens, updated_at=excluded.updated_at")
+    .bind(String(b.slug), rpm && rpm > 0 ? Math.floor(rpm) : null, cap && cap > 0 ? Math.floor(cap) : null, nowIso()).run();
+  return c.json({ slug: String(b.slug), requests_per_minute: rpm, max_total_tokens: cap });
+});
+app.delete("/admin/model-limits/:slug", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const slug = decodeURIComponent(c.req.param("slug"));
+  await c.env.DB.prepare("DELETE FROM model_limits WHERE slug=?").bind(slug).run();
+  await c.env.DB.prepare("DELETE FROM model_rate_windows WHERE slug=?").bind(slug).run();
+  await c.env.DB.prepare("DELETE FROM model_token_usage WHERE slug=?").bind(slug).run();
+  return c.json({ ok: true });
 });
 app.post("/admin/trajectory-settings", async (c) => {
   const denied = await requireAdmin(c);

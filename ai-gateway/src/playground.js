@@ -162,6 +162,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="chat">Playground</button>
   <button type="button" data-tab="cache">Cache</button>
   <button type="button" data-tab="prices">Prices</button>
+  <button type="button" data-tab="limits">Limits</button>
   <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
@@ -285,6 +286,19 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-b flush" id="pr-list"></div></div>
   </section>
 
+  <section class="tab" id="tab-limits">
+    <div class="pagehead"><div><h2 class="sec">Model limits</h2><p class="sub">Per-model global caps. Requests/min applies instantly; daily token budget counts every recorded request and resets at midnight UTC. 0 or blank means unlimited.</p></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Set limit</h2></div><div class="panel-b">
+      <div class="form-grid">
+        <div><label>Model slug</label><select id="lm-slug"></select></div>
+        <div><label>Requests / minute</label><input id="lm-rpm" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div><label>Max tokens / day</label><input id="lm-tokens" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div class="full"><button class="act" id="lm-save">Save limit</button></div>
+      </div>
+    </div></div>
+    <div class="panel"><div class="panel-b flush" id="lm-list"></div></div>
+  </section>
+
   <section class="tab" id="tab-trajectories">
     <div class="pagehead"><div><h2 class="sec">Trajectories</h2><p class="sub">Structured record of every request: route chain, provider outcome, tokens, cost, and full request/response bodies for RL and SFT export.</p></div><div class="actions"><button class="ghost" id="tj-export-sft">Export SFT</button><button class="ghost" id="tj-export-full">Export full</button><button class="ghost" id="tj-refresh">Refresh</button><button class="danger" id="tj-purge">Purge</button></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Settings</h2></div><div class="panel-b">
@@ -352,6 +366,7 @@ async function selectTab(t){
     if(t==='chat') await refreshPlaygroundModels();
     if(t==='cache') await loadCache();
     if(t==='prices') await loadPrices();
+    if(t==='limits') await loadLimits();
     if(t==='trajectories') await loadTrajectories();
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
@@ -986,6 +1001,52 @@ document.getElementById('tj-capture').addEventListener('change',async function(e
 function downloadTraj(fmt){ const a=document.createElement('a'); a.href=API+'/admin/trajectories-export?format='+fmt; a.download='trajectories-'+fmt+'.jsonl'; document.body.appendChild(a); a.click(); a.remove(); }
 document.getElementById('tj-export-sft').onclick=function(){ downloadTraj('sft'); };
 document.getElementById('tj-export-full').onclick=function(){ downloadTraj('full'); };
+
+// ---------- LIMITS ----------
+async function loadLimits(){
+  const el=document.getElementById('lm-list');
+  paintSkeleton(el);
+  await refreshLimitSlugSelect();
+  let data; try{ const res=await api('/admin/model-limits'); data=res.data; }catch(e){ paintLoadError(el,'Could not load limits: '+e.message,loadLimits); return; }
+  const rows=(data&&data.limits||[]).map(function(l){
+    const rpm=l.requests_per_minute?l.requests_per_minute+'/min':'<span class="pill mut">unlimited</span>';
+    const cap=l.max_total_tokens?fmt(l.max_total_tokens)+'/day':'<span class="pill mut">unlimited</span>';
+    const used=l.today_tokens?fmt(l.today_tokens)+' today':'<span class="pill mut">0 today</span>';
+    const win=l.recent_windows?('<div class="small">'+esc(l.recent_windows)+'</div>'):'';
+    return '<tr><td class="mono">'+esc(l.slug)+'</td><td>'+rpm+'</td><td>'+cap+'</td><td>'+used+win+'</td><td><button class="ghost" data-act="lmedit" data-slug="'+esc(l.slug)+'" data-rpm="'+(l.requests_per_minute||'')+'" data-cap="'+(l.max_total_tokens||'')+'">edit</button> <button class="danger" data-act="lmdel" data-slug="'+esc(l.slug)+'">remove</button></td></tr>';
+  }).join('') || '<tr><td colspan="5"><div class="empty">No model limits set.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Slug</th><th>Requests/min</th><th>Tokens/day</th><th>Used today</th><th></th></tr>'+rows+'</table>';
+}
+async function refreshLimitSlugSelect(){
+  const sel=document.getElementById('lm-slug'); if(!sel) return;
+  const opts=await publicModelOptions();
+  sel.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';}).join('') || '<option value="">No enabled public models</option>';
+}
+document.getElementById('lm-save').onclick=async function(){
+  const slug=document.getElementById('lm-slug').value;
+  if(!slug){ toast('pick a slug','err'); return; }
+  const body={ slug, requests_per_minute: document.getElementById('lm-rpm').value, max_total_tokens: document.getElementById('lm-tokens').value };
+  const {status,data}=await api('/admin/model-limits',{method:'POST',body:JSON.stringify(body)});
+  if(status===200){ toast('limit saved for '+slug,'ok'); document.getElementById('lm-rpm').value=''; document.getElementById('lm-tokens').value=''; loadLimits(); }
+  else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
+};
+document.addEventListener('click',function(e){
+  const b=e.target.closest('button[data-act]'); if(!b) return;
+  const act=b.getAttribute('data-act');
+  if(act==='lmedit'){
+    document.getElementById('lm-slug').value=b.getAttribute('data-slug');
+    document.getElementById('lm-rpm').value=b.getAttribute('data-rpm');
+    document.getElementById('lm-tokens').value=b.getAttribute('data-cap');
+    toast('editing '+b.getAttribute('data-slug'),'ok');
+    return;
+  }
+  if(act==='lmdel'){
+    confirmAction('Remove model limit','Remove the limit on '+b.getAttribute('data-slug')+'?','Remove',async function(){
+      await api('/admin/model-limits/'+encodeURIComponent(b.getAttribute('data-slug')),{method:'DELETE'});
+      loadLimits();
+    });
+  }
+});
 
 // init
 loadOverview();

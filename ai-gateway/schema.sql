@@ -155,3 +155,25 @@ CREATE TABLE IF NOT EXISTS gateway_settings (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Global per-model limits: request rate (per minute, sliding bucket) and
+-- total token budget. A 0/NULL in either means "unlimited".
+CREATE TABLE IF NOT EXISTS model_limits (
+  slug TEXT PRIMARY KEY,
+  requests_per_minute INTEGER,
+  max_total_tokens INTEGER,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_rate_windows (
+  slug TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  request_count INTEGER NOT NULL DEFAULT 1,
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (slug, bucket)
+);
+CREATE TABLE IF NOT EXISTS model_token_usage (
+  slug TEXT NOT NULL,
+  day TEXT NOT NULL,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (slug, day)
+);
