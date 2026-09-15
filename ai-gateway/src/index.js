@@ -173,7 +173,7 @@ function bytesToB64url(bytes) {
   let s = "";
   for (const b of bytes)
     s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g).replace(/=+$/g, "");
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 function b64urlToBytes(text) {
   const b64 = text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4);
