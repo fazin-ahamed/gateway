@@ -723,16 +723,24 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   // rotated value so the stored provider key does not keep a token the site has
   // already retired (that is the "worked yesterday, 401 today" failure).
   const recovered = rotatedToken(created.headers) || token;
+  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered });
+}
+
+// One converter for both transports: the signed HTTP path and the browser path
+// hand over the same chat.z.ai frame stream, so the OpenAI mapping lives here
+// rather than twice.
+async function shapeFrameResponse(input) {
+  const { id, model, source, promptTokens, isStream, recovered } = input;
   if (isStream) {
     const headers = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };
-    return { response: new Response(toOpenAiStream(up.body, route.upstream_model || modelId, id), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
+    return { response: new Response(toOpenAiStream(source, model, id), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
   }
 
   // Non-streaming: drain the same frame stream into a single completion body.
   let content = "";
   let reasoning = "";
   let failure = null;
-  await readDeltas(up.body, (delta) => {
+  await readDeltas(source, (delta) => {
     if (delta.error) {
       failure = delta.error;
       return true;
@@ -754,7 +762,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
     id,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: route.upstream_model || modelId,
+    model,
     choices: [{ index: 0, message, finish_reason: "stop" }],
     usage: { prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, total_tokens: usage.total_tokens }
   };
@@ -777,7 +785,87 @@ export function withRotatedToken(rawKey, newToken) {
 }
 
 export function isZaiWebFormat(value) {
-  return String(value || "").toLowerCase() === "zaiweb";
+  const fmt2 = String(value || "").toLowerCase();
+  return fmt2 === "zaiweb" || fmt2 === "zaiwebbrowser";
+}
+
+export function isZaiBrowserFormat(value) {
+  return String(value || "").toLowerCase() === "zaiwebbrowser";
+}
+
+// Browser-backed transport: no captcha from the caller, because the page makes
+// the call itself. Requires the Node host (a browser cannot run in a Worker).
+export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
+  const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
+  const caps = getModelCapabilities(modelId);
+  if (!caps)
+    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
+  if (payload.tools || payload.functions)
+    throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
+  const images = countImages(payload.messages);
+  if (images && !caps.vision)
+    throw new ZaiWebError(400, "Z.ai model " + unprefixedModelId(modelId) + " does not accept image input; use glm-5.3-flash.", "zai_vision_unsupported");
+
+  const { token } = parseCredential(rawKey, payload);
+  if (!token || !userIdFromToken(token))
+    throw credentialError();
+
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const prompt = foldPrompt(messages, payload.system);
+  if (!prompt)
+    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
+
+  const { runBrowserTurn, ZaiBrowserUnavailable } = c && c.zaiRunBrowserTurn
+    ? { runBrowserTurn: c.zaiRunBrowserTurn, ZaiBrowserUnavailable: class extends Error {} }
+    : await import("./zaibrowser.js");
+  let turn;
+  try {
+    turn = await runBrowserTurn(token, prompt, { turnTimeoutMs: Number(payload.turn_timeout_ms) || 0 });
+  } catch (e) {
+    if (e instanceof ZaiBrowserUnavailable)
+      throw new ZaiWebError(e.status || 503, e.message, e.code || "zai_browser_unavailable");
+    throw new ZaiWebError(502, "Z.AI browser transport failed: " + String(e && e.message || e).slice(0, 300), "zai_browser");
+  }
+
+  const id = "chatcmpl-zaib-" + Date.now().toString(36);
+  const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
+  // The frame converter reads a stream; wrap the captured response text.
+  const source = new Response(turn.body).body || new Response("").body;
+  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: null });
+}
+
+// Rebuild the caller's conversation into one prompt for the browser transport.
+function foldPrompt(messages, system) {
+  const out = [];
+  if (typeof system === "string" && system.trim())
+    out.push("SYSTEM:\n" + system.trim());
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m)
+      continue;
+    const text = foldText(m.content);
+    if (!text.trim())
+      continue;
+    const role = m.role === "assistant" ? "ASSISTANT" : m.role === "system" || m.role === "developer" ? "SYSTEM" : "USER";
+    out.push(role + ":\n" + text);
+  }
+  return out.join("\n\n");
+}
+
+function foldText(content) {
+  if (typeof content === "string")
+    return content;
+  if (!Array.isArray(content))
+    return "";
+  const parts = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object")
+      continue;
+    if (typeof part.text === "string")
+      parts.push(part.text);
+    else if (part.type === "image_url" && part.image_url && typeof part.image_url.url === "string")
+      parts.push("[image: " + part.image_url.url.slice(0, 2048) + "]");
+  }
+  return parts.join("\n");
 }
 
 // Probe used by the admin "test provider" button: reports whether the stored

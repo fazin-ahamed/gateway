@@ -535,7 +535,7 @@ function applyHeaderPreset(v){
   delete v.header_preset; return v;
 }
 var HEADER_PRESET_OPTIONS=[{value:'none',label:'No preset'},{value:'openrouter',label:'OpenRouter app headers'},{value:'claudecode',label:'Claude Code beta'},{value:'anthropicbeta',label:'Anthropic prompt-caching beta'},{value:'harness',label:'Harness fingerprint (omp / Claude Code)'},{value:'custom',label:'Custom only'}];
-var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'},{value:'zaiweb',label:'Z.ai web chat (chat.z.ai session)'}];
+var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'},{value:'zaiweb',label:'Z.ai web chat (HTTP + captcha proof)'},{value:'zaiwebbrowser',label:'Z.ai web chat (browser, automatic)'}];
 // Applies a provider preset to the open provider form: fills the copy the
 // preset owns and reveals the route fields, so a known upstream is two clicks
 // in the console instead of a hand-typed base_url + fmt + slugs.

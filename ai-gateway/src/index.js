@@ -2,7 +2,7 @@ import { LOGIN_HTML } from "./login.js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
-import { callZaiWeb, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
+import { callZaiBrowser, callZaiWeb, isZaiBrowserFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options");
@@ -807,6 +807,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
 }
 async function forwardToProvider(c, route, apiKey, payload, isStream, requestId) {
   const fmt2 = (route.fmt || "openai").toLowerCase();
+  if (isZaiBrowserFormat(fmt2)) {
+    if (route.transport && route.transport !== "auto" && route.transport !== "direct")
+      throw new ZaiWebError(400, 'Z.AI browser routes must use direct transport (transport="' + route.transport + '"); the browser runs on the gateway host.', "zai_transport");
+    blog("FWD zaibrowser model=" + (route.upstream_model || (payload && payload.model)));
+    return callZaiBrowser(c, route, apiKey, payload, isStream);
+  }
   // Z.ai consumer web chat is signed-HTTP only: it talks to chat.z.ai with a
   // session JWT, not to a base_url. Relays would strip the session, so it is
   // clamped to direct egress rather than silently failing through a tunnel.
@@ -941,7 +947,7 @@ function koyebCfg(env) {
     secret: String(env && env.KOYEB_RELAY_SECRET || "")
   };
 }
-var PROVIDER_FORMATS = ["openai", "anthropic", "zaiweb"];
+var PROVIDER_FORMATS = ["openai", "anthropic", "zaiweb", "zaiwebbrowser"];
 function normalizeProviderFormat(value, fallback) {
   const fmt2 = String(value == null ? "" : value).trim().toLowerCase();
   if (!fmt2)
@@ -2883,6 +2889,21 @@ app.get("/admin/proxy-health", async (c) => {
 // upstream offers a standard family, seeds routes so a new provider is usable
 // from the console without hand-copying slugs and model ids.
 var PROVIDER_PRESETS = [
+  {
+    id: "zai-browser",
+    label: "Z.AI web chat — automatic (browser)",
+    summary: "Drives chat.z.ai in a local Chromium so the page solves its own CAPTCHA: no proof to paste, ever. Needs the Node host (Chromium installed) and the session token.",
+    fmt: "zaiwebbrowser",
+    name: "Z.AI web chat (browser)",
+    base_url: "https://chat.z.ai",
+    transport: "direct",
+    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — no captcha needed',
+    credential_format: "provider_credential",
+    routes: [
+      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
+      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
+    ]
+  },
   {
     id: "zai-web",
     label: "Z.AI web chat (chat.z.ai, no API key)",

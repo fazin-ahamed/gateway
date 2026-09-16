@@ -89,17 +89,46 @@ wrangler d1 execute DB --command "ALTER TABLE providers ADD COLUMN enabled INTEG
 | `anthropic` | `{base_url}/messages`                      | API key, sent as `x-api-key`                                                                          |
 | `zaiweb`    | Z.ai consumer web chat (`https://chat.z.ai`) | JSON `{"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}` or a bare JWT token |
 
-### Presets
+### Z.ai web chat — automatic (`zaiwebbrowser`)
+
+The `zaiweb` format above needs a fresh CAPTCHA proof per completion, which no
+one wants to paste by hand. `zaiwebbrowser` removes that step: the gateway
+drives chat.z.ai in a local Chromium and lets the page mint its own proof.
+
+- Requires the **Node host** (a Worker cannot run a browser) with Chromium:
+  `npm install playwright && npx playwright install chromium`, or point
+  `BROWSER_EXECUTABLE` at an existing Chromium binary.
+- Credential is the session token only: `{"token":"<chat.z.ai localStorage token>"}`.
+- Measured live: first turn ~8 s (includes cold Chromium launch), warm turns
+  ~2.4 s, no captcha input at any point.
+- One browser context is pooled per credential and reused, so consecutive
+  requests stay warm; idle contexts are closed after 5 minutes.
+- Same gates as `zaiweb`: no caller-supplied tools (`zai_tools_unsupported`),
+  images only on `glm-5.3-flash`, model access still per account tier.
+- Memory: a Chromium process runs alongside the gateway (roughly 300–500 MB).
+  On a small VM set `SESSION_POOL_SIZE`/limits accordingly, or use an API-key
+  provider where a browser is not needed at all.
+
+### Using an OpenAI-compatible bridge instead
+
+If you would rather not run a browser, any OpenAI-compatible bridge for
+chat.z.ai works as a plain `openai` provider — point `base_url` at it and use
+the bridge's own token as the credential. A preset is not needed; the
+**Custom / other provider** option in the console covers it. Such bridges mint
+the CAPTCHA proof themselves, which is efficient, but it means a third-party
+process (and whatever credentials it ships) sits in your request path, so run
+one you build or trust locally rather than a public instance.
 
 **Providers → Add provider** opens with a **Preset** picker. A preset fills the
 name, base URL, format and transport, retargets the credential hint, and offers
 the usual model routes; every field stays editable before saving, and choosing
 *Custom / other provider* clears the form back to blank.
 
-| Preset    | Result                                                                                  |
-| --------- | --------------------------------------------------------------------------------------- |
-| `zai-web` | `zaiweb` provider on `https://chat.z.ai`, direct transport, routes `z-ai/glm-5.3-flash` + `z-ai/glm-5.3` |
-| `zai-api` | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
+| Preset         | Result                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------- |
+| `zai-browser`  | `zaiwebbrowser` provider on `https://chat.z.ai` — automatic, no captcha; routes `z-ai/glm-5.3-flash` + `z-ai/glm-5.3` |
+| `zai-web`      | `zaiweb` provider on `https://chat.z.ai`, direct transport; routes `z-ai/glm-5.3-flash` + `z-ai/glm-5.3` |
+| `zai-api`      | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
 
 Route seeding never repoints a live slug: a preset only adds routes for slugs
 that have no enabled route yet, and reports the rest as kept. API:
