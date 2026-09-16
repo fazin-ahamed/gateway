@@ -155,6 +155,30 @@ CREATE INDEX IF NOT EXISTS idx_trajectories_created
 CREATE INDEX IF NOT EXISTS idx_trajectories_slug
   ON trajectories(slug);
 
+-- Model-integrity probe runs (`ai-gateway/src/modelprobe.js`): does a provider
+-- actually serve the model a route claims? Kept out of `trajectories` on
+-- purpose — that table feeds cost/limits and RL/SFT export, and a probe is
+-- neither traffic nor a completion. One row per (slug, provider) run; the
+-- latest verdict per pair is what the console and the auto-router read.
+CREATE TABLE IF NOT EXISTS provider_probe_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  slug TEXT NOT NULL,
+  upstream_model TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  measured_family TEXT,
+  claimed_family TEXT,
+  relay_count INTEGER NOT NULL DEFAULT 0,
+  exact_fingerprint INTEGER NOT NULL DEFAULT 0,
+  signals_json TEXT NOT NULL DEFAULT '[]',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  http_status INTEGER,
+  elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_probe_runs_slug_provider
+  ON provider_probe_runs(slug, provider_id, created_at);
+
 CREATE TABLE IF NOT EXISTS gateway_settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

@@ -1894,7 +1894,28 @@ async function routerHealth(c) {
        FROM (SELECT slug, status, latency_ms, created_at FROM trajectories WHERE created_at >= ?)
        GROUP BY slug`
     ).bind(new Date(now - 24 * 3600000).toISOString()).all();
-    routerHealthCache = { at: now, rows: rows.results || [] };
+    // Fold in the latest integrity verdict: a slug whose only route failed
+    // verification is not a model the router should prefer, and a relay is not
+    // a model at all. Kept as a penalty rather than an exclusion so an operator
+    // can still reach the slug deliberately.
+    const probes = await c.env.DB.prepare(
+      `SELECT slug, verdict FROM provider_probe_runs
+       WHERE id IN (SELECT MAX(id) FROM provider_probe_runs GROUP BY slug, provider_id)`
+    ).all();
+    const penaltyBySlug = new Map();
+    for (const row of probes.results || []) {
+      const worst = row.verdict === "MULTI-MODEL RELAY" || row.verdict === "TOKENIZER MISMATCH" || row.verdict === "STACK LEAK" ? 0.35
+        : row.verdict === "CONSISTENT WITH CLAIM" ? 1
+          : 0.85;
+      const current = penaltyBySlug.get(row.slug);
+      if (current === void 0 || worst < current)
+        penaltyBySlug.set(row.slug, worst);
+    }
+    const merged = (rows.results || []).map((row) => {
+      const factor = penaltyBySlug.has(row.slug) ? penaltyBySlug.get(row.slug) : 1;
+      return factor === 1 ? row : { ...row, ok_rate: Number(row.ok_rate) * factor, probe_penalty: factor };
+    });
+    routerHealthCache = { at: now, rows: merged };
   } catch {
     routerHealthCache = { at: now, rows: [] };
   }
@@ -3158,10 +3179,195 @@ app.post("/admin/providers/:id/test", async (c) => {
   const keys = await providerKeys(c, id);
   if (!keys.length)
     return c.json({ ok: false, error: "provider has no usable key", key_label: null }, 200);
-  if (!isZaiWebFormat(provider.fmt))
-    return c.json({ ok: false, error: "no credential probe for fmt=" + provider.fmt, key_label: keys[0].label }, 200);
-  const result = await validateZaiWebKey(keys[0].key, fetch);
-  return c.json({ ok: result.ok, status: result.status, error: result.error, key_label: keys[0].label, fmt: provider.fmt }, 200);
+  if (isZaiWebFormat(provider.fmt)) {
+    const result = await validateZaiWebKey(keys[0].key, fetch);
+    return c.json({ ok: result.ok, status: result.status, error: result.error, key_label: keys[0].label, fmt: provider.fmt }, 200);
+  }
+  // Any other provider gets a real reachability check against its own base_url,
+  // so the button means something for every format instead of only chat.z.ai.
+  const route = await c.env.DB.prepare("SELECT * FROM model_routes WHERE provider_id=? ORDER BY rank LIMIT 1").bind(id).first();
+  if (!route)
+    return c.json({ ok: false, error: "provider has no model route to probe", key_label: keys[0].label, fmt: provider.fmt }, 200);
+  const probeBase = providerBaseFor(provider, route);
+  try {
+    const res = await probeEgress(c, provider, route, keys[0].key, probeBase + "/chat/completions", "POST",
+      { "Content-Type": "application/json", Authorization: "Bearer " + keys[0].key }, 12000);
+    const status = res.response.status;
+    return c.json({
+      ok: status >= 200 && status < 400,
+      status,
+      error: status >= 400 ? String(await res.response.text().catch(() => "")).slice(0, 200) : null,
+      key_label: keys[0].label,
+      fmt: provider.fmt,
+      base_url: probeBase
+    }, 200);
+  } catch (e) {
+    return c.json({ ok: false, status: 0, error: String(e && e.message || e).slice(0, 200), key_label: keys[0].label, fmt: provider.fmt }, 200);
+  }
+});
+// ---------------------------------------------------------------------------
+// Model-integrity probes (ported from modelprobe): does this provider actually
+// serve the model a route claims, or is it a reseller answering with something
+// cheaper? See ai-gateway/src/modelprobe.js for the probes and their evidence.
+// ---------------------------------------------------------------------------
+function providerBaseFor(provider, route) {
+  const raw = String((provider && provider.base_url) || (route && route.base_url) || "").trim();
+  return raw.replace(/\/+$/, "");
+}
+// One egress path for probes so they honour the same transport rules as traffic.
+// The body must be forwarded: a probe with a dropped body looks like a request
+// for no model at all, which many gateways answer with 200 for anything.
+async function probeEgress(c, provider, route, key, url, method, headers, body, timeoutMs) {
+  const transport = routeTransport(route, c.env);
+  const merged = withExtraHeaders(headers, route);
+  if (transport === "oci" && route.proxy_url)
+    return fetchViaProxy(c, route.proxy_url, url, method, merged, body);
+  if (transport === "koyeb") {
+    const providerName = String((route && route.provider_name) || (provider && provider.name) || "").toLowerCase();
+    const res = await koyebExchange(c, {
+      provider: providerName,
+      method,
+      path: url,
+      headers: merged,
+      body: body ? encoder.encode(body) : void 0,
+      isStream: false,
+      requestId: "probe-" + Date.now()
+    });
+    return { response: new Response(res.bytes || "", { status: res.status, headers: res.headers }), usage: null };
+  }
+  const res = await probeFetchWithTimeout(c, url, { method, headers: merged, body: body || void 0 }, timeoutMs);
+  return { response: res, usage: null };
+}
+function probeFetchWithTimeout(c, url, init, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+  return fetch(url, { ...init, signal: ctrl.signal })
+    .then((r) => {
+      clearTimeout(timer);
+      return r;
+    })
+    .catch((e) => {
+      clearTimeout(timer);
+      throw e;
+    });
+}
+async function declaredLimitForSlug(c, slug) {
+  try {
+    if (!modelsDevCache.catalog)
+      await fetchModelsDevCatalog().catch(() => {});
+    const byId = modelsDevCache.catalog ? flattenModelsDevCatalog(modelsDevCache.catalog) : null;
+    const entry = byId ? matchModelsDevPrice(byId, slug) : null;
+    const caps = entryCapabilities(entry);
+    return { input: Number(entry && entry.limit && entry.limit.input) || caps.context || 0, context: caps.context || 0, entry };
+  } catch {
+    return { input: 0, context: 0, entry: null };
+  }
+}
+async function runIntegrityProbe(c, provider, route, key, options) {
+  const { runProbes } = await import("./modelprobe.js");
+  const base = providerBaseFor(provider, route);
+  const model = route.upstream_model || route.slug;
+  const declared = await declaredLimitForSlug(c, route.slug);
+  // Probes must not become a side door around egress rules, so every probe
+  // request rides the provider's own transport.
+  const fetchImpl = (url, init) => probeEgress(
+    c, provider, route, key, url,
+    (init && init.method) || "POST",
+    (init && init.headers) || {},
+    (init && init.body) || null,
+    (options && options.timeoutMs) || 20000
+  ).then((r) => r.response);
+  const result = await runProbes({
+    base,
+    model,
+    key,
+    declaredInputTokens: declared.input || declared.context || null,
+    options: { timeoutMs: (options && options.timeoutMs) || 20000, fetchImpl }
+  });
+  return { result, base, model, declared };
+}
+app.post("/admin/providers/:id/integrity", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  let body = {};
+  try {
+    body = await c.req.json();
+  } catch {
+  }
+  const provider = await c.env.DB.prepare("SELECT * FROM providers WHERE id=?").bind(id).first();
+  if (!provider)
+    return c.json({ error: { message: "provider not found" } }, 404);
+  if (isZaiWebFormat(provider.fmt))
+    return c.json({ error: { message: "the z.ai consumer transports are not OpenAI-compatible endpoints; integrity probing does not apply" } }, 400);
+  const keys = await providerKeys(c, id);
+  if (!keys.length)
+    return c.json({ error: { message: "provider has no usable key" } }, 400);
+  const routes = await c.env.DB.prepare("SELECT * FROM model_routes WHERE provider_id=? ORDER BY rank").bind(id).all();
+  const all = routes.results || [];
+  // Named slug = that route only, even if it's currently off. Unnamed = first
+  // enabled route, so a provider-level verify never walks the whole catalog.
+  const wanted = body.slug ? all.filter((r) => r.slug === body.slug) : all.filter((r) => r.enabled).slice(0, Number(body.limit) || 1);
+  if (!wanted.length)
+    return c.json({ error: { message: body.slug ? "no route with that slug on this provider" : "no enabled route to probe for this provider" } }, 400);
+  const key = keys[0].key;
+  const runs = [];
+  for (const route of wanted) {
+    const { result } = await runIntegrityProbe(c, provider, route, key, body);
+    const signals = result.signals || [];
+    const relay = signals.find((s) => s.kind === "routing" && s.level === "alert");
+    const exact = !!(result.tokenize && result.tokenize.available && result.tokenize.exactMatches && result.tokenize.exactMatches.length);
+    await c.env.DB.prepare(
+      "INSERT INTO provider_probe_runs (provider_id, slug, upstream_model, verdict, measured_family, claimed_family, relay_count, exact_fingerprint, signals_json, detail_json, http_status, elapsed_ms, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    ).bind(
+      id, route.slug, route.upstream_model || "", result.verdict || "UNKNOWN",
+      result.measured_family || null, (result.expected && result.expected.family) || null,
+      (result.routing && result.routing.count) || 0, exact ? 1 : 0,
+      JSON.stringify(signals).slice(0, 8000), JSON.stringify({ slope: result.slope, tokenize: result.tokenize, identity: result.identity, limit: result.limit, determinism: result.determinism, leak: result.leak, ceiling: result.ceiling, cutoff: result.cutoff }).slice(0, 8000),
+      result.basic && result.basic.http, result.elapsed_ms || 0, nowIso()
+    ).run();
+    blog("PROBE provider=" + provider.name + " slug=" + route.slug + " verdict=" + result.verdict);
+    runs.push({ slug: route.slug, upstream_model: route.upstream_model, ...result, relay_signal: relay ? relay.text : null });
+  }
+  return c.json({ provider_id: id, provider: provider.name, runs });
+});
+app.get("/admin/integrity", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  // Latest verdict per (slug, provider) — the console's integrity board.
+  const rows = await c.env.DB.prepare(
+    `SELECT r.id, r.provider_id, r.slug, r.upstream_model, r.verdict, r.measured_family, r.claimed_family,
+            r.relay_count, r.exact_fingerprint, r.created_at, p.name AS provider_name, p.enabled AS provider_enabled
+     FROM provider_probe_runs r
+     JOIN providers p ON p.id = r.provider_id
+     WHERE r.id IN (SELECT MAX(id) FROM provider_probe_runs GROUP BY slug, provider_id)
+     ORDER BY CASE r.verdict WHEN 'MULTI-MODEL RELAY' THEN 0 WHEN 'TOKENIZER MISMATCH' THEN 1 WHEN 'STACK LEAK' THEN 2 WHEN 'UNVERIFIED' THEN 3 WHEN 'INCONCLUSIVE' THEN 4 ELSE 5 END, r.slug`
+  ).all();
+  const runs = rows.results || [];
+  const counts = { alert: 0, ok: 0, unverified: 0, blocked: 0 };
+  for (const r of runs) {
+    if (r.verdict === "MULTI-MODEL RELAY" || r.verdict === "TOKENIZER MISMATCH" || r.verdict === "STACK LEAK")
+      counts.alert++;
+    else if (r.verdict === "CONSISTENT WITH CLAIM")
+      counts.ok++;
+    else if (r.verdict === "INCONCLUSIVE")
+      counts.blocked++;
+    else
+      counts.unverified++;
+  }
+  return c.json({ runs, counts });
+});
+app.get("/admin/providers/:id/integrity", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  const rows = await c.env.DB.prepare(
+    "SELECT * FROM provider_probe_runs WHERE provider_id=? ORDER BY id DESC LIMIT 50"
+  ).bind(id).all();
+  return c.json({ runs: rows.results || [] });
 });
 app.post("/admin/providers/:id/toggle", async (c) => {
   const denied = await requireAdmin(c);
@@ -3218,7 +3424,16 @@ app.get("/admin/routes", async (c) => {
   if (denied)
     return denied;
   const rows = await c.env.DB.prepare(
-    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
+    `SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled,
+            p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled,
+            pr.verdict AS probe_verdict, pr.measured_family AS probe_measured_family, pr.created_at AS probe_at
+     FROM model_routes mr
+     JOIN providers p ON p.id=mr.provider_id
+     LEFT JOIN provider_probe_runs pr ON pr.id = (
+       SELECT MAX(id) FROM provider_probe_runs
+       WHERE slug = mr.slug AND provider_id = mr.provider_id
+     )
+     ORDER BY mr.slug, mr.rank`
   ).all();
   return c.json({ routes: rows.results || [] });
 });
@@ -3795,7 +4010,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

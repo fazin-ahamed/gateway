@@ -173,6 +173,64 @@ So the remaining gap is entirely in the gateway's completion request shape, not
 in token validity or minting. Until that is closed, use `zaiwebbrowser` (or an
 API-key provider) for anything you depend on.
 
+### Model-integrity probes
+
+A gateway trusts its `model_routes`: nothing today checks that the provider
+behind a slug actually serves the model that slug claims. Resellers advertise
+frontier names (Claude Opus, GPT-5.x, Grok, GLM…) while answering with cheaper
+open weights, and the `model` field in a response proves nothing.
+
+**Model routes → verify** on a slug (or `POST /admin/providers/:id/integrity`
+with `{ "slug": "openai/gpt-4o" }`) probes that route only. Provider-level
+verify still exists and probes the first enabled route.
+
+| Verdict | Meaning |
+| --- | --- |
+| `CONSISTENT WITH CLAIM` | no contradiction found |
+| `TOKENIZER MISMATCH` | measured tokenizer contradicts the claim |
+| `MULTI-MODEL RELAY` | one endpoint answers unrelated model slugs — a reseller |
+| `STACK LEAK` | serving stack named a different model (`response.model` or a limit error) |
+| `INCONCLUSIVE` | auth/rate/transport blocked the probe; **not** evidence of faking |
+| `UNVERIFIED` | nothing measurable (no usage field, no `/tokenize`, unknown slug) |
+
+What it measures, in order of strength:
+
+1. **`/tokenize` raw token IDs** — compared for equality against reference
+   tokenizers. An exact match is identity, not a guess.
+2. **Token-count slope** — `usage.prompt_tokens` across growing prompts, matched
+   against 9 reference families. A fit worse than 6% is reported as unverified
+   rather than naming the least-bad family.
+3. **Routing** — six unrelated slugs; three or more answering is a relay.
+4. **Stack leak** — `response.model` that does not echo the request, or a
+   `max_tokens` rejection that names a different id. Echoes count as no evidence.
+5. **Output ceiling** — absurd `max_tokens` rejection; scored only when the
+   error names a cap or id. Silent clamp is recorded, not scored.
+6. **Knowledge horizon** — dated trivia vs the advertised family's training
+   window. Soft: two late facts (or two early misses) before it warns.
+7. **Declared-limit breach** — a prompt past the context the claim advertises.
+8. **Identity and determinism** — self-reported name (promptable, warn only)
+   and temperature 0 reproducibility.
+
+Playground **Verify this slug** runs the same probe against the selected model
+only. Stack-leak, ceiling, and cutoff probes follow
+[truemodel](https://github.com/pavandoescode/truemodel) (MIT).
+
+Reference token data is **precomputed and committed**
+(`ai-gateway/src/modelprobe-refs.js`): the probe text and sizes are constants, so
+every reference count and ID sequence is a constant too. That is why the probes
+run on Workers and Node with no tokenizer dependency — `hono` stays the only
+package. Regenerate after changing the probe text:
+
+```sh
+python3 scripts/build-modelprobe-refs.py > ai-gateway/src/modelprobe-refs.js
+```
+
+Results persist in `provider_probe_runs` (latest verdict per slug + provider),
+surface on Model routes, the Playground integrity panel, and
+`GET /admin/integrity`, and feed the auto-router: a slug whose latest verdict
+is a relay, a mismatch, or a stack leak has its health score scaled to 0.35.
+It is a penalty, not a ban — you can still call the slug deliberately.
+
 ### Using an OpenAI-compatible bridge instead
 
 If you would rather not run a browser, any OpenAI-compatible bridge for

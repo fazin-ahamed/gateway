@@ -59,19 +59,20 @@ var PLAYGROUND_HTML = `<!doctype html>
   @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
   @media (max-width:980px){nav{position:sticky;top:56px;bottom:auto;width:100%;height:auto;flex-direction:row;overflow:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px 14px}nav:before{display:none}nav button{flex:0 0 auto}nav button.active:before{left:10px;right:10px;top:auto;bottom:-8px;width:auto;height:2px}main{margin-left:0;padding:24px}.grid.s4{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media (max-width:620px){header{padding:0 14px}.base{display:none}header .clock{margin-left:auto}.grid.s4,.grid.s3,.grid.s2{grid-template-columns:1fr}.row>*{min-width:100%}main{padding:18px 14px}.card{padding:16px}.toolbar{align-items:flex-start;flex-wrap:wrap}.toolbar .spacer{display:none}.modal{padding:16px}.toast{right:14px;left:14px;bottom:14px;max-width:none}}
-  .pg-shell{display:grid;grid-template-columns:300px minmax(0,1fr);gap:16px;align-items:start}
-  .pg-config{position:sticky;top:80px}
-  .pg-check{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12px;color:var(--text)}
+  .pg-shell{display:grid;grid-template-columns:280px minmax(0,1fr);gap:16px;align-items:stretch;min-height:calc(100dvh - 120px)}
+  .pg-config{display:flex;flex-direction:column;gap:12px}
+  .pg-config .card{margin:0}
+  .pg-check{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--text)}
   .pg-check input{width:auto;accent-color:var(--accent)}
-  .pg-advanced{margin-top:16px;border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;background:var(--surface-deep)}
+  .pg-advanced{margin-top:12px;border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;background:var(--surface-deep)}
   .pg-advanced summary{cursor:pointer;font-size:12px;color:var(--muted);font-weight:var(--w-med)}
-  .pg-advanced textarea{margin-top:10px;min-height:140px}
-  .pg-main{display:grid;gap:16px;min-width:0}
-  .pg-chat{display:flex;flex-direction:column;min-height:560px;overflow:hidden;padding:0}
-  .pg-chat-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
-  .pg-messages{flex:1;min-height:360px;max-height:520px;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:12px;background:var(--surface-deep)}
+  .pg-advanced textarea{margin-top:10px;min-height:120px}
+  .pg-main{display:grid;grid-template-rows:minmax(0,1fr) auto;gap:12px;min-width:0}
+  .pg-chat{display:flex;flex-direction:column;min-height:0;overflow:hidden;padding:0;margin:0}
+  .pg-chat-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .pg-messages{flex:1;min-height:280px;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:12px;background:var(--surface-deep)}
   .pg-msg{max-width:78%;padding:12px 14px;border-radius:10px;line-height:1.55}
-  .pg-msg.user{align-self:flex-end;background:rgba(61,214,198,.12);border:1px solid rgba(61,214,198,.28);border-bottom-right-radius:4px}
+  .pg-msg.user{align-self:flex-end;background:rgba(47,212,181,.12);border:1px solid rgba(47,212,181,.28);border-bottom-right-radius:4px}
   .pg-msg.assistant{align-self:flex-start;background:var(--surface-hi);border:1px solid var(--line);border-bottom-left-radius:4px}
   .pg-msg.streaming{border-style:dashed}
   .pg-msg .who{font:10px/1 var(--mono);letter-spacing:.08em;color:var(--muted);margin-bottom:6px}
@@ -80,20 +81,16 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-body{white-space:pre-wrap;word-break:break-word}
   .pg-meta{margin-top:8px;font:10px/1.4 var(--mono);color:var(--muted)}
   .pg-composer{display:flex;gap:10px;align-items:flex-end;padding:14px 18px;border-top:1px solid var(--line);background:var(--surface)}
-  .pg-composer textarea{flex:1;min-height:44px;max-height:160px;resize:vertical}
+  .pg-composer textarea{flex:1;min-height:52px;max-height:160px;resize:vertical}
   .pg-composer button{flex:0 0 auto;margin-top:0}
-  .pg-detail{overflow:hidden}
-  .pg-detail-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
-  .pg-detail-tabs{display:flex;gap:6px;padding:12px 18px 0;flex-wrap:wrap}
-  .pg-detail-body{padding:16px 18px 20px}
-  .pg-detail-body pre{max-height:320px}
-  .pg-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
-  .pg-summary .stat{min-height:78px;padding:12px 14px}
-  .pg-summary .stat .v{font-size:17px;margin-top:7px}
-  .pg-kv{display:grid;grid-template-columns:110px 1fr;gap:8px 14px;font-size:11px;margin:12px 0 0}
-  .pg-kv dt{color:var(--muted)}
-  .pg-kv dd{margin:0;word-break:break-word}
-  @media (max-width:980px){.pg-shell{grid-template-columns:1fr}.pg-config{position:static}.pg-messages{max-height:400px}.pg-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.pg-msg{max-width:100%}}
+  .pg-trace{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:var(--surface)}
+  .pg-trace .k{font:9px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .pg-trace .v{font:12px/1.3 var(--mono);margin-top:4px;word-break:break-all}
+  .pg-probe{margin:0;padding:0;overflow:hidden}
+  .pg-probe-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .pg-probe-body{padding:12px 16px 16px;max-height:280px;overflow:auto}
+  .pg-signals{display:flex;flex-direction:column;gap:6px}
+  @media (max-width:980px){.pg-shell{grid-template-columns:1fr;min-height:0}.pg-messages{min-height:240px}.pg-msg{max-width:100%}.pg-trace{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:0 0 14px}
   .pagehead h2.sec{font-size:20px;letter-spacing:-.025em;margin:0}
   .pagehead .sub{color:var(--muted);font-size:12px;margin:6px 0 0;max-width:60ch;line-height:1.45}
@@ -227,21 +224,34 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-chat">
+    <div class="pagehead">
+      <div>
+        <h2 class="sec">Playground</h2>
+        <p class="sub">Chat through the gateway, then verify the slug that actually answered. Probe hits that route only.</p>
+      </div>
+    </div>
     <div class="pg-shell">
-      <aside class="pg-config card">
-        <h2 class="sec" style="margin-top:0">Playground</h2>
-        <p class="hint">Run a model through the gateway with your admin session.</p>
-        <label for="c-model">Model slug</label>
-        <select id="c-model"><option value="">Loading enabled models...</option></select>
-        <label class="pg-check" for="c-stream"><input type="checkbox" id="c-stream"> Stream responses</label>
-        <div class="form-actions"><button class="act" id="c-clear">Clear chat</button></div>
-        <div class="form-actions"><button class="act" id="c-batch">Batch test all models</button></div>
-        <button class="ghost" id="c-batch-cancel" style="margin-top:8px;display:none">Cancel batch</button>
-        <p class="hint">Sends the current prompt once to every enabled model, non-streaming. Usage is recorded.</p>
-        <details class="pg-advanced">
-          <summary>Request JSON</summary>
-          <textarea id="c-messages">[]</textarea>
-        </details>
+      <aside class="pg-config">
+        <div class="card">
+          <h2 class="sec" style="margin-top:0">Run</h2>
+          <label for="c-model">Model slug</label>
+          <select id="c-model"><option value="">Loading enabled models...</option></select>
+          <div class="small" id="c-route-hint" style="margin-top:6px">Pick a slug to see its last integrity verdict.</div>
+          <label class="pg-check" for="c-stream"><input type="checkbox" id="c-stream"> Stream responses</label>
+          <div class="form-actions">
+            <button class="act" id="c-verify">Verify this slug</button>
+            <button class="ghost" id="c-clear">Clear chat</button>
+          </div>
+          <div class="form-actions">
+            <button class="ghost" id="c-batch">Batch test all models</button>
+            <button class="ghost" id="c-batch-cancel" style="display:none">Cancel batch</button>
+          </div>
+          <p class="hint">Batch sends the current prompt once to every enabled model, non-streaming. Usage is recorded.</p>
+          <details class="pg-advanced">
+            <summary>Request JSON</summary>
+            <textarea id="c-messages">[]</textarea>
+          </details>
+        </div>
       </aside>
       <div class="pg-main">
         <section class="pg-chat card">
@@ -250,9 +260,16 @@ var PLAYGROUND_HTML = `<!doctype html>
               <h2 class="sec" style="margin:0">Conversation</h2>
               <div class="small" id="c-status">Ready when you are.</div>
             </div>
+            <span class="pill mut" id="c-verdict-pill">unverified</span>
           </header>
           <div class="pg-messages" id="c-chat">
-            <div class="empty">Send a message to start a run.</div>
+            <div class="empty">Send a message, or verify the slug first.</div>
+          </div>
+          <div class="pg-trace" id="c-trace">
+            <div><div class="k">Request</div><div class="v" id="c-trace-id">—</div></div>
+            <div><div class="k">Route</div><div class="v" id="c-trace-route">—</div></div>
+            <div><div class="k">Attempts</div><div class="v" id="c-trace-attempts">—</div></div>
+            <div><div class="k">Usage</div><div class="v" id="c-trace-usage">—</div></div>
           </div>
           <div class="pg-composer">
             <textarea id="c-prompt" placeholder="Send a prompt through the gateway…"></textarea>
@@ -260,16 +277,29 @@ var PLAYGROUND_HTML = `<!doctype html>
             <button class="act" id="c-send">Send</button>
           </div>
         </section>
-      <section class="card" id="c-batch-panel" hidden>
-        <header class="pg-detail-head">
-          <div>
-            <h2 class="sec" style="margin:0">Batch results</h2>
-            <div class="small" id="c-batch-meta">No batch run yet.</div>
+        <section class="card pg-probe" id="c-probe-panel">
+          <header class="pg-probe-head">
+            <div>
+              <h2 class="sec" style="margin:0">Integrity</h2>
+              <div class="small" id="c-probe-meta">No probe yet for this slug.</div>
+            </div>
+          </header>
+          <div class="pg-probe-body" id="c-probe-body">
+            <div class="empty">Verify this slug to fingerprint tokenizer, routing, stack leaks, output ceiling, and knowledge horizon.</div>
           </div>
-          <button class="ghost" id="c-batch-close">Close</button>
-        </header>
-        <div class="pg-detail-body" id="c-batch-results"></div>
-      </section>
+        </section>
+        <section class="card" id="c-batch-panel" hidden>
+          <header class="pg-detail-head">
+            <div>
+              <h2 class="sec" style="margin:0">Batch results</h2>
+              <div class="small" id="c-batch-meta">No batch run yet.</div>
+            </div>
+            <button class="ghost" id="c-batch-close">Close</button>
+          </header>
+          <div class="pg-detail-body" id="c-batch-results"></div>
+        </section>
+      </div>
+    </div>
   </section>
 
   <section class="tab" id="tab-cache">
@@ -395,7 +425,7 @@ async function selectTab(t){
     if(t==='routes') await loadRoutes();
     if(t==='tiers') await loadTiers();
     if(t==='keys') await loadKeys();
-    if(t==='chat') await refreshPlaygroundModels();
+    if(t==='chat'){ await refreshPlaygroundModels(); await refreshPlaygroundIntegrity(); }
     if(t==='cache') await loadCache();
     if(t==='prices') await loadPrices();
     if(t==='limits') await loadLimits();
@@ -668,8 +698,55 @@ async function switchProvider(id, enabled){
     loadProviders();
   }catch(e){ toast('switch failed: '+e.message,'err'); }
 }
+// Model-integrity probe: show what the provider really serves. The verdict and
+// per-probe signals come straight from /admin/providers/:id/integrity.
+var PROBE_LEVEL_CLASS={alert:'bad',warn:'warn',ok:'ok',inconclusive:'mut',info:'mut'};
+function verdictClass(verdict){
+  if(verdict==='MULTI-MODEL RELAY'||verdict==='TOKENIZER MISMATCH'||verdict==='STACK LEAK') return 'bad';
+  if(verdict==='CONSISTENT WITH CLAIM') return 'ok';
+  if(verdict==='INCONCLUSIVE') return 'warn';
+  return 'mut';
+}
+async function verifyProvider(id, slug){
+  const body=document.getElementById('modal-body');
+  document.querySelector('.modal').classList.remove('wide');
+  document.getElementById('modal-title').textContent=slug?'Verifying '+slug:'Verifying provider '+id;
+  document.getElementById('modal-title').style.color='';
+  body.innerHTML='<p class="hint" style="margin:0">Probing '+(slug?esc(slug)+' only':'the first enabled route')+': tokenizer fingerprint, relay routing, identity, declared limits, determinism. This sends a handful of small requests.</p>';
+  const save=document.getElementById('modal-save'); save.style.display='none';
+  document.getElementById('overlay').classList.add('show');
+  let data;
+  try{ const res=await api('/admin/providers/'+id+'/integrity',{method:'POST',body:JSON.stringify(slug?{slug:slug}:{limit:1})}); data=res.data; }
+  catch(e){ body.innerHTML='<p class="hint" style="margin:0">Probe failed: '+esc(e.message)+'</p>'; save.style.display=''; return; }
+  if(data&&data.error){ body.innerHTML='<p class="hint" style="margin:0">'+esc(data.error.message)+'</p>'; save.style.display=''; return; }
+  const run=(data.runs||[])[0];
+  if(!run){ body.innerHTML='<p class="hint" style="margin:0">No probe result returned.</p>'; save.style.display=''; return; }
+  document.getElementById('modal-title').textContent='Integrity: '+run.slug;
+  let html='<div class="kvrow"><span class="pill '+verdictClass(run.verdict)+'">'+esc(run.verdict)+'</span>'
+    +'<span class="right mono small">'+esc(String(run.elapsed_ms||0))+'ms · '+esc(run.model||'')+'</span></div>';
+  if(run.measured_family||run.expected){
+    html+='<div class="small mono" style="margin:8px 0">measured '+(esc(run.measured_family||'—'))+' · claimed '+(esc((run.expected&&run.expected.family)||'—'))+(run.tokenize&&run.tokenize.exactMatches&&run.tokenize.exactMatches.length?' · exact token-ID match':'')+'</div>';
+  }
+  html+='<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Signals</h3>';
+  html+=(run.signals||[]).map(function(s){
+    return '<div class="kvrow"><span class="pill '+(PROBE_LEVEL_CLASS[s.level]||'mut')+'">'+esc(s.kind)+'</span><span class="grow small">'+esc(s.text)+'</span></div>';
+  }).join('')||'<div class="empty">No signals.</div>';
+  if(run.slope&&run.slope.rows&&run.slope.rows.length){
+    html+='<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Tokenizer families (ratio ~1.0 = match)</h3>';
+    html+='<table><tr><th>Reference</th><th>ratio</th><th></th></tr>'+run.slope.rows.slice(0,6).map(function(r){
+      return '<tr><td class="small">'+esc(r.label)+'</td><td class="mono small">'+esc(String(r.ratio))+'</td><td>'+(run.measured_family===r.key?'<span class="pill acc">measured</span>':'')+'</td></tr>';
+    }).join('')+'</table>';
+  }
+  if(run.routing&&run.routing.distinct_models_served&&run.routing.distinct_models_served.length){
+    html+='<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Also answered as</h3><div class="small mono">'+run.routing.distinct_models_served.map(esc).join(', ')+'</div>';
+  }
+  body.innerHTML=html;
+  save.style.display='';
+  if(slug) loadRoutes();
+}
+
 async function delProvider(id){
-  confirmAction('Delete provider','Delete provider '+id+' and all of its routes? This cannot be undone.','Delete',async function(){ const {status}=await api('/admin/providers/'+id,{method:'DELETE'}); if(status===200){ toast('provider deleted','ok'); loadProviders(); } else toast('delete failed','err'); }); return;
+  confirmAction('Delete provider','Delete provider '+id+' and all of its routes? This cannot be undone.','Delete',async function(){ const {status}=await api('/admin/providers/'+id,{method:'DELETE'}); if(status===200){ toast('provider deleted','ok'); loadProviders(); } else toast('delete failed','err'); });
 }
 async function loadProviders(){
   const el=document.getElementById('providers-list');
@@ -686,7 +763,7 @@ async function loadProviders(){
     const healthBtn=on?('<button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'mark down':'mark up')+'</button>'):'';
     const switchBtn=on?('<button class="danger" data-act="pdisable" data-id="'+p.id+'" title="Take this provider out of rotation: its slugs stop being advertised and routed">disable</button>'):('<button class="ghost" data-act="penable" data-id="'+p.id+'" title="Put this provider back into rotation">enable</button>');
     return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td>'+keys+'</td><td>'+esc(p.key_strategy||'round_robin')+'</td><td><span class="pill '+cls+'">'+state+'</span></td>'+
-      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> '+healthBtn+' '+switchBtn+' <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
+      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="pverify" data-id="'+p.id+'" title="Probe what this provider really serves: tokenizer fingerprint, relay routing, identity, limits">verify</button> '+healthBtn+' '+switchBtn+' <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
   }).join('')||'<tr><td colspan="7"><div class="empty">No providers yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>Keys</th><th>Strategy</th><th>State</th><th></th></tr>'+rows+'</table>';
 }
@@ -755,10 +832,13 @@ async function loadRoutes(){
     const cls=(r.enabled&&r.provider_healthy&&!providerOff)?'ok':'bad';
     const label=r.enabled?(providerOff?'<span class="pill bad">provider disabled</span>':(r.provider_healthy?'on':'<span class="pill bad">provider down</span>')):'off';
     const role=r.rank===0?'<span class="pill acc">primary</span>':'<span class="pill mut">fallback '+esc(String(r.rank))+'</span>';
-    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+label+'</span></td>'+
-      '<td class="rowact"><button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+'">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="6"><div class="empty">No model routes yet.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Role</th><th>Provider</th><th>Upstream model</th><th>Route</th><th></th></tr>'+rows+'</table>';
+    const verdict=r.probe_verdict
+      ? '<span class="pill '+verdictClass(r.probe_verdict)+'" title="'+(r.probe_measured_family?('measured '+r.probe_measured_family):'')+'">'+esc(r.probe_verdict)+'</span>'
+      : '<span class="pill mut">unverified</span>';
+    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+label+'</span></td><td>'+verdict+'</td>'+
+      '<td class="rowact"><button class="ghost" data-act="rverify" data-id="'+esc(String(r.provider_id))+'" data-slug="'+esc(r.slug)+'" title="Probe this slug only: tokenizer fingerprint, relay routing, identity, limits">verify</button> <button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+'">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
+  }).join('') || '<tr><td colspan="7"><div class="empty">No model routes yet.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Slug</th><th>Role</th><th>Provider</th><th>Upstream model</th><th>Route</th><th>Integrity</th><th></th></tr>'+rows+'</table>';
 }
 async function providerOptions(){
   const {data}=await api('/admin/providers'); return (data.providers||[]).map(function(p){return {value:String(p.id),label:esc(p.name)};});
@@ -828,8 +908,10 @@ document.addEventListener('click', function(e){
   else if(act==='ptoggle') toggleProvider(id, btn.getAttribute('data-h')==='1'?0:1);
   else if(act==='pdisable') switchProvider(id, false);
   else if(act==='penable') switchProvider(id, true);
+  else if(act==='pverify') verifyProvider(id);
   else if(act==='pdel') delProvider(id);
   else if(act==='redit') editRoute(id);
+  else if(act==='rverify') verifyProvider(id, btn.getAttribute('data-slug'));
   else if(act==='raddfb') addFallbackRoute(btn);
   else if(act==='rtoggle') toggleRoute(id, btn.getAttribute('data-e')==='1'?0:1);
   else if(act==='rdel') delRoute(id);
@@ -964,14 +1046,95 @@ async function refreshPlaygroundModels(){
   select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===selected?' selected':'')+'>'+esc(o.label)+'</option>';}).join('') || '<option value="">No enabled public models</option>';
   if(!select.value&&select.options.length&&select.options[0].value) select.value=select.options[0].value;
 }
+function setPlaygroundTrace(info){
+  const id=document.getElementById('c-trace-id');
+  const route=document.getElementById('c-trace-route');
+  const attempts=document.getElementById('c-trace-attempts');
+  const usage=document.getElementById('c-trace-usage');
+  if(id) id.textContent=(info&&info.id)||'—';
+  if(route) route.textContent=(info&&info.route)||'—';
+  if(attempts) attempts.textContent=(info&&info.attempts)||'—';
+  if(usage) usage.textContent=(info&&info.usage)||'—';
+}
+function setPlaygroundVerdictPill(verdict){
+  const pill=document.getElementById('c-verdict-pill'); if(!pill) return;
+  const v=verdict||'unverified';
+  pill.className='pill '+verdictClass(v==='unverified'?'':v);
+  pill.textContent=v;
+}
+function paintPlaygroundProbe(run, meta){
+  const body=document.getElementById('c-probe-body');
+  const metaEl=document.getElementById('c-probe-meta');
+  if(!body) return;
+  if(!run){
+    if(metaEl) metaEl.textContent=meta||'No probe yet for this slug.';
+    body.innerHTML='<div class="empty">Verify this slug to fingerprint tokenizer, routing, stack leaks, output ceiling, and knowledge horizon.</div>';
+    setPlaygroundVerdictPill('unverified');
+    return;
+  }
+  setPlaygroundVerdictPill(run.verdict);
+  if(metaEl) metaEl.textContent=(run.slug||'')+' · '+(run.elapsed_ms||0)+'ms'+(run.measured_family?' · measured '+run.measured_family:'');
+  let html='<div class="kvrow"><span class="pill '+verdictClass(run.verdict)+'">'+esc(run.verdict)+'</span><span class="right mono small">'+esc(run.model||'')+'</span></div>';
+  html+='<div class="pg-signals" style="margin-top:10px">';
+  html+=(run.signals||[]).map(function(s){
+    return '<div class="kvrow"><span class="pill '+(PROBE_LEVEL_CLASS[s.level]||'mut')+'">'+esc(s.kind)+'</span><span class="grow small">'+esc(s.text)+'</span></div>';
+  }).join('')||'<div class="empty">No signals.</div>';
+  html+='</div>';
+  if(run.leak&&run.leak.leaked) html+='<p class="hint">Stack leak: response.model was '+esc(run.leak.leaked)+'.</p>';
+  if(run.ceiling&&run.ceiling.ceiling) html+='<p class="hint">Enforced output cap '+esc(String(run.ceiling.ceiling))+'.</p>';
+  body.innerHTML=html;
+}
+async function refreshPlaygroundIntegrity(){
+  const select=document.getElementById('c-model');
+  const slug=select?select.value.trim():'';
+  const hint=document.getElementById('c-route-hint');
+  if(!slug){ if(hint) hint.textContent='Pick a slug to see its last integrity verdict.'; paintPlaygroundProbe(null); return; }
+  let data; try{ const res=await api('/admin/routes'); data=res.data; }catch(e){ if(hint) hint.textContent='Could not load routes.'; return; }
+  const routes=((data&&data.routes)||[]).filter(function(r){return r.slug===slug;});
+  const primary=routes[0];
+  if(hint){
+    if(!primary) hint.textContent=slug+' has no route.';
+    else hint.textContent=(primary.provider_name||'provider')+' · rank '+String(primary.rank)+(routes.length>1?' · '+routes.length+' routes':'');
+  }
+  if(primary&&primary.probe_verdict){
+    paintPlaygroundProbe({ slug:slug, verdict:primary.probe_verdict, measured_family:primary.probe_measured_family, model:primary.upstream_model, signals:[], elapsed_ms:0 });
+    const metaEl=document.getElementById('c-probe-meta');
+    if(metaEl) metaEl.textContent='Last stored verdict'+(primary.probe_at?' · '+String(primary.probe_at).slice(0,19).replace('T',' '):'')+'. Click Verify to re-probe.';
+  } else {
+    paintPlaygroundProbe(null, slug+' has not been probed yet.');
+  }
+}
+async function verifyPlaygroundSlug(){
+  const select=document.getElementById('c-model');
+  const slug=select?select.value.trim():'';
+  if(!slug){ toast('choose a model','err'); return; }
+  let routesData; try{ routesData=(await api('/admin/routes')).data; }catch(e){ toast('could not load routes','err'); return; }
+  const route=((routesData&&routesData.routes)||[]).find(function(r){return r.slug===slug;});
+  if(!route){ toast('no route for '+slug,'err'); return; }
+  const body=document.getElementById('c-probe-body');
+  const metaEl=document.getElementById('c-probe-meta');
+  if(metaEl) metaEl.textContent='Probing '+slug+'…';
+  if(body) body.innerHTML='<div class="empty">Running tokenizer, routing, stack-leak, ceiling, and cutoff probes.</div>';
+  setPlaygroundStatus('Verifying '+slug+'…');
+  try{
+    const {status,data}=await api('/admin/providers/'+route.provider_id+'/integrity',{method:'POST',body:JSON.stringify({slug:slug})});
+    if(status!==200){ toast((data&&data.error&&data.error.message)||('verify failed '+status),'err'); paintPlaygroundProbe(null,'Verify failed.'); return; }
+    const run=(data.runs||[])[0];
+    paintPlaygroundProbe(run);
+    setPlaygroundStatus(run&&run.verdict?run.verdict:'Verify complete.');
+    toast(run&&run.verdict?run.verdict:'probed','ok');
+  }catch(e){ toast('verify failed: '+e.message,'err'); setPlaygroundStatus('Verify failed.'); }
+}
 document.getElementById('c-send').onclick=async function(){ await sendPlaygroundMessage(); };
 document.getElementById('c-prompt').addEventListener('keydown',function(e){ if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){ e.preventDefault(); sendPlaygroundMessage(); } });
 document.getElementById('c-clear').onclick=function(){
   pgMessages=[];
   document.getElementById('c-messages').value=JSON.stringify(playgroundDefaultMessages(),null,2);
   document.getElementById('c-prompt').value='';
-  renderPlaygroundMessages([]); setPlaygroundStatus('Ready when you are.');
+  renderPlaygroundMessages([]); setPlaygroundStatus('Ready when you are.'); setPlaygroundTrace(null);
 };
+document.getElementById('c-verify').onclick=function(){ verifyPlaygroundSlug(); };
+document.getElementById('c-model').addEventListener('change',function(){ refreshPlaygroundIntegrity(); });
 let pgLastRun=null;
 let pgBusy=false;
 function pgRateMeta(elapsedMs, totalTokens){
@@ -994,7 +1157,7 @@ async function sendPlaygroundMessage(promptOverride, historyOverride){
   let history;
   if(historyOverride) history=historyOverride;
   else { try{ history=JSON.parse(document.getElementById('c-messages').value); if(!Array.isArray(history)) throw new Error('array'); }
-  catch(e){ toast('Request JSON must be a messages array','err'); return; } }
+  catch(e){ toast('Request JSON must be a messages array','err'); pgBusy=false; if(sendBtn) sendBtn.disabled=false; return; } }
   const messages=history.concat([{role:'user',content:prompt}]);
   document.getElementById('c-messages').value=JSON.stringify(messages,null,2);
   if(promptEl) promptEl.value='';
@@ -1002,11 +1165,17 @@ async function sendPlaygroundMessage(promptOverride, historyOverride){
   pgLastRun={prompt:prompt,history:history.slice(),model:model,stream:stream};
   const requestId=Math.random().toString(36).slice(2);
   setPlaygroundStatus('Running '+model+(stream?' (streaming)':'')+'…');
+  setPlaygroundTrace({id:requestId,route:'…',attempts:'…',usage:'…'});
   const startedAt=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
   const elapsed=function(){ return (((typeof performance!=='undefined'&&performance.now)?performance.now():Date.now())-startedAt)/1000; };
   try{
     const r=await fetch(API+'/admin/playground/completions',{method:'POST',headers:{'Content-Type':'application/json','x-request-id':requestId},credentials:'same-origin',body:JSON.stringify({model:model,messages:messages,stream:stream})});
-    const usage=r.headers.get('x-gateway-used-usd')?('used '+r.headers.get('x-gateway-used-tokens')+' tokens / '+r.headers.get('x-gateway-used-usd')+' USD'):null;
+    const usedUsd=r.headers.get('x-gateway-used-usd');
+    const usedTok=r.headers.get('x-gateway-used-tokens');
+    const usage=usedUsd?('used '+usedTok+' tokens / '+usedUsd+' USD'):null;
+    const routeRank=r.headers.get('x-gateway-route');
+    const attempts=r.headers.get('x-gateway-attempts');
+    setPlaygroundTrace({id:requestId,route:routeRank==null||routeRank===''?'—':'rank '+routeRank,attempts:attempts||'—',usage:usage||'—'});
     if(!r.ok){ const t=await r.text(); appendPlaygroundMessage('assistant','Request failed (HTTP '+r.status+'): '+t.slice(0,1200),'request '+requestId+' · '+elapsed().toFixed(1)+'s'); setPlaygroundStatus('Failed: HTTP '+r.status); return; }
     if(stream){
       const handle=appendStreamingMessage();
@@ -1021,7 +1190,6 @@ async function sendPlaygroundMessage(promptOverride, historyOverride){
       appendPlaygroundMessage('assistant',out||'(no content)',meta);
       document.getElementById('c-messages').value=JSON.stringify(pgMessages,null,2);
     } else {
-
       const j=await r.json(); const content=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||'(no content)';
       const ju=j.usage||{}; const jt=(ju.total_tokens||((ju.prompt_tokens||0)+(ju.completion_tokens||0)))||null;
       const meta=pgRateMeta(elapsed()*1000,jt)+(usage?' · '+usage:'');

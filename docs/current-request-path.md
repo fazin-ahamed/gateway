@@ -35,3 +35,8 @@ stable across deploys.
 - Auto-routing capability gates (context window, vision, tools) read the
   models.dev catalog, plus a local overlay for `zaiweb` routes whose models the
   catalog does not carry.
+- Auto-router health folds in the latest `provider_probe_runs` verdict for a
+  slug: `MULTI-MODEL RELAY`, `TOKENIZER MISMATCH`, and `STACK LEAK` scale
+  `ok_rate` by 0.35 (below the eligibility floor). Integrity probes themselves
+  are admin-only (`POST /admin/providers/:id/integrity`) and never sit on the
+  client path. Playground **Verify this slug** hits that same endpoint.
