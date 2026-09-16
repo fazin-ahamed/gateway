@@ -109,6 +109,24 @@ drives chat.z.ai in a local Chromium and lets the page mint its own proof.
   On a small VM set `SESSION_POOL_SIZE`/limits accordingly, or use an API-key
   provider where a browser is not needed at all.
 
+### Experimental: programmatic captcha minting
+
+`ai-gateway/src/zai-captcha.js` ports the published GLM-Free-API approach —
+Aliyun `InitCaptchaV3`, the `generateArg`/`aliHash`/`encrypt` payload
+construction, and `VerifyCaptchaV3` with a harvested device token. It is
+**not wired into any provider**, because it does not yet yield a usable proof:
+
+| Step | Result |
+| --- | --- |
+| Aliyun `InitCaptchaV3` | works (standard RPC signing; the reference's percent-everything encoder is rejected) |
+| `generateArg`, tracking JSON, `aliHash` | byte-identical to the reference's Go output |
+| `VerifyCaptchaV3` with page-harvested device tokens | `VerifyCode F001`, `VerifyResult false` |
+
+The same tokens fail identically through the reference's own Go `tryCompute`,
+so the blocker is device-token provenance, not the port. Until that is solved
+the browser transport above is the automated route, and minting stays a
+documented dead end rather than a half-working provider.
+
 ### Using an OpenAI-compatible bridge instead
 
 If you would rather not run a browser, any OpenAI-compatible bridge for
