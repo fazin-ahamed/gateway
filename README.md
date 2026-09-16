@@ -89,6 +89,25 @@ wrangler d1 execute DB --command "ALTER TABLE providers ADD COLUMN enabled INTEG
 | `anthropic` | `{base_url}/messages`                      | API key, sent as `x-api-key`                                                                          |
 | `zaiweb`    | Z.ai consumer web chat (`https://chat.z.ai`) | JSON `{"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}` or a bare JWT token |
 
+### Presets
+
+**Providers → Add provider** opens with a **Preset** picker. A preset fills the
+name, base URL, format and transport, retargets the credential hint, and offers
+the usual model routes; every field stays editable before saving, and choosing
+*Custom / other provider* clears the form back to blank.
+
+| Preset    | Result                                                                                  |
+| --------- | --------------------------------------------------------------------------------------- |
+| `zai-web` | `zaiweb` provider on `https://chat.z.ai`, direct transport, routes `z-ai/glm-5.3` + `z-ai/glm-5.3-flash` |
+| `zai-api` | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
+
+Route seeding never repoints a live slug: a preset only adds routes for slugs
+that have no enabled route yet, and reports the rest as kept. API:
+`GET /admin/provider-presets`, and
+`POST /admin/providers {"preset":"zai-web","api_key":"…"}` (add
+`seed_routes:false` for the provider alone, or `routes:[{slug,upstream_model}]`
+to override the preset's list).
+
 ### Z.ai web chat (`zaiweb`)
 
 The consumer site (chat.z.ai) is not an API: it authenticates with a session
@@ -111,8 +130,11 @@ Getting the credential:
 3. Send one message, then in DevTools → Network find the `POST` to
    `/api/v2/chat/completions`, and copy `captcha_verify_param` out of its
    request body.
-4. Add a provider with format `Z.ai web chat` and paste both values as JSON.
-   Verify with the console's provider **test** button (`POST /admin/providers/:id/test`).
+4. In the console: **Providers → Add provider**, leave the preset on *Z.AI web
+   chat*, paste both values as JSON into **Credential**, and save. The preset
+   fills the name, base URL, `zaiweb` format, direct transport, and the two
+   model routes. Verify with the **test** button afterwards
+   (`POST /admin/providers/:id/test`).
 
 Behavior and limits:
 

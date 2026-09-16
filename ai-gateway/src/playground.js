@@ -411,7 +411,7 @@ document.querySelector('nav').addEventListener('click',function(e){
 
 // ---------- modal helper ----------
 let modalSubmit=null;
-function openModal(title, fields, onSubmit, saveLabel){
+function openModal(title, fields, onSubmit, saveLabel, onReady){
   document.querySelector('.modal').classList.remove('wide');
   document.getElementById('modal-title').textContent=title;
   const body=document.getElementById('modal-body'); body.innerHTML='';
@@ -422,6 +422,7 @@ function openModal(title, fields, onSubmit, saveLabel){
     if(f.type==='select'||f.type==='multiselect'){ inp=document.createElement('select'); if(f.type==='multiselect') inp.multiple=true; (f.options||[]).forEach(function(o){ const op=document.createElement('option'); op.value=o.value; op.textContent=o.label; if(f.type==='multiselect'&&Array.isArray(f.value)&&f.value.map(String).includes(String(o.value))) op.selected=true; inp.appendChild(op); }); }
     else if(f.type==='textarea'){ inp=document.createElement('textarea'); inp.rows=f.rows||4; }
     else { inp=document.createElement('input'); inp.type=f.type||'text'; }
+    inp.dataset.key=f.key;
     if(f.value!=null&&f.type!=='multiselect') inp.value=f.value;
     if(f.placeholder) inp.placeholder=f.placeholder;
     if(f.hint){ const h=document.createElement('div'); h.className='small'; h.style.margin='-6px 0 12px'; h.textContent=f.hint; body.appendChild(inp); body.appendChild(h); vals[f.key]=inp; return; }
@@ -434,6 +435,7 @@ function openModal(title, fields, onSubmit, saveLabel){
   saveBtn.style.display='';
   saveBtn.classList.remove('danger'); saveBtn.classList.add('act');
   document.getElementById('overlay').classList.add('show');
+  if(onReady) onReady(vals, body);
   const first=body.querySelector('input,select,textarea'); if(first) setTimeout(function(){ try{first.focus();}catch(e){} },30);
 }
 function paintSkeleton(el,kind){
@@ -534,22 +536,101 @@ function applyHeaderPreset(v){
 }
 var HEADER_PRESET_OPTIONS=[{value:'none',label:'No preset'},{value:'openrouter',label:'OpenRouter app headers'},{value:'claudecode',label:'Claude Code beta'},{value:'anthropicbeta',label:'Anthropic prompt-caching beta'},{value:'harness',label:'Harness fingerprint (omp / Claude Code)'},{value:'custom',label:'Custom only'}];
 var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'},{value:'zaiweb',label:'Z.ai web chat (chat.z.ai session)'}];
+// Applies a provider preset to the open provider form: fills the copy the
+// preset owns and reveals the route fields, so a known upstream is two clicks
+// in the console instead of a hand-typed base_url + fmt + slugs.
+var PRESET_FIELD_KEYS=['name','base_url','fmt','transport','api_key','header_preset','extra_headers','seed_routes','preset_slug','preset_upstream','preset_slug2','preset_upstream2'];
+function presetRow(vals,key){
+  const el=vals[key]; return el?(el.closest('div')||el.parentNode):null;
+}
+function applyProviderPreset(vals,preset){
+  const custom=!preset||preset.id==='custom';
+  const set=function(key,value){ if(vals[key]) vals[key].value=value; };
+  if(custom){
+    set('name',''); set('base_url',''); set('fmt','openai'); set('transport','auto');
+    set('preset_slug',''); set('preset_upstream',''); set('preset_slug2',''); set('preset_upstream2','');
+    if(vals.api_key){ vals.api_key.value=''; vals.api_key.placeholder='sk-... (stored in DB)'; }
+    if(vals.extra_headers) vals.extra_headers.value='';
+  } else {
+    if(preset.name) set('name',preset.name);
+    if(preset.base_url) set('base_url',preset.base_url);
+    if(preset.fmt) set('fmt',preset.fmt);
+    if(preset.transport) set('transport',preset.transport);
+    if(preset.extra_headers) set('extra_headers',preset.extra_headers);
+    if(vals.api_key){ vals.api_key.value=''; if(preset.credential_hint) vals.api_key.placeholder=preset.credential_hint; }
+    const routes=preset.routes||[];
+    const r0=routes[0]||{};
+    const r1=routes[1]||{};
+    set('preset_slug',r0.slug||'');
+    set('preset_upstream',r0.upstream_model||'');
+    set('preset_slug2',r1.slug||'');
+    set('preset_upstream2',r1.upstream_model||'');
+  }
+  set('seed_routes','1');
+  PRESET_FIELD_KEYS.forEach(function(key){
+    const row=presetRow(vals,key);
+    if(!row) return;
+    const optional=row.getAttribute('data-preset-optional')==='1';
+    if(optional) row.style.display=custom?'none':'';
+  });
+  if(vals.preset) vals.preset.value=preset&&preset.id?preset.id:'custom';
+}
+function bindPresetPicker(vals,presets){
+  if(!vals.preset) return;
+  vals.preset.addEventListener('change',function(){
+    const preset=presets.find(function(p){ return p.id===vals.preset.value; })||{id:'custom'};
+    applyProviderPreset(vals,preset);
+  });
+}
 async function addProvider(){
+  let presets=[];
+  try{ presets=((await api('/admin/provider-presets')).data.presets)||[]; }catch(e){}
+  const options=[{value:'custom',label:'Custom / other provider'}].concat(presets.map(function(p){ return {value:p.id,label:p.label}; }));
+  const first=presets[0];
   openModal('Add provider',[
-    {key:'name',label:'Name',placeholder:'OpenRouter'},
-    {key:'base_url',label:'Base URL',placeholder:'https://api.example.com/v1'},
-    {key:'api_key',label:'API Key',type:'password',placeholder:'sk-... (stored in DB)'},
-    {key:'fmt',label:'Format',type:'select',options:PROVIDER_FMT_OPTIONS},
+    {key:'preset',label:'Preset',type:'select',value:'custom',options:options,hint:first?('Presets fill this form and seed routes for the usual model ids. '+first.label+': '+first.summary):'Pick a preset or fill the fields yourself.'},
+    {key:'name',label:'Name',value:first?first.name:'',placeholder:'OpenRouter'},
+    {key:'base_url',label:'Base URL',value:first?first.base_url:'',placeholder:'https://api.example.com/v1'},
+    {key:'api_key',label:'Credential',type:'password',placeholder:(first&&first.credential_hint)||'sk-... (stored in DB)'},
+    {key:'fmt',label:'Format',type:'select',value:first?first.fmt:'openai',options:PROVIDER_FMT_OPTIONS},
     {key:'priority',label:'Priority (lower = first)',type:'number',value:'0'},
     {key:'proxy_url',label:'OCI proxy URL (rollback only)',placeholder:'http://user:pass@host:8080'},
-    {key:'transport',label:'Transport',type:'select',value:'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
+    {key:'transport',label:'Transport',type:'select',value:(first&&first.transport)||'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
     {key:'header_preset',label:'Header preset',type:'select',value:'none',options:HEADER_PRESET_OPTIONS},
     {key:'extra_headers',label:'Extra upstream headers',type:'textarea',placeholder:'HTTP-Referer: https://example.com\\nX-Title: My app',hint:'One Name: value per line. Sent to this provider on every request. Auth and content headers are managed automatically.'},
+    {key:'seed_routes',label:'Seed preset routes',type:'select',value:'1',options:[{value:'1',label:'Yes — add the preset model routes'},{value:'0',label:'No — provider only'}],hint:'Routes are only added for slugs that do not already have an enabled route.'},
+    {key:'preset_slug',label:'Primary route slug',placeholder:'z-ai/glm-5.3'},
+    {key:'preset_upstream',label:'Primary upstream model',placeholder:'glm-5.3'},
+    {key:'preset_slug2',label:'Fallback route slug (optional)',placeholder:'z-ai/glm-5.3-flash'},
+    {key:'preset_upstream2',label:'Fallback upstream model (optional)',placeholder:'glm-5.3-flash'}
   ], async function(v){
     applyHeaderPreset(v);
+    if(v.seed_routes==='1'){
+      v.routes=[];
+      if((v.preset_slug||'').trim() && (v.preset_upstream||'').trim()) v.routes.push({slug:v.preset_slug.trim(),upstream_model:v.preset_upstream.trim()});
+      if((v.preset_slug2||'').trim() && (v.preset_upstream2||'').trim()) v.routes.push({slug:v.preset_slug2.trim(),upstream_model:v.preset_upstream2.trim()});
+    }
+    delete v.seed_routes; delete v.preset_slug; delete v.preset_upstream; delete v.preset_slug2; delete v.preset_upstream2;
     const {status,data}=await api('/admin/providers',{method:'POST',body:JSON.stringify(v)});
-    if(status===201){ toast('provider created (id '+data.id+')','ok'); closeModal(); loadProviders(); }
+    if(status===201){
+      const added=(data.routes||[]);
+      const skipped=(data.routes_skipped||[]);
+      let msg='provider created (id '+data.id+')';
+      if(added.length) msg+=' — routes: '+added.join(', ');
+      if(skipped.length) msg+=' — kept existing: '+skipped.join(', ');
+      toast(msg,'ok'); closeModal(); loadProviders();
+    }
     else toast('create failed: '+(data&&data.error&&data.error.message||status),'err');
+  }, undefined, function(vals,body){
+    ['proxy_url','header_preset','extra_headers','seed_routes','preset_slug','preset_upstream','preset_slug2','preset_upstream2'].forEach(function(key){
+      const row=presetRow(vals,key); if(row) row.setAttribute('data-preset-optional','1');
+    });
+    applyProviderPreset(vals,first||{id:'custom'});
+    PRESET_FIELD_KEYS.concat(['preset']).forEach(function(key){
+      const row=presetRow(vals,key);
+      if(row) row.setAttribute('data-preset-field',key);
+    });
+    bindPresetPicker(vals,presets);
   });
 };
 async function editProvider(id){

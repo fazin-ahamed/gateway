@@ -2879,6 +2879,115 @@ app.get("/admin/proxy-health", async (c) => {
   }
   return c.json({ health: out });
 });
+// One-click provider setups. Each preset fills provider fields and, when the
+// upstream offers a standard family, seeds routes so a new provider is usable
+// from the console without hand-copying slugs and model ids.
+var PROVIDER_PRESETS = [
+  {
+    id: "zai-web",
+    label: "Z.AI web chat (chat.z.ai, no API key)",
+    summary: "Consumer GLM-5.3 session. Needs the token from chat.z.ai Local Storage plus a captcha_verify_param; no tools.",
+    fmt: "zaiweb",
+    name: "Z.AI web chat",
+    base_url: "https://chat.z.ai",
+    transport: "direct",
+    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}',
+    credential_format: "provider_credential",
+    routes: [
+      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" },
+      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" }
+    ]
+  },
+  {
+    id: "zai-api",
+    label: "Z.AI API key (api.z.ai)",
+    summary: "Standard GLM API on an API key, OpenAI-compatible, tools supported.",
+    fmt: "openai",
+    name: "Z.AI API",
+    base_url: "https://api.z.ai/api/paas/v4",
+    transport: "auto",
+    credential_hint: "Paste the API key from z.ai/manage-apikey.",
+    credential_format: "api_key",
+    routes: [
+      { slug: "z-ai/glm-4.6", upstream_model: "glm-4.6" },
+      { slug: "z-ai/glm-4.5", upstream_model: "glm-4.5" }
+    ]
+  }
+];
+function providerPreset(id) {
+  return PROVIDER_PRESETS.find((p) => p.id === String(id || "")) || null;
+}
+// Creates a provider, its routes, and optionally its credential in one call so
+// the console's "add provider" can apply a preset without a second pass.
+async function createProviderFromPreset(c, body) {
+  const preset = providerPreset(body.preset);
+  if (!preset)
+    return c.json({ error: { message: 'unknown preset "' + String(body.preset || "") + '"' } }, 400);
+  const name = String(body.name || preset.name).trim();
+  const baseUrl = String(body.base_url || preset.base_url).trim();
+  if (!name || !baseUrl)
+    return c.json({ error: { message: "preset needs a name and base_url" } }, 400);
+  const fmt2 = body.fmt ? normalizeProviderFormat(body.fmt, preset.fmt) : preset.fmt;
+  let transport = preset.transport || "auto";
+  try {
+    transport = normalizeTransport(body.transport || transport);
+  } catch (e) {
+    return c.json({ error: { message: e.message } }, 400);
+  }
+  let extraHeaders = "{}";
+  try {
+    extraHeaders = normalizeExtraHeaders(body.extra_headers);
+  } catch (e) {
+    return c.json({ error: { message: e.message } }, 400);
+  }
+  const sealed = body.api_key ? await sealProviderKey(c.env, String(body.api_key)) : null;
+  const info = await c.env.DB.prepare(
+    "INSERT INTO providers (name, base_url, priority, healthy, notes, fmt, proxy_url, transport, extra_headers, api_key, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id"
+  ).bind(name, baseUrl, Number(body.priority) || 0, 1, body.notes || null, fmt2, body.proxy_url || null, transport, extraHeaders, sealed, "round_robin", nowIso()).all();
+  const pid = info.results && info.results[0] && info.results[0].id;
+  if (sealed)
+    await c.env.DB.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(pid, sealed, "primary", nowIso()).run();
+  // Seed routes only when asked: a preset should never silently repoint a slug
+  // that already has routes. The console may pass its own edited route list.
+  const created = [];
+  const skipped = [];
+  const requestedRoutes = Array.isArray(body.routes) && body.routes.length ? body.routes : (preset.routes || []);
+  if (body.seed_routes !== false) {
+    for (const route of requestedRoutes) {
+      const slug = String(route && route.slug || "").trim();
+      const upstream = String(route && route.upstream_model || "").trim();
+      if (!slug || !upstream)
+        continue;
+      const existing = await c.env.DB.prepare("SELECT id FROM model_routes WHERE slug=? AND enabled=1 LIMIT 1").bind(slug).first();
+      if (existing) {
+        skipped.push(slug);
+        continue;
+      }
+      const next = await c.env.DB.prepare("SELECT COALESCE(MAX(rank),-1)+1 AS next FROM model_routes WHERE slug=?").bind(slug).first();
+      await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,?,1)").bind(slug, pid, upstream, Number(next && next.next) || 0).run();
+      created.push(slug);
+    }
+  }
+  blog("PROVIDER preset=" + preset.id + " id=" + pid + " name=" + name + " routes=" + created.length + " skipped=" + skipped.length);
+  return c.json({
+    id: pid,
+    preset: preset.id,
+    name,
+    base_url: baseUrl,
+    fmt: fmt2,
+    transport,
+    api_key_set: !!body.api_key,
+    routes: created,
+    routes_skipped: skipped,
+    credential_hint: preset.credential_hint
+  }, 201);
+}
+app.get("/admin/provider-presets", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return c.json({ presets: PROVIDER_PRESETS });
+});
 app.post("/admin/providers", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
@@ -2889,6 +2998,8 @@ app.post("/admin/providers", async (c) => {
   } catch {
     return c.json({ error: { message: "Invalid JSON" } }, 400);
   }
+  if (b && b.preset)
+    return createProviderFromPreset(c, b);
   if (!b.name || !b.base_url)
     return c.json({ error: { message: "name + base_url required" } }, 400);
   let fmt2;
