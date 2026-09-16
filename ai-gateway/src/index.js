@@ -2894,8 +2894,8 @@ var PROVIDER_PRESETS = [
     credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}',
     credential_format: "provider_credential",
     routes: [
-      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" },
-      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" }
+      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
+      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
     ]
   },
   {

@@ -98,7 +98,7 @@ the usual model routes; every field stays editable before saving, and choosing
 
 | Preset    | Result                                                                                  |
 | --------- | --------------------------------------------------------------------------------------- |
-| `zai-web` | `zaiweb` provider on `https://chat.z.ai`, direct transport, routes `z-ai/glm-5.3` + `z-ai/glm-5.3-flash` |
+| `zai-web` | `zaiweb` provider on `https://chat.z.ai`, direct transport, routes `z-ai/glm-5.3-flash` + `z-ai/glm-5.3` |
 | `zai-api` | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
 
 Route seeding never repoints a live slug: a preset only adds routes for slugs
@@ -116,11 +116,11 @@ on each completion. This provider speaks that protocol from the server.
 
 Model routes to create (slug → `upstream_model`):
 
-| Public slug (suggested) | `upstream_model` | Thinking | Vision | Tools |
-| ----------------------- | ---------------- | -------- | ------ | ----- |
-| `z-ai/glm-5.3`          | `glm-5.3`        | yes      | no     | no    |
-| `z-ai/glm-5.3-flash`    | `glm-5.3-flash`  | yes      | yes    | no    |
-| `z-ai/glm-5.2`          | `glm-5.2`        | yes      | no     | no    |
+| Public slug (suggested) | `upstream_model` | Thinking | Vision | Tools | Tier note                     |
+| ----------------------- | ---------------- | -------- | ------ | ----- | ----------------------------- |
+| `z-ai/glm-5.3-flash`    | `glm-5.3-flash`  | yes      | yes    | no    | reachable on guest sessions   |
+| `z-ai/glm-5.3`          | `glm-5.3`        | yes      | no     | no    | signed-in accounts only       |
+| `z-ai/glm-5.2`          | `glm-5.2`        | yes      | no     | no    | signed-in accounts only       |
 
 Getting the credential:
 
@@ -138,6 +138,18 @@ Getting the credential:
 
 Behavior and limits:
 
+- Model access is per account tier, not per gateway. A signed-out/guest
+  `chat.z.ai` session may only reach `glm-5.3-flash` (`x-preview-l`); asking
+  for `glm-5.3`/`glm-5.2` on such an account returns
+  "Model not available for current user level" surfaced as a typed 502
+  (`zai_stream_error`). Add routes only for models your account actually
+  serves — the preset ships `z-ai/glm-5.3-flash` as primary for that reason.
+- The session JWT carries no expiry, but the **captcha proof is short-lived
+  and single-use**: the first completion consumes it and later ones fail with
+  `Captcha verification failed` (typed 502 `zai_stream_error`). Re-pasting a
+  fresh `captcha_verify_param` via the provider's **keys** dialog restores it.
+  Treat this provider as bursty by nature; an API-key provider does not have
+  this limitation.
 - Thinking is always on (the consumer models expose no non-thinking mode).
   `reasoning_effort` (`low`/`medium`/`high`/`max`) is forwarded; `glm-5.2`
   has no `low`, so it clamps to `high`. Reasoning arrives as
