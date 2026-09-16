@@ -2886,6 +2886,44 @@ app.get("/admin/trajectories", async (c) => {
   const agg = await c.env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok_count, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost FROM trajectories").first();
   return c.json({ trajectories: rows.results || [], stats: agg || { total: 0, ok_count: 0, tokens: 0, cost: 0 } });
 });
+app.get("/admin/trajectories-export", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const format = String(c.req.query("format") || "openai");
+  if (!["openai", "sharegpt", "trl", "rl"].includes(format))
+    return c.json({ error: { message: "format must be one of openai, sharegpt, trl, rl" } }, 400);
+  const slugFilter = String(c.req.query("slug") || "").trim();
+  let sql = "SELECT slug, stream, status, provider, attempts, steps_json, request_json, response_json, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at FROM trajectories WHERE status='ok' AND request_json IS NOT NULL AND response_json IS NOT NULL";
+  const binds = [];
+  if (slugFilter) {
+    sql += " AND slug=?";
+    binds.push(slugFilter);
+  }
+  sql += " ORDER BY created_at";
+  const rows = await c.env.DB.prepare(sql).bind(...binds).all();
+  const lines = [];
+  let skipped = 0;
+  for (const r of rows.results || []) {
+    try {
+      const line = exportTrajectoryLine(r, format);
+      if (line)
+        lines.push(line);
+      else
+        skipped++;
+    } catch {
+      skipped++;
+    }
+  }
+  return new Response(lines.join("\n") + (lines.length ? "\n" : ""), {
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "content-disposition": "attachment; filename=trajectories-" + format + ".jsonl",
+      "x-trajectory-count": String(lines.length),
+      "x-trajectory-skipped": String(skipped)
+    }
+  });
+});
 app.get("/admin/trajectories/:id", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
@@ -2895,40 +2933,105 @@ app.get("/admin/trajectories/:id", async (c) => {
     return c.json({ error: { message: "trajectory not found" } }, 404);
   return c.json({ trajectory: row });
 });
-app.get("/admin/trajectories-export", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied)
-    return denied;
-  const format = String(c.req.query("format") || "sft");
-  const rows = await c.env.DB.prepare("SELECT slug, stream, status, provider, attempts, steps_json, request_json, response_json, cost_usd, total_tokens, created_at FROM trajectories WHERE status='ok' AND request_json IS NOT NULL AND response_json IS NOT NULL ORDER BY created_at").all();
-  const lines = [];
-  for (const r of rows.results || []) {
-    try {
-      const req = JSON.parse(r.request_json);
-      const resObj = JSON.parse(r.response_json);
-      const content = resObj && resObj.choices && resObj.choices[0] && resObj.choices[0].message && resObj.choices[0].message.content;
-      if (format === "sft") {
-        if (!Array.isArray(req.messages) || !content)
-          continue;
-        const messages = req.messages.concat([{ role: "assistant", content }]);
-        lines.push(JSON.stringify({ messages, model: r.slug }));
-      } else {
-        lines.push(JSON.stringify({
-          input: req, output: resObj, model: r.slug, provider: r.provider,
-          attempts: r.attempts, steps: JSON.parse(r.steps_json || "[]"),
-          tokens: r.total_tokens, cost_usd: r.cost_usd, created_at: r.created_at
-        }));
-      }
-    } catch {
-    }
-  }
-  return new Response(lines.join("\n") + "\n", {
-    headers: {
-      "content-type": "application/x-ndjson; charset=utf-8",
-      "content-disposition": "attachment; filename=trajectories-" + format + ".jsonl"
-    }
+// ---- Trajectory exporters ----
+// Each ok request/response pair becomes a training example. The request
+// already carries the full multi-turn conversation (agents resend history
+// including tool results), so the trajectory is the whole sequence, not
+// just the last turn.
+function assistantMessage(resObj) {
+  const msg = resObj && resObj.choices && resObj.choices[0] && resObj.choices[0].message;
+  if (!msg)
+    return null;
+  return {
+    role: "assistant",
+    ...(msg.content != null ? { content: msg.content } : { content: "" }),
+    ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
+    ...(Array.isArray(msg.tool_calls) && msg.tool_calls.length ? { tool_calls: msg.tool_calls } : {})
+  };
+}
+function validTrainingMessages(messages) {
+  return Array.isArray(messages) && messages.length > 0 && messages.every(function (m) {
+    if (!m || typeof m.role !== "string")
+      return false;
+    // Assistant turns with tool calls may legitimately carry null content.
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length)
+      return true;
+    return m.content != null;
   });
-});
+}
+function exportTrajectoryLine(r, format) {
+  const req = JSON.parse(r.request_json);
+  const resObj = JSON.parse(r.response_json);
+  const assistant = assistantMessage(resObj);
+  if (!assistant || !validTrainingMessages(req.messages))
+    return null;
+  const finish = resObj.choices && resObj.choices[0] && resObj.choices[0].finish_reason || "stop";
+  if (format === "openai") {
+    // OpenAI fine-tuning / chatml convention: full conversation + target.
+    return JSON.stringify({
+      messages: req.messages.concat([assistant]),
+      model: r.slug
+    });
+  }
+  if (format === "sharegpt") {
+    // ShareGPT/Vicuna convention: {"conversations": [{from,value},...]}
+    // tool calls/results map to function_call/function_response turns.
+    const conv = [];
+    for (const m of req.messages) {
+      if (m.role === "system") {
+        conv.push({ from: "system", value: String(m.content) });
+      } else if (m.role === "user") {
+        conv.push({ from: "human", value: typeof m.content === "string" ? m.content : JSON.stringify(m.content) });
+      } else if (m.role === "assistant") {
+        if (m.content)
+          conv.push({ from: "gpt", value: typeof m.content === "string" ? m.content : JSON.stringify(m.content) });
+        if (Array.isArray(m.tool_calls))
+          for (const tc of m.tool_calls)
+            conv.push({ from: "function_call", value: JSON.stringify({ name: tc.function && tc.function.name, arguments: tc.function && tc.function.arguments }) });
+      } else if (m.role === "tool") {
+        conv.push({ from: "function_response", value: { name: m.name || m.tool_call_id || "tool", content: m.content } });
+      }
+    }
+    if (assistant.content)
+      conv.push({ from: "gpt", value: assistant.content });
+    if (Array.isArray(assistant.tool_calls))
+      for (const tc of assistant.tool_calls)
+        conv.push({ from: "function_call", value: JSON.stringify({ name: tc.function && tc.function.name, arguments: tc.function && tc.function.arguments }) });
+    if (!conv.some(function (x) { return x.from === "gpt"; }))
+      return null;
+    return JSON.stringify({ conversations: conv, model: r.slug });
+  }
+  if (format === "trl") {
+    // HuggingFace TRL conversational format: {"messages": [...]} with
+    // system/user/assistant/tool roles, tool calls preserved verbatim.
+    return JSON.stringify({
+      messages: req.messages.concat([assistant]),
+      metadata: { model: r.slug, finish_reason: finish }
+    });
+  }
+  if (format === "rl") {
+    // RL episode: state = conversation so far, action = the completion,
+    // reward signal fields for downstream preference/RLHF pipelines.
+    return JSON.stringify({
+      prompt: { messages: req.messages },
+      completion: { message: assistant, finish_reason: finish },
+      reward: null,
+      info: {
+        model: r.slug,
+        provider: r.provider,
+        attempts: r.attempts,
+        steps: JSON.parse(r.steps_json || "[]"),
+        prompt_tokens: r.prompt_tokens || 0,
+        completion_tokens: r.completion_tokens || 0,
+        total_tokens: r.total_tokens || 0,
+        cost_usd: r.cost_usd,
+        latency_ms: r.latency_ms,
+        created_at: r.created_at
+      }
+    });
+  }
+  return null;
+}
 app.post("/admin/trajectories/purge", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
