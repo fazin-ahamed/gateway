@@ -4,8 +4,8 @@ OpenAI-compatible AI gateway on Node + SQLite (direct egress, Koyeb WebSocket re
 
 ## Layout
 
-- `ai-gateway/` — app source (`src/index.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), SQLite schema, admin console UI
-- `server/` — Node entrypoint (`server.mjs`, `db.mjs`, `import.mjs`), the only deploy target
+- `ai-gateway/` — app source (`src/index.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), SQLite schema, admin console UI, Worker entry + `wrangler.jsonc`
+- `server/` — Node entrypoint (`server.mjs`, `db.mjs`, `import.mjs`), the Node deploy target (Workers deploy from `ai-gateway/`)
 - `relay/` — small Go relay for providers that need non-Cloudflare egress
 - `docs/` — request-path and hosting runbooks
 
@@ -78,3 +78,60 @@ from this commit:
 ```sh
 wrangler d1 execute DB --command "ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
 ```
+
+## Provider formats
+
+`providers.fmt` accepts three values. The admin UI exposes all three.
+
+| `fmt`       | Upstream                                   | Credential (sealed `provider_keys` row)                                                              |
+| ----------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `openai`    | `{base_url}/chat/completions`              | API key, sent as `Authorization: Bearer …`                                                            |
+| `anthropic` | `{base_url}/messages`                      | API key, sent as `x-api-key`                                                                          |
+| `zaiweb`    | Z.ai consumer web chat (`https://chat.z.ai`) | JSON `{"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}` or a bare JWT token |
+
+### Z.ai web chat (`zaiweb`)
+
+The consumer site (chat.z.ai) is not an API: it authenticates with a session
+JWT from the browser's Local Storage and requires a short-lived CAPTCHA proof
+on each completion. This provider speaks that protocol from the server.
+
+Model routes to create (slug → `upstream_model`):
+
+| Public slug (suggested) | `upstream_model` | Thinking | Vision | Tools |
+| ----------------------- | ---------------- | -------- | ------ | ----- |
+| `z-ai/glm-5.3`          | `glm-5.3`        | yes      | no     | no    |
+| `z-ai/glm-5.3-flash`    | `glm-5.3-flash`  | yes      | yes    | no    |
+| `z-ai/glm-5.2`          | `glm-5.2`        | yes      | no     | no    |
+
+Getting the credential:
+
+1. Sign in at chat.z.ai in a browser.
+2. Open DevTools → Application → Local Storage → `https://chat.z.ai` → copy
+   the `token` value (a JWT).
+3. Send one message, then in DevTools → Network find the `POST` to
+   `/api/v2/chat/completions`, and copy `captcha_verify_param` out of its
+   request body.
+4. Add a provider with format `Z.ai web chat` and paste both values as JSON.
+   Verify with the console's provider **test** button (`POST /admin/providers/:id/test`).
+
+Behavior and limits:
+
+- Thinking is always on (the consumer models expose no non-thinking mode).
+  `reasoning_effort` (`low`/`medium`/`high`/`max`) is forwarded; `glm-5.2`
+  has no `low`, so it clamps to `high`. Reasoning arrives as
+  `reasoning_content` deltas.
+- Caller-supplied `tools` are refused with a 400 (`zai_tools_unsupported`).
+  These models cannot call tools; silently dropping them would break agents.
+- Images are accepted only on `glm-5.3-flash`; anything else returns 400
+  (`zai_vision_unsupported`). Image parts are forwarded as `[image: <url>]`
+  markers — uploading attachments is not implemented.
+- `transport` must be `auto` or `direct`; the signed session cannot survive a
+  relay hop, so `koyeb`/`oci` are rejected with a 400 (`zai_transport`).
+- Captcha proofs are short-lived. When one expires the route fails with a
+  typed 503 (`zai_captcha`) naming the fix, and never trips the provider
+  circuit breaker.
+- chat.z.ai rotates the session cookie on each chat creation; the gateway
+  re-seals and stores the rotated token (keeping the other credential fields),
+  so a long-lived route survives rotation.
+- Usage is estimated (chat.z.ai reports none): ~4 chars/token on input, ~3
+  chars/token on output, plus a per-image allowance.
