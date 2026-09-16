@@ -198,8 +198,11 @@ What it measures, in order of strength:
 1. **`/tokenize` raw token IDs** — compared for equality against reference
    tokenizers. An exact match is identity, not a guess.
 2. **Token-count slope** — `usage.prompt_tokens` across growing prompts, matched
-   against 9 reference families. A fit worse than 6% is reported as unverified
-   rather than naming the least-bad family.
+   against 12 reference families (OpenAI o200k/cl100k/p50k/r50k/gpt2, Qwen,
+   GLM-5, DeepSeek, Llama 3, Mistral, Kimi K2.6, MiniMax). A fit worse than 6%
+   is reported as unverified rather than naming the least-bad family. Gemini
+   and Claude have no public tokenizer, so those slugs stay unverified on the
+   fingerprint path.
 3. **Routing** — six unrelated slugs; three or more answering is a relay.
 4. **Stack leak** — `response.model` that does not echo the request, or a
    `max_tokens` rejection that names a different id. Echoes count as no evidence.

@@ -60,12 +60,15 @@ export const EXPECTED_FAMILY = {
   "qwen": "qwen",
   "mistral": "mistral",
   "deepseek": "deepseek",
-  "gemma": "gpt2",
+  "glm": "glm",
+  "chatglm": "glm",
+  "kimi": "kimi",
+  "moonshot": "kimi",
+  "minimax": "minimax",
+  "gemma": null,
+  "gemini": null,
   "claude": null,
   "grok": null,
-  "glm": null,
-  "kimi": null,
-  "minimax": null,
   "fable": null
 };
 
@@ -147,9 +150,11 @@ export function extractLeakedModel(json, requested) {
 // against measured behaviour rather than taken on trust.
 export function expectedFamilyFor(model) {
   const m = String(model || "").toLowerCase();
+  const tail = m.split("/").pop();
   let best = null;
   for (const [slug, family] of Object.entries(EXPECTED_FAMILY)) {
-    if (m.startsWith(slug) && (best === null || slug.length > best[0].length))
+    const hit = m.startsWith(slug) || tail.startsWith(slug) || m.includes("/" + slug);
+    if (hit && (best === null || slug.length > best[0].length))
       best = [slug, family];
   }
   if (!best)

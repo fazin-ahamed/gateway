@@ -58,14 +58,18 @@ TIKTOKEN_FAMILIES = {
 }
 
 # Open-weights families worth distinguishing, when `tokenizers` and network
-# access are available. Each is a byte-level BPE variant that a relay would use
-# to serve a cheap model behind a frontier name.
+# access are available. Stealth resellers usually serve GLM-5 / Kimi / MiniMax
+# / Qwen behind a frontier name. Gemini has no public tokenizer; Gemma is gated
+# so it is omitted rather than guessed from an unofficial copy.
 HF_FAMILIES = {
     "qwen": ("Qwen/Qwen2.5-0.5B", "Qwen 2.5/3"),
-    "glm": ("zai-org/glm-4-9b-chat", "Zhipu GLM"),
+    "glm": ("zai-org/GLM-5", "Zhipu GLM-5"),
     "deepseek": ("deepseek-ai/DeepSeek-V3", "DeepSeek V3/R1"),
     "llama": ("NousResearch/Llama-3.2-1B", "Meta Llama 3.x"),
     "mistral": ("mistralai/Mistral-7B-v0.3", "Mistral 7B"),
+    # tokenizer.json is not on main; converted file lives on this commit.
+    "kimi": ("moonshotai/Kimi-K2.6", "Moonshot Kimi K2.6", "https://huggingface.co/moonshotai/Kimi-K2.6/resolve/37f90fe3c9e87348816d678f04bbd8e25a7e3f68/tokenizer.json"),
+    "minimax": ("MiniMaxAI/MiniMax-Text-01", "MiniMax"),
 }
 
 
@@ -90,13 +94,34 @@ def build_hf():
     except ImportError:
         print("[build] tokenizers not installed; shipping tiktoken families only", file=sys.stderr)
         return []
+    import urllib.request
     families = []
-    for key, (repo, label) in HF_FAMILIES.items():
-        try:
-            tok = Tokenizer.from_pretrained(repo)
-        except Exception as e:
-            print(f"[build] {label} ({repo}) unavailable: {e}", file=sys.stderr)
-            continue
+    for key, spec in HF_FAMILIES.items():
+        repo, label = spec[0], spec[1]
+        pinned = spec[2] if len(spec) > 2 else None
+        tok = None
+        err = None
+        if pinned:
+            try:
+                with urllib.request.urlopen(pinned, timeout=60) as resp:
+                    tok = Tokenizer.from_buffer(resp.read())
+                print(f"[build] {label} loaded from pinned {pinned}", file=sys.stderr)
+            except Exception as e:
+                print(f"[build] {label} pinned tokenizer unavailable: {e}", file=sys.stderr)
+                continue
+        else:
+            try:
+                tok = Tokenizer.from_pretrained(repo)
+            except Exception as e:
+                err = e
+                url = "https://huggingface.co/" + repo + "/resolve/main/tokenizer.json"
+                try:
+                    with urllib.request.urlopen(url, timeout=60) as resp:
+                        tok = Tokenizer.from_buffer(resp.read())
+                    print(f"[build] {label} loaded from {url}", file=sys.stderr)
+                except Exception as e2:
+                    print(f"[build] {label} ({repo}) unavailable: {err}; json fallback: {e2}", file=sys.stderr)
+                    continue
         families.append({
             "key": key,
             "label": label + f" [{repo}]",
