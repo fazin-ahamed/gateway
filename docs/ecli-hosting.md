@@ -60,7 +60,7 @@ First boot creates `./data/gateway.db` (SQLite). Apply the schema once:
 sqlite3 ./data/gateway.db < ../ai-gateway/schema.sql
 ```
 
-The console lives at `http://n1.eclipsesystems.org:30012/_gw` (or `http://<allocation-host>:30012/_gw`). Sign in with `ADMIN_TOKEN`. Add providers, routes, and API keys there — D1 is not used.
+The console lives at `http://<allocation-host>:30012/_gw` on the ecli allocation. Sign in with `ADMIN_TOKEN`. Add providers, routes, and API keys there — D1 is not used.
 
 ## 4. Optional: relay on the same VM
 
