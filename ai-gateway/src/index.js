@@ -13,7 +13,7 @@ app.use("/*", async (c, next) => {
 app.use("/v1/*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
-  allowHeaders: ["Content-Type", "Authorization", "x-api-key", "x-request-id", "x-gateway-cache", "x-gateway-cache-ttl"],
+  allowHeaders: ["Content-Type", "Authorization", "x-api-key", "x-request-id", "x-gateway-cache", "x-gateway-cache-ttl", "x-zai-captcha"],
   exposeHeaders: ["x-request-id", "x-gateway-cache", "x-gateway-used-usd", "x-gateway-used-tokens", "x-gateway-route", "x-gateway-attempts"]
 }));
 var encoder = new TextEncoder();
@@ -2891,7 +2891,7 @@ var PROVIDER_PRESETS = [
     name: "Z.AI web chat",
     base_url: "https://chat.z.ai",
     transport: "direct",
-    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}',
+    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — the captcha proof changes every completion, so send it per request as the x-zai-captcha header',
     credential_format: "provider_credential",
     routes: [
       { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },

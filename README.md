@@ -144,12 +144,24 @@ Behavior and limits:
   "Model not available for current user level" surfaced as a typed 502
   (`zai_stream_error`). Add routes only for models your account actually
   serves — the preset ships `z-ai/glm-5.3-flash` as primary for that reason.
-- The session JWT carries no expiry, but the **captcha proof is short-lived
-  and single-use**: the first completion consumes it and later ones fail with
-  `Captcha verification failed` (typed 502 `zai_stream_error`). Re-pasting a
-  fresh `captcha_verify_param` via the provider's **keys** dialog restores it.
-  Treat this provider as bursty by nature; an API-key provider does not have
-  this limitation.
+- The session JWT carries no expiry, but the **captcha proof is issued per
+  completion and single-use**: the first completion consumes it and later ones
+  fail with `Captcha verification failed` (typed 502 `zai_stream_error`).
+  There is no way to store a working proof, because it changes every time. So
+  the provider key only needs the `token`, and each caller passes a fresh proof
+  per request:
+
+  ```sh
+  curl -sS http://<host>:3000/v1/chat/completions \
+    -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
+    -H "x-zai-captcha: <fresh captcha_verify_param>" \
+    -d '{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}'
+  ```
+
+  Precedence is header → request body → stored credential, so a stored value
+  still works exactly once for a smoke test. Missing proof returns a typed 503
+  (`zai_captcha`) naming the header. Treat this provider as a bursty,
+  captcha-gated route; an API-key provider has no such limitation.
 - Thinking is always on (the consumer models expose no non-thinking mode).
   `reasoning_effort` (`low`/`medium`/`high`/`max`) is forwarded; `glm-5.2`
   has no `low`, so it clamps to `high`. Reasoning arrives as

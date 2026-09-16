@@ -582,12 +582,27 @@ export class ZaiWebError extends Error {
 }
 
 function credentialError() {
-  return new ZaiWebError(503, 'Z.ai route needs a web session: paste the chat.z.ai localStorage "token" (and a fresh captcha_verify_param) as the provider key.', "zai_credentials");
+  return new ZaiWebError(503, 'Z.ai route needs a web session: put the chat.z.ai localStorage "token" in the provider key.', "zai_credentials");
+}
+
+// chat.z.ai issues the captcha proof per completion, so it cannot be stored
+// with the credential and reused. A caller holding a fresh one can pass it per
+// request instead of re-pasting the provider key.
+var ZAI_CAPTCHA_HEADERS = ["x-zai-captcha", "x-zai-captcha-verify-param", "x-captcha-verify-param"];
+export function captureFromHeaders(headers) {
+  if (!headers || typeof headers.get !== "function")
+    return "";
+  for (const name of ZAI_CAPTCHA_HEADERS) {
+    const value = headers.get(name);
+    if (value && String(value).trim())
+      return String(value).trim();
+  }
+  return "";
 }
 
 // Credential bag accepted as the provider key: a JSON object with `token`
 // and `captcha_verify_param`, or a raw JWT / cookie string.
-function parseCredential(rawKey, payload) {
+function parseCredential(rawKey, payload, headers) {
   let token = "";
   let captcha = "";
   const key = String(rawKey == null ? "" : rawKey);
@@ -602,8 +617,13 @@ function parseCredential(rawKey, payload) {
   } else {
     token = extractToken(key);
   }
+  // Precedence: a per-request header (newest proof) beats the stored one, then
+  // anything the caller inlined in the request body.
   if (!captcha)
     captcha = captureVerifyParam(payload);
+  const fromHeader = captureFromHeaders(headers);
+  if (fromHeader)
+    captcha = fromHeader;
   return { token, captcha };
 }
 
@@ -621,12 +641,14 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (images && !caps.vision)
     throw new ZaiWebError(400, "Z.ai model " + unprefixedModelId(modelId) + " does not accept image input; use glm-5.3-flash.", "zai_vision_unsupported");
 
-  const { token, captcha } = parseCredential(rawKey, payload);
+  const { token, captcha } = parseCredential(rawKey, payload, c && c.req && typeof c.req.header === "function" ? {
+    get: (name) => c.req.header(name)
+  } : null);
   const userId = userIdFromToken(token);
   if (!token || !userId)
     throw credentialError();
   if (!captcha)
-    throw new ZaiWebError(503, "Z.ai needs a fresh captcha_verify_param (copy it from a chat.z.ai completion request); the proof is short-lived.", "zai_captcha");
+    throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion. Pass it as the x-zai-captcha request header (or providerSpecificData), or store one in the provider key. It is issued per completion, so the stored value only works once.", "zai_captcha");
 
   const messages = Array.isArray(payload.messages) ? payload.messages : [];
   const prompt = latestUserPrompt(messages);
@@ -798,5 +820,6 @@ export const __zaiTest = {
   parseFrame,
   toOpenAiStream,
   estimatePromptTokens,
-  parseCredential
+  parseCredential,
+  captureFromHeaders
 };
