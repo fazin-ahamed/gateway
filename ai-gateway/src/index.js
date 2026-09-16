@@ -1982,28 +1982,33 @@ function promptComplexity(payload) {
     score += 0.5;
   return { score, chars: a.textChars, words: askWords, estInputTokens: tokens, images: a.imageCount };
 }
-function qualityPrior(entry) {
-  if (!entry)
-    return 1;
-  const reasoning = !!(entry.reasoning);
-  const ctx = Number(entry.limit && entry.limit.context) || 0;
-  const id = String(entry.id || "").toLowerCase();
-  // Capability signals only. Price is deliberately NOT a quality proxy
-  // (OpenRouter-style decoupling): a genuinely strong cheap model must not
-  // score low just because it is affordable.
+function qualityPrior(entry, slug) {
+  const id = String((entry && entry.id) || slug || "").toLowerCase();
+  const reasoning = !!(entry && entry.reasoning);
+  const ctx = Number(entry && entry.limit && entry.limit.context) || 0;
+  // Named 2026 families first. Price is not quality: a cheap GLM-5 / Kimi
+  // / DeepSeek must still outrank a tiny 8k model on hard work, and only
+  // true flagships (Astra, Fable, Mythos, GPT-6, Opus 5, Grok 4) sit at the
+  // top so the router can still spend when the ask actually needs them.
   let q = 1;
-  if (reasoning)
-    q += 1.5;
-  if (ctx >= 400000)
-    q += 1;
-  else if (ctx >= 128000)
-    q += 0.5;
-  // Naming conventions carry tier information across vendors.
-  if (/(flash|lite|mini|small|air|nano|tiny|instant)/.test(id))
-    q -= 0.75;
-  if (/(pro|max|ultra|opus|flagship|thinking|reasoning|frontier)/.test(id))
-    q += 0.75;
-  return Math.max(0.25, q);
+  if (/(gpt-6-astra|astra|claude-fable|fable-5|mythos|gpt-6(?!.*mini)|opus-5|claude-opus-5|grok-4)/.test(id))
+    q = 5.4;
+  else if (/(gpt-5\.2|gpt-5-2|o3(?!.*mini)|o4(?!.*mini)|opus-4|sonnet-5|glm-5(?!.*flash)|kimi-k2|kimi-k3|deepseek-v4(?!.*flash)|deepseek-r1|qwen3-max|gemini-3(?!.*flash))/.test(id))
+    q = 4.2;
+  else if (/(gpt-5(?!.*(mini|nano))|gpt-4\.1(?!.*mini)|sonnet-4|glm-5\.3-flash|glm-5-flash|kimi|deepseek-v3|qwen3|gemini-2\.5-pro|llama-4)/.test(id))
+    q = 3.2;
+  else if (/(gpt-4o(?!.*mini)|haiku-4|gemini-2\.5-flash|mistral-large|command-a)/.test(id))
+    q = 2.4;
+  else {
+    q = 1;
+    if (reasoning) q += 1.5;
+    if (ctx >= 1000000) q += 1.4;
+    else if (ctx >= 400000) q += 1;
+    else if (ctx >= 128000) q += 0.5;
+    if (/(flash|lite|mini|small|air|nano|tiny|instant)/.test(id)) q -= 0.5;
+    if (/(pro|max|ultra|opus|flagship|thinking|reasoning|frontier)/.test(id)) q += 0.75;
+  }
+  return Math.max(0.25, Math.min(6, q));
 }
 // Request shape analysis for routing: text size, image payloads, tool
 // definitions. Token counts are heuristics (~4 chars/token, ~1 token/KB of
@@ -2140,29 +2145,28 @@ async function pickAutoModel(c, payload) {
   const score = cx.score;
   // Complexity is unbounded; compress it into the quality-prior scale
   // (priors land between ~0.5 and ~5). need in [1, 6].
-  let need = Math.min(6, 1 + Math.max(0, score) / 2.5);
-  const hasTools = !!(payload.tools || payload.functions);
-  // Auto-Exacto pattern: tool calls are capability-bound, so they raise the
-  // quality floor hard (+2.5) - small-tier models (flash/lite/mini) sit
-  // below it and are skipped for tool traffic entirely.
-  if (hasTools)
-    need = Math.min(6, need + 2.5);
   const reqTokens = cx.estInputTokens || 0;
   const reqImages = cx.images || 0;
+  let need = Math.min(6, 1 + Math.max(0, score) / 2.2);
+  const hasTools = !!(payload.tools || payload.functions);
+  if (hasTools)
+    need = Math.min(6, Math.max(need, 2.6));
+  if (reqImages)
+    need = Math.min(6, Math.max(need, 2.4));
   const candidates = [];
   for (const r of enabled) {
     const entry = overlay.get(r.slug) || (byId ? matchModelsDevPrice(byId, r.slug) : null);
     const mult = Number(cfg.overrides[r.slug]);
-    let q = qualityPrior(entry) + (entry ? 0 : 1.5);
+    let q = qualityPrior(entry, r.slug);
     if (Number.isFinite(mult) && mult > 0)
-      q *= mult;
+      q *= Math.min(3, mult);
     const caps = entryCapabilities(entry);
     const ctxOk = !caps.context || reqTokens <= Math.floor(caps.context * 0.9);
+    const ctxTight = !!(caps.context && reqTokens > caps.context * 0.55);
     const visionOk = reqImages === 0 || caps.vision;
     const toolsOk = !hasTools || caps.tools;
     const capable = ctxOk && visionOk && toolsOk;
-    // Provider circuits are keyed by provider name (route loop); the router
-    // works per slug, so consult this slug's providers, not the slug.
+    // Provider circuits are keyed by provider name; the router works per slug.
     const provNames = String(r.providers || "").split(",").map((s) => s.trim()).filter(Boolean);
     let openCount = 0;
     let wob = 0;
@@ -2178,24 +2182,18 @@ async function pickAutoModel(c, payload) {
     const allOpen = provNames.length > 0 && openCount >= provNames.length;
     const h = healthBySlug.get(r.slug);
     const okRate = h ? Number(h.ok_rate) : 1;
-    const eligible = capable && !allOpen && q + 0.5 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
-    // Unknown price is NaN, not "free": an entry with a null cost column would
-    // otherwise poison every score comparison (NaN > x is false for all x), so
-    // the router silently picked nothing and every plain request got a 503.
+    // Eligible if capable and not a known-bad integrity slug. Quality floor
+    // is a soft skip (q + 0.8 >= need) so a 3.2 GLM-5 still takes need=3.6
+    // agent work instead of falling through to Astra.
+    const eligible = capable && !allOpen && q + 0.8 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight });
   }
-  // Preference blend: 0 = highest quality among eligible, 100 = cheapest.
-  // Health and latency always matter: a cheap-but-slow flaky model loses
-  // to a slightly pricier reliable fast one at any preference. With tools,
-  // the blend shifts 30 points toward quality (capability first).
   const eligibleList = candidates.filter((x) => x.eligible);
   let picked;
   if (!eligibleList.length) {
-    // Fall back to the strongest CAPABLE model first; only when nothing fits
-    // (e.g. context exceeds every window) take the overall strongest.
     const pool = candidates.some((x) => x.capable) ? candidates.filter((x) => x.capable) : candidates;
     let best = null;
     for (const cand of pool) {
@@ -2203,23 +2201,30 @@ async function pickAutoModel(c, payload) {
         best = cand;
     }
     picked = best ? { ...best, fallback: true } : null;
+  } else if (need <= 2.1) {
+    // Small talk: cheapest capable model, not the strongest cheap-ish one.
+    let best = null;
+    for (const cand of eligibleList) {
+      if (!best || cand.cost < best.cost || cand.cost === best.cost && cand.quality > best.quality)
+        best = cand;
+    }
+    picked = best;
   } else {
     const maxCost = Math.max(...eligibleList.map((x) => x.cost), 1e-9);
     const maxMs = Math.max(...eligibleList.map((x) => x.avgMs || 0), 1);
     const rawW = cfg.preference / 100;
-    const w = hasTools ? Math.max(0, rawW - 0.3) : rawW;
+    const hardShift = need >= 4.2 ? 0.2 : 0;
+    const w = Math.max(0, Math.min(1, rawW - hardShift));
     let bestScore = -Infinity;
     for (const cand of eligibleList) {
       const reliability = cand.samples >= 3 ? cand.okRate : 1;
       const relPenalty = (1 - reliability) * 6;
       const slowPenalty = (cand.avgMs || 0) / maxMs * 2;
-      // Half-open circuits (recent failures, not yet tripped) get pushed
-      // back like OpenRouter's 30s outage deprioritization.
       const wobbling = cand.wob || 0;
-      // Inverse-square price weighting: among eligible models, cheap wins
-      // hard; quality still gates via the floor above.
+      const overkill = cand.quality >= 5 && cand.quality > need + 1.2 ? (cand.quality - need - 1.2) * 0.7 : 0;
+      const tight = cand.ctxTight ? 1.35 : 0;
       const costTerm = Math.pow(cand.cost / maxCost, 2) * 6;
-      const s = (1 - w) * cand.quality - w * costTerm - relPenalty - slowPenalty - wobbling;
+      const s = (1 - w) * cand.quality - w * costTerm - relPenalty - slowPenalty - wobbling - overkill - tight;
       if (s > bestScore) {
         bestScore = s;
         picked = cand;
