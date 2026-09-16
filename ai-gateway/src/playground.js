@@ -122,6 +122,8 @@ var PLAYGROUND_HTML = `<!doctype html>
   .modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
   .form-actions{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
   #modal-body label{margin-top:2px}
+  .field{margin:0 0 12px}
+  .field .small{margin:6px 0 0}
   .filter-grid{display:grid;grid-template-columns:1.2fr 1.4fr 1.2fr 1.2fr .8fr auto;gap:12px;align-items:end}
   .tj-chart{display:flex;flex-direction:column;gap:8px}
   .tj-bar{display:grid;grid-template-columns:160px 1fr 80px;gap:10px;align-items:center}
@@ -447,7 +449,8 @@ function openModal(title, fields, onSubmit, saveLabel, onReady){
   const body=document.getElementById('modal-body'); body.innerHTML='';
   const vals={};
   fields.forEach(function(f){
-    const lab=document.createElement('label'); lab.textContent=f.label; body.appendChild(lab);
+    const wrap=document.createElement('div'); wrap.className='field'; wrap.dataset.field=f.key;
+    const lab=document.createElement('label'); lab.textContent=f.label; wrap.appendChild(lab);
     let inp;
     if(f.type==='select'||f.type==='multiselect'){ inp=document.createElement('select'); if(f.type==='multiselect') inp.multiple=true; (f.options||[]).forEach(function(o){ const op=document.createElement('option'); op.value=o.value; op.textContent=o.label; if(f.type==='multiselect'&&Array.isArray(f.value)&&f.value.map(String).includes(String(o.value))) op.selected=true; inp.appendChild(op); }); }
     else if(f.type==='textarea'){ inp=document.createElement('textarea'); inp.rows=f.rows||4; }
@@ -455,8 +458,9 @@ function openModal(title, fields, onSubmit, saveLabel, onReady){
     inp.dataset.key=f.key;
     if(f.value!=null&&f.type!=='multiselect') inp.value=f.value;
     if(f.placeholder) inp.placeholder=f.placeholder;
-    if(f.hint){ const h=document.createElement('div'); h.className='small'; h.style.margin='-6px 0 12px'; h.textContent=f.hint; body.appendChild(inp); body.appendChild(h); vals[f.key]=inp; return; }
-    inp.dataset.key=f.key; body.appendChild(inp); vals[f.key]=inp;
+    wrap.appendChild(inp);
+    if(f.hint){ const h=document.createElement('div'); h.className='small'; h.textContent=f.hint; wrap.appendChild(h); }
+    body.appendChild(wrap); vals[f.key]=inp;
   });
   modalSubmit=function(){ const out={}; fields.forEach(function(f){ out[f.key]=f.type==='multiselect'?Array.from(vals[f.key].selectedOptions).map(function(o){return o.value;}):vals[f.key].value; }); onSubmit(out); };
   const saveBtn=document.getElementById('modal-save');
@@ -569,9 +573,10 @@ var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'ant
 // Applies a provider preset to the open provider form: fills the copy the
 // preset owns and reveals the route fields, so a known upstream is two clicks
 // in the console instead of a hand-typed base_url + fmt + slugs.
-var PRESET_FIELD_KEYS=['name','base_url','fmt','transport','api_key','header_preset','extra_headers','seed_routes','preset_slug','preset_upstream','preset_slug2','preset_upstream2'];
+var PRESET_FIELD_KEYS=['name','base_url','fmt','transport','api_key','proxy_url','header_preset','extra_headers','seed_routes','preset_slug','preset_upstream','preset_slug2','preset_upstream2'];
 function presetRow(vals,key){
-  const el=vals[key]; return el?(el.closest('div')||el.parentNode):null;
+  const el=vals[key];
+  return el?(el.closest('.field')||el.parentNode):null;
 }
 function applyProviderPreset(vals,preset){
   const custom=!preset||preset.id==='custom';
