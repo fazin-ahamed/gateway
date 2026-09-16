@@ -375,7 +375,7 @@ app.get("/v1/models", async (c) => {
   if (!allowed.length)
     return c.json({ object: "list", data: [] });
   const routes = await c.env.DB.prepare(
-    "SELECT DISTINCT slug FROM model_routes WHERE enabled=1 AND slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY slug"
+    "SELECT DISTINCT mr.slug FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug"
   ).bind(...allowed).all();
   const data = (routes.results || []).map((r) => ({
     id: r.slug,
@@ -392,6 +392,23 @@ app.get("/status", async (c) => {
   const provs = await c.env.DB.prepare("SELECT * FROM providers ORDER BY priority").all();
   const status = [];
   for (const p of provs.results || []) {
+    if (p.enabled === 0) {
+      // Fully disabled by the operator: never probed, never routed, and not
+      // advertised in the route inventory.
+      status.push({
+        id: p.id,
+        name: p.name,
+        base_url: p.base_url,
+        priority: p.priority,
+        fmt: p.fmt,
+        healthy_flag: false,
+        enabled: false,
+        last_status: p.last_status,
+        ok: false,
+        error: "disabled"
+      });
+      continue;
+    }
     const key = await providerKey(c, p.id);
     let ok = false, code = null, err = null;
     if (!key) {
@@ -415,13 +432,14 @@ app.get("/status", async (c) => {
       priority: p.priority,
       fmt: p.fmt,
       healthy_flag: !!p.healthy,
+      enabled: true,
       last_status: code,
       ok,
       error: err
     });
   }
   const routes = await c.env.DB.prepare(
-    "SELECT mr.slug, mr.rank, mr.upstream_model, mr.enabled, p.name AS provider, p.healthy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
+    "SELECT mr.slug, mr.rank, mr.upstream_model, mr.enabled, p.name AS provider, p.healthy, p.enabled FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
   ).all();
   return c.json({ providers: status, routes: routes.results || [] });
 });
@@ -460,7 +478,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
   const routes = await c.env.DB.prepare(
-    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
+    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.healthy=1 AND p.enabled=1 ORDER BY mr.rank"
   ).bind(slug).all();
   if (!routes.results || !routes.results.length) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 503, attempts: 0, latencyMs: Date.now() - started, error: "no healthy route" });
@@ -2168,7 +2186,7 @@ app.get("/admin/providers", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const rows = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, last_status, last_checked, notes, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers ORDER BY priority").all();
+  const rows = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, enabled, last_status, last_checked, notes, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers ORDER BY priority").all();
   return c.json({ providers: rows.results || [] });
 });
 app.get("/admin/proxy-health", async (c) => {
@@ -2284,6 +2302,10 @@ app.patch("/admin/providers/:id", async (c) => {
     sets.push("healthy=?");
     binds.push(b.healthy ? 1 : 0);
   }
+  if (b.enabled !== void 0) {
+    sets.push("enabled=?");
+    binds.push(b.enabled ? 1 : 0);
+  }
   if (b.transport !== void 0) {
     try {
       sets.push("transport=?");
@@ -2303,7 +2325,7 @@ app.patch("/admin/providers/:id", async (c) => {
   if (!sets.length)
     return c.json({ id });
   await c.env.DB.prepare("UPDATE providers SET " + sets.join(", ") + ", updated_at=? WHERE id=?").bind(...binds, nowIso(), id).run();
-  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers WHERE id=?").bind(id).first();
+  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, enabled, fmt, proxy_url, transport, extra_headers, (api_key IS NOT NULL AND api_key <> '') AS api_key_set FROM providers WHERE id=?").bind(id).first();
   return c.json({ provider: p });
 });
 app.post("/admin/providers/:id/toggle", async (c) => {
@@ -2314,6 +2336,27 @@ app.post("/admin/providers/:id/toggle", async (c) => {
   await c.env.DB.prepare("UPDATE providers SET healthy = CASE WHEN healthy=1 THEN 0 ELSE 1 END WHERE id=?").bind(id).run();
   const p = await c.env.DB.prepare("SELECT id, healthy FROM providers WHERE id=?").bind(id).first();
   return c.json({ id: p.id, healthy: !!p.healthy });
+});
+// Full disable (operator off-switch). Unlike the healthy toggle — which marks
+// a provider down for routing but still lists/probes it — a disabled provider
+// disappears from /v1/models, /status and route resolution entirely.
+app.post("/admin/providers/:id/disable", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  await c.env.DB.prepare("UPDATE providers SET enabled=0, updated_at=? WHERE id=?").bind(nowIso(), id).run();
+  const p = await c.env.DB.prepare("SELECT id, enabled FROM providers WHERE id=?").bind(id).first();
+  return c.json({ id: p.id, enabled: !!p.enabled });
+});
+app.post("/admin/providers/:id/enable", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  await c.env.DB.prepare("UPDATE providers SET enabled=1, updated_at=? WHERE id=?").bind(nowIso(), id).run();
+  const p = await c.env.DB.prepare("SELECT id, enabled FROM providers WHERE id=?").bind(id).first();
+  return c.json({ id: p.id, enabled: !!p.enabled });
 });
 app.post("/admin/routes", async (c) => {
   const denied = await requireAdmin(c);
@@ -2411,10 +2454,10 @@ app.get("/admin/overview", async (c) => {
   if (denied)
     return denied;
   const providers = await c.env.DB.prepare(
-    "SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.fmt, p.proxy_url, p.transport, p.last_status, p.last_checked, (SELECT COUNT(*) FROM model_routes mr WHERE mr.provider_id=p.id) AS route_count FROM providers p ORDER BY p.priority"
+    "SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.last_status, p.last_checked, (SELECT COUNT(*) FROM model_routes mr WHERE mr.provider_id=p.id) AS route_count FROM providers p ORDER BY p.priority"
   ).all();
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
   ).all();
   const keys = await c.env.DB.prepare(
     "SELECT key_id, name, budget_mode, budget_limit, used_tokens, used_usd, request_count, active, allowed_models, created_at FROM api_keys ORDER BY created_at DESC"

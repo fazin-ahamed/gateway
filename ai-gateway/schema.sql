@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS providers (
   base_url TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 0,
   healthy INTEGER NOT NULL DEFAULT 1,
+  enabled INTEGER NOT NULL DEFAULT 1,
   notes TEXT,
   fmt TEXT NOT NULL DEFAULT 'openai',
   proxy_url TEXT,
@@ -21,6 +22,9 @@ CREATE TABLE IF NOT EXISTS providers (
   created_at TEXT NOT NULL,
   updated_at TEXT
 );
+-- Fully disable a provider (operator off-switch), independent of `healthy`
+-- (a runtime health flag a probe or a 429 can flip). Disabled providers are
+-- invisible to routing, /v1/models and /status; see index.js routeFilter.
 
 CREATE TABLE IF NOT EXISTS model_routes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +159,11 @@ CREATE TABLE IF NOT EXISTS gateway_settings (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- Add providers.enabled to pre-existing databases (see providers table).
+-- Guarded by a settings row so it runs exactly once per install.
+INSERT INTO gateway_settings (key, value, updated_at)
+SELECT 'providers.enabled.col', '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info('providers') WHERE name = 'enabled');
 
 -- Global per-model limits: request rate (per minute, sliding bucket) and
 -- total token budget. A 0/NULL in either means "unlimited".

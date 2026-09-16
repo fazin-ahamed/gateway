@@ -32,6 +32,18 @@ try {
 } catch (e) {
   console.warn("[gateway] schema auto-apply skipped:", e.message);
 }
+// providers.enabled was added after launch; CREATE TABLE IF NOT EXISTS cannot
+// add a column to an existing table, so apply it here, once, guarded by the
+// column's presence (a duplicate ADD COLUMN raises in SQLite).
+try {
+  const cols = db.prepare("SELECT name FROM pragma_table_info('providers')").all().results || [];
+  if (!cols.some((c) => c.name === "enabled")) {
+    db.exec("ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1");
+    console.log("[gateway] migration: added providers.enabled");
+  }
+} catch (e) {
+  console.warn("[gateway] providers.enabled migration skipped:", e.message);
+}
 const env = {
   DB: db,
   ADMIN_TOKEN,

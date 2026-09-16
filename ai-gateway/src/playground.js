@@ -531,6 +531,12 @@ async function editProvider(id){
 async function toggleProvider(id, healthy){
   await api('/admin/providers/'+id+'/toggle',{method:'POST'}); loadProviders();
 }
+async function disableProvider(id){
+  await api('/admin/providers/'+id+'/disable',{method:'POST'}); loadProviders();
+}
+async function enableProvider(id){
+  await api('/admin/providers/'+id+'/enable',{method:'POST'}); loadProviders();
+}
 async function delProvider(id){
   confirmAction('Delete provider','Delete provider '+id+' and all of its routes? This cannot be undone.','Delete',async function(){ const {status}=await api('/admin/providers/'+id,{method:'DELETE'}); if(status===200){ toast('provider deleted','ok'); loadProviders(); } else toast('delete failed','err'); }); return;
 }
@@ -539,11 +545,16 @@ async function loadProviders(){
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/providers'); data=res.data; }catch(e){ paintLoadError(el,'Could not load providers: '+e.message,loadProviders); return; }
   const rows=((data&&data.providers)||[]).map(function(p){
-    const ok=p.healthy&&p.last_status&&p.last_status>=200&&p.last_status<400;
-    const cls=ok?'ok':(p.healthy?'warn':'bad');
-    const state=!p.healthy?'disabled':(p.last_status?('HTTP '+p.last_status):'unprobed');
+    const off=p.enabled===false;
+    const ok=!off&&p.healthy&&p.last_status&&p.last_status>=200&&p.last_status<400;
+    const cls=off?'bad':(ok?'ok':(p.healthy?'warn':'bad'));
+    const state=off?'DISABLED':(!p.healthy?'unhealthy':(p.last_status?('HTTP '+p.last_status):'unprobed'));
     return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td><span class="pill '+cls+'">'+state+'</span></td>'+
-      '<td class="rowact"><button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'disable':'enable')+'</button> <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
+      '<td class="rowact"><button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> '+
+      (off
+        ? '<button class="ghost" data-act="penable" data-id="'+p.id+'">enable</button>'
+        : '<button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'mark down':'mark up')+'</button> <button class="danger" data-act="pdisable" data-id="'+p.id+'">disable</button>')+
+      ' <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
   }).join('')||'<tr><td colspan="5"><div class="empty">No providers yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>State</th><th></th></tr>'+rows+'</table>';
 }
@@ -555,9 +566,11 @@ async function loadRoutes(){
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/routes'); data=res.data; }catch(e){ paintLoadError(el,'Could not load routes: '+e.message,loadRoutes); return; }
   const rows=(data.routes||[]).map(function(r){
-    const cls=(r.enabled&&r.provider_healthy)?'ok':'bad';
+    const provOff=r.provider_enabled===false;
+    const cls=provOff?'bad':((r.enabled&&r.provider_healthy)?'ok':'bad');
     const role=r.rank===0?'<span class="pill acc">primary</span>':'<span class="pill mut">fallback '+esc(String(r.rank))+'</span>';
-    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+(r.enabled?'on':'off')+'</span></td>'+
+    const routePill=provOff?'<span class="pill bad">provider disabled</span>':('<span class="pill '+cls+'">'+(r.enabled?'on':'off')+'</span>');
+    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td>'+routePill+'</td>'+
       '<td class="rowact"><button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+'">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
   }).join('') || '<tr><td colspan="6"><div class="empty">No model routes yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Slug</th><th>Role</th><th>Provider</th><th>Upstream model</th><th>Route</th><th></th></tr>'+rows+'</table>';
@@ -628,6 +641,8 @@ document.addEventListener('click', function(e){
   const id=btn.getAttribute('data-id'); const act=btn.getAttribute('data-act');
   if(act==='pedit') editProvider(id);
   else if(act==='ptoggle') toggleProvider(id, btn.getAttribute('data-h')==='1'?0:1);
+  else if(act==='pdisable') disableProvider(id);
+  else if(act==='penable') enableProvider(id);
   else if(act==='pdel') delProvider(id);
   else if(act==='redit') editRoute(id);
   else if(act==='raddfb') addFallbackRoute(btn);
