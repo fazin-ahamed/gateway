@@ -49,11 +49,15 @@ func ConfigFromEnv() (*Config, error) {
 		providers[strings.ToLower(p.ID)] = p
 	}
 	return &Config{
-		Port:         port,
-		Secret:       secret,
-		LogLevel:     strings.ToLower(os.Getenv("LOG_LEVEL")),
-		Providers:    providers,
-		MaxBodyBytes: 4 << 20,
+		Port:      port,
+		Secret:    secret,
+		LogLevel:  strings.ToLower(os.Getenv("LOG_LEVEL")),
+		Providers: providers,
+		// Request bodies buffer fully in memory (needed for the body-hash
+		// check before first upstream byte); 16MB matches the gateway's
+		// Koyeb non-stream buffer so huge-context turns fail the same way
+		// on both sides instead of dying only at the relay.
+		MaxBodyBytes: 16 << 20,
 		PingInterval: 15 * time.Second,
 	}, nil
 }
@@ -321,9 +325,9 @@ func (s *Server) serveSession(ws *wsConn) {
 		Log(fields)
 		return
 	}
-	if total > 0 || upResp.StatusCode < 400 {
-		s.sendResponseEnd(ws, open.RequestID, total)
-	}
+	// Always terminate the exchange, including empty-body errors: the gateway
+	// waits for response_end and would otherwise surface a tunnel-closed error.
+	s.sendResponseEnd(ws, open.RequestID, total)
 	if fields.Disconnect == "" {
 		fields.Disconnect = "complete"
 	}

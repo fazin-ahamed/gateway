@@ -487,7 +487,11 @@ func TestBodyTooLarge(t *testing.T) {
 	c := dialTunnel(t, relayBase)
 	defer c.close()
 	open := newOpen("test", "POST", "/v1/chat/completions", nil, []byte(`{}`))
-	open.BodyLen = int(4<<20) + 1
+	// testEnv pins MaxBodyBytes at 4MB; keep this unit coupled to the test
+	// env so prod limit changes cannot silently void the rejection path.
+	open.BodyLen = 4<<20 + 1
+	// BodyLen is part of the signed open frame: re-sign after mutating it
+	// or auth fails before the size check runs.
 	signOpen(testSecret, open)
 	raw, _ := json.Marshal(open)
 	c.sendText(raw)
