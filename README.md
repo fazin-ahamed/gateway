@@ -96,8 +96,20 @@ one wants to paste by hand. `zaiwebbrowser` removes that step: the gateway
 drives chat.z.ai in a local Chromium and lets the page mint its own proof.
 
 - Requires the **Node host** (a Worker cannot run a browser) with Chromium:
-  `npm install playwright && npx playwright install chromium`, or point
-  `BROWSER_EXECUTABLE` at an existing Chromium binary.
+  `npm install playwright && npx playwright install chromium`. On a host where
+  you cannot install system packages, the `npx playwright install` step may
+  report missing shared libraries; two ways around it:
+  - point `BROWSER_EXECUTABLE` at a Chromium already present on the host
+    (or in `~/.cache/ms-playwright/*/chrome-linux64/chrome`) and skip the
+    download entirely, or
+  - run the browser on another machine and give this provider a `proxy_url`
+    pointing at the existing OCI relay — the guard that pins z.ai routes to
+    direct transport applies to `zaiminted`, not to this one.
+
+  ```sh
+  # in .env on the gateway host
+  BROWSER_EXECUTABLE=/home/<user>/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome
+  ```
 - Credential is the session token only: `{"token":"<chat.z.ai localStorage token>"}`.
 - Measured live: first turn ~8 s (includes cold Chromium launch), warm turns
   ~2.4 s, no captcha input at any point.
