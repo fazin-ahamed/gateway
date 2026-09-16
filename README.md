@@ -147,19 +147,31 @@ Each completion consumes exactly one device token (Aliyun binds a token to a
 single verification), so the store needs topping up as it drains. An empty store
 returns a typed 503 (`zai_tokens`) naming the harvest script.
 
-**Status — verified in parts, not yet end-to-end.** Measured live:
+**Status — minting works; the gateway's minted route does not yet.** Measured live:
 
 | Step | Result |
 | --- | --- |
-| Token harvest (`window.z_um.getToken()`) | works; 60 tokens in ~14 s |
-| `InitCaptchaV3` + payload construction | works; the `data` blob is byte-identical to the reference implementation |
-| `VerifyCaptchaV3` with a fresh token | works — `VerifyCode T001`, real `securityToken` |
-| Gateway flow (create chat → mint → completion) | reached chat.z.ai and completed once, then later requests were answered `Captcha verification failed` for the same flow |
+| Token harvest (`window.z_um.getToken()`) | works; 30 tokens in ~16 s |
+| `InitCaptchaV3` + payload construction | works; `data` blob byte-identical to the reference implementation |
+| `VerifyCaptchaV3` with a stealth-harvested token | works — `VerifyCode T001`, real `securityToken` |
+| A full direct flow (create chat → mint → completion) | **completed twice** on a signed-in account (`glm-5.3-flash`) |
+| The same flow through this gateway's provider | still answered `Captcha verification failed` / an outage sentinel |
 
-The browser transport keeps working on the same account and token, so the
-account is healthy; what is not durable is chat.z.ai's acceptance of an
-externally minted proof. Treat `zaiminted` as experimental and use
-`zaiwebbrowser` (or an API-key provider) for anything you depend on.
+Two things that are now settled:
+
+- **The harvester must inject a stealth fingerprint.** Aliyun will not mint a
+  usable token from a plainly automated browser; `scripts/zai-harvest-stealth.js`
+  patches `navigator.webdriver`, plugins, `window.chrome`, WebGL and screen
+  geometry before any page JS runs. Without it every token fails with
+  `VerifyCode F001` — verified by running the harvested tokens through the
+  reference bridge, which failed the same way.
+- **The account tier matters.** A guest session only reaches `glm-5.3-flash`;
+  a signed-in account (`glm-5.3`, `glm-5.2`, vision models) is what makes the
+  route worth having.
+
+So the remaining gap is entirely in the gateway's completion request shape, not
+in token validity or minting. Until that is closed, use `zaiwebbrowser` (or an
+API-key provider) for anything you depend on.
 
 ### Using an OpenAI-compatible bridge instead
 

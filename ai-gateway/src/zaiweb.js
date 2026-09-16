@@ -362,7 +362,10 @@ function buildNewChatBody(input) {
       history: { messages: { [userMessageId]: { id: userMessageId, parentId: null, childrenIds: [], role: "user", content: input.prompt, timestamp: Math.floor(Date.now() / 1000), models: [model] } }, currentId: userMessageId },
       tags: [],
       flags: [],
-      features: [{ server: "tool_selector_h", status: "hidden", type: "tool_selector" }],
+      // chat.z.ai accepts features:[] for both guest and signed-in accounts; the
+      // tool-selector placeholder the web client sends is rejected on stricter
+      // accounts and surfaced as an upstream outage, so omit it.
+      features: [],
       mcp_servers: [],
       enable_thinking: input.enableThinking,
       reasoning_effort: input.reasoningEffort,
