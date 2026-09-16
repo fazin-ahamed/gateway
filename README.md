@@ -109,23 +109,45 @@ drives chat.z.ai in a local Chromium and lets the page mint its own proof.
   On a small VM set `SESSION_POOL_SIZE`/limits accordingly, or use an API-key
   provider where a browser is not needed at all.
 
-### Experimental: programmatic captcha minting
+### Z.ai web chat — minted (`zaiminted`)
 
-`ai-gateway/src/zai-captcha.js` ports the published GLM-Free-API approach —
-Aliyun `InitCaptchaV3`, the `generateArg`/`aliHash`/`encrypt` payload
-construction, and `VerifyCaptchaV3` with a harvested device token. It is
-**not wired into any provider**, because it does not yet yield a usable proof:
+The `zaiweb` format needs a caller-supplied captcha proof per completion and the
+`zaiwebbrowser` format needs a browser. `zaiminted` needs neither: it mints the
+Aliyun proof itself in pure Node (no packages, no Chromium) from a file of
+harvested device tokens.
+
+Setup:
+
+1. Harvest device tokens on a machine that has a browser (this is the only step
+   that needs one — the gateway stays browser-free):
+
+   ```sh
+   node scripts/harvest-zai-tokens.mjs --token "<chat.z.ai localStorage token>" --count 300
+   ```
+
+2. Copy the file to the gateway host: `scp data/zai-device-tokens.txt <host>:~/gateway/data/`.
+3. Supply the Aliyun captcha credential pair (`ZAI_CAPTCHA_ACCESS_KEY`,
+   `ZAI_CAPTCHA_SECRET_KEY`) — see `.env.example`. There is no shared default.
+4. Console → Providers → Add provider → preset **Z.AI web chat — automatic
+   (no browser)**, credential `{"token":"<chat.z.ai token>"}`.
+
+Each completion consumes exactly one device token (Aliyun binds a token to a
+single verification), so the store needs topping up as it drains. An empty store
+returns a typed 503 (`zai_tokens`) naming the harvest script.
+
+**Status — verified in parts, not yet end-to-end.** Measured live:
 
 | Step | Result |
 | --- | --- |
-| Aliyun `InitCaptchaV3` | works (standard RPC signing; the reference's percent-everything encoder is rejected) |
-| `generateArg`, tracking JSON, `aliHash` | byte-identical to the reference's Go output |
-| `VerifyCaptchaV3` with page-harvested device tokens | `VerifyCode F001`, `VerifyResult false` |
+| Token harvest (`window.z_um.getToken()`) | works; 60 tokens in ~14 s |
+| `InitCaptchaV3` + payload construction | works; the `data` blob is byte-identical to the reference implementation |
+| `VerifyCaptchaV3` with a fresh token | works — `VerifyCode T001`, real `securityToken` |
+| Gateway flow (create chat → mint → completion) | reached chat.z.ai and completed once, then later requests were answered `Captcha verification failed` for the same flow |
 
-The same tokens fail identically through the reference's own Go `tryCompute`,
-so the blocker is device-token provenance, not the port. Until that is solved
-the browser transport above is the automated route, and minting stays a
-documented dead end rather than a half-working provider.
+The browser transport keeps working on the same account and token, so the
+account is healthy; what is not durable is chat.z.ai's acceptance of an
+externally minted proof. Treat `zaiminted` as experimental and use
+`zaiwebbrowser` (or an API-key provider) for anything you depend on.
 
 ### Using an OpenAI-compatible bridge instead
 

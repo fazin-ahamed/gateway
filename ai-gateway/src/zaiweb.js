@@ -786,7 +786,136 @@ export function withRotatedToken(rawKey, newToken) {
 
 export function isZaiWebFormat(value) {
   const fmt2 = String(value || "").toLowerCase();
-  return fmt2 === "zaiweb" || fmt2 === "zaiwebbrowser";
+  return fmt2 === "zaiweb" || fmt2 === "zaiwebbrowser" || fmt2 === "zaiminted";
+}
+
+export function isZaiMintedFormat(value) {
+  return String(value || "").toLowerCase() === "zaiminted";
+}
+
+/**
+ * Minted transport: pure HTTP, no browser and no caller-supplied captcha.
+ *
+ * One flow per request, matching what the reference bridge does:
+ *   1. create the chat (chat.z.ai materializes it on first completion)
+ *   2. mint a captcha proof from a harvested device token
+ *   3. POST the completion with that proof
+ *
+ * Device tokens are single-use, so each request consumes one from the store.
+ */
+export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchImpl) {
+  const fetcher = fetchImpl || ((url, init) => upstreamFetch(c, url, init));
+  const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
+  const caps = getModelCapabilities(modelId);
+  if (!caps)
+    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
+  if (payload.tools || payload.functions)
+    throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
+  const images = countImages(payload.messages);
+  if (images && !caps.vision)
+    throw new ZaiWebError(400, "Z.ai model " + unprefixedModelId(modelId) + " does not accept image input; use glm-5.3-flash.", "zai_vision_unsupported");
+
+  const { token } = parseCredential(rawKey, payload);
+  const userId = userIdFromToken(token);
+  if (!token || !userId)
+    throw credentialError();
+
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const prompt = latestUserPrompt(messages);
+  if (!prompt && !images)
+    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
+
+  const { takeDeviceToken } = await import("./zai-tokens.js");
+  const { mintCaptcha } = await import("./zai-captcha.js");
+  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
+
+  const thinking = resolveThinking(modelId, payload);
+  const features = resolveFeatures(payload);
+  const frontendVersion = await resolveFrontendVersion(fetcher);
+  const userMessageId = crypto.randomUUID();
+
+  // 1. Create the chat.
+  let created;
+  try {
+    created = await fetcher(ZAI_NEW_CHAT_URL, {
+      method: "POST",
+      headers: buildHeaders(token, { accept: "application/json", frontendVersion }),
+      body: JSON.stringify(buildNewChatBody({
+        messages,
+        modelId,
+        prompt,
+        userMessageId,
+        enableThinking: thinking.enabled,
+        reasoningEffort: thinking.effort,
+        features
+      }).payload)
+    });
+  } catch (e) {
+    throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
+  }
+  if (!created.ok)
+    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + String(await created.text().catch(() => "")).slice(0, 300), "zai_chat_create");
+  const createdJson = await created.json().catch(() => null);
+  const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
+  if (!chatId)
+    throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
+
+  // 2. Mint a proof, retrying with another token when Aliyun rejects one.
+  let proof = null;
+  let lastReason = "";
+  let remaining = 0;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const taken = await takeDeviceToken(storePath);
+    remaining = taken.remaining;
+    if (!taken.token)
+      break;
+    const minted = await mintCaptcha(taken.token, { fetchImpl: fetcher });
+    if (minted.ok) {
+      proof = minted.param;
+      break;
+    }
+    lastReason = minted.reason + (minted.detail ? ": " + String(minted.detail).slice(0, 160) : "");
+  }
+  if (!proof)
+    throw new ZaiWebError(503, remaining === 0
+      ? "Z.ai device-token store is empty (or exhausted). Harvest tokens and add them to the store; see docs/zai-minted.md."
+      : "Z.ai captcha minting failed for " + 5 + " device tokens (" + lastReason + ").",
+      "zai_tokens");
+
+  // 3. Completion with the minted proof.
+  const timestamp = Date.now();
+  const requestId = crypto.randomUUID();
+  const signature = await buildSignature({ prompt, requestId, timestamp, userId });
+  const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
+  let up;
+  try {
+    up = await fetcher(completionUrl, {
+      method: "POST",
+      headers: buildHeaders(token, { accept: "text/event-stream", frontendVersion, signature }),
+      body: JSON.stringify(buildCompletionBody({
+        body: payload,
+        captchaVerifyParam: proof,
+        chatId,
+        messages,
+        modelId,
+        prompt,
+        requestId,
+        userMessageId,
+        enableThinking: thinking.enabled,
+        reasoningEffort: thinking.effort,
+        effortSupported: thinking.effortSupported,
+        features
+      }))
+    });
+  } catch (e) {
+    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
+  }
+  if (!up.ok || !up.body)
+    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + String(await up.text().catch(() => "")).slice(0, 300), "zai_completion");
+
+  const id = "chatcmpl-zaim-" + Date.now().toString(36);
+  const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
+  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null });
 }
 
 export function isZaiBrowserFormat(value) {

@@ -126,12 +126,23 @@ export function aliHash(input, salt) {
   return out;
 }
 
-// Builds the tracking payload exactly as the web client does: a TrackList
-// holding the start time, the arg generated from the certify id, and a verify
-// time 300 ms after the start.
+// Builds the tracking payload exactly as the web client does. Every TrackList
+// field is present: Aliyun hashes and encrypts this JSON byte-for-byte, and a
+// struct marshalled from Go emits all nine keys (eight empty strings) in this
+// order. Omitting them changes the bytes and Aliyun answers F001.
 export function buildTrackPayload(certifyId, startTime) {
   const track = {
-    TrackList: { startTime },
+    TrackList: {
+      fi: "",
+      ks: "",
+      mc: "",
+      mp: "",
+      mu: "",
+      startTime,
+      tc: "",
+      te: "",
+      tmv: ""
+    },
     TrackStartTime: startTime,
     VerifyTime: startTime + 300,
     arg: generateArg(certifyId)

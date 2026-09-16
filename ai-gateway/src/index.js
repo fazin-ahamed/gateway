@@ -2,7 +2,7 @@ import { LOGIN_HTML } from "./login.js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
-import { callZaiBrowser, callZaiWeb, isZaiBrowserFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
+import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options");
@@ -807,6 +807,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
 }
 async function forwardToProvider(c, route, apiKey, payload, isStream, requestId) {
   const fmt2 = (route.fmt || "openai").toLowerCase();
+  if (isZaiMintedFormat(fmt2)) {
+    if (route.transport && route.transport !== "auto" && route.transport !== "direct")
+      throw new ZaiWebError(400, 'Z.AI minted routes must use direct transport (transport="' + route.transport + '").', "zai_transport");
+    blog("FWD zaiminted model=" + (route.upstream_model || (payload && payload.model)));
+    return callZaiMinted(c, route, apiKey, payload, isStream, (url, init) => upstreamFetch(c, url, init));
+  }
   if (isZaiBrowserFormat(fmt2)) {
     if (route.transport && route.transport !== "auto" && route.transport !== "direct")
       throw new ZaiWebError(400, 'Z.AI browser routes must use direct transport (transport="' + route.transport + '"); the browser runs on the gateway host.', "zai_transport");
@@ -947,7 +953,7 @@ function koyebCfg(env) {
     secret: String(env && env.KOYEB_RELAY_SECRET || "")
   };
 }
-var PROVIDER_FORMATS = ["openai", "anthropic", "zaiweb", "zaiwebbrowser"];
+var PROVIDER_FORMATS = ["openai", "anthropic", "zaiweb", "zaiwebbrowser", "zaiminted"];
 function normalizeProviderFormat(value, fallback) {
   const fmt2 = String(value == null ? "" : value).trim().toLowerCase();
   if (!fmt2)
@@ -2890,9 +2896,24 @@ app.get("/admin/proxy-health", async (c) => {
 // from the console without hand-copying slugs and model ids.
 var PROVIDER_PRESETS = [
   {
+    id: "zai-minted",
+    label: "Z.AI web chat — automatic (no browser)",
+    summary: "Pure HTTP: the gateway mints the Aliyun captcha proof itself from a harvested device-token file. No browser, no packages. Needs the session token plus data/zai-device-tokens.txt.",
+    fmt: "zaiminted",
+    name: "Z.AI web chat (minted)",
+    base_url: "https://chat.z.ai",
+    transport: "direct",
+    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — captcha is minted automatically',
+    credential_format: "provider_credential",
+    routes: [
+      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
+      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
+    ]
+  },
+  {
     id: "zai-browser",
     label: "Z.AI web chat — automatic (browser)",
-    summary: "Drives chat.z.ai in a local Chromium so the page solves its own CAPTCHA: no proof to paste, ever. Needs the Node host (Chromium installed) and the session token.",
+    summary: "Drives chat.z.ai in a local Chromium so the page solves its own CAPTCHA. No token file, but needs Chromium and playwright installed on the host.",
     fmt: "zaiwebbrowser",
     name: "Z.AI web chat (browser)",
     base_url: "https://chat.z.ai",
