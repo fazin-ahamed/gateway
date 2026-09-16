@@ -49,3 +49,32 @@ Public defaults live in `.env.example`
 
 Model routing: each public slug maps to one primary route (rank 0) plus
 automatic fallbacks (higher ranks, tried in order).
+
+## Provider state: enabled vs healthy
+
+Two independent switches on every provider row:
+
+| Flag      | Meaning                                | Effect                                                                                          |
+| --------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `enabled` | Operator off-switch (default on)       | Provider is never routed, never probed by `/status`, and advertises no slugs.                    |
+| `healthy` | Runtime state / manual "mark down"     | Provider is skipped for routing but stays listed and probed, so it can recover or be inspected.   |
+
+Console: **disable** / **enable** is the off-switch (row shows a `DISABLED`
+pill); **mark down** / **mark up** is the health toggle. API:
+`POST /admin/providers/:id/disable`, `POST /admin/providers/:id/enable`, or
+`PATCH /admin/providers/:id` with `{"enabled":false}`.
+
+`GET /v1/models` lists only slugs that can actually be served right now — a
+slug whose providers are all disabled or all down is withheld instead of being
+advertised and then 503ing on use. Routing a withheld slug returns 503 with
+`code: "provider_disabled"` when a disabled provider is the reason, so the
+cause is visible in the error rather than only in the console.
+
+Migration: `providers.enabled` is in `schema.sql` (fresh installs) and is added
+by an idempotent `ALTER TABLE` on Node boot. On Cloudflare Workers/D1 the Node
+runtime never runs, so apply it once by hand before deploying a Worker built
+from this commit:
+
+```sh
+wrangler d1 execute DB --command "ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
+```

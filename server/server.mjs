@@ -21,6 +21,7 @@ const KOYEB_RELAY_URL = process.env.KOYEB_RELAY_URL || "";
 const RELAY_BACKEND = process.env.RELAY_BACKEND || "koyeb";
 const UPSTREAM_APP_TITLE = process.env.UPSTREAM_APP_TITLE || "AI Gateway";
 const UPSTREAM_HTTP_REFERER = process.env.UPSTREAM_HTTP_REFERER || "";
+const UPSTREAM_TIMEOUT_MS = process.env.UPSTREAM_TIMEOUT_MS || "";
 
 if (!ADMIN_TOKEN) console.warn("[gateway] ADMIN_TOKEN is empty: admin login is disabled.");
 if (!PROVIDER_CRYPTO_KEY) console.warn("[gateway] PROVIDER_CRYPTO_KEY is empty: sealed provider keys cannot be opened.");
@@ -49,6 +50,18 @@ try {
 } catch (e) {
   console.warn("[gateway] model_limits migration skipped:", e.message);
 }
+// Operator off-switch: providers created before this column existed were all
+// implicitly enabled. Guarded by pragma_table_info because a duplicate ADD
+// COLUMN raises in SQLite.
+try {
+  const cols = db.prepare("PRAGMA table_info(providers)").all();
+  if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "enabled")) {
+    db.exec("ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1");
+    console.warn("[gateway] migration: added providers.enabled");
+  }
+} catch (e) {
+  console.warn("[gateway] providers.enabled migration skipped:", e.message);
+}
 // Multi-key providers: add key_strategy column and seed provider_keys
 // from the legacy single api_key column when the pool is empty.
 try {
@@ -73,6 +86,7 @@ const env = {
   KOYEB_RELAY_SECRET,
   KOYEB_RELAY_URL,
   RELAY_BACKEND,
+  UPSTREAM_TIMEOUT_MS,
   UPSTREAM_APP_TITLE,
   UPSTREAM_HTTP_REFERER,
 };

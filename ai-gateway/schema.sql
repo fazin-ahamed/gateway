@@ -10,6 +10,10 @@ CREATE TABLE IF NOT EXISTS providers (
   base_url TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 0,
   healthy INTEGER NOT NULL DEFAULT 1,
+  -- Operator off-switch, distinct from runtime health: a disabled provider is
+  -- never probed, never routed, and advertises no slugs. The health toggle
+  -- marks a provider down but keeps it visible and probed.
+  enabled INTEGER NOT NULL DEFAULT 1,
   notes TEXT,
   fmt TEXT NOT NULL DEFAULT 'openai',
   proxy_url TEXT,

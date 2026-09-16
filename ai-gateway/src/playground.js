@@ -533,12 +533,13 @@ function applyHeaderPreset(v){
   delete v.header_preset; return v;
 }
 var HEADER_PRESET_OPTIONS=[{value:'none',label:'No preset'},{value:'openrouter',label:'OpenRouter app headers'},{value:'claudecode',label:'Claude Code beta'},{value:'anthropicbeta',label:'Anthropic prompt-caching beta'},{value:'harness',label:'Harness fingerprint (omp / Claude Code)'},{value:'custom',label:'Custom only'}];
+var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'},{value:'zaiweb',label:'Z.ai web chat (chat.z.ai session)'}];
 async function addProvider(){
   openModal('Add provider',[
     {key:'name',label:'Name',placeholder:'OpenRouter'},
     {key:'base_url',label:'Base URL',placeholder:'https://api.example.com/v1'},
     {key:'api_key',label:'API Key',type:'password',placeholder:'sk-... (stored in DB)'},
-    {key:'fmt',label:'Format',type:'select',options:[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'}]},
+    {key:'fmt',label:'Format',type:'select',options:PROVIDER_FMT_OPTIONS},
     {key:'priority',label:'Priority (lower = first)',type:'number',value:'0'},
     {key:'proxy_url',label:'OCI proxy URL (rollback only)',placeholder:'http://user:pass@host:8080'},
     {key:'transport',label:'Transport',type:'select',value:'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
@@ -557,7 +558,7 @@ async function editProvider(id){
     {key:'name',label:'Name',value:p.name},
     {key:'base_url',label:'Base URL',value:p.base_url},
     {key:'api_key',label:'API Key',type:'password',placeholder: p.api_key_set ? '(saved; leave blank to keep)' : 'sk-... (stored in DB)'},
-    {key:'fmt',label:'Format',type:'select',value:p.fmt,options:[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'}]},
+    {key:'fmt',label:'Format',type:'select',value:p.fmt,options:PROVIDER_FMT_OPTIONS},
     {key:'priority',label:'Priority',type:'number',value:p.priority},
     {key:'proxy_url',label:'OCI proxy URL (rollback only)',value:p.proxy_url||''},
     {key:'transport',label:'Transport',type:'select',value:p.transport||'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
@@ -575,6 +576,17 @@ async function editProvider(id){
 async function toggleProvider(id, healthy){
   await api('/admin/providers/'+id+'/toggle',{method:'POST'}); loadProviders();
 }
+// Operator off-switch: takes the provider fully out of rotation (distinct from
+// marking it down). Reports which slugs just went dark.
+async function switchProvider(id, enabled){
+  try{
+    const {status,data}=await api('/admin/providers/'+id+(enabled?'/enable':'/disable'),{method:'POST'});
+    if(status!==200){ toast((data&&data.error&&data.error.message)||'switch failed','err'); return; }
+    const slugs=(data&&data.slugs)||[];
+    toast((enabled?'provider enabled':'provider disabled')+(slugs.length?' — affects '+slugs.join(', '):''),'ok');
+    loadProviders();
+  }catch(e){ toast('switch failed: '+e.message,'err'); }
+}
 async function delProvider(id){
   confirmAction('Delete provider','Delete provider '+id+' and all of its routes? This cannot be undone.','Delete',async function(){ const {status}=await api('/admin/providers/'+id,{method:'DELETE'}); if(status===200){ toast('provider deleted','ok'); loadProviders(); } else toast('delete failed','err'); }); return;
 }
@@ -583,12 +595,17 @@ async function loadProviders(){
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/providers'); data=res.data; }catch(e){ paintLoadError(el,'Could not load providers: '+e.message,loadProviders); return; }
   const rows=((data&&data.providers)||[]).map(function(p){
+    const on=p.enabled===undefined?true:!!p.enabled;
     const ok=p.healthy&&p.last_status&&p.last_status>=200&&p.last_status<400;
-    const cls=ok?'ok':(p.healthy?'warn':'bad');
-    const state=!p.healthy?'disabled':(p.last_status?('HTTP '+p.last_status):'unprobed');
+    const cls=!on?'bad':(ok?'ok':(p.healthy?'warn':'bad'));
+    const state=!on?'DISABLED':(!p.healthy?'down':(p.last_status?('HTTP '+p.last_status):'unprobed'));
     const keys=p.key_count>0?'<span class="pill acc">'+p.key_count+' key'+(p.key_count>1?'s':'')+'</span>':'<span class="pill bad">no key</span>';
+    // Two distinct controls: "mark down" flips runtime health (the provider
+    // stays listed and probed), "disable" takes it out of rotation entirely.
+    const healthBtn=on?('<button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'mark down':'mark up')+'</button>'):'';
+    const switchBtn=on?('<button class="danger" data-act="pdisable" data-id="'+p.id+'" title="Take this provider out of rotation: its slugs stop being advertised and routed">disable</button>'):('<button class="ghost" data-act="penable" data-id="'+p.id+'" title="Put this provider back into rotation">enable</button>');
     return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td>'+keys+'</td><td>'+esc(p.key_strategy||'round_robin')+'</td><td><span class="pill '+cls+'">'+state+'</span></td>'+
-      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'disable':'enable')+'</button> <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
+      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> '+healthBtn+' '+switchBtn+' <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
   }).join('')||'<tr><td colspan="7"><div class="empty">No providers yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>Keys</th><th>Strategy</th><th>State</th><th></th></tr>'+rows+'</table>';
 }
@@ -651,9 +668,13 @@ async function loadRoutes(){
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/routes'); data=res.data; }catch(e){ paintLoadError(el,'Could not load routes: '+e.message,loadRoutes); return; }
   const rows=(data.routes||[]).map(function(r){
-    const cls=(r.enabled&&r.provider_healthy)?'ok':'bad';
+    // A route can be on while its provider is off: say so, otherwise a slug
+    // going dark looks like a routing bug.
+    const providerOff=r.provider_enabled===undefined?false:!r.provider_enabled;
+    const cls=(r.enabled&&r.provider_healthy&&!providerOff)?'ok':'bad';
+    const label=r.enabled?(providerOff?'<span class="pill bad">provider disabled</span>':(r.provider_healthy?'on':'<span class="pill bad">provider down</span>')):'off';
     const role=r.rank===0?'<span class="pill acc">primary</span>':'<span class="pill mut">fallback '+esc(String(r.rank))+'</span>';
-    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+(r.enabled?'on':'off')+'</span></td>'+
+    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+label+'</span></td>'+
       '<td class="rowact"><button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+'">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
   }).join('') || '<tr><td colspan="6"><div class="empty">No model routes yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Slug</th><th>Role</th><th>Provider</th><th>Upstream model</th><th>Route</th><th></th></tr>'+rows+'</table>';
@@ -724,6 +745,8 @@ document.addEventListener('click', function(e){
   const id=btn.getAttribute('data-id'); const act=btn.getAttribute('data-act');
   if(act==='pedit') editProvider(id);
   else if(act==='ptoggle') toggleProvider(id, btn.getAttribute('data-h')==='1'?0:1);
+  else if(act==='pdisable') switchProvider(id, false);
+  else if(act==='penable') switchProvider(id, true);
   else if(act==='pdel') delProvider(id);
   else if(act==='redit') editRoute(id);
   else if(act==='raddfb') addFallbackRoute(btn);

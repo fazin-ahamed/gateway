@@ -2,6 +2,7 @@ import { LOGIN_HTML } from "./login.js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
+import { callZaiWeb, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options");
@@ -60,6 +61,10 @@ function isCacheableRequest(payload, isStream, mode) {
   if (!payload)
     return false;
   if (mode !== "loose" && payload.temperature != null && Number(payload.temperature) !== 0)
+    return false;
+  // Vision requests bypass the cache: base64 bodies make keys expensive and
+  // hits vanishingly rare; correctness then rests on exact byte matches.
+  if (hasImageContent(payload))
     return false;
   // Availability probes ("ping", "hi", max_tokens=1) are noise: never cache
   // them, and never serve a cached answer for them.
@@ -412,6 +417,17 @@ function orderKeys(keys, strategy, providerId) {
   }
   return keys; // failover: all keys in order
 }
+// Rewrites one provider secret in place. Used when an upstream hands back a
+// rotated session credential (chat.z.ai) so the stored key never goes stale.
+async function updateProviderKeySecret(c, keyRowId, value) {
+  try {
+    const sealed = await sealProviderKey(c.env, value);
+    await c.env.DB.prepare("UPDATE provider_keys SET api_key=? WHERE id=?").bind(sealed, keyRowId).run();
+    blog("PROVIDER_KEY rotated row=" + keyRowId);
+  } catch (e) {
+    blog("PROVIDER_KEY rotate failed row=" + keyRowId + ": " + String(e.message || e));
+  }
+}
 async function providerKey(c, id) {
   const keys = await providerKeys(c, id);
   if (!keys.length)
@@ -484,8 +500,11 @@ app.get("/v1/models", async (c) => {
   const allowed = await allowedSlugs(c, key);
   if (!allowed.length)
     return c.json({ object: "list", data: [] });
+  // Only advertise slugs that can actually be served right now: a slug whose
+  // providers are all disabled or all marked down would 503 on use, which is
+  // exactly the "client picked a model that fails" trap.
   const routes = await c.env.DB.prepare(
-    "SELECT DISTINCT slug FROM model_routes WHERE enabled=1 AND slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY slug"
+    "SELECT DISTINCT mr.slug FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug"
   ).bind(...allowed).all();
   const data = [{ id: AUTO_SLUG, object: "model", created: 0, owned_by: "gateway" }];
   for (const r of routes.results || [])
@@ -499,6 +518,26 @@ app.get("/status", async (c) => {
   const provs = await c.env.DB.prepare("SELECT * FROM providers ORDER BY priority").all();
   const status = [];
   for (const p of provs.results || []) {
+    // A disabled provider is out of rotation on purpose: do not probe it (that
+    // costs an upstream call and a key decrypt per poll) and do not decrypt its
+    // key. It still appears, so the console can explain why it is dark.
+    const row = {
+      id: p.id,
+      name: p.name,
+      base_url: p.base_url,
+      priority: p.priority,
+      fmt: p.fmt,
+      enabled: p.enabled === void 0 ? true : !!p.enabled,
+      healthy_flag: !!p.healthy,
+      last_status: p.last_status,
+      ok: false,
+      error: null
+    };
+    if (!row.enabled) {
+      row.error = "disabled (out of rotation)";
+      status.push(row);
+      continue;
+    }
     const key = await providerKey(c, p.id);
     let ok = false, code = null, err = null;
     if (!key) {
@@ -515,20 +554,13 @@ app.get("/status", async (c) => {
         err = String(e.message || e);
       }
     }
-    status.push({
-      id: p.id,
-      name: p.name,
-      base_url: p.base_url,
-      priority: p.priority,
-      fmt: p.fmt,
-      healthy_flag: !!p.healthy,
-      last_status: code,
-      ok,
-      error: err
-    });
+    row.last_status = code;
+    row.ok = ok;
+    row.error = err;
+    status.push(row);
   }
   const routes = await c.env.DB.prepare(
-    "SELECT mr.slug, mr.rank, mr.upstream_model, mr.enabled, p.name AS provider, p.healthy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
+    "SELECT mr.slug, mr.rank, mr.upstream_model, mr.enabled, p.name AS provider, p.healthy, p.enabled AS provider_enabled FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
   ).all();
   return c.json({ providers: status, routes: routes.results || [] });
 });
@@ -583,11 +615,24 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
   const routes = await c.env.DB.prepare(
-    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
+    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
   ).bind(slug).all();
   if (!routes.results || !routes.results.length) {
-    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 503, attempts: 0, latencyMs: Date.now() - started, error: "no healthy route" });
-    return c.json({ error: { message: 'No healthy route for model "' + slug + '"', type: "no_route" } }, 503);
+    // Say why the slug is dark: a disabled provider is an operator choice, not
+    // an outage, and "no healthy route" sends people hunting for the wrong bug.
+    const disabled = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=0"
+    ).bind(slug).first();
+    const why = Number(disabled && disabled.n) > 0 ? "provider disabled" : "no healthy route";
+    await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 503, attempts: 0, latencyMs: Date.now() - started, error: why });
+    return c.json({
+      error: {
+        message: Number(disabled && disabled.n) > 0
+          ? 'No enabled provider for model "' + slug + '": its provider is disabled in the console.'
+          : 'No healthy route for model "' + slug + '"',
+        type: Number(disabled && disabled.n) > 0 ? "provider_disabled" : "no_route"
+      }
+    }, 503);
   }
   const modelDenied = await enforceModelLimits(c, slug);
   if (modelDenied) {
@@ -663,6 +708,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         try {
           const res = await forwardToProvider(c, route, k.key, payload, isStream, requestId);
           const up = res.response;
+          // chat.z.ai retires its session cookie as it issues a new one; keep
+          // the stored secret current so the route survives past the rotation.
+          if (res.recovered && res.recovered !== k.key && k.keyId)
+            await updateProviderKeySecret(c, k.keyId, withRotatedToken(k.key, res.recovered));
           await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
           if (!up.ok || !up.body) {
             const txt = await up.text();
@@ -718,6 +767,23 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c) });
           return result;
         } catch (e) {
+          // Zai-web failures carry an actionable status and code (missing
+          // session, stale captcha, unsupported tools). Return them as-is —
+          // collapsing them into a 503 "no healthy route" would hide the fix.
+          // Client-side (4xx) faults skip the circuit breaker: the provider is
+          // healthy, the request was not.
+          if (e instanceof ZaiWebError) {
+            if (e.status >= 500)
+              circuitRecord(route.provider_name, false);
+            // Client-facing: scrub hosts/provider names out of upstream text the
+            // same way every other upstream body is scrubbed, so a private
+            // provider's error never names the provider or its URL.
+            const safeMessage = sanitizeUpstreamResponse(e.message);
+            blog("FWD ZAI " + route.provider_name + " -> " + e.status + " " + e.code + " " + e.message);
+            traj.steps.push({ ...baseStep, error: e.code, key: k.label, http: e.status, ms: Date.now() - stepStart });
+            await recordTrajectory(c, { ...traj, status: "fail", httpStatus: e.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
+            return c.json({ error: { message: safeMessage, type: "upstream_error", code: e.code } }, e.status, { "x-gateway-attempts": String(attempts + 1) });
+          }
           circuitRecord(route.provider_name, false);
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
           lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
@@ -741,6 +807,15 @@ async function runChatCompletion(c, key, isAdminPlayground) {
 }
 async function forwardToProvider(c, route, apiKey, payload, isStream, requestId) {
   const fmt2 = (route.fmt || "openai").toLowerCase();
+  // Z.ai consumer web chat is signed-HTTP only: it talks to chat.z.ai with a
+  // session JWT, not to a base_url. Relays would strip the session, so it is
+  // clamped to direct egress rather than silently failing through a tunnel.
+  if (isZaiWebFormat(fmt2)) {
+    if (route.transport && route.transport !== "auto" && route.transport !== "direct")
+      throw new ZaiWebError(400, 'Z.ai web-chat routes must use direct transport (transport="' + route.transport + '").', "zai_transport");
+    blog("FWD zaiweb model=" + (route.upstream_model || (payload && payload.model)));
+    return callZaiWeb(c, route, apiKey, payload, isStream, (url, init) => upstreamFetch(c, url, init));
+  }
   const transport = routeTransport(route, c.env);
   if (transport === "oci" && route.proxy_url) {
     blog("FWD proxy_url present len=" + route.proxy_url.length);
@@ -865,6 +940,15 @@ function koyebCfg(env) {
     url: String(env && env.KOYEB_RELAY_URL || ""),
     secret: String(env && env.KOYEB_RELAY_SECRET || "")
   };
+}
+var PROVIDER_FORMATS = ["openai", "anthropic", "zaiweb"];
+function normalizeProviderFormat(value, fallback) {
+  const fmt2 = String(value == null ? "" : value).trim().toLowerCase();
+  if (!fmt2)
+    return fallback || "openai";
+  if (!PROVIDER_FORMATS.includes(fmt2))
+    throw new Error("fmt must be one of " + PROVIDER_FORMATS.join(", "));
+  return fmt2;
 }
 function routeTransport(route, env) {
   const explicit = String(route.transport || "auto").toLowerCase();
@@ -1109,6 +1193,8 @@ async function koyebExchange(c, opts) {
           continue;
         if (frame.type === "response") {
           status = Number(frame.status) || 0;
+          if (frame.headers && typeof frame.headers === "object")
+            respHeaders = frame.headers;
           continue;
         }
         if (frame.type === "response_end")
@@ -1177,7 +1263,11 @@ function toAnthropicUserParts(content){
     if(!b) continue;
     if(typeof b==='string'){ out.push({type:'text',text:b}); continue; }
     if(b.type==='image_url'){ const img=toAnthropicImageBlock(b); if(img) out.push(img); continue; }
-    out.push(b);
+    if(b.type==='image'&&b.source){ out.push({type:'image',source:b.source}); continue; }
+    // Drop provider-specific parts (audio/files): Anthropic would 400 and
+    // text+images carry the ask; images are gated to vision models upstream.
+    if(b.type==='text'&&typeof b.text==='string'){ out.push({type:'text',text:b.text}); continue; }
+    continue;
   }
   return out;
 }
@@ -1351,13 +1441,25 @@ function fromAnthropicStreamChunk(obj, model) {
     };
   }
   if (obj.type === "message_start") {
-    return {
+    const chunk = {
       id: "x",
       object: "chat.completion.chunk",
       created: 0,
       model,
       choices: [{ index: 0, delta: { role: "assistant" } }]
     };
+    // Anthropic reports input tokens up front; propagate them so gateway
+    // usage/cost accounting doesn't lose the prompt side on streams.
+    const mu = obj.message && obj.message.usage;
+    if (mu && (mu.input_tokens || mu.output_tokens)) {
+      chunk.usage = {
+        prompt_tokens: mu.input_tokens || 0,
+        completion_tokens: mu.output_tokens || 0,
+        total_tokens: (mu.input_tokens || 0) + (mu.output_tokens || 0),
+        cost_usd: 0
+      };
+    }
+    return chunk;
   }
   if (obj.type === "message_delta" && obj.usage) {
     const sr = obj.delta && obj.delta.stop_reason;
@@ -1706,6 +1808,11 @@ function flattenModelsDevCatalog(catalog) {
         prompt_per_1m: Number.isFinite(input) ? input : 0,
         completion_per_1m: Number.isFinite(output) ? output : 0,
         reasoning: !!(model && model.reasoning),
+        // Preserve an explicit `tool_call: false` from the catalog; dropping
+        // it would make incapable models look eligible for tool traffic.
+        ...model && "tool_call" in Object(model) ? { toolCall: model.tool_call } : {},
+        attachment: !!(model && model.attachment),
+        modalities: model && model.modalities || null,
         limit: model && model.limit || null
       };
       if (!byId.has(id) || provider && provider.id && id.startsWith(provider.id + "/"))
@@ -1783,39 +1890,45 @@ async function routerHealth(c) {
 }
 function promptComplexity(payload) {
   const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
-  // Coding agents (omp, opencode, Claude Code) attach a large static system
-  // prompt full of heavy words ("refactor", "architecture", "security") and
-  // tool schemas to EVERY request - even "hi". Scoring that boilerplate
-  // makes trivial chats look like hard engineering. Score only the live
-  // conversation (user + assistant turns); skip system/developer entirely.
+  // Live conversation = user + assistant turns. System/developer boilerplate
+  // (agent harnesses attach tens of KB to every request) never signals
+  // difficulty, so it stays out of both the keyword ask and the size score.
   const isBoilerplate = (m) => m && (m.role === "system" || m.role === "developer");
-  let text = "";
+  const live = msgs.filter((m) => !isBoilerplate(m));
+  const a = analyzeRequest({ ...payload, messages: live });
+  // Live ask: latest user turn text only.
   let lastUserText = "";
-  for (const m of msgs) {
-    if (!m || isBoilerplate(m))
+  for (const m of live) {
+    if (!m || m.role !== "user")
       continue;
-    let piece = "";
     if (typeof m.content === "string")
-      piece = m.content;
+      lastUserText = m.content;
     else if (Array.isArray(m.content))
-      for (const part of m.content)
-        if (part && typeof part.text === "string")
-          piece += " " + part.text;
-    text += " " + piece;
-    if (m.role === "user")
-      lastUserText = piece;
+      lastUserText = m.content.map((p) => p && typeof p.text === "string" ? p.text : "").filter(Boolean).join(" ");
   }
-  // Keyword scan runs on the latest user turn only: that is the actual ask.
   const ask = lastUserText.toLowerCase();
-  // Conversation length (sans boilerplate) still signals harder work.
-  const t = text.toLowerCase();
-  const chars = t.length;
   let score = 0;
-  // Tools are always present for agents; not a per-request difficulty signal.
-  if (payload.tools || payload.functions)
+  // Context size dominates and is absolute: a one-word ask over a 200k-token
+  // context must still clear a large-window quality floor.
+  const tokens = a.estInputTokens;
+  if (tokens > 100000)
+    score += 4;
+  else if (tokens > 40000)
+    score += 3;
+  else if (tokens > 12000)
+    score += 2;
+  else if (tokens > 4000)
+    score += 1;
+  else if (tokens > 800)
     score += 0.5;
-  if (payload.response_format)
-    score += 0.5;
+  // Images are capability-bound like tools: each pushes toward stronger
+  // vision models (capped so screenshots alone can't pin need at max).
+  if (a.imageCount)
+    score += Math.min(3, a.imageCount);
+  // Tools are always present for agents; the per-request signal is zero —
+  // capability gating in pickAutoModel does the heavy lifting. (A flat +0.5
+  // here is what made "hi with tools attached" look harder than "hi".)
+  const hasTools = !!(payload.tools || payload.functions);
   const heavyWords = ["refactor", "architecture", "optimize", "debug", "migrate", "implement", "algorithm", "prove", "derive", "theorem", "race condition", "memory leak", "regression", "benchmark", "stack trace", "root cause"];
   const midWords = ["write", "explain", "summarize", "compare", "convert", "review", "fix", "why", "how", "difference"];
   for (const w of heavyWords)
@@ -1824,21 +1937,17 @@ function promptComplexity(payload) {
   for (const w of midWords)
     if (ask.includes(w))
       score += 0.5;
-  if (chars > 12000)
-    score += 2;
-  else if (chars > 4000)
-    score += 1;
-  else if (chars > 800)
-    score += 0.5;
   const askWords = ask.split(/\s+/).filter(Boolean).length;
-  if (askWords > 0 && askWords < 4)
-    score -= 1.5;
+  // Short-ask discount only for small plain-text chats: never let
+  // "summarize this" over a huge context, image, or tool request look easy.
+  if (askWords > 0 && askWords < 4 && tokens < 4000 && !a.imageCount && !hasTools)
+    score = Math.min(score, 0);
   const turns = msgs.filter((m) => m && m.role === "user").length;
   if (turns >= 6)
     score += 1;
   else if (turns >= 3)
     score += 0.5;
-  return { score, chars, words: askWords };
+  return { score, chars: a.textChars, words: askWords, estInputTokens: tokens, images: a.imageCount };
 }
 function qualityPrior(entry) {
   if (!entry)
@@ -1863,6 +1972,90 @@ function qualityPrior(entry) {
     q += 0.75;
   return Math.max(0.25, q);
 }
+// Request shape analysis for routing: text size, image payloads, tool
+// definitions. Token counts are heuristics (~4 chars/token, ~1 token/KB of
+// image bytes + 500/image) — order-of-magnitude, for routing only.
+function analyzeRequest(payload) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  let textChars = 0;
+  let imageCount = 0;
+  let imageBytes = 0;
+  const addPart = (part) => {
+    if (!part)
+      return;
+    if (typeof part === "string") {
+      textChars += part.length;
+      return;
+    }
+    if (typeof part.text === "string")
+      textChars += part.text.length;
+    if (part.type === "image_url" && part.image_url && typeof part.image_url.url === "string") {
+      imageCount++;
+      const u = part.image_url.url;
+      if (u.indexOf("data:") === 0) {
+        const comma = u.indexOf(",");
+        const b64 = comma >= 0 ? u.length - comma - 1 : u.length;
+        if (b64 > 0)
+          imageBytes += Math.floor(b64 * 3 / 4);
+      }
+    }
+  };
+  for (const m of msgs) {
+    if (!m)
+      continue;
+    const content = m.content;
+    if (typeof content === "string")
+      textChars += content.length;
+    else if (Array.isArray(content))
+      for (const part of content) addPart(part);
+    else if (content && typeof content === "object")
+      addPart(content);
+    if (m.tool_calls) {
+      try {
+        textChars += JSON.stringify(m.tool_calls).length;
+      } catch {
+      }
+    }
+  }
+  let toolChars = 0;
+  try {
+    const t = (payload && (payload.tools || payload.functions)) || null;
+    if (t)
+      toolChars += JSON.stringify(t).length;
+  } catch {
+  }
+  if (payload && typeof payload.system === "string")
+    textChars += payload.system.length;
+  const estInputTokens = Math.ceil(textChars / 4) + Math.ceil(toolChars / 4) + imageCount * 500 + Math.ceil(imageBytes / 1500);
+  return { textChars, toolChars, imageCount, imageBytes, estInputTokens };
+}
+function hasImageContent(payload) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  for (const m of msgs) {
+    const content = m && m.content;
+    if (!content)
+      continue;
+    const parts = typeof content === "string" ? [] : Array.isArray(content) ? content : [content];
+    for (const p of parts) {
+      if (p && (p.type === "image_url" || p.type === "image"))
+        return true;
+    }
+  }
+  return false;
+}
+// Capability gate from the models.dev catalog entry. Unknown models (no
+// entry) stay permissive so private gateways keep working; known models
+// must actually fit the request.
+function entryCapabilities(entry) {
+  if (!entry)
+    return { context: 0, vision: true, tools: true, unknown: true };
+  const ctx = Number(entry.limit && entry.limit.context) || 0;
+  const input = entry.modalities && Array.isArray(entry.modalities.input) ? entry.modalities.input : null;
+  const vision = input ? input.some((m) => String(m).toLowerCase() === "image") : true;
+  // models.dev omits tool_call for many providers: only an explicit false
+  // blocks tools, otherwise the model stays eligible (OpenAI-compatible).
+  return { context: ctx, vision, tools: entry.toolCall === false ? false : true, unknown: false };
+}
 async function autoSettings(c) {
   const enabled = (await settingValue(c, "auto_enabled", "on")) !== "off";
   const pref = Math.min(100, Math.max(0, Number(await settingValue(c, "auto_preference", "70")) || 70));
@@ -1885,15 +2078,33 @@ async function pickAutoModel(c, payload) {
   const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
   const routes = await c.env.DB.prepare(
     `SELECT mr.slug,
-            COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1),0) AS healthy
+            COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1 AND p2.enabled=1),0) AS healthy,
+            (SELECT GROUP_CONCAT(p3.name) FROM model_routes mr3 JOIN providers p3 ON p3.id=mr3.provider_id WHERE mr3.slug=mr.slug AND mr3.enabled=1 AND p3.enabled=1) AS providers
      FROM model_routes mr WHERE mr.enabled=1 GROUP BY mr.slug`
   ).all();
   const enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1 && !cfg.excluded.includes(r.slug));
   if (!enabled.length)
     return null;
+  const routes2 = await c.env.DB.prepare(
+    `SELECT mr.slug, p.fmt, MIN(mr.upstream_model) AS upstream_model
+     FROM model_routes mr JOIN providers p ON p.id=mr.provider_id
+     WHERE mr.enabled=1 AND p.enabled=1 GROUP BY mr.slug`
+  ).all();
+  const overlay = new Map();
+  for (const r of routes2.results || []) {
+    if (!isZaiWebFormat(r.fmt))
+      continue;
+    const local = modelCatalogEntry(r.upstream_model);
+    // Local capability row keyed by the public slug: models.dev carries no
+    // chat.z.ai consumer entries, so without this the router would treat the
+    // route as unknown (permissive) instead of gating tools/vision/context.
+    if (local)
+      overlay.set(r.slug, local);
+  }
   const health = await routerHealth(c);
   const healthBySlug = new Map(health.map((h) => [h.slug, h]));
-  const { score } = promptComplexity(payload);
+  const cx = promptComplexity(payload);
+  const score = cx.score;
   // Complexity is unbounded; compress it into the quality-prior scale
   // (priors land between ~0.5 and ~5). need in [1, 6].
   let need = Math.min(6, 1 + Math.max(0, score) / 2.5);
@@ -1903,22 +2114,45 @@ async function pickAutoModel(c, payload) {
   // below it and are skipped for tool traffic entirely.
   if (hasTools)
     need = Math.min(6, need + 2.5);
+  const reqTokens = cx.estInputTokens || 0;
+  const reqImages = cx.images || 0;
   const candidates = [];
-  let strongest = null;
   for (const r of enabled) {
-    const entry = byId ? matchModelsDevPrice(byId, r.slug) : null;
+    const entry = overlay.get(r.slug) || (byId ? matchModelsDevPrice(byId, r.slug) : null);
     const mult = Number(cfg.overrides[r.slug]);
     let q = qualityPrior(entry) + (entry ? 0 : 1.5);
     if (Number.isFinite(mult) && mult > 0)
       q *= mult;
+    const caps = entryCapabilities(entry);
+    const ctxOk = !caps.context || reqTokens <= Math.floor(caps.context * 0.9);
+    const visionOk = reqImages === 0 || caps.vision;
+    const toolsOk = !hasTools || caps.tools;
+    const capable = ctxOk && visionOk && toolsOk;
+    // Provider circuits are keyed by provider name (route loop); the router
+    // works per slug, so consult this slug's providers, not the slug.
+    const provNames = String(r.providers || "").split(",").map((s) => s.trim()).filter(Boolean);
+    let openCount = 0;
+    let wob = 0;
+    for (const name of provNames) {
+      if (circuitOpen(name))
+        openCount++;
+      else {
+        const cs = circuitState.get(name);
+        if (cs && cs.fails > 0)
+          wob = Math.max(wob, cs.fails >= 2 ? 1.2 : 0.5);
+      }
+    }
+    const allOpen = provNames.length > 0 && openCount >= provNames.length;
     const h = healthBySlug.get(r.slug);
     const okRate = h ? Number(h.ok_rate) : 1;
-    const eligible = q + 0.5 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
-    const cost = entry ? (Number(entry.prompt_per_1m) + Number(entry.completion_per_1m)) : 0.5;
-    const cand = { slug: r.slug, cost, quality: q, okRate, avgMs: h ? Number(h.avg_ms) || 0 : 0, eligible, samples: h ? Number(h.n) : 0 };
-    candidates.push(cand);
-    if (!strongest || cand.quality > strongest.quality || (cand.quality === strongest.quality && cand.cost < strongest.cost))
-      strongest = cand;
+    const eligible = capable && !allOpen && q + 0.5 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
+    // Unknown price is NaN, not "free": an entry with a null cost column would
+    // otherwise poison every score comparison (NaN > x is false for all x), so
+    // the router silently picked nothing and every plain request got a 503.
+    const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
+    const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
+    const rawMs = h ? Number(h.avg_ms) : 0;
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob });
   }
   // Preference blend: 0 = highest quality among eligible, 100 = cheapest.
   // Health and latency always matter: a cheap-but-slow flaky model loses
@@ -1927,7 +2161,15 @@ async function pickAutoModel(c, payload) {
   const eligibleList = candidates.filter((x) => x.eligible);
   let picked;
   if (!eligibleList.length) {
-    picked = strongest ? { ...strongest, fallback: true } : null;
+    // Fall back to the strongest CAPABLE model first; only when nothing fits
+    // (e.g. context exceeds every window) take the overall strongest.
+    const pool = candidates.some((x) => x.capable) ? candidates.filter((x) => x.capable) : candidates;
+    let best = null;
+    for (const cand of pool) {
+      if (!best || cand.quality > best.quality || cand.quality === best.quality && cand.cost < best.cost)
+        best = cand;
+    }
+    picked = best ? { ...best, fallback: true } : null;
   } else {
     const maxCost = Math.max(...eligibleList.map((x) => x.cost), 1e-9);
     const maxMs = Math.max(...eligibleList.map((x) => x.avgMs || 0), 1);
@@ -1937,11 +2179,10 @@ async function pickAutoModel(c, payload) {
     for (const cand of eligibleList) {
       const reliability = cand.samples >= 3 ? cand.okRate : 1;
       const relPenalty = (1 - reliability) * 6;
-      const slowPenalty = ((cand.avgMs || 0) / maxMs) * 2;
+      const slowPenalty = (cand.avgMs || 0) / maxMs * 2;
       // Half-open circuits (recent failures, not yet tripped) get pushed
       // back like OpenRouter's 30s outage deprioritization.
-      const cs = circuitState.get(cand.slug);
-      const wobbling = cs && cs.fails > 0 && !circuitOpen(cand.slug) ? (cs.fails >= 2 ? 1.2 : 0.5) : 0;
+      const wobbling = cand.wob || 0;
       // Inverse-square price weighting: among eligible models, cheap wins
       // hard; quality still gates via the floor above.
       const costTerm = Math.pow(cand.cost / maxCost, 2) * 6;
@@ -1954,7 +2195,7 @@ async function pickAutoModel(c, payload) {
   }
   if (!picked)
     return null;
-  return { ...picked, candidates, need, complexity: score, preference: cfg.preference };
+  return { ...picked, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages };
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -1962,12 +2203,20 @@ async function fetchModelsDevCatalog() {
   const now = Date.now();
   if (modelsDevCache.catalog && now - modelsDevCache.at < MODELS_DEV_CACHE_MS)
     return modelsDevCache.catalog;
-  const r = await fetch(MODELS_DEV_API, { headers: { accept: "application/json" } });
-  if (!r.ok)
-    throw new Error("models.dev HTTP " + r.status);
-  const catalog = await r.json();
-  modelsDevCache = { at: now, catalog };
-  return catalog;
+  // Auto must never hang a chat request on the catalog fetch: 12s cap, and
+  // pickAutoModel already tolerates a missing catalog (price-blind priors).
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const r = await fetch(MODELS_DEV_API, { headers: { accept: "application/json" }, signal: ctrl.signal });
+    if (!r.ok)
+      throw new Error("models.dev HTTP " + r.status);
+    const catalog = await r.json();
+    modelsDevCache = { at: now, catalog };
+    return catalog;
+  } finally {
+    clearTimeout(t);
+  }
 }
 async function computeCost(c, slug, usage) {
   const pt = Number(usage && usage.cost_usd) || 0;
@@ -2532,7 +2781,7 @@ app.get("/admin/providers", async (c) => {
   if (denied)
     return denied;
   const rows = await c.env.DB.prepare(
-    `SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.last_status, p.last_checked, p.notes, p.fmt, p.proxy_url, p.transport, p.extra_headers, p.key_strategy,
+    `SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.enabled, p.last_status, p.last_checked, p.notes, p.fmt, p.proxy_url, p.transport, p.extra_headers, p.key_strategy,
             (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id=p.id AND pk.enabled=1) AS key_count
      FROM providers p ORDER BY p.priority`
   ).all();
@@ -2576,10 +2825,16 @@ app.get("/admin/proxy-health", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const rows = await c.env.DB.prepare("SELECT id, name, base_url, proxy_url, transport FROM providers").all();
+  const rows = await c.env.DB.prepare("SELECT id, name, base_url, proxy_url, transport, enabled FROM providers").all();
   const out = [];
   const koyebHealthUrl = String(c.env.KOYEB_RELAY_URL || "").replace(/^wss:/i, "https:").replace(/^ws:/i, "http:").replace(/\/tunnel\/?$/, "/healthz");
   for (const p of rows.results || []) {
+    // Same rule as /status: a disabled provider is out of rotation, so do not
+    // spend a probe on it. It stays in the response so the console can list it.
+    if (p.enabled === 0 || p.enabled === false) {
+      out.push({ id: p.id, name: p.name, enabled: false, transport: String(p.transport || "auto"), proxy: false, reason: "disabled (out of rotation)" });
+      continue;
+    }
     const transport = routeTransport(p, c.env);
     if (transport === "koyeb") {
       if (!koyebHealthUrl) {
@@ -2636,7 +2891,12 @@ app.post("/admin/providers", async (c) => {
   }
   if (!b.name || !b.base_url)
     return c.json({ error: { message: "name + base_url required" } }, 400);
-  const fmt2 = b.fmt === "anthropic" ? "anthropic" : "openai";
+  let fmt2;
+  try {
+    fmt2 = normalizeProviderFormat(b.fmt, "zaiweb");
+  } catch (e) {
+    return c.json({ error: { message: e.message } }, 400);
+  }
   let transport = "auto";
   try {
     transport = normalizeTransport(b.transport);
@@ -2667,11 +2927,19 @@ app.patch("/admin/providers/:id", async (c) => {
   }
   const sets = [];
   const binds = [];
-  for (const f of ["name", "base_url", "notes", "fmt", "proxy_url"]) {
+  if (b.fmt !== void 0) {
+    try {
+      sets.push("fmt=?");
+      binds.push(normalizeProviderFormat(b.fmt, "zaiweb"));
+    } catch (e) {
+      return c.json({ error: { message: e.message } }, 400);
+    }
+  }
+  for (const f of ["name", "base_url", "notes", "proxy_url"]) {
     if (b[f] === void 0)
       continue;
     sets.push(f + "=?");
-    binds.push(f === "fmt" ? b.fmt === "anthropic" ? "anthropic" : "openai" : b[f]);
+    binds.push(b[f]);
   }
   if (b.api_key) {
     const sealedNew = await sealProviderKey(c.env, String(b.api_key));
@@ -2690,6 +2958,13 @@ app.patch("/admin/providers/:id", async (c) => {
   if (b.healthy !== void 0) {
     sets.push("healthy=?");
     binds.push(b.healthy ? 1 : 0);
+  }
+  // enabled is the operator off-switch and is deliberately independent of
+  // healthy: disabling takes the provider out of rotation, marking it down
+  // does not.
+  if (b.enabled !== void 0) {
+    sets.push("enabled=?");
+    binds.push(b.enabled ? 1 : 0);
   }
   if (b.transport !== void 0) {
     try {
@@ -2716,8 +2991,24 @@ app.patch("/admin/providers/:id", async (c) => {
   if (!sets.length)
     return c.json({ id });
   await c.env.DB.prepare("UPDATE providers SET " + sets.join(", ") + ", updated_at=? WHERE id=?").bind(...binds, nowIso(), id).run();
-  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, fmt, proxy_url, transport, extra_headers, key_strategy, (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id=providers.id AND pk.enabled=1) AS key_count FROM providers WHERE id=?").bind(id).first();
+  const p = await c.env.DB.prepare("SELECT id, name, base_url, priority, healthy, enabled, fmt, proxy_url, transport, extra_headers, key_strategy, (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id=providers.id AND pk.enabled=1) AS key_count FROM providers WHERE id=?").bind(id).first();
   return c.json({ provider: p });
+});
+app.post("/admin/providers/:id/test", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  const provider = await c.env.DB.prepare("SELECT id, name, fmt FROM providers WHERE id=?").bind(id).first();
+  if (!provider)
+    return c.json({ error: { message: "provider not found" } }, 404);
+  const keys = await providerKeys(c, id);
+  if (!keys.length)
+    return c.json({ ok: false, error: "provider has no usable key", key_label: null }, 200);
+  if (!isZaiWebFormat(provider.fmt))
+    return c.json({ ok: false, error: "no credential probe for fmt=" + provider.fmt, key_label: keys[0].label }, 200);
+  const result = await validateZaiWebKey(keys[0].key, fetch);
+  return c.json({ ok: result.ok, status: result.status, error: result.error, key_label: keys[0].label, fmt: provider.fmt }, 200);
 });
 app.post("/admin/providers/:id/toggle", async (c) => {
   const denied = await requireAdmin(c);
@@ -2727,6 +3018,30 @@ app.post("/admin/providers/:id/toggle", async (c) => {
   await c.env.DB.prepare("UPDATE providers SET healthy = CASE WHEN healthy=1 THEN 0 ELSE 1 END WHERE id=?").bind(id).run();
   const p = await c.env.DB.prepare("SELECT id, healthy FROM providers WHERE id=?").bind(id).first();
   return c.json({ id: p.id, healthy: !!p.healthy });
+});
+// Explicit off-switch endpoints. Separate from /toggle (health): disable takes
+// a provider fully out of rotation so its slugs stop being advertised and
+// selected, while /toggle only marks it down.
+async function setProviderEnabled(c, id, enabled) {
+  const provider = await c.env.DB.prepare("SELECT id, name FROM providers WHERE id=?").bind(id).first();
+  if (!provider)
+    return c.json({ error: { message: "provider not found" } }, 404);
+  await c.env.DB.prepare("UPDATE providers SET enabled=?, updated_at=? WHERE id=?").bind(enabled ? 1 : 0, nowIso(), id).run();
+  const slugs = await c.env.DB.prepare("SELECT DISTINCT slug FROM model_routes WHERE provider_id=?").bind(id).all();
+  blog("PROVIDER " + (enabled ? "enabled" : "disabled") + " id=" + id + " name=" + provider.name);
+  return c.json({ id, name: provider.name, enabled: !!enabled, slugs: (slugs.results || []).map((r) => r.slug) });
+}
+app.post("/admin/providers/:id/disable", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return setProviderEnabled(c, Number(c.req.param("id")), false);
+});
+app.post("/admin/providers/:id/enable", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return setProviderEnabled(c, Number(c.req.param("id")), true);
 });
 app.post("/admin/routes", async (c) => {
   const denied = await requireAdmin(c);
@@ -2750,7 +3065,7 @@ app.get("/admin/routes", async (c) => {
   if (denied)
     return denied;
   const rows = await c.env.DB.prepare(
-    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
   ).all();
   return c.json({ routes: rows.results || [] });
 });
@@ -2824,10 +3139,10 @@ app.get("/admin/overview", async (c) => {
   if (denied)
     return denied;
   const providers = await c.env.DB.prepare(
-    "SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.fmt, p.proxy_url, p.transport, p.last_status, p.last_checked, (SELECT COUNT(*) FROM model_routes mr WHERE mr.provider_id=p.id) AS route_count FROM providers p ORDER BY p.priority"
+    "SELECT p.id, p.name, p.base_url, p.priority, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.last_status, p.last_checked, (SELECT COUNT(*) FROM model_routes mr WHERE mr.provider_id=p.id) AS route_count FROM providers p ORDER BY p.priority"
   ).all();
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled, p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled FROM model_routes mr JOIN providers p ON p.id=mr.provider_id ORDER BY mr.slug, mr.rank"
   ).all();
   const keys = await c.env.DB.prepare(
     "SELECT key_id, name, budget_mode, budget_limit, used_tokens, used_usd, request_count, active, allowed_models, created_at FROM api_keys ORDER BY created_at DESC"
@@ -3327,7 +3642,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
