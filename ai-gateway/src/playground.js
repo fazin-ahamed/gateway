@@ -619,13 +619,13 @@ async function addProvider(){
   const first=presets[0];
   openModal('Add provider',[
     {key:'preset',label:'Preset',type:'select',value:'custom',options:options,hint:first?('Presets fill this form and seed routes for the usual model ids. '+first.label+': '+first.summary):'Pick a preset or fill the fields yourself.'},
-    {key:'name',label:'Name',value:first?first.name:'',placeholder:'OpenRouter'},
-    {key:'base_url',label:'Base URL',value:first?first.base_url:'',placeholder:'https://api.example.com/v1'},
-    {key:'api_key',label:'Credential',type:'password',placeholder:(first&&first.credential_hint)||'sk-... (stored in DB)'},
-    {key:'fmt',label:'Format',type:'select',value:first?first.fmt:'openai',options:PROVIDER_FMT_OPTIONS},
+    {key:'name',label:'Name',placeholder:'OpenRouter'},
+    {key:'base_url',label:'Base URL',placeholder:'https://api.example.com/v1'},
+    {key:'api_key',label:'Credential',type:'password',placeholder:'sk-... (stored in DB)'},
+    {key:'fmt',label:'Format',type:'select',value:'openai',options:PROVIDER_FMT_OPTIONS},
     {key:'priority',label:'Priority (lower = first)',type:'number',value:'0'},
     {key:'proxy_url',label:'OCI proxy URL (rollback only)',placeholder:'http://user:pass@host:8080'},
-    {key:'transport',label:'Transport',type:'select',value:(first&&first.transport)||'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
+    {key:'transport',label:'Transport',type:'select',value:'auto',options:[{value:'auto',label:'Auto (direct unless relay needed)'},{value:'direct',label:'Direct from Worker'},{value:'koyeb',label:'Koyeb relay'},{value:'oci',label:'OCI relay (rollback)'}]},
     {key:'header_preset',label:'Header preset',type:'select',value:'none',options:HEADER_PRESET_OPTIONS},
     {key:'extra_headers',label:'Extra upstream headers',type:'textarea',placeholder:'HTTP-Referer: https://example.com\\nX-Title: My app',hint:'One Name: value per line. Sent to this provider on every request. Auth and content headers are managed automatically.'},
     {key:'seed_routes',label:'Seed preset routes',type:'select',value:'1',options:[{value:'1',label:'Yes — add the preset model routes'},{value:'0',label:'No — provider only'}],hint:'Routes are only added for slugs that do not already have an enabled route.'},
@@ -641,6 +641,7 @@ async function addProvider(){
       if((v.preset_slug2||'').trim() && (v.preset_upstream2||'').trim()) v.routes.push({slug:v.preset_slug2.trim(),upstream_model:v.preset_upstream2.trim()});
     }
     delete v.seed_routes; delete v.preset_slug; delete v.preset_upstream; delete v.preset_slug2; delete v.preset_upstream2;
+    if(!v.preset || v.preset==='custom') delete v.preset;
     const {status,data}=await api('/admin/providers',{method:'POST',body:JSON.stringify(v)});
     if(status===201){
       const added=(data.routes||[]);
@@ -655,7 +656,7 @@ async function addProvider(){
     ['proxy_url','header_preset','extra_headers','seed_routes','preset_slug','preset_upstream','preset_slug2','preset_upstream2'].forEach(function(key){
       const row=presetRow(vals,key); if(row) row.setAttribute('data-preset-optional','1');
     });
-    applyProviderPreset(vals,first||{id:'custom'});
+    applyProviderPreset(vals,{id:'custom'});
     PRESET_FIELD_KEYS.concat(['preset']).forEach(function(key){
       const row=presetRow(vals,key);
       if(row) row.setAttribute('data-preset-field',key);

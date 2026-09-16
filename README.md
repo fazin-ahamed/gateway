@@ -253,7 +253,10 @@ the usual model routes; every field stays editable before saving, and choosing
 | `zai-api`      | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
 
 Route seeding never repoints a live slug: a preset only adds routes for slugs
-that have no enabled route yet, and reports the rest as kept. API:
+that have no enabled route yet, and reports the rest as kept. Custom /
+other provider is not a catalog id: the console omits `preset` and
+`POST /admin/providers` with `"preset":"custom"` uses the normal create path
+(default format `openai`). Typed route slugs still seed. API:
 `GET /admin/provider-presets`, and
 `POST /admin/providers {"preset":"zai-web","api_key":"…"}` (add
 `seed_routes:false` for the provider alone, or `routes:[{slug,upstream_model}]`

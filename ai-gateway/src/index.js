@@ -2980,6 +2980,25 @@ var PROVIDER_PRESETS = [
 function providerPreset(id) {
   return PROVIDER_PRESETS.find((p) => p.id === String(id || "")) || null;
 }
+async function seedProviderRoutes(c, pid, routes) {
+  const created = [];
+  const skipped = [];
+  for (const route of routes || []) {
+    const slug = String(route && route.slug || "").trim();
+    const upstream = String(route && route.upstream_model || "").trim();
+    if (!slug || !upstream)
+      continue;
+    const existing = await c.env.DB.prepare("SELECT id FROM model_routes WHERE slug=? AND enabled=1 LIMIT 1").bind(slug).first();
+    if (existing) {
+      skipped.push(slug);
+      continue;
+    }
+    const next = await c.env.DB.prepare("SELECT COALESCE(MAX(rank),-1)+1 AS next FROM model_routes WHERE slug=?").bind(slug).first();
+    await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,?,1)").bind(slug, pid, upstream, Number(next && next.next) || 0).run();
+    created.push(slug);
+  }
+  return { created, skipped };
+}
 // Creates a provider, its routes, and optionally its credential in one call so
 // the console's "add provider" can apply a preset without a second pass.
 async function createProviderFromPreset(c, body) {
@@ -3010,28 +3029,9 @@ async function createProviderFromPreset(c, body) {
   const pid = info.results && info.results[0] && info.results[0].id;
   if (sealed)
     await c.env.DB.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(pid, sealed, "primary", nowIso()).run();
-  // Seed routes only when asked: a preset should never silently repoint a slug
-  // that already has routes. The console may pass its own edited route list.
-  const created = [];
-  const skipped = [];
   const requestedRoutes = Array.isArray(body.routes) && body.routes.length ? body.routes : (preset.routes || []);
-  if (body.seed_routes !== false) {
-    for (const route of requestedRoutes) {
-      const slug = String(route && route.slug || "").trim();
-      const upstream = String(route && route.upstream_model || "").trim();
-      if (!slug || !upstream)
-        continue;
-      const existing = await c.env.DB.prepare("SELECT id FROM model_routes WHERE slug=? AND enabled=1 LIMIT 1").bind(slug).first();
-      if (existing) {
-        skipped.push(slug);
-        continue;
-      }
-      const next = await c.env.DB.prepare("SELECT COALESCE(MAX(rank),-1)+1 AS next FROM model_routes WHERE slug=?").bind(slug).first();
-      await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,?,1)").bind(slug, pid, upstream, Number(next && next.next) || 0).run();
-      created.push(slug);
-    }
-  }
-  blog("PROVIDER preset=" + preset.id + " id=" + pid + " name=" + name + " routes=" + created.length + " skipped=" + skipped.length);
+  const seeded = body.seed_routes === false ? { created: [], skipped: [] } : await seedProviderRoutes(c, pid, requestedRoutes);
+  blog("PROVIDER preset=" + preset.id + " id=" + pid + " name=" + name + " routes=" + seeded.created.length + " skipped=" + seeded.skipped.length);
   return c.json({
     id: pid,
     preset: preset.id,
@@ -3040,8 +3040,8 @@ async function createProviderFromPreset(c, body) {
     fmt: fmt2,
     transport,
     api_key_set: !!body.api_key,
-    routes: created,
-    routes_skipped: skipped,
+    routes: seeded.created,
+    routes_skipped: seeded.skipped,
     credential_hint: preset.credential_hint
   }, 201);
 }
@@ -3061,13 +3061,15 @@ app.post("/admin/providers", async (c) => {
   } catch {
     return c.json({ error: { message: "Invalid JSON" } }, 400);
   }
-  if (b && b.preset)
+  const presetId = String((b && b.preset) || "").trim();
+  if (presetId && presetId !== "custom")
     return createProviderFromPreset(c, b);
+  if (b) delete b.preset;
   if (!b.name || !b.base_url)
     return c.json({ error: { message: "name + base_url required" } }, 400);
   let fmt2;
   try {
-    fmt2 = normalizeProviderFormat(b.fmt, "zaiweb");
+    fmt2 = normalizeProviderFormat(b.fmt, "openai");
   } catch (e) {
     return c.json({ error: { message: e.message } }, 400);
   }
@@ -3086,7 +3088,8 @@ app.post("/admin/providers", async (c) => {
   const pid = info.results && info.results[0] && info.results[0].id;
   if (sealedKey)
     await c.env.DB.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(pid, sealedKey, "primary", nowIso()).run();
-  return c.json({ id: pid, name: b.name, fmt: fmt2, proxy_url: b.proxy_url || null, transport, api_key_set: !!b.api_key, key_strategy: strategy }, 201);
+  const seeded = await seedProviderRoutes(c, pid, Array.isArray(b.routes) ? b.routes : []);
+  return c.json({ id: pid, name: b.name, fmt: fmt2, proxy_url: b.proxy_url || null, transport, api_key_set: !!b.api_key, key_strategy: strategy, routes: seeded.created, routes_skipped: seeded.skipped }, 201);
 });
 app.patch("/admin/providers/:id", async (c) => {
   const denied = await requireAdmin(c);
