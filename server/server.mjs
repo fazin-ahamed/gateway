@@ -1,11 +1,11 @@
-// Standalone Node entrypoint for hosts like ecli.app (EclipseSystems panel +
-// QEMU Debian 13 VM) where there is no Cloudflare Workers runtime. It serves
-// the same Hono app as the Worker, backed by a local SQLite file.
+// Node entrypoint for hosts like ecli.app (EclipseSystems panel + QEMU Debian
+// 13 VM). Serves the shared Hono app from ai-gateway/src, backed by a local
+// SQLite file.
 //
 // Layout:
 //   server/            Node host (this file, package.json, db.mjs, env docs)
 //   ../ai-gateway/src  shared app code (index.js, playground.js, login.js)
-//   ../relay/          optional Go egress relay (same as Worker transport)
+//   ../relay/          optional Go egress relay
 
 import { serve } from "@hono/node-server";
 import { readFileSync } from "node:fs";
@@ -91,8 +91,7 @@ const env = {
   UPSTREAM_APP_TITLE,
   UPSTREAM_HTTP_REFERER,
 };
-// The shared worker module exports createApp(env); the factory binds env
-// per request so the same code runs on Workers and Node.
+// The shared module exports createApp(env); the factory binds env per request.
 const { createApp } = await import("../ai-gateway/src/index.js");
 const app = createApp(env);
 

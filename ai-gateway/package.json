@@ -3,15 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dry-run": "wrangler deploy --dry-run",
-    "dev": "wrangler dev",
+    "test": "node --test test/*.test.mjs",
     "check": "node --input-type=module --check < src/index.js"
   },
   "dependencies": {
     "hono": "^4.6.0"
-  },
-  "devDependencies": {
-    "wrangler": "^4.0.0"
   }
 }

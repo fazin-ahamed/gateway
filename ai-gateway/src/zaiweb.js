@@ -1,16 +1,15 @@
 // Z.ai consumer chat (chat.z.ai) provider adapter.
 //
-// An OpenAI-compatible front for Z.ai's web chat: the consumer site
-// authenticates with a Bearer JWT from localStorage and requires a
-// browser-issued CAPTCHA proof, then takes a signed completion call.
-//
-// Transport here is signed HTTP only — no browser automation. That means a
-// route works when the operator supplies both the session token and a
-// (short-lived) captcha proof; without a proof the provider returns a clear
-// 503 telling the operator what to paste, instead of failing opaquely.
+// An OpenAI-compatible front for Z.ai's web chat. Session state (cookies,
+// guest/account token, frontend version) lives in the Node-native
+// ZaiSession, so the signed path no longer depends on a hand-pasted JWT and
+// a browser-issued CAPTCHA proof is the only per-request input.
 //
 // Wire shape ported from OmniRoute (open-sse/executors/zai-web) so both
 // gateways speak the identical protocol.
+
+import { sessionFor } from "./zai-session.js";
+import { registryFor } from "./zai-models.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
@@ -594,7 +593,7 @@ export class ZaiWebError extends Error {
 }
 
 function credentialError() {
-  return new ZaiWebError(503, 'Z.ai route needs a web session: put the chat.z.ai localStorage "token" in the provider key.', "zai_credentials");
+  return new ZaiWebError(503, "Z.ai session has no usable user id: guest bootstrap failed and no account token was supplied in the provider key.", "zai_credentials");
 }
 
 // chat.z.ai issues the captcha proof per completion, so it cannot be stored
@@ -653,12 +652,9 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (images)
     throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
 
-  const { token, captcha } = parseCredential(rawKey, payload, c && c.req && typeof c.req.header === "function" ? {
+  const { token: credentialToken, captcha } = parseCredential(rawKey, payload, c && c.req && typeof c.req.header === "function" ? {
     get: (name) => c.req.header(name)
   } : null);
-  const userId = userIdFromToken(token);
-  if (!token || !userId)
-    throw credentialError();
   if (!captcha)
     throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion. Pass it as the x-zai-captcha request header (or providerSpecificData), or store one in the provider key. It is issued per completion, so the stored value only works once.", "zai_captcha");
 
@@ -667,9 +663,23 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (!prompt && !images)
     throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
 
+  // Account token when the operator supplied one; guest session otherwise.
+  const session = sessionFor({ fetcher, credential: credentialToken, key: route.zai_session_key });
+  const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id) });
+  const entry = await registry.resolve(modelId);
+  if (entry && entry.available === false)
+    throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
+
+  const active = await session.acquire();
+  let token = active.token;
+  let userId = active.userId || userIdFromToken(token);
+  if (!token || !userId)
+    throw credentialError();
+  if (!session.feVersion)
+    session.feVersion = await resolveFrontendVersion(fetcher);
+
   const thinking = resolveThinking(modelId, payload);
   const features = resolveFeatures(payload);
-  const frontendVersion = await resolveFrontendVersion(fetcher);
   const userMessageId = crypto.randomUUID();
 
   // 1. Create the remote chat the completion is attached to.
@@ -677,7 +687,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   try {
     created = await fetcher(ZAI_NEW_CHAT_URL, {
       method: "POST",
-      headers: buildHeaders(token, { accept: "application/json", frontendVersion }),
+      headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" }),
       body: JSON.stringify(buildNewChatBody({
         messages,
         modelId,
@@ -691,6 +701,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   } catch (e) {
     throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
   }
+  session.noteResponse(created.headers);
   if (!created.ok)
     throw new ZaiWebError(created.status, "Z.ai chat creation error: " + String(await created.text().catch(() => "")).slice(0, 300), "zai_chat_create");
   const createdJson = await created.json().catch(() => null);
@@ -698,17 +709,17 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (!chatId)
     throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
 
-  // 2. Signed completion call. chat.z.ai is stateful per chat, so the
-  // throwaway chat must not pile up in the account.
-  const timestamp = Date.now();
-  const requestId = crypto.randomUUID();
-  const signature = await buildSignature({ prompt, requestId, timestamp, userId });
-  const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
-  let up;
-  try {
-    up = await fetcher(completionUrl, {
+  // 2. Signed completion. A 401 means the session aged out mid-flight: refresh
+  //    once and replay, rather than surfacing an auth error the operator
+  //    cannot act on.
+  const postCompletion = async (useToken, useUserId) => {
+    const timestamp = Date.now();
+    const requestId = crypto.randomUUID();
+    const signature = await buildSignature({ prompt, requestId, timestamp, userId: useUserId });
+    const completionUrl = buildCompletionUrl({ requestId, timestamp, token: useToken, userId: useUserId });
+    return fetcher(completionUrl, {
       method: "POST",
-      headers: buildHeaders(token, { accept: "text/event-stream", frontendVersion, signature }),
+      headers: session.headers({ Accept: "text/event-stream", "Content-Type": "application/json", "X-Signature": signature }),
       body: JSON.stringify(buildCompletionBody({
         body: payload,
         captchaVerifyParam: captcha,
@@ -724,25 +735,45 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
         features
       }))
     });
+  };
+
+  let up;
+  try {
+    up = await postCompletion(token, userId);
+    if (up.status === 401) {
+      session.invalidate("completion 401");
+      const again = await session.refresh("completion 401");
+      if (again && again.token && again.token !== token) {
+        token = again.token;
+        userId = again.userId || userIdFromToken(token) || userId;
+        if (again.feVersion)
+          session.feVersion = session.feVersion || again.feVersion;
+        up = await postCompletion(token, userId);
+      }
+    }
   } catch (e) {
     throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
   }
-  if (!up.ok || !up.body)
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + String(await up.text().catch(() => "")).slice(0, 300), "zai_completion");
+  session.noteResponse(up.headers);
+  if (!up.ok || !up.body) {
+    const text = String(await up.text().catch(() => "")).slice(0, 300);
+    if (isWafChallenge(up.status, text))
+      throw new ZaiWebError(up.status || 403, "Z.ai rejected the signed request at the edge (challenge/WAF). Use the browser transport for this route.", "zai_waf");
+    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
+  }
 
   const id = "chatcmpl-zai-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  // chat.z.ai refreshes its session cookie on every chat creation. Capture the
-  // rotated value so the stored provider key does not keep a token the site has
-  // already retired (that is the "worked yesterday, 401 today" failure).
-  const recovered = rotatedToken(created.headers) || token;
+  // The session now owns the token chat.z.ai rotated during this request, so
+  // the stored provider key never keeps a credential the site already retired.
+  const recovered = session.token !== active.token ? session.token : rotatedToken(created.headers) || token;
   // The remote chat is single-use; once the stream drains, delete it so the
   // account doesn't accumulate dead conversations.
   const cleanup = () => {
     if (!chatId) return Promise.resolve();
     return fetcher(ZAI_DELETE_CHAT_URL(chatId), {
       method: "DELETE",
-      headers: buildHeaders(token, { accept: "application/json", frontendVersion })
+      headers: session.headers({ Accept: "application/json" })
     }).catch(() => {});
   };
   if (isStream && up.body) {
@@ -767,6 +798,16 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered });
   await cleanup();
   return shaped;
+}
+
+// The Z.AI edge answers a blocked request with an HTML/security page rather
+// than a model error; callers need to tell that apart from a provider outage
+// so they can fall back to the browser transport.
+export function isWafChallenge(status, body) {
+  const text = String(body || "").toLowerCase();
+  if (/aliyun|waf|challenge|captcha|security|f001|verify/.test(text))
+    return true;
+  return (status === 403 || status === 405) && /<html|<!doctype/i.test(text);
 }
 
 // One converter for both transports: the signed HTTP path and the browser path
@@ -989,7 +1030,7 @@ export function isZaiBrowserFormat(value) {
 }
 
 // Browser-backed transport: no captcha from the caller, because the page makes
-// the call itself. Requires the Node host (a browser cannot run in a Worker).
+// the call itself. Requires the Node host for Chromium.
 export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
   const caps = getModelCapabilities(modelId);
@@ -1009,6 +1050,13 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   const prompt = foldPrompt(messages, payload.system);
   if (!prompt)
     throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
+
+  const registryFetcher = (c && c.upstreamFetch) || globalThis.fetch;
+  const session = sessionFor({ fetcher: registryFetcher, credential: token, key: route.zai_session_key });
+  const registry = registryFor({ session, fetcher: registryFetcher, fallback: (id) => modelCatalogEntry(id) });
+  const entry = await registry.resolve(modelId);
+  if (entry && entry.available === false)
+    throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
 
   const { runBrowserTurn, ZaiBrowserUnavailable } = c && c.zaiRunBrowserTurn
     ? { runBrowserTurn: c.zaiRunBrowserTurn, ZaiBrowserUnavailable: class extends Error {} }
@@ -1104,5 +1152,6 @@ export const __zaiTest = {
   toOpenAiStream,
   estimatePromptTokens,
   parseCredential,
-  captureFromHeaders
+  captureFromHeaders,
+  isWafChallenge
 };

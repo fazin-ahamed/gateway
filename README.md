@@ -4,8 +4,8 @@ OpenAI-compatible AI gateway on Node + SQLite (direct egress, Koyeb WebSocket re
 
 ## Layout
 
-- `ai-gateway/` — app source (`src/index.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), SQLite schema, admin console UI, Worker entry + `wrangler.jsonc`
-- `server/` — Node entrypoint (`server.mjs`, `db.mjs`, `import.mjs`), the Node deploy target (Workers deploy from `ai-gateway/`)
+- `ai-gateway/` — app source (`src/index.js`, `src/zai-session.js`, `src/zai-models.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), SQLite schema, admin console UI
+- `server/` — Node entrypoint (`server.mjs`, `db.mjs`, `import.mjs`), the only deploy target
 - `relay/` — small Go relay for providers that need non-Cloudflare egress
 - `docs/` — request-path and hosting runbooks
 
@@ -74,13 +74,8 @@ advertised and then 503ing on use. Routing a withheld slug returns 503 with
 cause is visible in the error rather than only in the console.
 
 Migration: `providers.enabled` is in `schema.sql` (fresh installs) and is added
-by an idempotent `ALTER TABLE` on Node boot. On Cloudflare Workers/D1 the Node
-runtime never runs, so apply it once by hand before deploying a Worker built
-from this commit:
-
-```sh
-wrangler d1 execute DB --command "ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
-```
+by an idempotent `ALTER TABLE` on Node boot, so an existing `data/gateway.db`
+picks it up on the next start with no manual step.
 
 ## Provider formats
 
@@ -90,18 +85,45 @@ wrangler d1 execute DB --command "ALTER TABLE providers ADD COLUMN enabled INTEG
 | ----------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | `openai`    | `{base_url}/chat/completions`              | API key, sent as `Authorization: Bearer …`                                                            |
 | `anthropic` | `{base_url}/messages`                      | API key, sent as `x-api-key`                                                                          |
-| `zaiweb`    | Z.ai consumer web chat (`https://chat.z.ai`) | JSON `{"token":"<chat.z.ai localStorage token>","captcha_verify_param":"<proof>"}` or a bare JWT token |
+| `zaiweb`    | Z.ai consumer web chat (`https://chat.z.ai`) | Optional: JSON `{"token":"<chat.z.ai token>","captcha_verify_param":"<proof>"}`. With no token the gateway bootstraps a guest session itself. |
 
-### Z.ai web chat — automatic (`zaiwebbrowser`)
+### Z.ai web chat — session, models, and transport
 
-The `zaiweb` format above needs a fresh CAPTCHA proof per completion, which no
-one wants to paste by hand. `zaiwebbrowser` removes that step: the gateway
-drives chat.z.ai in a local Chromium and lets the page mint its own proof.
+`zaiweb` runs against a real session object (`src/zai-session.js`) rather than a
+hand-pasted JWT:
 
-- Requires the **Node host** (a Worker cannot run a browser) with Chromium:
-  `npm install playwright && npx playwright install chromium`. On a host where
-  you cannot install system packages, the `npx playwright install` step may
-  report missing shared libraries; two ways around it:
+- **Guest bootstrap** — `GET /` (warm cookies + discover the frontend build) →
+  `POST /api/v1/auths/guest` → `GET /api/v1/auths/`. An account token in the
+  provider key is validated first and preferred; guest is the fallback.
+- **Cookie jar** — every `Set-Cookie` from warm, auth, chat-create, completion,
+  and delete is retained and replayed, which is what the edge expects.
+- **Single-flight refresh** — concurrent requests share one refresh; a 401
+  mid-flight invalidates, refreshes once, and replays the completion.
+- **Rotation** — a token the site rotates during a request is adopted and
+  returned as the provider key's new value, so a stored credential never keeps
+  a token the site already retired.
+- **Live models** (`src/zai-models.js`) — `GET /api/models` with the session's
+  cookies decides which models the account can actually use. A model the
+  account cannot see is reported `available: false` and the router skips it;
+  the static table is fallback metadata only.
+- **Chat lifecycle** — each request uses a throwaway chat and deletes it once
+  the stream drains, so the account's history does not accumulate.
+- **Failure classification** — an edge/WAF/challenge block (`code: "zai_waf"`)
+  is reported separately from an auth failure or a model outage, so the caller
+  can fall back to the browser transport instead of treating them all as 5xx.
+
+`captcha_verify_param` is still required per completion on the signed path;
+it is issued once and cannot be reused.
+
+### Z.ai web chat — browser (`zaiwebbrowser`)
+
+`zaiwebbrowser` removes the captcha step entirely: the gateway drives chat.z.ai
+in a local Chromium and lets the page mint its own proof. Each request gets a
+fresh page (no cross-conversation state), serialized by a per-credential mutex.
+
+- Requires Chromium: `npm install playwright && npx playwright install chromium`.
+  On a host where you cannot install system packages, the `npx playwright install`
+  step may report missing shared libraries; two ways around it:
   - point `BROWSER_EXECUTABLE` at a Chromium already present on the host
     (or in `~/.cache/ms-playwright/*/chrome-linux64/chrome`) and skip the
     download entirely, or
@@ -224,8 +246,8 @@ only. Stack-leak, ceiling, and cutoff probes follow
 Reference token data is **precomputed and committed**
 (`ai-gateway/src/modelprobe-refs.js`): the probe text and sizes are constants, so
 every reference count and ID sequence is a constant too. That is why the probes
-run on Workers and Node with no tokenizer dependency — `hono` stays the only
-package. Regenerate after changing the probe text:
+run with no tokenizer dependency — `hono` stays the only package. Regenerate
+after changing the probe text:
 
 ```sh
 python3 scripts/build-modelprobe-refs.py > ai-gateway/src/modelprobe-refs.js

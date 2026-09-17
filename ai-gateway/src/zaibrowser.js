@@ -8,9 +8,8 @@ import { createHash } from "node:crypto";
 // to use this account class without a human pasting a fresh proof each turn --
 // the page's own JavaScript mints the proof in the right context.
 //
-// This runs only where a browser can: the Node host. The Worker build never
-// executes it, and importing it there is harmless because playwright is pulled
-// in lazily, only when a browser-backed request actually arrives.
+// Playwright is imported lazily, only when a browser-backed request actually
+// arrives, so hosts without Chromium still serve every other provider.
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
