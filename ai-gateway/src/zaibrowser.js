@@ -212,6 +212,17 @@ export async function runBrowserTurn(token, prompt, options = {}) {
       pool.lastUsed = Date.now();
       if (!result.status && result.timeout)
         throw new Error("the page did not issue a completion within " + timeoutMs + "ms");
+      // chat.z.ai rotates its session token during turns; pull the current one
+      // so the stored credential ages with the browser, not against it.
+      let recovered = "";
+      try {
+        const cookies = await pool.context.cookies("https://chat.z.ai");
+        const tok = cookies.find((CK) => CK.name === "token");
+        if (tok && tok.value && tok.value !== token)
+          recovered = tok.value;
+      } catch {
+      }
+      result.recovered = recovered || null;
       return result;
     } finally {
       page.off("response", onResponse);

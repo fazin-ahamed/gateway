@@ -16,6 +16,7 @@ const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
 const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
 const ZAI_SETTINGS_URL = ZAI_BASE_URL + "/api/v1/users/user/settings";
+const ZAI_DELETE_CHAT_URL = (chatId) => ZAI_BASE_URL + "/api/v1/chats/" + encodeURIComponent(chatId);
 const ZAI_DEFAULT_MODEL = "glm-5.3";
 const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.92";
 const ZAI_FE_VERSION_CACHE_MS = 15 * 60 * 1000;
@@ -35,7 +36,10 @@ const IMAGE_TOKEN_ALLOWANCE = 500;
 // input. `context` is the measured chat.z.ai transport window (not the
 // theoretical 1M GLM-5.3 paper context). `output` is the completion clamp.
 const ZAI_MODELS = {
-  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: true, context: 98304, output: 16384 },
+  // vision=false until we actually upload image bytes; "[image: URL]" text is
+  // not multimodal input. Advertising it would make the router send images
+  // the model never sees.
+  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: false, context: 98304, output: 16384 },
   "glm-5.3": { name: "GLM-5.3", thinking: true, vision: false, context: 98304, output: 16384 },
   "glm-5.2": { name: "GLM-5.2", thinking: true, vision: false, context: 98304, output: 16384 }
 };
@@ -170,7 +174,7 @@ async function buildSignature(input) {
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map((pair) => pair.join(","))
     .join(",");
-  const encodedPrompt = bytesToBase64(new TextEncoder().encode(input.prompt));
+  const encodedPrompt = bytesToBase64(new TextEncoder().encode(String(input.prompt || "").trim()));
   const bucket = Math.floor(Number(timestamp) / (5 * 60 * 1000));
   const derivedKey = await hmacSha256(SIGNATURE_KEY, String(bucket));
   return hmacSha256(derivedKey, sortedPayload + "|" + encodedPrompt + "|" + timestamp);
@@ -262,9 +266,10 @@ function estimatePromptTokens(messages, toolsChars) {
   return Math.ceil(chars / PROMPT_CHARS_PER_TOKEN);
 }
 
-// The consumer models expose an effort selector but no non-thinking mode, so
-// a client asking for "none"/"off" still gets thinking, at the lowest effort
-// the model actually supports (low on 5.3, high on 5.2). Never map off→max.
+// The consumer settings UI exposes a bucketed effort selector. Live model
+// data only advertises buckets the account actually has; sending an
+// unsupported value can corrupt the response. Keep to high/max for now;
+// more granular levels require live capability discovery.
 function resolveThinking(modelId, payload) {
   const caps = getModelCapabilities(modelId);
   if (!caps || !caps.thinking)
@@ -275,16 +280,11 @@ function resolveThinking(modelId, payload) {
     : typeof reasoning?.effort === "string"
       ? reasoning.effort.trim().toLowerCase()
       : "";
-  const supportsLow = capabilityModelId(modelId) !== "glm-5.2";
   let effort;
-  if (!raw || raw === "none" || raw === "off" || raw === "nothink" || raw === "low")
-    effort = supportsLow ? "low" : "high";
-  else if (raw === "medium" || raw === "high")
-    effort = "high";
-  else if (raw === "max" || raw === "xhigh")
+  if (raw === "max" || raw === "xhigh")
     effort = "max";
   else
-    effort = supportsLow ? "low" : "high";
+    effort = "high";
   return { enabled: true, effort, effortSupported: true };
 }
 
@@ -650,8 +650,8 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (payload.tools || payload.functions)
     throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
   const images = countImages(payload.messages);
-  if (images && !caps.vision)
-    throw new ZaiWebError(400, "Z.ai model " + unprefixedModelId(modelId) + " does not accept image input; use glm-5.3-flash.", "zai_vision_unsupported");
+  if (images)
+    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
 
   const { token, captcha } = parseCredential(rawKey, payload, c && c.req && typeof c.req.header === "function" ? {
     get: (name) => c.req.header(name)
@@ -698,7 +698,8 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (!chatId)
     throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
 
-  // 2. Signed completion call.
+  // 2. Signed completion call. chat.z.ai is stateful per chat, so the
+  // throwaway chat must not pile up in the account.
   const timestamp = Date.now();
   const requestId = crypto.randomUUID();
   const signature = await buildSignature({ prompt, requestId, timestamp, userId });
@@ -735,7 +736,37 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   // rotated value so the stored provider key does not keep a token the site has
   // already retired (that is the "worked yesterday, 401 today" failure).
   const recovered = rotatedToken(created.headers) || token;
-  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered });
+  // The remote chat is single-use; once the stream drains, delete it so the
+  // account doesn't accumulate dead conversations.
+  const cleanup = () => {
+    if (!chatId) return Promise.resolve();
+    return fetcher(ZAI_DELETE_CHAT_URL(chatId), {
+      method: "DELETE",
+      headers: buildHeaders(token, { accept: "application/json", frontendVersion })
+    }).catch(() => {});
+  };
+  if (isStream && up.body) {
+    // Tee the stream: client gets the shaped half; the discard half drives the
+    // stream to completion so cleanup fires even when the caller abandons it.
+    const [clientStream, discard] = up.body.tee();
+    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered });
+    (async () => {
+      try {
+        const reader = discard.getReader();
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      } catch {
+      } finally {
+        await cleanup();
+      }
+    })().catch(() => {});
+    return shaped;
+  }
+  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered });
+  await cleanup();
+  return shaped;
 }
 
 // One converter for both transports: the signed HTTP path and the browser path
@@ -824,8 +855,8 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   if (payload.tools || payload.functions)
     throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
   const images = countImages(payload.messages);
-  if (images && !caps.vision)
-    throw new ZaiWebError(400, "Z.ai model " + unprefixedModelId(modelId) + " does not accept image input; use glm-5.3-flash.", "zai_vision_unsupported");
+  if (images)
+    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
 
   const { token } = parseCredential(rawKey, payload);
   const userId = userIdFromToken(token);
@@ -927,7 +958,30 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
 
   const id = "chatcmpl-zaim-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null });
+  const cleanup = () => fetcher(ZAI_DELETE_CHAT_URL(chatId), {
+    method: "DELETE",
+    headers: buildHeaders(token, { accept: "application/json", frontendVersion })
+  }).catch(() => {});
+  if (isStream && up.body) {
+    const [clientStream, discard] = up.body.tee();
+    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null });
+    (async () => {
+      try {
+        const reader = discard.getReader();
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      } catch {
+      } finally {
+        await cleanup();
+      }
+    })().catch(() => {});
+    return shaped;
+  }
+  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null });
+  await cleanup();
+  return shaped;
 }
 
 export function isZaiBrowserFormat(value) {
@@ -944,8 +998,8 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   if (payload.tools || payload.functions)
     throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
   const images = countImages(payload.messages);
-  if (images && !caps.vision)
-    throw new ZaiWebError(400, "Z.ai model " + unprefixedModelId(modelId) + " does not accept image input; use glm-5.3-flash.", "zai_vision_unsupported");
+  if (images)
+    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
 
   const { token } = parseCredential(rawKey, payload);
   if (!token || !userIdFromToken(token))
@@ -972,7 +1026,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
   // The frame converter reads a stream; wrap the captured response text.
   const source = new Response(turn.body).body || new Response("").body;
-  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: null });
+  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: turn.recovered || null });
 }
 
 // Rebuild the caller's conversation into one prompt for the browser transport.
