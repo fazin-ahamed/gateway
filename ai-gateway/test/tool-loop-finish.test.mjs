@@ -1,16 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { __test } from "../src/index.js";
-
-const normalizeTerminalFinishReason = (...args) => {
-  assert.equal(
-    typeof __test.normalizeTerminalFinishReason,
-    "function",
-    "stream protocol normalizer must be exported for regression tests"
-  );
-  return __test.normalizeTerminalFinishReason(...args);
-};
+import {
+  guardToolLoopResponse,
+  normalizeTerminalFinishReason
+} from "../../server/tool-loop-guard.mjs";
 
 test("missing finish reason after tool calls stays in the agent loop", () => {
   assert.equal(normalizeTerminalFinishReason(null, true, true), "tool_calls");
@@ -30,4 +24,35 @@ test("plain completed text without a finish reason receives stop", () => {
 
 test("an unclean EOF is not disguised as a successful stop", () => {
   assert.equal(normalizeTerminalFinishReason(null, false, false), null);
+});
+
+test("SSE stop after a tool call is rewritten to tool_calls", async () => {
+  const source = [
+    'data: {"id":"x","model":"grok-4.6","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}',
+    '',
+    'data: {"id":"x","model":"grok-4.6","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join("\n");
+  const response = new Response(source, { headers: { "content-type": "text/event-stream" } });
+  const guarded = guardToolLoopResponse(response, "grok-4.6");
+  const text = await guarded.text();
+  assert.match(text, /"finish_reason":"tool_calls"/);
+  assert.doesNotMatch(text, /"finish_reason":"stop"/);
+});
+
+test("SSE missing terminal chunk after a tool call gets tool_calls before DONE", async () => {
+  const source = [
+    'data: {"id":"x","model":"grok-4.6","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"grep","arguments":"{}"}}]},"finish_reason":null}]}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join("\n");
+  const response = new Response(source, { headers: { "content-type": "text/event-stream" } });
+  const guarded = guardToolLoopResponse(response, "grok-4.6");
+  const text = await guarded.text();
+  const finishAt = text.indexOf('"finish_reason":"tool_calls"');
+  const doneAt = text.indexOf("data: [DONE]");
+  assert.ok(finishAt >= 0 && finishAt < doneAt, "terminal tool_calls chunk should precede [DONE]");
 });
