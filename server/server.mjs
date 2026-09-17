@@ -10,6 +10,7 @@
 import { serve } from "@hono/node-server";
 import { readFileSync } from "node:fs";
 import { createDb } from "./db.mjs";
+import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -95,8 +96,13 @@ const env = {
 const { createApp } = await import("../ai-gateway/src/index.js");
 const app = createApp(env);
 
-
-const handler = async (req) => app.fetch(req, env, { waitUntil: () => {} });
+const handler = async (req) => {
+  const response = await app.fetch(req, env, { waitUntil: () => {} });
+  const path = new URL(req.url).pathname;
+  if (path === "/v1/chat/completions" || path === "/admin/playground/completions")
+    return guardToolLoopResponse(response);
+  return response;
+};
 
 console.log(`[gateway] listening on http://${HOST}:${PORT} (db=${DB_PATH})`);
 // Huge-context requests upload megabytes of JSON and slow models take
