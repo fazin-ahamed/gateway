@@ -1982,31 +1982,40 @@ function promptComplexity(payload) {
     score += 0.5;
   return { score, chars: a.textChars, words: askWords, estInputTokens: tokens, images: a.imageCount };
 }
+function isLuxuryFlagship(id) {
+  return /(gpt-6-astra|astra|claude-fable|fable-5|mythos|gpt-6(?!.*mini)|opus-5|claude-opus-5|grok-4)/.test(String(id || "").toLowerCase());
+}
+function isWorkhorse(id) {
+  // Cheap 2026 labs that actually rival Astra on coding/agents at a fraction
+  // of the price. Auto prefers these whenever they can serve the request.
+  return /(glm-5|glm-4\.6|kimi|moonshot|deepseek|qwen3)/.test(String(id || "").toLowerCase());
+}
 function qualityPrior(entry, slug) {
   const id = String((entry && entry.id) || slug || "").toLowerCase();
   const reasoning = !!(entry && entry.reasoning);
   const ctx = Number(entry && entry.limit && entry.limit.context) || 0;
-  // Named 2026 families first. Price is not quality: a cheap GLM-5 / Kimi
-  // / DeepSeek must still outrank a tiny 8k model on hard work, and only
-  // true flagships (Astra, Fable, Mythos, GPT-6, Opus 5, Grok 4) sit at the
-  // top so the router can still spend when the ask actually needs them.
+  // Workhorses are scored as Astra-class rivals so the router will use them
+  // for hard work. Luxury ids stay high only for last-resort fallback.
   let q = 1;
-  if (/(gpt-6-astra|astra|claude-fable|fable-5|mythos|gpt-6(?!.*mini)|opus-5|claude-opus-5|grok-4)/.test(id))
+  if (isLuxuryFlagship(id))
     q = 5.4;
-  else if (/(gpt-5\.2|gpt-5-2|o3(?!.*mini)|o4(?!.*mini)|opus-4|sonnet-5|glm-5(?!.*flash)|kimi-k2|kimi-k3|deepseek-v4(?!.*flash)|deepseek-r1|qwen3-max|gemini-3(?!.*flash))/.test(id))
-    q = 4.2;
-  else if (/(gpt-5(?!.*(mini|nano))|gpt-4\.1(?!.*mini)|sonnet-4|glm-5\.3-flash|glm-5-flash|kimi|deepseek-v3|qwen3|gemini-2\.5-pro|llama-4)/.test(id))
+  else if (/(glm-5(?!.*flash)|kimi-k3|kimi-k2\.6)/.test(id))
+    q = 4.7;
+  else if (/(kimi-k2|deepseek-v4(?!.*flash)|deepseek-r1|qwen3-max|glm-4\.6)/.test(id))
+    q = 4.3;
+  else if (/(glm-5\.3-flash|glm-5-flash|kimi|deepseek-v3|qwen3|deepseek-v4-flash)/.test(id))
+    q = 3.6;
+  else if (/(gpt-5(?!.*(mini|nano))|sonnet-5|sonnet-4|gpt-4\.1(?!.*mini)|gemini-3(?!.*flash))/.test(id))
     q = 3.2;
-  else if (/(gpt-4o(?!.*mini)|haiku-4|gemini-2\.5-flash|mistral-large|command-a)/.test(id))
+  else if (/(gpt-4o(?!.*mini)|haiku-4|gemini-2\.5|mistral-large)/.test(id))
     q = 2.4;
   else {
     q = 1;
     if (reasoning) q += 1.5;
-    if (ctx >= 1000000) q += 1.4;
-    else if (ctx >= 400000) q += 1;
+    if (ctx >= 400000) q += 1;
     else if (ctx >= 128000) q += 0.5;
-    if (/(flash|lite|mini|small|air|nano|tiny|instant)/.test(id)) q -= 0.5;
-    if (/(pro|max|ultra|opus|flagship|thinking|reasoning|frontier)/.test(id)) q += 0.75;
+    if (/(flash|lite|mini|small|air|nano|tiny|instant)/.test(id)) q -= 0.4;
+    if (/(pro|max|ultra|thinking|reasoning)/.test(id)) q += 0.6;
   }
   return Math.max(0.25, Math.min(6, q));
 }
@@ -2189,12 +2198,16 @@ async function pickAutoModel(c, payload) {
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: /(flash|lite|mini|small|air|nano)/.test(r.slug) });
   }
-  const eligibleList = candidates.filter((x) => x.eligible);
+  const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
+  const strongWork = workhorseEligible.filter((x) => !x.tiny);
+  const eligibleList = (need >= 2.5 && strongWork.length) ? strongWork : (workhorseEligible.length ? workhorseEligible : candidates.filter((x) => x.eligible));
   let picked;
   if (!eligibleList.length) {
-    const pool = candidates.some((x) => x.capable) ? candidates.filter((x) => x.capable) : candidates;
+    const poolBase = candidates.some((x) => x.capable) ? candidates.filter((x) => x.capable) : candidates;
+    const poolWork = poolBase.filter((x) => x.workhorse);
+    const pool = poolWork.length ? poolWork : poolBase;
     let best = null;
     for (const cand of pool) {
       if (!best || cand.quality > best.quality || cand.quality === best.quality && cand.cost < best.cost)
@@ -2202,7 +2215,6 @@ async function pickAutoModel(c, payload) {
     }
     picked = best ? { ...best, fallback: true } : null;
   } else if (need <= 2.1) {
-    // Small talk: cheapest capable model, not the strongest cheap-ish one.
     let best = null;
     for (const cand of eligibleList) {
       if (!best || cand.cost < best.cost || cand.cost === best.cost && cand.quality > best.quality)
