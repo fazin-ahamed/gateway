@@ -638,10 +638,38 @@ function parseCredential(rawKey, payload, headers) {
   return { token, captcha };
 }
 
-// Runs one chat turn against chat.z.ai and returns an OpenAI-shaped stream or
+// chat.z.ai/Aliyun fingerprints the TLS client hello, which Node's fetch
+// cannot imitate. When ZAI_UTLS_PROXY points at the local zaihttp helper, the
+// chat.z.ai calls are routed through it so they carry a Chrome ClientHello.
+// Everything else (and every test) keeps using the plain fetcher.
+export function wrapUtlsFetcher(fetcher) {
+  const proxy = process.env.ZAI_UTLS_PROXY;
+  if (!proxy || typeof fetcher !== "function")
+    return fetcher;
+  const base = String(proxy).replace(/\/+$/, "");
+  return async (url, init = {}) => {
+    let host = "";
+    try {
+      host = new URL(String(url)).hostname;
+    } catch {
+      return fetcher(url, init);
+    }
+    if (host !== "chat.z.ai")
+      return fetcher(url, init);
+    return fetcher(base + "/proxy", {
+      ...init,
+      method: "POST",
+      headers: {
+        ...(init.headers || {}),
+        "X-Target-Url": String(url),
+        "X-Target-Method": String(init.method || "GET").toUpperCase()
+      }
+    });
+  };
+}
 // JSON body, matching the { response, usage } contract of forwardToProvider.
 export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl) {
-  const fetcher = fetchImpl || c.upstreamFetch;
+  const fetcher = wrapUtlsFetcher(fetchImpl || c.upstreamFetch);
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
   const caps = getModelCapabilities(modelId);
   if (!caps)
@@ -702,8 +730,13 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
     throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
   }
   session.noteResponse(created.headers);
-  if (!created.ok)
-    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + String(await created.text().catch(() => "")).slice(0, 300), "zai_chat_create");
+  if (!created.ok) {
+    const text = String(await created.text().catch(() => "")).slice(0, 300);
+    const viaBrowser = await fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, created.status, text);
+    if (viaBrowser)
+      return viaBrowser;
+    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + text, "zai_chat_create");
+  }
   const createdJson = await created.json().catch(() => null);
   const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
   if (!chatId)
@@ -757,8 +790,9 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   session.noteResponse(up.headers);
   if (!up.ok || !up.body) {
     const text = String(await up.text().catch(() => "")).slice(0, 300);
-    if (isWafChallenge(up.status, text))
-      throw new ZaiWebError(up.status || 403, "Z.ai rejected the signed request at the edge (challenge/WAF). Use the browser transport for this route.", "zai_waf");
+    const viaBrowser = await fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, up.status, text);
+    if (viaBrowser)
+      return viaBrowser;
     throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
   }
 
@@ -799,15 +833,21 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   await cleanup();
   return shaped;
 }
-
-// The Z.AI edge answers a blocked request with an HTML/security page rather
-// than a model error; callers need to tell that apart from a provider outage
-// so they can fall back to the browser transport.
 export function isWafChallenge(status, body) {
   const text = String(body || "").toLowerCase();
   if (/aliyun|waf|challenge|captcha|security|f001|verify/.test(text))
     return true;
   return (status === 403 || status === 405) && /<html|<!doctype/i.test(text);
+}
+async function fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, status, text) {
+  if (!isWafChallenge(status, text))
+    return null;
+  const browserRaw = (session && session.token) ? JSON.stringify({ token: session.token }) : rawKey;
+  try {
+    return await callZaiBrowser(c, route, browserRaw, payload, isStream);
+  } catch (e) {
+    throw new ZaiWebError(status || 403, "Z.ai rejected the signed request at the edge (challenge/WAF). Browser fallback failed: " + String(e && e.message || e).slice(0, 180), "zai_waf");
+  }
 }
 
 // One converter for both transports: the signed HTTP path and the browser path
@@ -1153,5 +1193,6 @@ export const __zaiTest = {
   estimatePromptTokens,
   parseCredential,
   captureFromHeaders,
-  isWafChallenge
+  isWafChallenge,
+  wrapUtlsFetcher
 };

@@ -109,8 +109,15 @@ hand-pasted JWT:
 - **Chat lifecycle** — each request uses a throwaway chat and deletes it once
   the stream drains, so the account's history does not accumulate.
 - **Failure classification** — an edge/WAF/challenge block (`code: "zai_waf"`)
-  is reported separately from an auth failure or a model outage, so the caller
-  can fall back to the browser transport instead of treating them all as 5xx.
+  is reported separately from an auth failure or a model outage. A challenge
+  on the signed path is retried once via the browser transport using the live
+  session token, instead of surfacing a 5xx to the client.
+- **Persist** — the cookie jar, token, and frontend version are mirrored to
+  `<db-dir>/zai-sessions.json` (override with `ZAI_SESSION_STORE`) so a
+  restart does not re-bootstrap every guest.
+- **Chrome TLS** — optional helper in `relay/cmd/zaihttp`. Run
+  `go run .` there and set `ZAI_UTLS_PROXY=http://127.0.0.1:8477` so signed
+  chat.z.ai calls present a Chrome ClientHello instead of Node's.
 
 `captcha_verify_param` is still required per completion on the signed path;
 it is issued once and cannot be reused.

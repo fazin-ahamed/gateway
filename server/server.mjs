@@ -9,8 +9,10 @@
 
 import { serve } from "@hono/node-server";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
+import { configureSessionStore } from "../ai-gateway/src/zai-session.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -26,8 +28,8 @@ const UPSTREAM_TIMEOUT_MS = process.env.UPSTREAM_TIMEOUT_MS || "";
 
 if (!ADMIN_TOKEN) console.warn("[gateway] ADMIN_TOKEN is empty: admin login is disabled.");
 if (!PROVIDER_CRYPTO_KEY) console.warn("[gateway] PROVIDER_CRYPTO_KEY is empty: sealed provider keys cannot be opened.");
-
 const db = createDb(DB_PATH);
+configureSessionStore(process.env.ZAI_SESSION_STORE || join(dirname(DB_PATH), "zai-sessions.json"));
 try {
   const schema = readFileSync(new URL("../ai-gateway/schema.sql", import.meta.url), "utf8");
   db.exec(schema);

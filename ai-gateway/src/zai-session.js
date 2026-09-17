@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
 // Node-native chat.z.ai session.
 //
 // The gateway is Node-only, so a Z.AI session can be a real long-lived
@@ -255,6 +258,7 @@ export class ZaiSession {
     this.lastValidated = Date.now();
     this.lastError = "";
     this.state = "VALID";
+    scheduleSave();
   }
 
   // Reject a rotated/expired token so the next acquire() rebuilds the session.
@@ -263,6 +267,7 @@ export class ZaiSession {
     this.token = "";
     this.userId = "";
     this.state = "INVALID";
+    scheduleSave();
   }
 
   // Called after any response; chat.z.ai reissues its session cookie as it works.
@@ -274,9 +279,42 @@ export class ZaiSession {
       this.userId = userIdFromJwt(rotated) || this.userId;
       this.source = this.source === "none" ? "guest" : this.source;
       this.generation++;
+      scheduleSave();
       return rotated;
     }
+    if (this.jar.cookies.size)
+      scheduleSave();
     return "";
+  }
+  hydrate(row) {
+    if (!row || typeof row !== "object")
+      return this;
+    if (row.cookies)
+      this.jar = new CookieJar(row.cookies);
+    if (typeof row.token === "string" && looksLikeJwt(row.token)) {
+      this.token = row.token;
+      this.userId = row.userId || userIdFromJwt(row.token);
+      this.source = row.source || "guest";
+      this.state = this.token ? "VALID" : this.state;
+    }
+    if (typeof row.feVersion === "string")
+      this.feVersion = row.feVersion;
+    if (Number(row.lastValidated))
+      this.lastValidated = Number(row.lastValidated);
+    if (Number(row.generation))
+      this.generation = Number(row.generation);
+    return this;
+  }
+  persistRow() {
+    return {
+      token: this.token,
+      userId: this.userId,
+      feVersion: this.feVersion,
+      source: this.source,
+      cookies: this.jar.toJSON(),
+      lastValidated: this.lastValidated,
+      generation: this.generation
+    };
   }
 
   async _validate(token) {
@@ -357,9 +395,63 @@ export class ZaiSession {
   }
 }
 
-// One session per credential identity, kept in process memory: the Node host
-// outlives requests, so a warm guest session is reused instead of re-bootstrapped.
+// One session per credential identity, kept in process memory and optionally
+// mirrored to a JSON file so a restart does not re-bootstrap every guest.
 const sessions = new Map();
+let storePath = "";
+let saveTimer = null;
+let storeCache = null;
+
+function defaultStorePath() {
+  const db = process.env.DB_PATH || "./data/gateway.db";
+  return join(dirname(db), "zai-sessions.json");
+}
+
+function loadStore() {
+  if (storeCache)
+    return storeCache;
+  if (!storePath) {
+    storeCache = {};
+    return storeCache;
+  }
+  try {
+    storeCache = JSON.parse(readFileSync(storePath, "utf8")) || {};
+  } catch {
+    storeCache = {};
+  }
+  return storeCache;
+}
+
+function scheduleSave() {
+  if (!storePath)
+    return;
+  if (saveTimer)
+    return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    persistNow();
+  }, 250);
+}
+
+export function persistNow() {
+  if (!storePath)
+    return;
+  const rows = {};
+  for (const [id, session] of sessions)
+    if (session.token || session.jar.cookies.size)
+      rows[id] = session.persistRow();
+  storeCache = rows;
+  try {
+    mkdirSync(dirname(storePath), { recursive: true });
+    writeFileSync(storePath, JSON.stringify(rows), { mode: 0o600 });
+  } catch {
+  }
+}
+
+export function configureSessionStore(path) {
+  storePath = path || "";
+  storeCache = null;
+}
 
 export function sessionFor({ fetcher, credential = "", key } = {}) {
   const id = key || ("cred:" + simpleHash(String(credential || "guest")));
@@ -371,12 +463,20 @@ export function sessionFor({ fetcher, credential = "", key } = {}) {
     return existing;
   }
   const session = new ZaiSession({ fetcher, credential, key: id });
+  const saved = loadStore()[id];
+  if (saved)
+    session.hydrate(saved);
   sessions.set(id, session);
   return session;
 }
 
 export function resetSessions() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
   sessions.clear();
+  storeCache = null;
 }
 
 function simpleHash(value) {
@@ -386,4 +486,4 @@ function simpleHash(value) {
   return h.toString(16);
 }
 
-export const __sessionTest = { sessions, simpleHash, ZAI_BASE };
+export const __sessionTest = { sessions, simpleHash, ZAI_BASE, defaultStorePath, loadStore };

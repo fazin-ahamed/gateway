@@ -9,14 +9,19 @@ import {
   resetSessions,
   sessionFor,
   setCookieList,
-  userIdFromJwt
+  userIdFromJwt,
+  configureSessionStore,
+  persistNow
 } from "../src/zai-session.js";
 import {
   ZaiModelRegistry,
   normalizeModels,
   resetRegistries
 } from "../src/zai-models.js";
-import { __zaiTest } from "../src/zaiweb.js";
+import { __zaiTest, callZaiWeb } from "../src/zaiweb.js";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
 const jwt = (claims, sig = "sig") => [b64u({ alg: "HS256" }), b64u(claims), sig].join(".");
@@ -246,4 +251,90 @@ test("a WAF/edge block is classified apart from a provider error", () => {
   assert.equal(__zaiTest.isWafChallenge(503, '{"error":{"code":"F001"}}'), true);
   assert.equal(__zaiTest.isWafChallenge(500, '{"error":{"message":"model overloaded"}}'), false);
   assert.equal(__zaiTest.isWafChallenge(502, "upstream timeout"), false);
+});
+
+test("a session survives a process restart via the JSON store", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "zai-store-"));
+  const path = join(dir, "zai-sessions.json");
+  configureSessionStore(path);
+  resetSessions();
+  const token = jwt({ id: "persist-1" });
+  const fetcher = async (url) => {
+    const p = new URL(String(url)).pathname;
+    if (p === "/")
+      return new Response("<html>/frontend/prod-fe-9.9.9/assets/x.js</html>", { status: 200, headers: { "set-cookie": "edge=keep; Path=/" } });
+    if (p === "/api/v1/auths/")
+      return new Response(JSON.stringify({ id: "persist-1" }), { status: 200 });
+    return new Response("{}", { status: 200 });
+  };
+  const first = sessionFor({ fetcher, credential: token, key: "persist-key" });
+  await first.acquire();
+  persistNow();
+  const saved = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(saved["persist-key"].token, token);
+  assert.equal(saved["persist-key"].cookies.edge, "keep");
+  resetSessions();
+  const second = sessionFor({ fetcher: async () => { throw new Error("must not hit network"); }, credential: token, key: "persist-key" });
+  assert.equal(second.state, "VALID");
+  assert.equal(second.token, token);
+  assert.equal(second.jar.get("edge"), "keep");
+  configureSessionStore("");
+  resetSessions();
+});
+
+test("wrapUtlsFetcher only proxies chat.z.ai and is a no-op without the env", async () => {
+  const hits = [];
+  const inner = async (url, init = {}) => {
+    hits.push({ url: String(url), method: init.method, target: init.headers && init.headers["X-Target-Url"] });
+    return new Response("ok", { status: 200 });
+  };
+  const plain = __zaiTest.wrapUtlsFetcher(inner);
+  await plain("https://chat.z.ai/api/models");
+  assert.equal(hits[0].url, "https://chat.z.ai/api/models");
+  const prev = process.env.ZAI_UTLS_PROXY;
+  process.env.ZAI_UTLS_PROXY = "http://127.0.0.1:8477";
+  try {
+    const wrapped = __zaiTest.wrapUtlsFetcher(inner);
+    await wrapped("https://chat.z.ai/api/models", { method: "GET", headers: { Accept: "application/json" } });
+    await wrapped("https://example.com/x");
+    assert.equal(hits[1].url, "http://127.0.0.1:8477/proxy");
+    assert.equal(hits[1].method, "POST");
+    assert.equal(hits[1].target, "https://chat.z.ai/api/models");
+    assert.equal(hits[2].url, "https://example.com/x");
+  } finally {
+    if (prev === undefined) delete process.env.ZAI_UTLS_PROXY;
+    else process.env.ZAI_UTLS_PROXY = prev;
+  }
+});
+
+test("a WAF block on chat-create falls back to the browser transport", async () => {
+  resetSessions();
+  configureSessionStore("");
+  const token = jwt({ id: "waf-1" });
+  const credential = JSON.stringify({ token, captcha_verify_param: "proof" });
+  const calls = [];
+  const fetcher = async (url, init = {}) => {
+    const u = String(url);
+    calls.push((init.method || "GET") + " " + u);
+    const path = new URL(u).pathname;
+    if (path === "/")
+      return new Response("<html></html>", { status: 200 });
+    if (path === "/api/v1/auths/")
+      return new Response(JSON.stringify({ id: "waf-1" }), { status: 200 });
+    if (path === "/api/models")
+      return new Response(JSON.stringify([{ id: "glm-5.3", capabilities: { thinking: true } }]), { status: 200 });
+    if (path === "/api/v1/chats/new")
+      return new Response("<html>Aliyun WAF</html>", { status: 403, headers: { "content-type": "text/html" } });
+    return new Response("unexpected " + u, { status: 500 });
+  };
+  const c = {
+    zaiRunBrowserTurn: async () => ({
+      status: 200,
+      body: "data: " + JSON.stringify({ data: { delta_content: "via-browser", phase: "answer" } }) + "\ndata: " + JSON.stringify({ data: { done: true, phase: "done" } }) + "\n"
+    })
+  };
+  const shaped = await callZaiWeb(c, { upstream_model: "glm-5.3" }, credential, { model: "glm-5.3", messages: [{ role: "user", content: "hi" }] }, false, fetcher);
+  const text = await shaped.response.text();
+  assert.match(text, /via-browser/);
+  assert.ok(calls.some((x) => x.includes("/api/v1/chats/new")), "signed path was attempted first");
 });
