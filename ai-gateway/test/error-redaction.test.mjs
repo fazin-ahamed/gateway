@@ -33,3 +33,11 @@ test("exhausted routes return a generic outage, not lastErr", async () => {
   assert.doesNotMatch(generic.error.message, /https?:\/\//i);
   assert.doesNotMatch(generic.error.message, /via-proxy|via-koyeb|DIRECT/);
 });
+
+test("same-key retry is one in-place attempt, then the next credential", () => {
+  assert.equal(t.shouldRetrySameKey(0, { code: "ECONNRESET", message: "read ECONNRESET" }), true);
+  assert.equal(t.shouldRetrySameKey(0, new Error("The socket connection was closed unexpectedly")), true);
+  assert.equal(t.shouldRetrySameKey(1, { code: "ECONNRESET" }), false);
+  assert.equal(t.shouldRetrySameKey(0, { status: 401, message: "unauthorized" }), false);
+  assert.equal(t.shouldRetrySameKey(0, { status: 503, message: "model overloaded" }), false);
+});

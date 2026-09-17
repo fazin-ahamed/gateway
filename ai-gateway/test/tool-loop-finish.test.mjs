@@ -57,6 +57,22 @@ test("SSE missing terminal chunk after a tool call gets tool_calls before DONE",
   assert.ok(finishAt >= 0 && finishAt < doneAt, "terminal tool_calls chunk should precede [DONE]");
 });
 
+test("partial tool call then an upstream error never ends in tool_calls", async () => {
+  const partial = [
+    'data: {"id":"x","model":"glm-5.3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_p","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\\""}}]},"finish_reason":null}]}',
+    '',
+    'data: {"error":{"message":"Upstream stream disconnected","type":"upstream_stream_error","code":"upstream_socket_closed","retryable":true}}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join("\n");
+  const response = new Response(partial, { headers: { "content-type": "text/event-stream" } });
+  const guarded = guardToolLoopResponse(response, "glm-5.3");
+  const text = await guarded.text();
+  assert.doesNotMatch(text, /"finish_reason":"tool_calls"/);
+  assert.match(text, /"code":"upstream_socket_closed"/);
+});
+
 test("a mid-stream source failure emits a structured SSE error then DONE", async () => {
   const source = new ReadableStream({
     start(controller) {

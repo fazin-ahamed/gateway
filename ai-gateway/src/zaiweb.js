@@ -553,7 +553,7 @@ function toOpenAiStream(source, model, id) {
         controller.close();
       } catch (e) {
         try {
-          send({ error: { message: "Upstream stream disconnected: " + String(e && e.message || e).slice(0, 240), type: "upstream_stream_error", code: "upstream_socket_closed", retryable: true } });
+          send({ error: { message: "Upstream stream disconnected", type: "upstream_stream_error", code: "upstream_socket_closed", retryable: true } });
           controller.enqueue(enc.encode("data: [DONE]\n\n"));
           controller.close();
         } catch {

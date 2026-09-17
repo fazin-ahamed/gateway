@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+func TestTemplatesUseHTTP11(t *testing.T) {
+	cfg := chromeTLSConfig()
+	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
+		t.Fatalf("ALPN %v; must force http/1.1 — Chrome's hello would otherwise negotiate h2 and break the manual request writer", cfg.NextProtos)
+	}
+}
+
 func TestRejectsNonZaiHost(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/proxy", strings.NewReader("{}"))
 	req.Header.Set("X-Target-Url", "https://evil.example/api")

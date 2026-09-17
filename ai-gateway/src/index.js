@@ -785,6 +785,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       }
       const orderedKeys = orderKeys(allKeys, strategy, route.provider_id);
       for (const k of orderedKeys) {
+        // One extra in-place attempt for pre-header transport failures; after
+        // that we move to the next credential, then the next route/slug.
+        for (let transportAttempt = 0; transportAttempt < 2; transportAttempt++) {
         try {
           const res = await forwardToProvider(c, route, k.key, payload, isStream, requestId);
           const up = res.response;
@@ -871,7 +874,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             lastErr = "provider " + route.provider_name + " -> " + e.code;
             lastErrStatus = e.status;
             attempts++;
-            continue;
+            break;
           }
           circuitRecord(route.provider_name, false);
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
@@ -880,11 +883,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             lastErrStatus = e.status;
           traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), key: k.label, ms: Date.now() - stepStart });
           attempts++;
-          if (isRetryableTransportError(e) && !k._retriedOnce) {
-            k._retriedOnce = true;
+          if (shouldRetrySameKey(transportAttempt, e)) {
             blog("FWD RETRY " + route.provider_name + " key=" + k.label + " pre-header transport error");
             continue;
           }
+        }
         }
       }
     }
@@ -2468,6 +2471,11 @@ async function pickAutoModel(c, payload, key) {
   const slug = (horizon && horizon.slug) || picked.slug;
   const chosen = candidates.find((x) => x.slug === slug) || picked;
   return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [] };
+}
+// True only when it is safe to retry the same upstream call: pre-header
+// transport failure (no bytes sent back yet) on the first attempt.
+function shouldRetrySameKey(transportAttempt, err) {
+  return transportAttempt === 0 && isRetryableTransportError(err);
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -4265,7 +4273,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, shouldRetrySameKey };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

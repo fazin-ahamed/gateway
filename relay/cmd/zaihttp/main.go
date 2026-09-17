@@ -30,6 +30,12 @@ import (
 )
 
 const targetHost = "chat.z.ai"
+func chromeTLSConfig() *utls.Config {
+	return &utls.Config{
+		ServerName: targetHost,
+		NextProtos: []string{"http/1.1"},
+	}
+}
 
 // headers that describe the hop itself and must not be forwarded upstream.
 var hopHeaders = map[string]bool{
@@ -100,7 +106,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	tlsConn := utls.UClient(conn, &utls.Config{ServerName: targetHost}, utls.HelloChrome_Auto)
+	tlsConn := utls.UClient(conn, chromeTLSConfig(), utls.HelloChrome_Auto)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		http.Error(w, "tls: "+err.Error(), http.StatusBadGateway)
 		return
