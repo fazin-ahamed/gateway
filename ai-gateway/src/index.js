@@ -96,7 +96,7 @@ function isRetryableTransportError(err) {
 function sseUpstreamDisconnect(message) {
   return "data: " + JSON.stringify({
     error: {
-      message: "Upstream stream disconnected" + (message ? ": " + String(message).slice(0, 240) : ""),
+      message: "Upstream stream disconnected",
       type: "upstream_stream_error",
       code: "upstream_socket_closed",
       retryable: true
@@ -891,8 +891,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
     const finalStatus = lastErrStatus || 503;
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
-    const errBody = lastErr
-      ? { error: { message: lastErr, type: "upstream_error", ...(lastErrStatus === 504 ? { code: "upstream_timeout" } : {}) } }
+    const errBody = lastErrStatus === 504
+      ? { error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } }
       : genericUpstreamError();
     return c.json(errBody, finalStatus, { "x-gateway-attempts": String(attempts || routes.results.length) });
   } finally {
@@ -2615,8 +2615,10 @@ function sanitizeUpstreamResponse(text) {
   if (!text)
     return text;
   let s = String(text);
-  s = s.replace(/https?:\/\/[^\s"'<>]+/gi, "[redacted-url]");
-  s = s.replace(/\b[a-z0-9.-]+\.(?:ai|top|cn|cc|site|top)\b/gi, "[redacted-provider]");
+  s = s.replace(/https?:\/\/[^\s"'<>\\\]]+/gi, "[redacted-url]");
+  s = s.replace(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b/gi, "[redacted-host]");
+  s = s.replace(/\b(?:via-proxy|via-koyeb|DIRECT)\b/g, "[redacted-transport]");
+  s = s.replace(/\bprovider\s+[^\s]+/gi, "upstream");
   return s;
 }
 function genericUpstreamError() {
@@ -4263,7 +4265,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
