@@ -26,7 +26,7 @@ export function guardOpenAiSse(source, modelHint = "") {
   let buffer = "";
   let sawToolCalls = false;
   let terminalSeen = false;
-  let sourceErrored = false;
+  let streamFailed = false;
   let model = modelHint;
 
   return new ReadableStream({
@@ -40,7 +40,7 @@ export function guardOpenAiSse(source, modelHint = "") {
         }
         const payload = line.slice(5).trim();
         if (payload === "[DONE]") {
-          if (sawToolCalls && !terminalSeen && !sourceErrored) {
+          if (sawToolCalls && !terminalSeen && !streamFailed) {
             emit("data: " + JSON.stringify(terminalChunk(model, "tool_calls")) + "\n\n");
             terminalSeen = true;
           }
@@ -55,12 +55,13 @@ export function guardOpenAiSse(source, modelHint = "") {
           return;
         }
         if (obj && typeof obj.model === "string" && obj.model) model = obj.model;
-        if (obj && obj.error) sourceErrored = true;
+        if (obj && obj.error)
+          streamFailed = true;
         const choice = obj && Array.isArray(obj.choices) ? obj.choices[0] : null;
         const delta = choice && choice.delta;
         if (delta && Array.isArray(delta.tool_calls) && delta.tool_calls.length) sawToolCalls = true;
         if (choice && choice.finish_reason != null) {
-          const fixed = normalizeTerminalFinishReason(choice.finish_reason, sawToolCalls, true);
+          const fixed = normalizeTerminalFinishReason(choice.finish_reason, sawToolCalls, !streamFailed);
           choice.finish_reason = fixed;
           terminalSeen = !!fixed;
         }

@@ -62,9 +62,19 @@ function isCacheableRequest(payload, isStream, mode) {
     return false;
   if (!payload)
     return false;
-  // Never assume an omitted provider default is deterministic. Normal cache mode
-  // requires an explicit temperature: 0; loose mode remains an operator opt-in.
-  if (mode !== "loose" && (payload.temperature == null || Number(payload.temperature) !== 0))
+  // Determinism must be explicit. A missing temperature means "provider
+  // default", which is not the same as 0, so serving a previous answer would
+  // be wrong; only an explicit 0 is cache-safe in normal mode. Loose mode
+  // stays an operator opt-in for near-deterministic traffic.
+  const temp = payload.temperature;
+  const explicitDeterministic = temp !== void 0 && temp !== null && Number(temp) === 0;
+  if (mode !== "loose" && !explicitDeterministic)
+    return false;
+  if (payload.top_p != null && Number(payload.top_p) !== 1)
+    return false;
+  if (payload.seed != null && !Number.isFinite(Number(payload.seed)))
+    return false;
+  if (payload.n != null && Number(payload.n) !== 1)
     return false;
   if (hasImageContent(payload))
     return false;
@@ -472,16 +482,20 @@ async function providerKeys(c, providerId) {
     return [];
   }
 }
+// Returns an ORDERED preference list, never a single key: the caller walks it
+// so a dead credential falls through to the next one instead of failing the
+// request. round_robin rotates which key leads; random shuffles; failover
+// keeps declaration order.
 function orderKeys(keys, strategy, providerId) {
   if (!keys.length)
     return [];
   if (strategy === "random") {
-    const out = keys.slice();
-    for (let i = out.length - 1; i > 0; i--) {
+    const shuffled = keys.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [out[i], out[j]] = [out[j], out[i]];
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
-    return out;
+    return shuffled;
   }
   if (strategy === "round_robin") {
     const n = rrCounters.get(providerId) || 0;
@@ -776,10 +790,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       if (payload.model !== liveSlug)
         payload = { ...payload, model: liveSlug };
       const routeCircuit = circuitKey(route);
-      if (circuitOpen(routeCircuit)) {
+      if (circuitOpen(routeCircuit) || circuitOpen("provider", route.provider_id)) {
         blog("ROUTE skip provider=" + route.provider_name + " circuit-open");
         traj.steps.push({ provider: route.provider_name, rank: route.rank, error: "circuit open", ms: 0, slug: liveSlug });
-        lastErr = "provider " + route.provider_name + " circuit open (recent failures)";
+        lastErr = "upstream circuit open";
         attempts++;
         continue;
       }
@@ -800,7 +814,15 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         continue;
       }
       const orderedKeys = orderKeys(allKeys, strategy, route.provider_id);
+      // Circuits are keyed per credential: a dead key is quarantined without
+      // taking the provider out of rotation for its healthy siblings.
       keyLoop: for (const k of orderedKeys) {
+        if (circuitOpen("key", k.keyId)) {
+          blog("ROUTE skip provider=" + route.provider_id + " key=" + k.label + " circuit-open");
+          traj.steps.push({ ...baseStep, error: "key circuit open", ms: 0 });
+          attempts++;
+          continue keyLoop;
+        }
         // One extra in-place attempt for pre-header transport failures; after
         // that we move to the next credential, then the next route/slug.
         for (let transportAttempt = 0; transportAttempt < 2; transportAttempt++) {
@@ -816,11 +838,32 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const txt = await up.text();
             const why = classifyUpstreamFailure(txt);
             blog("FWD FAIL " + route.provider_name + " key=" + k.label + " -> HTTP " + up.status + " [" + why + "] " + String(txt).slice(0, 300));
+            // Credential-scoped faults quarantine the key, never the provider.
+            if (why === "auth") {
+              circuitRecordFail("key", k.keyId, { expiresHintMs: 900 });
+              if (orderedKeys.indexOf(k) < orderedKeys.length - 1) {
+                attempts++;
+                continue keyLoop;
+              }
+              break;
+            }
+            if (why === "rate_limit") {
+              circuitRecordFail("key", k.keyId, { expiresHintMs: 60 });
+              if (orderedKeys.indexOf(k) < orderedKeys.length - 1) {
+                attempts++;
+                continue keyLoop;
+              }
+              break;
+            }
+            if (why === "model" || why === "tool_schema" || why === "request_size") {
+              if (why === "model") circuitRecordFail("route", route.id);
+              attempts++;
+              break;
+            }
             circuitRecordFailure(routeCircuit, { status: up.status, kind: why });
             lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + why + "]";
+            lastErrStatus = up.status;
             attempts++;
-            if (why === "auth" && orderedKeys.indexOf(k) < orderedKeys.length - 1)
-              continue keyLoop; // next key on this provider
             break; // next route
           }
           if (!isStream) {
@@ -830,10 +873,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const clientTxt = sanitizeClientResponse(txt, liveSlug);
             if (isGenericUpstreamErrorResponse(clientTxt)) {
               blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
-              lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
+              lastErr = "malformed upstream completion envelope";
+              circuitRecordFail("route", route.id);
               traj.steps.push({ ...baseStep, http: up.status, error: "malformed envelope", ms: Date.now() - stepStart });
               attempts++;
-              break; // next route
+              break;
             }
             await recordUsage(c, key, { ...usage, cost_usd: costUsd });
             await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
@@ -858,12 +902,16 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             if (cacheKey)
               hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
             blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
-            circuitRecord(routeCircuit, true);
+            circuitRecordOk("provider", route.provider_id);
+            circuitRecordOk("route", route.id);
+            circuitRecordOk("key", k.keyId);
             traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart });
             await recordTrajectory(c, { ...traj, slug: liveSlug, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
             return new Response(clientTxt, { status: up.status, headers: hdrs });
           }
-          circuitRecord(routeCircuit, true);
+          circuitRecordOk("provider", route.provider_id);
+          circuitRecordOk("route", route.id);
+          circuitRecordOk("key", k.keyId);
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
           const horizonHdrs = { "x-gateway-model": liveSlug };
@@ -872,15 +920,33 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs });
           return result;
         } catch (e) {
-          // Adapter diagnostics stay internal. Only gateway-owned, provider-neutral
-          // errors may cross the public API boundary.
+          // Adapter diagnostics stay internal; only gateway-owned errors cross
+          // the public API boundary.
           if (e instanceof ZaiWebError) {
-            circuitRecordFailure(routeCircuit, { status: e.status, kind: e.code });
+            // Credential faults quarantine the key; provider faults hit the
+            // keyed provider breaker. Route faults hit the route.
+            if (e.status === 401 || e.status === 403) {
+              circuitRecordFail("key", k.keyId, { expiresHintMs: 900 });
+              attempts++;
+              continue keyLoop;
+            }
+            if (e.status === 429) {
+              circuitRecordFail("key", k.keyId, { expiresHintMs: 60 });
+              attempts++;
+              continue keyLoop;
+            }
+            if (e.status === 404) {
+              circuitRecordFail("route", route.id);
+              attempts++;
+              break;
+            }
+            if (e.status >= 500)
+              circuitRecordFailure(routeCircuit, { status: e.status, kind: e.code });
             if (Number(e.retryAfterSec) > 0)
               lastRetryAfter = Math.max(Number(lastRetryAfter) || 0, Math.ceil(Number(e.retryAfterSec)));
             blog("FWD ZAI " + route.provider_name + " -> " + e.status + " " + e.code + " " + e.message);
             traj.steps.push({ ...baseStep, error: e.code, key: k.label, http: e.status, ms: Date.now() - stepStart });
-            if (isPublicRequestProviderError(e)) {
+            if (e.status < 500) {
               const pub = publicProviderError(e);
               await recordTrajectory(c, { ...traj, status: "fail", httpStatus: pub.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
               return c.json({ error: pub.error }, pub.status, { "x-gateway-attempts": String(attempts + 1) });
@@ -888,13 +954,17 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             attempts++;
             lastErr = "provider " + route.provider_name + " -> " + e.code;
             lastErrStatus = e.status === 504 ? 504 : 503;
+            break;
+            attempts++;
+            lastErr = "provider " + route.provider_name + " -> " + e.code;
+            lastErrStatus = e.status === 504 ? 504 : 503;
             if (/auth|credential|session/i.test(String(e.code || "")) && orderedKeys.indexOf(k) < orderedKeys.length - 1)
               continue keyLoop;
             break;
           }
-          circuitRecord(routeCircuit, false);
+          circuitRecordFailure(routeCircuit, { status: (e && e.status) || 0, kind: "unknown" });
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
-          lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
+          lastErr = "upstream transport error";
           if (e && e.status)
             lastErrStatus = e.status;
           traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), key: k.label, ms: Date.now() - stepStart });
@@ -1976,54 +2046,145 @@ function matchModelsDevPrice(byId, slug) {
   }
   return null;
 }
-// Circuit-breaker: three provider failures within a minute opens the
-// circuit for 60s; the auto router and route loop skip open providers.
+// ---- Circuit breaker (CLOSED → OPEN → HALF_OPEN) ----
+//
+// State is keyed by kind + id, not by provider name alone:
+//   key:<providerKeyId>   credential quarantine (401/403, hard 429)
+//   route:<routeId>       route penalty (model-not-found, malformed)
+//   provider:<providerId> provider breaker, only for correlated 5xx/network
+//
+// Only 5xx and transport/network failures count toward the provider breaker.
+// Caller-side faults (auth on the caller's key, bad tool schema, oversized
+// context) never touch provider health: the provider is up, the request was
+// not servable.
+var CIRCUIT_FAILURE_THRESHOLD = 3;
+var CIRCUIT_BASE_COOLDOWN_MS = 30000;
+var CIRCUIT_MAX_COOLDOWN_MS = 10 * 60000;
+var CIRCUIT_WINDOW_MS = 60000;
 var circuitState = new Map();
-function circuitKey(route) {
-  if (route && route.id != null)
-    return "route:" + String(route.id);
-  const providerId = route && route.provider_id != null ? String(route.provider_id) : "unknown";
-  const model = route && route.upstream_model ? String(route.upstream_model) : "unknown";
-  return "route:" + providerId + ":" + model;
-}
-function circuitOpen(providerName) {
-  const s = circuitState.get(providerName);
-  return !!(s && s.openUntil && Date.now() < s.openUntil);
-}
-function circuitRecord(providerName, ok) {
-  const now = Date.now();
-  const s = circuitState.get(providerName) || { fails: 0, firstFail: 0, openUntil: 0 };
-  if (ok) {
-    s.fails = 0;
-    s.firstFail = 0;
-    s.openUntil = 0;
-  } else {
-    // A new rolling window must not inherit failures from an expired one.
-    if (!s.firstFail || now - s.firstFail > 60000) {
-      s.firstFail = now;
-      s.fails = 0;
-    }
-    s.fails++;
-    if (s.fails >= 3)
-      s.openUntil = now + 60000;
+// Accepts three shapes:
+//   toKey("provider", 7)            → "provider:7"
+//   toKey({ id: 41, provider_id })  → "route:41"
+//   toKey("p") / toKey("route:41")  → the string itself
+function toKey(kindOrKey, id) {
+  if (id !== undefined && id !== null && typeof kindOrKey !== "object")
+    return String(kindOrKey) + ":" + String(id);
+  if (kindOrKey && typeof kindOrKey === "object") {
+    if (kindOrKey.id != null)
+      return "route:" + String(kindOrKey.id);
+    if (kindOrKey.provider_id != null)
+      return "provider:" + String(kindOrKey.provider_id);
   }
-  circuitState.set(providerName, s);
+  return String(kindOrKey);
 }
-function circuitRecordFailure(providerName, failure = {}) {
-  const status = Number(failure.status) || 0;
-  const kind = String(failure.kind || "unknown");
-  // Client/request, credential, quota and model-route failures are not proof
-  // that the provider itself is unhealthy. Keep them out of the provider breaker.
-  if (["auth", "rate_limit", "model", "tool_schema", "request_size"].includes(kind))
+function circuitKey(kindOrRoute, id) {
+  return toKey(kindOrRoute, id);
+}
+
+function circuitOpen(kindOrKey, id) {
+  const s = circuitState.get(toKey(kindOrKey, id));
+  if (!s)
+    return false;
+  const now = Date.now();
+  if (s.openUntil && now < s.openUntil)
+    return true;
+  if (s.openUntil && now >= s.openUntil) {
+    // OPEN → HALF_OPEN: exactly one in-flight probe may try the provider.
+    if (s.probeUsed)
+      return true;
+    s.probeUsed = true;
+    s.halfOpen = true;
+    return false;
+  }
+  return false;
+}
+// Classification gate: a failure only reaches the breaker kind the audit
+// assigned it to. Caller/request faults, credential faults, quota and
+// model-route faults never open the provider-wide breaker. Two call shapes:
+//   circuitRecordFailure(circuitName, { status, kind })   — already-built key
+//   circuitRecordFailure(kind, id, { status, kind })      — explicit kind+id
+function circuitRecordFailure(a, b, c) {
+  const f = (c !== undefined ? c : b) || {};
+  const key = c !== undefined ? toKey(a, b) : toKey(a);
+  const status = Number(f.status) || 0;
+  const fkind = String(f.kind || "unknown");
+  if (["auth", "rate_limit", "model", "tool_schema", "request_size"].includes(fkind))
     return;
-  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|transport|unsupported)/i.test(kind))
+  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|unsupported)/i.test(fkind))
     return;
   if (status >= 400 && status < 500 && status !== 408)
     return;
-  circuitRecord(providerName, false);
+  recordFailOn(key);
 }
 function __resetCircuitState() {
   circuitState.clear();
+}
+// Read-only view of every circuit, for the console and the auto router.
+function circuitSnapshot() {
+  const out = [];
+  const now = Date.now();
+  for (const [key, s] of circuitState) {
+    const sep = key.indexOf(":");
+    out.push({
+      key,
+      kind: sep >= 0 ? key.slice(0, sep) : key,
+      id: sep >= 0 ? key.slice(sep + 1) : "",
+      fails: s.fails || 0,
+      open: !!(s.openUntil && now < s.openUntil),
+      halfOpen: !!s.halfOpen,
+      openUntil: s.openUntil || null,
+      cooldownMs: s.cooldownMs || null,
+      consecutiveOpens: s.consecutiveOpens || 0
+    });
+  }
+  return out;
+}
+function circuitRecordOk(kind, id) {
+  const s = circuitState.get(toKey(kind, id));
+  if (s) {
+    s.fails = 0;
+    s.firstFail = 0;
+    s.openUntil = 0;
+    s.halfOpen = false;
+    s.probeUsed = false;
+    s.consecutiveOpens = 0;
+  }
+}
+function recordFailOn(key, { expiresHintMs } = {}) {
+  const now = Date.now();
+  const s = circuitState.get(key) || { fails: 0, firstFail: 0, openUntil: 0, consecutiveOpens: 0, probeUsed: false, halfOpen: false };
+  // Rolling window: failures older than the window do not accumulate.
+  if (!s.firstFail || now - s.firstFail > CIRCUIT_WINDOW_MS) {
+    s.firstFail = now;
+    s.fails = 0;
+  }
+  s.fails++;
+  if (s.fails >= CIRCUIT_FAILURE_THRESHOLD) {
+    const n = s.consecutiveOpens || 0;
+    const expo = Math.min(CIRCUIT_MAX_COOLDOWN_MS, CIRCUIT_BASE_COOLDOWN_MS * Math.pow(2, n));
+    const jitter = Math.floor(Math.random() * Math.floor(expo * 0.2));
+    const cooldown = expiresHintMs ? Math.max(1000, Math.min(CIRCUIT_MAX_COOLDOWN_MS, expiresHintMs * 1000)) : expo + jitter;
+    s.openUntil = now + cooldown;
+    s.openedAt = now;
+    s.cooldownMs = cooldown;
+    s.probeUsed = false;
+    s.halfOpen = false;
+    s.fails = 0;
+    s.firstFail = 0;
+    s.consecutiveOpens = n + 1;
+  }
+  circuitState.set(key, s);
+}
+function circuitRecordFail(kind, id, opts) {
+  recordFailOn(toKey(kind, id), opts || {});
+}
+// Legacy 2-arg shape used by tests and a few call sites:
+//   circuitRecord("p", false) / circuitRecord(routeKey, true)
+function circuitRecord(kindOrKey, ok) {
+  if (ok)
+    circuitRecordOk(kindOrKey);
+  else
+    circuitRecordFail(kindOrKey);
 }
 var AUTO_SLUG = "auto";
 var routerHealthCache = { at: 0, rows: [] };
@@ -2449,6 +2610,8 @@ async function pickAutoModel(c, payload, key) {
         if (cs && cs.fails > 0)
           wob = Math.max(wob, cs.fails >= 2 ? 1.2 : 0.5);
       }
+      if (snap.fails > 0)
+        wob = Math.max(wob, snap.fails >= 2 ? 1.2 : 0.5);
     }
     const allOpen = routeIds.length > 0 && openCount >= routeIds.length;
     const h = healthBySlug.get(r.slug);
@@ -2687,14 +2850,28 @@ function publicProviderError(err) {
   if (code === "zai_vision_unsupported") {
     return { status: 400, error: { message: "Image input is not supported by the selected model.", type: "invalid_request_error", code: "unsupported_image_input" } };
   }
+  if (code === "zai_captcha") {
+    return { status: 503, error: { message: "This route needs a fresh captcha proof. Send one per request, or use a transport that acquires it automatically.", type: "unsupported_feature", code: "captcha_required" } };
+  }
+  if (code === "zai_credentials" || code === "zai_browser_unavailable" || code === "zai_model" || code === "zai_model_unavailable") {
+    return { status: 503, error: { message: "The selected model is not available on this route right now.", type: "model_unavailable", code: "model_unavailable" } };
+  }
+  if (code === "zai_waf") {
+    return { status: 503, error: { message: "The upstream edge challenged this request. Please retry shortly.", type: "service_busy", code: "upstream_challenged" } };
+  }
+  if (code === "zai_no_prompt") {
+    return { status: 400, error: { message: "At least one user message is required.", type: "invalid_request_error", code: "empty_prompt" } };
+  }
   if (Number(err && err.status) === 504) {
     return { status: 504, error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } };
   }
   return { status: 503, error: genericUpstreamError().error };
 }
+// Codes whose failures belong to the caller's request, not provider health:
+// they may reach the client and never open a provider breaker.
 function isPublicRequestProviderError(err) {
   const code = String(err && err.code || "");
-  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported";
+  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported" || code === "zai_no_prompt" || code === "zai_captcha";
 }
 function isGenericUpstreamErrorResponse(text) {
   try {
@@ -4337,7 +4514,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, publicProviderError, shouldRetrySameKey, circuitKey, circuitOpen, circuitRecord, circuitRecordFailure, __resetCircuitState, orderKeys };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, shouldRetrySameKey, circuitKey, circuitOpen, circuitRecord, circuitRecordOk, circuitRecordFail, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

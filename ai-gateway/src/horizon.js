@@ -191,6 +191,9 @@ export function generateActions(candidates, taskIR, world) {
       role,
       family: familyOf(cand.slug),
       mvc: mvcOf(cand, taskIR, phase),
+      // cost must travel with the action: pickAction's reflex branch compares
+      // a.cost, and an undefined cost made every model look equally cheap.
+      cost: Math.max(1e-4, Number(cand.cost) || 0.5),
       tiny: isTinySlug(cand.slug) || !!cand.tiny,
       workhorse: !!cand.workhorse,
       capable: cand.capable !== false,
