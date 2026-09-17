@@ -82,7 +82,19 @@ export function guardOpenAiSse(source, modelHint = "") {
         if (buffer.trim()) handleLine(buffer);
         controller.close();
       } catch (err) {
-        controller.error(err);
+        try {
+          emit("data: " + JSON.stringify({
+            error: {
+              message: "Upstream stream disconnected: " + String(err && err.message || err).slice(0, 240),
+              type: "upstream_stream_error",
+              code: "upstream_socket_closed",
+              retryable: true
+            }
+          }) + "\n\n");
+          emit("data: [DONE]\n\n");
+          controller.close();
+        } catch {
+        }
       } finally {
         try { reader.releaseLock(); } catch {}
       }

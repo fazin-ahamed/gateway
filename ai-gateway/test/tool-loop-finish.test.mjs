@@ -56,3 +56,19 @@ test("SSE missing terminal chunk after a tool call gets tool_calls before DONE",
   const doneAt = text.indexOf("data: [DONE]");
   assert.ok(finishAt >= 0 && finishAt < doneAt, "terminal tool_calls chunk should precede [DONE]");
 });
+
+test("a mid-stream source failure emits a structured SSE error then DONE", async () => {
+  const source = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('data: {"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n'));
+      controller.error(new Error("ECONNRESET"));
+    }
+  });
+  const response = new Response(source, { headers: { "content-type": "text/event-stream" } });
+  const guarded = guardToolLoopResponse(response, "grok-4.6");
+  const text = await guarded.text();
+  assert.match(text, /"code":"upstream_socket_closed"/);
+  assert.match(text, /"retryable":true/);
+  assert.match(text, /data: \[DONE\]/);
+});

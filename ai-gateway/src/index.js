@@ -87,6 +87,34 @@ function hasAccumulatedToolCalls(buf) {
   }
   return false;
 }
+function isRetryableTransportError(err) {
+  const code = String(err && (err.code || (err.cause && err.cause.code)) || "");
+  const msg = String(err && err.message || err || "");
+  return /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ECONNABORTED|UND_ERR_SOCKET|UND_ERR_CONNECT|UND_ERR_HEADERS_TIMEOUT)$/i.test(code)
+    || /ECONNRESET|UND_ERR_SOCKET|ETIMEDOUT|ECONNREFUSED|socket connection was closed|fetch failed/i.test(msg);
+}
+function sseUpstreamDisconnect(message) {
+  return "data: " + JSON.stringify({
+    error: {
+      message: "Upstream stream disconnected" + (message ? ": " + String(message).slice(0, 240) : ""),
+      type: "upstream_stream_error",
+      code: "upstream_socket_closed",
+      retryable: true
+    }
+  }) + "\n\ndata: [DONE]\n\n";
+}
+function closeSseGracefully(controller, enc, err) {
+  if (!controller)
+    return;
+  try {
+    controller.enqueue(enc.encode(sseUpstreamDisconnect(err && err.message || err)));
+  } catch {
+  }
+  try {
+    controller.close();
+  } catch {
+  }
+}
 function synthesizeStreamCompletion(chunks) {
   return "data: " + chunks.join("\n\ndata: ") + "\n\ndata: [DONE]\n\n";
 }
@@ -625,7 +653,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   let slug = payload.model;
   let autoDecision = null;
   if (String(slug).toLowerCase() === AUTO_SLUG) {
-    autoDecision = await pickAutoModel(c, payload);
+    autoDecision = await pickAutoModel(c, payload, key);
     if (!autoDecision) {
       const cfg = await autoSettings(c);
       const msg = cfg.enabled
@@ -836,14 +864,14 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const safeMessage = sanitizeUpstreamResponse(e.message);
             blog("FWD ZAI " + route.provider_name + " -> " + e.status + " " + e.code + " " + e.message);
             traj.steps.push({ ...baseStep, error: e.code, key: k.label, http: e.status, ms: Date.now() - stepStart });
-            if (e.status < 500 || !autoDecision) {
+            if (e.status < 500) {
               await recordTrajectory(c, { ...traj, status: "fail", httpStatus: e.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
               return c.json({ error: { message: safeMessage, type: "upstream_error", code: e.code } }, e.status, { "x-gateway-attempts": String(attempts + 1) });
             }
             lastErr = "provider " + route.provider_name + " -> " + e.code;
             lastErrStatus = e.status;
             attempts++;
-            break;
+            continue;
           }
           circuitRecord(route.provider_name, false);
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
@@ -852,6 +880,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             lastErrStatus = e.status;
           traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), key: k.label, ms: Date.now() - stepStart });
           attempts++;
+          if (isRetryableTransportError(e) && !k._retriedOnce) {
+            k._retriedOnce = true;
+            blog("FWD RETRY " + route.provider_name + " key=" + k.label + " pre-header transport error");
+            continue;
+          }
         }
       }
     }
@@ -1645,10 +1678,7 @@ function wrapAnthropicStream(upReq, model) {
         controller.enqueue(enc.encode("data: [DONE]\n\n"));
         controller.close();
       } catch (e) {
-        try {
-          controller.error(e);
-        } catch {
-        }
+        closeSseGracefully(controller, enc, e);
       }
     }
   }), { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
@@ -1826,12 +1856,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     } catch (e) {
       streamError = String(e && e.message || e).slice(0, 4e3);
       blog("Stream error id=" + requestId + " " + streamError);
-      if (!clientCancelled) {
-        try {
-          controllerRef.error(e);
-        } catch {
-        }
-      }
+      if (!clientCancelled)
+        closeSseGracefully(controllerRef, enc, e);
     } finally {
       await persistOnce();
     }
@@ -2297,7 +2323,7 @@ async function autoSettings(c) {
   }
   return { enabled, preference: pref, excluded, overrides };
 }
-async function pickAutoModel(c, payload) {
+async function pickAutoModel(c, payload, key) {
   const cfg = await autoSettings(c);
   if (!cfg.enabled)
     return null;
@@ -2311,7 +2337,11 @@ async function pickAutoModel(c, payload) {
             (SELECT GROUP_CONCAT(p3.name) FROM model_routes mr3 JOIN providers p3 ON p3.id=mr3.provider_id WHERE mr3.slug=mr.slug AND mr3.enabled=1 AND p3.enabled=1) AS providers
      FROM model_routes mr WHERE mr.enabled=1 GROUP BY mr.slug`
   ).all();
-  const enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1 && !cfg.excluded.includes(r.slug));
+  let enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1 && !cfg.excluded.includes(r.slug));
+  if (key) {
+    const allowed = new Set(await allowedSlugs(c, key));
+    enabled = enabled.filter((r) => allowed.has(r.slug));
+  }
   if (!enabled.length)
     return null;
   const routes2 = await c.env.DB.prepare(
@@ -4233,7 +4263,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
