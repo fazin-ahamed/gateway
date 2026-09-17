@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
+import { planHorizon, renderHorizonState, isTinySlug } from "./horizon.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options");
@@ -14,7 +15,7 @@ app.use("/v1/*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
   allowHeaders: ["Content-Type", "Authorization", "x-api-key", "x-request-id", "x-gateway-cache", "x-gateway-cache-ttl", "x-zai-captcha"],
-  exposeHeaders: ["x-request-id", "x-gateway-cache", "x-gateway-used-usd", "x-gateway-used-tokens", "x-gateway-route", "x-gateway-attempts"]
+  exposeHeaders: ["x-request-id", "x-gateway-cache", "x-gateway-used-usd", "x-gateway-used-tokens", "x-gateway-route", "x-gateway-attempts", "x-gateway-model", "x-gateway-horizon"]
 }));
 var encoder = new TextEncoder();
 var LOG_BUFFER_MAX = 500;
@@ -598,28 +599,40 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     }
     slug = autoDecision.slug;
     payload = applyAutoHarness({ ...payload, model: slug }, autoDecision);
-    blog("AUTO picked " + slug + " quality=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + " need=" + (autoDecision.need || 0).toFixed(2) + " pref=" + (autoDecision.preference ?? "-") + (autoDecision.fallback ? " fallback" : ""));
+    const hz = autoDecision.horizon;
+    blog("AUTO picked " + slug + " speed=" + ((hz && hz.speed) || "-") + " role=" + ((hz && hz.role) || "-") + " mvc=" + Number(hz && hz.mvc || 0).toFixed(2) + " quality=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + " need=" + (autoDecision.need || 0).toFixed(2) + (autoDecision.fallback ? " fallback" : "") + (autoDecision.queue && autoDecision.queue.length ? " queue=" + autoDecision.queue.join(",") : ""));
   }
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
   const isStream = !!payload.stream;
   const traj = trajectorySeed(c, payload, key, slug || "unknown", isStream, requestId);
   if (autoDecision)
-    traj.steps.push({ provider: "auto-router", rank: 0, ok: true, picked: slug, costPer1M: autoDecision.cost, quality: autoDecision.quality, fallback: !!autoDecision.fallback });
+    traj.steps.push({ provider: "horizon", rank: 0, ok: true, picked: slug, costPer1M: autoDecision.cost, quality: autoDecision.quality, fallback: !!autoDecision.fallback, speed: autoDecision.horizon && autoDecision.horizon.speed, role: autoDecision.horizon && autoDecision.horizon.role, queue: autoDecision.queue || [] });
   if (!slug) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model is required" });
     return c.json({ error: { message: "model is required" } }, 400);
   }
-  if (!isAdminPlayground && slug !== AUTO_SLUG && !await slugAllowed(c, key, slug)) {
+  if (!isAdminPlayground && !autoDecision && slug !== AUTO_SLUG && !await slugAllowed(c, key, slug)) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 403, attempts: 0, latencyMs: Date.now() - started, error: "model not enabled for this key" });
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
-  const routes = await c.env.DB.prepare(
-    "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
-  ).bind(slug).all();
-  if (!routes.results || !routes.results.length) {
-    // Say why the slug is dark: a disabled provider is an operator choice, not
-    // an outage, and "no healthy route" sends people hunting for the wrong bug.
+  const slugQueue = [];
+  const seenSlug = new Set();
+  for (const s of [slug, ...((autoDecision && autoDecision.queue) || [])]) {
+    if (!s || seenSlug.has(s)) continue;
+    seenSlug.add(s);
+    slugQueue.push(s);
+  }
+  const combined = [];
+  for (const s of slugQueue) {
+    const rows = await c.env.DB.prepare(
+      "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
+    ).bind(s).all();
+    for (const r of rows.results || [])
+      combined.push({ ...r, public_slug: s });
+  }
+  const routes = { results: combined };
+  if (!routes.results.length) {
     const disabled = await c.env.DB.prepare(
       "SELECT COUNT(*) AS n FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=0"
     ).bind(slug).first();
@@ -641,7 +654,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   }
   const cacheModeHeader = String(c.req.header("x-gateway-cache") || "true").toLowerCase();
   const cacheMode = (cacheModeHeader === "off" || cacheModeHeader === "false" || cacheModeHeader === "0") ? "off" : cacheModeHeader;
-  const cacheable = !!key && isCacheableRequest(payload, isStream, cacheMode);
+  const cacheable = !!key && !autoDecision && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
   blog("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));
   if (cacheKey && cacheMode !== "refresh") {
@@ -680,15 +693,18 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     let lastErrStatus = null;
     let attempts = 0;
     for (const route of routes.results) {
+      const liveSlug = route.public_slug || slug;
+      if (payload.model !== liveSlug)
+        payload = { ...payload, model: liveSlug };
       if (circuitOpen(route.provider_name)) {
         blog("ROUTE skip provider=" + route.provider_name + " circuit-open");
-        traj.steps.push({ provider: route.provider_name, rank: route.rank, error: "circuit open", ms: 0 });
+        traj.steps.push({ provider: route.provider_name, rank: route.rank, error: "circuit open", ms: 0, slug: liveSlug });
         lastErr = "provider " + route.provider_name + " circuit open (recent failures)";
         attempts++;
         continue;
       }
       const stepStart = Date.now();
-      const baseStep = { provider: route.provider_name, rank: route.rank };
+      const baseStep = { provider: route.provider_name, rank: route.rank, slug: liveSlug };
       let strategy = "round_robin";
       try {
         const prow = await c.env.DB.prepare("SELECT key_strategy FROM providers WHERE id=?").bind(route.provider_id).first();
@@ -727,8 +743,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           if (!isStream) {
             const txt = await up.text();
             const usage = res.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
-            const costUsd = await computeCost(c, slug, usage);
-            const clientTxt = sanitizeClientResponse(txt, slug);
+            const costUsd = await computeCost(c, liveSlug, usage);
+            const clientTxt = sanitizeClientResponse(txt, liveSlug);
             if (isGenericUpstreamErrorResponse(clientTxt)) {
               blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
               lastErr = "provider " + route.provider_name + " -> malformed upstream completion envelope";
@@ -737,12 +753,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               break; // next route
             }
             await recordUsage(c, key, { ...usage, cost_usd: costUsd });
-            await recordModelUsage(c, slug, usage.total_tokens, costUsd);
+            await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
             if (cacheKey && isCacheableResponse(clientTxt)) {
               await storeResponseCache(c, {
                 cacheKey,
                 keyId: key.key_id,
-                slug,
+                slug: liveSlug,
                 responseBody: clientTxt,
                 sourceCostUsd: costUsd,
                 sourceTokens: usage.total_tokens,
@@ -753,18 +769,24 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             hdrs["x-request-id"] = requestId;
             hdrs["x-gateway-route"] = String(route.rank);
             hdrs["x-gateway-attempts"] = String(attempts + 1);
+            hdrs["x-gateway-model"] = liveSlug;
+            if (autoDecision && autoDecision.horizon)
+              hdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
             if (cacheKey)
               hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
-            blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " key=" + k.label + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
+            blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
             circuitRecord(route.provider_name, true);
             traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart });
-            await recordTrajectory(c, { ...traj, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
+            await recordTrajectory(c, { ...traj, slug: liveSlug, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
             return new Response(clientTxt, { status: up.status, headers: hdrs });
           }
           circuitRecord(route.provider_name, true);
-          blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " key=" + k.label + " rank=" + route.rank);
+          blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
-          const result = await handleStream(c, up, key, slug, route, requestId, payload, started, res.usage, { traj, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c) });
+          const horizonHdrs = { "x-gateway-model": liveSlug };
+          if (autoDecision && autoDecision.horizon)
+            horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
+          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs });
           return result;
         } catch (e) {
           // Zai-web failures carry an actionable status and code (missing
@@ -775,14 +797,17 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           if (e instanceof ZaiWebError) {
             if (e.status >= 500)
               circuitRecord(route.provider_name, false);
-            // Client-facing: scrub hosts/provider names out of upstream text the
-            // same way every other upstream body is scrubbed, so a private
-            // provider's error never names the provider or its URL.
             const safeMessage = sanitizeUpstreamResponse(e.message);
             blog("FWD ZAI " + route.provider_name + " -> " + e.status + " " + e.code + " " + e.message);
             traj.steps.push({ ...baseStep, error: e.code, key: k.label, http: e.status, ms: Date.now() - stepStart });
-            await recordTrajectory(c, { ...traj, status: "fail", httpStatus: e.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
-            return c.json({ error: { message: safeMessage, type: "upstream_error", code: e.code } }, e.status, { "x-gateway-attempts": String(attempts + 1) });
+            if (e.status < 500 || !autoDecision) {
+              await recordTrajectory(c, { ...traj, status: "fail", httpStatus: e.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
+              return c.json({ error: { message: safeMessage, type: "upstream_error", code: e.code } }, e.status, { "x-gateway-attempts": String(attempts + 1) });
+            }
+            lastErr = "provider " + route.provider_name + " -> " + e.code;
+            lastErrStatus = e.status;
+            attempts++;
+            break;
           }
           circuitRecord(route.provider_name, false);
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
@@ -1784,6 +1809,10 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   hdrs["cache-control"] = "no-cache, no-store";
   hdrs["connection"] = "keep-alive";
   hdrs["x-request-id"] = requestId;
+  if (extra && extra.gatewayHeaders) {
+    for (const [k, v] of Object.entries(extra.gatewayHeaders))
+      if (v) hdrs[k] = v;
+  }
   return new Response(reader2, { status: upReq.status, headers: hdrs });
 }
 function usageFrom(obj) {
@@ -2087,11 +2116,12 @@ function compactMessages(messages, maxChars) {
 }
 function applyAutoHarness(payload, decision) {
   const msgs = Array.isArray(payload && payload.messages) ? payload.messages.slice() : [];
-  const world = buildWorldModel(payload);
-  const state = renderWorldState(world, decision);
-  const window = Number(decision && decision.context) || 128000;
-  const budgetChars = Math.max(8000, Math.floor(window * 0.55 * 4));
-  const compacted = compactMessages(msgs.filter((m) => !(m && m.role === "system" && String(m.content || "").indexOf("WORLD STATE:") === 0)), budgetChars);
+  const horizon = decision && decision.horizon;
+  const state = horizon ? renderHorizonState(horizon) : renderWorldState(buildWorldModel(payload), decision);
+  const window = Number(decision && decision.context) || Number(horizon && horizon.taskIR && 128000) || 128000;
+  const tight = !!(horizon && horizon.compact);
+  const budgetChars = Math.max(tight ? 4000 : 8000, Math.floor(window * (tight ? 0.35 : 0.55) * 4));
+  const compacted = compactMessages(msgs.filter((m) => !(m && m.role === "system" && /WORLD STATE:|TASKIR:/.test(String(m.content || "")))), budgetChars);
   compacted.unshift({ role: "system", content: state });
   return { ...payload, messages: compacted };
 }
@@ -2274,7 +2304,7 @@ async function pickAutoModel(c, payload) {
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: /(flash|lite|mini|small|air|nano|xs)/.test(r.slug) });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
   }
   const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
   const strongWork = workhorseEligible.filter((x) => !x.tiny);
@@ -2321,7 +2351,17 @@ async function pickAutoModel(c, payload) {
   }
   if (!picked)
     return null;
-  return { ...picked, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: picked.context || 0 };
+  const horizon = planHorizon({
+    payload,
+    candidates,
+    picked,
+    need,
+    reqTokens,
+    cx: { score, estInputTokens: reqTokens, images: reqImages }
+  });
+  const slug = (horizon && horizon.slug) || picked.slug;
+  const chosen = candidates.find((x) => x.slug === slug) || picked;
+  return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, horizon, queue: (horizon && horizon.queue) || [] };
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -3927,13 +3967,24 @@ app.post("/admin/auto-preview", async (c) => {
   const decision = await pickAutoModel(c, { messages, tools: b.tools || undefined });
   if (!decision)
     return c.json({ error: { message: "auto routing unavailable (disabled or no routed models)" } }, 503);
+  const hz = decision.horizon || {};
   return c.json({
     picked: decision.slug,
     fallback: !!decision.fallback,
     need: decision.need,
     complexity: decision.complexity,
     preference: decision.preference,
-    candidates: decision.candidates
+    candidates: decision.candidates,
+    queue: decision.queue || hz.queue || [],
+    horizon: {
+      speed: hz.speed,
+      role: hz.role,
+      mvc: hz.mvc,
+      hopsMax: hz.hopsMax,
+      phase: hz.phase,
+      compact: !!hz.compact,
+      taskIR: hz.taskIR || null
+    }
   });
 });
 app.get("/admin/cache", async (c) => {
@@ -4106,7 +4157,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

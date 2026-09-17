@@ -47,13 +47,11 @@ Public defaults live in `.env.example`
 - `GET /health`, `GET /status` (admin) — liveness and route inventory
 - `/_gw` — operator console (Overview, Providers, Model routes, Tiers, Keys, Playground, Cache, Prices)
 
-Model routing: each public slug maps to one primary route (rank 0) plus
-automatic fallbacks. `model: "auto"` picks **only from your enabled routes**
+`model: "auto"` is HORIZON-Ω, a compute kernel over **your enabled routes only**
 (GLM-5.3, DeepSeek V4, MiniMax, Qwen3.8, Grok 4.6, Laguna, Agnes). It never
-invents GPT-6 Astra. Easy asks use a cheap flash; agent/hard coding uses
-GLM-5.3 / DeepSeek-V4-Pro / Grok-4.6. Overflow context is compacted into a
-WORLD STATE block (goal, files, tools, constraints) so smaller windows can
-still hold a long session.
+invents GPT-6 Astra. Easy asks take one cheap flash hop. Hard coding compiles
+to TaskIR, injects WORLD/TASKIR, ranks actions by marginal value of compute,
+and reroutes to an uncorrelated family on 5xx. Overflow turns compact.
 
 ## Provider state: enabled vs healthy
 
