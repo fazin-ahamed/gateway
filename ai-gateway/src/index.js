@@ -597,7 +597,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       return c.json({ error: { message: msg, type: cfg.enabled ? "no_route" : "auto_disabled" } }, cfg.enabled ? 503 : 400);
     }
     slug = autoDecision.slug;
-    payload = { ...payload, model: slug };
+    payload = applyAutoHarness({ ...payload, model: slug }, autoDecision);
     blog("AUTO picked " + slug + " quality=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + " need=" + (autoDecision.need || 0).toFixed(2) + " pref=" + (autoDecision.preference ?? "-") + (autoDecision.fallback ? " fallback" : ""));
   }
   const requestId = c.req.header("x-request-id") || uuid();
@@ -1983,41 +1983,117 @@ function promptComplexity(payload) {
   return { score, chars: a.textChars, words: askWords, estInputTokens: tokens, images: a.imageCount };
 }
 function isLuxuryFlagship(id) {
-  return /(gpt-6-astra|astra|claude-fable|fable-5|mythos|gpt-6(?!.*mini)|opus-5|claude-opus-5|grok-4)/.test(String(id || "").toLowerCase());
+  // Models this gateway does not operate. Auto must never prefer them when
+  // the operator's own routes can serve the request.
+  return /(gpt-6-astra|\bastra\b|claude-fable|fable-5|mythos|gpt-6(?!.*mini)|opus-5|claude-opus-5)/.test(String(id || "").toLowerCase());
 }
 function isWorkhorse(id) {
-  // Cheap 2026 labs that actually rival Astra on coding/agents at a fraction
-  // of the price. Auto prefers these whenever they can serve the request.
-  return /(glm-5|glm-4\.6|kimi|moonshot|deepseek|qwen3)/.test(String(id || "").toLowerCase());
+  // The operator's cheap 2026 pool (from live routes): GLM-5, DeepSeek V4,
+  // MiniMax, Qwen3.8, Grok 4.6, Laguna, Agnes. These rival Astra-class
+  // coding/agents at a fraction of the price.
+  return /(glm-5|glm-4\.6|kimi|moonshot|deepseek|qwen3|minimax|grok-4|laguna|agnes|muse-spark)/.test(String(id || "").toLowerCase());
 }
 function qualityPrior(entry, slug) {
   const id = String((entry && entry.id) || slug || "").toLowerCase();
   const reasoning = !!(entry && entry.reasoning);
   const ctx = Number(entry && entry.limit && entry.limit.context) || 0;
-  // Workhorses are scored as Astra-class rivals so the router will use them
-  // for hard work. Luxury ids stay high only for last-resort fallback.
   let q = 1;
   if (isLuxuryFlagship(id))
-    q = 5.4;
-  else if (/(glm-5(?!.*flash)|kimi-k3|kimi-k2\.6)/.test(id))
-    q = 4.7;
-  else if (/(kimi-k2|deepseek-v4(?!.*flash)|deepseek-r1|qwen3-max|glm-4\.6)/.test(id))
-    q = 4.3;
-  else if (/(glm-5\.3-flash|glm-5-flash|kimi|deepseek-v3|qwen3|deepseek-v4-flash)/.test(id))
-    q = 3.6;
-  else if (/(gpt-5(?!.*(mini|nano))|sonnet-5|sonnet-4|gpt-4\.1(?!.*mini)|gemini-3(?!.*flash))/.test(id))
-    q = 3.2;
-  else if (/(gpt-4o(?!.*mini)|haiku-4|gemini-2\.5|mistral-large)/.test(id))
-    q = 2.4;
+    q = 3.1;
+  else if (/(glm-5(?!.*flash)|deepseek-v4-pro|grok-4\.6|kimi-k3|kimi-k2\.6)/.test(id))
+    q = 4.8;
+  else if (/(minimax-m3|qwen3\.8|qwen3-max|deepseek-v4(?!.*flash)|kimi-k2|glm-4\.6)/.test(id))
+    q = 4.4;
+  else if (/(glm-5\.3-flash|glm-5-flash|deepseek-v4-flash|qwen3|laguna-s|agnes-3|kimi)/.test(id))
+    q = 3.8;
+  else if (/(laguna-xs|muse-spark)/.test(id))
+    q = 2.8;
   else {
-    q = 1;
-    if (reasoning) q += 1.5;
+    q = 1.4;
+    if (reasoning) q += 1.2;
     if (ctx >= 400000) q += 1;
     else if (ctx >= 128000) q += 0.5;
-    if (/(flash|lite|mini|small|air|nano|tiny|instant)/.test(id)) q -= 0.4;
-    if (/(pro|max|ultra|thinking|reasoning)/.test(id)) q += 0.6;
+    if (/(flash|lite|mini|small|air|nano|tiny|instant|xs)/.test(id)) q -= 0.3;
+    if (/(pro|max|ultra|thinking|reasoning)/.test(id)) q += 0.5;
   }
   return Math.max(0.25, Math.min(6, q));
+}
+function textOfMessage(m) {
+  if (!m) return "";
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content))
+    return m.content.map((p) => p && typeof p.text === "string" ? p.text : "").filter(Boolean).join(" ");
+  return "";
+}
+function buildWorldModel(payload) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  const live = msgs.filter((m) => m && m.role !== "system" && m.role !== "developer");
+  let lastUser = "";
+  for (const m of live) {
+    if (m.role === "user") lastUser = textOfMessage(m);
+  }
+  const blob = live.map(textOfMessage).join("\n");
+  const files = [...new Set((blob.match(/(?:[\w.-]+\/)+[\w.-]+\.[a-z0-9]{1,8}/gi) || [])).values()].slice(0, 8);
+  const urls = [...new Set((blob.match(/https?:\/\/[^\s)]+/gi) || [])).values()].slice(0, 6);
+  const tools = Array.isArray(payload && payload.tools) ? payload.tools.map((t) => (t && t.function && t.function.name) || t.name).filter(Boolean).slice(0, 8) : [];
+  const nums = [...new Set((lastUser.match(/\b\d+(?:\.\d+)?\b/g) || [])).values()].slice(0, 8);
+  const goal = lastUser.replace(/\s+/g, " ").trim().slice(0, 280);
+  return {
+    goal: goal || "(none)",
+    files, urls, tools, nums,
+    turns: live.filter((m) => m.role === "user").length,
+    images: (payload && promptComplexity(payload).images) || 0
+  };
+}
+function renderWorldState(world, decision) {
+  const lines = [
+    "You are running behind the gateway auto-router. Stay inside the current task.",
+    "WORLD STATE:",
+    "- goal: " + world.goal,
+    "- turns: " + world.turns,
+    world.files.length ? "- files: " + world.files.join(", ") : "",
+    world.urls.length ? "- urls: " + world.urls.join(", ") : "",
+    world.tools.length ? "- tools: " + world.tools.join(", ") : "",
+    world.nums.length ? "- numbers: " + world.nums.join(", ") : "",
+    decision ? "- routed: " + decision.slug + " (need " + Number(decision.need || 0).toFixed(2) + ", window-fit " + (decision.ctxOk === false ? "tight" : "ok") + ")" : "",
+    "Rules: keep a running model of entities and constraints. Prefer acting over restating. If context was compacted, trust this block over forgotten turns."
+  ];
+  return lines.filter(Boolean).join("\n");
+}
+function compactMessages(messages, maxChars) {
+  const msgs = Array.isArray(messages) ? messages.slice() : [];
+  let total = 0;
+  for (const m of msgs) total += textOfMessage(m).length;
+  if (total <= maxChars) return msgs;
+  const keepTail = [];
+  let users = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m && (m.role === "system" || m.role === "developer")) continue;
+    keepTail.unshift(m);
+    if (m && m.role === "user") users++;
+    if (users >= 3) break;
+  }
+  const keepSet = new Set(keepTail);
+  const older = msgs.filter((m) => m && m.role !== "system" && m.role !== "developer" && !keepSet.has(m));
+  if (!older.length) return msgs;
+  const digest = older.map((m) => (m.role || "?") + ": " + textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, 220)).join("\n").slice(0, 2400);
+  const out = [];
+  for (const m of msgs) {
+    if (m && (m.role === "system" || m.role === "developer")) out.push(m);
+  }
+  out.push({ role: "system", content: "COMPACTED PRIOR TURNS:\n" + digest });
+  return out.concat(keepTail);
+}
+function applyAutoHarness(payload, decision) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages.slice() : [];
+  const world = buildWorldModel(payload);
+  const state = renderWorldState(world, decision);
+  const window = Number(decision && decision.context) || 128000;
+  const budgetChars = Math.max(8000, Math.floor(window * 0.55 * 4));
+  const compacted = compactMessages(msgs.filter((m) => !(m && m.role === "system" && String(m.content || "").indexOf("WORLD STATE:") === 0)), budgetChars);
+  compacted.unshift({ role: "system", content: state });
+  return { ...payload, messages: compacted };
 }
 // Request shape analysis for routing: text size, image payloads, tool
 // definitions. Token counts are heuristics (~4 chars/token, ~1 token/KB of
@@ -2198,7 +2274,7 @@ async function pickAutoModel(c, payload) {
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: /(flash|lite|mini|small|air|nano)/.test(r.slug) });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: /(flash|lite|mini|small|air|nano|xs)/.test(r.slug) });
   }
   const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
   const strongWork = workhorseEligible.filter((x) => !x.tiny);
@@ -2245,7 +2321,7 @@ async function pickAutoModel(c, payload) {
   }
   if (!picked)
     return null;
-  return { ...picked, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages };
+  return { ...picked, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: picked.context || 0 };
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -4030,7 +4106,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

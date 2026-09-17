@@ -48,12 +48,12 @@ Public defaults live in `.env.example`
 - `/_gw` — operator console (Overview, Providers, Model routes, Tiers, Keys, Playground, Cache, Prices)
 
 Model routing: each public slug maps to one primary route (rank 0) plus
-automatic fallbacks (higher ranks, tried in order). `model: "auto"` uses
-only cheap 2026 workhorses (GLM-5, Kimi, DeepSeek, Qwen3) when they can
-serve the request. GPT-6 Astra / Fable 5 / Mythos / Opus 5 are last-resort
-only. Easy asks take GLM-5.3-flash; agent and hard coding take GLM-5.3;
-context that overflows a 200k window takes Kimi. Explicitly pick Astra if
-you want it.
+automatic fallbacks. `model: "auto"` picks **only from your enabled routes**
+(GLM-5.3, DeepSeek V4, MiniMax, Qwen3.8, Grok 4.6, Laguna, Agnes). It never
+invents GPT-6 Astra. Easy asks use a cheap flash; agent/hard coding uses
+GLM-5.3 / DeepSeek-V4-Pro / Grok-4.6. Overflow context is compacted into a
+WORLD STATE block (goal, files, tools, constraints) so smaller windows can
+still hold a long session.
 
 ## Provider state: enabled vs healthy
 
