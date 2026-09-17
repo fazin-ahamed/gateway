@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
+import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options");
@@ -77,6 +78,15 @@ function isCacheableRequest(payload, isStream, mode) {
     return false;
   return true;
 }
+function hasAccumulatedToolCalls(buf) {
+  if (!Array.isArray(buf))
+    return false;
+  for (const tc of buf) {
+    if (tc && (tc.id || (tc.function && (tc.function.name || tc.function.arguments))))
+      return true;
+  }
+  return false;
+}
 function synthesizeStreamCompletion(chunks) {
   return "data: " + chunks.join("\n\ndata: ") + "\n\ndata: [DONE]\n\n";
 }
@@ -91,7 +101,12 @@ async function serveCachedCompletion(c, { cached, key, slug, payload, started, s
       const usage = obj.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
       const chunk1 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: { role: "assistant", ...(toolCalls ? { tool_calls: toolCalls } : {}) } }] };
       const chunk2 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: { content } }] };
-      const chunk3 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage };
+      const cachedFr = normalizeTerminalFinishReason(
+        obj.choices && obj.choices[0] && obj.choices[0].finish_reason,
+        !!(toolCalls && toolCalls.length),
+        true
+      );
+      const chunk3 = { id: "cache-" + Date.now(), object: "chat.completion.chunk", created: 0, model: slug, choices: [{ index: 0, delta: {}, ...(cachedFr !== null ? { finish_reason: cachedFr } : {}) }], usage };
       const sse = synthesizeStreamCompletion([JSON.stringify(chunk1), JSON.stringify(chunk2), JSON.stringify(chunk3)]);
       const hdrs = clientResponseHeaders(new Headers(), true);
       hdrs["x-gateway-cache"] = state || "HIT";
@@ -1683,7 +1698,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
         responseJson: (contentBuf || reasoningBuf || toolCallsBuf.length) ? JSON.stringify({ choices: [{ message: msg }], usage: lastUsage }) : null
       });
       if (!streamError && extra.cacheKey && (contentBuf || toolCallsBuf.length)) {
-        const replayBody = JSON.stringify({ id: "cached-" + requestId, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: extra.traj.slug, choices: [{ index: 0, message: msg, finish_reason: "stop" }], usage: lastUsage });
+        const replayFr = normalizeTerminalFinishReason("stop", hasAccumulatedToolCalls(toolCallsBuf), !!(contentBuf || reasoningBuf));
+        const replayBody = JSON.stringify({ id: "cached-" + requestId, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: extra.traj.slug, choices: [{ index: 0, message: msg, finish_reason: replayFr !== null ? replayFr : undefined }], usage: lastUsage });
         await storeResponseCache(c, {
           cacheKey: extra.cacheKey,
           keyId: extra.traj.keyId || "admin",
@@ -1735,8 +1751,13 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
               continue;
             }
             const fr = choices && choices[0] && choices[0].finish_reason;
-            if (fr)
+            if (fr) {
+              const sawTools = hasAccumulatedToolCalls(toolCallsBuf);
+              const fixed = normalizeTerminalFinishReason(fr, sawTools, true);
+              if (fixed !== fr)
+                choices[0].finish_reason = fixed;
               finishSeen = true;
+            }
             const dc = choices && choices[0] && choices[0].delta;
             if (dc) {
               if (typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
@@ -1774,17 +1795,18 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
         }
       }
       if (!clientCancelled) {
-        // Many OpenAI-compatible upstreams end with [DONE] but never sent a
-        // finish_reason chunk (or died mid-reasoning). Clients hard-fail with
-        // "stream closed before a finish_reason was received" — synthesize the
-        // terminal stop chunk so the stream always completes gracefully.
         if (!finishSeen) {
+          const finishReason = normalizeTerminalFinishReason(
+            null,
+            hasAccumulatedToolCalls(toolCallsBuf),
+            !!(contentBuf || reasoningBuf)
+          );
           const finishChunk = {
             id: "gen-" + requestId,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
             model: slug,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+            choices: [{ index: 0, delta: {}, ...(finishReason !== null ? { finish_reason: finishReason } : {}) }]
           };
           const hasUsage = lastUsage && (lastUsage.total_tokens || lastUsage.completion_tokens);
           if (hasUsage)
