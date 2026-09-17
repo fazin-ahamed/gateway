@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // Browser-backed chat.z.ai transport.
 //
 // Why this exists: chat.z.ai issues its CAPTCHA proof per completion, and the
@@ -16,15 +17,23 @@ const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
 const ZAI_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 const DEFAULT_TURN_TIMEOUT_MS = 120000;
 const PAGE_IDLE_CLOSE_MS = 300000;
-const MAX_TURNS_PER_PAGE = 60;
 
-// One shared browser process; pages are pooled per credential so a warm session
-// (and its captcha continuity) is reused instead of paying a cold start.
+// One shared browser process; contexts are pooled per credential. Each
+// gateway request gets a fresh page so chat.z.ai history cannot leak
+// across OpenAI-compatible turns. A per-pool mutex serializes fill/click.
 const pools = new Map();
 let browserPromise = null;
 
+function sha256hexSync(str) {
+  return createHash("sha256").update(String(str)).digest("hex");
+}
+
 function poolKey(token) {
-  return "zai:" + String(token).slice(-24);
+  try {
+    return "zai:" + sha256hexSync(token).slice(0, 32);
+  } catch {
+    return "zai:" + String(token).length + ":" + String(token).slice(0, 8);
+  }
 }
 
 async function loadPlaywright() {
@@ -80,24 +89,25 @@ async function getPool(token) {
   const browser = await getBrowser();
   const context = await browser.newContext({ userAgent: ZAI_USER_AGENT, locale: "en-US", viewport: { width: 1280, height: 800 } });
   await context.addCookies([{ name: "token", value: token, domain: "chat.z.ai", path: "/" }]);
-  const pool = { context, page: null, turns: 0, idleTimer: null, lastUsed: Date.now() };
+  const pool = { context, page: null, lock: Promise.resolve(), idleTimer: null, lastUsed: Date.now() };
   pools.set(key, pool);
   return pool;
 }
-
-async function getPage(pool, token) {
-  if (pool.page && pool.turns < MAX_TURNS_PER_PAGE) {
-    if (pool.idleTimer) {
-      clearTimeout(pool.idleTimer);
-      pool.idleTimer = null;
-    }
-    return pool.page;
+function withLock(pool, fn) {
+  const prev = pool.lock || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  pool.lock = prev.then(() => gate, () => gate);
+  return prev.catch(() => {}).then(fn).finally(() => release());
+}
+async function openFreshPage(pool, token) {
+  if (pool.idleTimer) {
+    clearTimeout(pool.idleTimer);
+    pool.idleTimer = null;
   }
   if (pool.page)
     await Promise.resolve(pool.page.close().catch(() => {})).catch(() => {});
-  pool.turns = 0;
   const page = await pool.context.newPage();
-  // Seed the session the page reads at boot, then reload so it picks it up.
   await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.evaluate(([t]) => {
     try {
@@ -170,43 +180,46 @@ export async function runBrowserTurn(token, prompt, options = {}) {
   const timeoutMs = Number(options.turnTimeoutMs) || DEFAULT_TURN_TIMEOUT_MS;
   const key = poolKey(token);
   const pool = await getPool(token);
-  const page = await getPage(pool, token);
-  let resolveResponse;
-  const responsePromise = new Promise((resolve) => {
-    resolveResponse = resolve;
-  });
-  let settled = false;
-  const onResponse = async (res) => {
-    if (settled || !res.url().includes("/api/v2/chat/completions"))
-      return;
-    settled = true;
-    let body = "";
+  return withLock(pool, async () => {
+    const page = await openFreshPage(pool, token);
+    let resolveResponse;
+    const responsePromise = new Promise((resolve) => {
+      resolveResponse = resolve;
+    });
+    let settled = false;
+    const onResponse = async (res) => {
+      if (settled || !res.url().includes("/api/v2/chat/completions"))
+        return;
+      settled = true;
+      let body = "";
+      try {
+        body = await res.text();
+      } catch {
+      }
+      resolveResponse({ status: res.status(), body });
+    };
+    page.on("response", onResponse);
     try {
-      body = await res.text();
-    } catch {
+      const input = page.locator("#chat-input").first();
+      await input.waitFor({ state: "visible", timeout: 30000 });
+      await input.fill(prompt);
+      const send = page.locator('[aria-label="Send Message"] button:not([disabled])').first();
+      await send.click({ timeout: 20000 });
+      const result = await Promise.race([
+        responsePromise,
+        new Promise((resolve) => setTimeout(() => resolve({ status: 0, body: "", timeout: true }), timeoutMs))
+      ]);
+      pool.lastUsed = Date.now();
+      if (!result.status && result.timeout)
+        throw new Error("the page did not issue a completion within " + timeoutMs + "ms");
+      return result;
+    } finally {
+      page.off("response", onResponse);
+      await Promise.resolve(page.close().catch(() => {})).catch(() => {});
+      pool.page = null;
+      armIdleClose(pool, key);
     }
-    resolveResponse({ status: res.status(), body });
-  };
-  page.on("response", onResponse);
-  try {
-    const input = page.locator("#chat-input").first();
-    await input.waitFor({ state: "visible", timeout: 30000 });
-    await input.fill(prompt);
-    const send = page.locator('[aria-label="Send Message"] button:not([disabled])').first();
-    await send.click({ timeout: 20000 });
-    const result = await Promise.race([
-      responsePromise,
-      new Promise((resolve) => setTimeout(() => resolve({ status: 0, body: "", timeout: true }), timeoutMs))
-    ]);
-    pool.turns++;
-    pool.lastUsed = Date.now();
-    armIdleClose(pool, key);
-    if (!result.status && result.timeout)
-      throw new Error("the page did not issue a completion within " + timeoutMs + "ms");
-    return result;
-  } finally {
-    page.off("response", onResponse);
-  }
+  });
 }
 
 export async function closeBrowserPools() {
@@ -223,4 +236,4 @@ export async function closeBrowserPools() {
   browserPromise = null;
 }
 
-export const __browserTest = { foldPrompt, poolKey, ZAI_CHAT_URL };
+export const __browserTest = { foldPrompt, poolKey, withLock, ZAI_CHAT_URL };

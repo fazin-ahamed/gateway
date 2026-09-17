@@ -32,12 +32,12 @@ const OUTPUT_CHARS_PER_TOKEN = 3;
 const IMAGE_TOKEN_ALLOWANCE = 500;
 
 // Descriptions of what each consumer model accepts. `vision` gates image
-// input, `thinking`/`efforts` drive the Deep Think control, `maxTokens` is
-// the upstream ceiling used to clamp caller-supplied max_tokens.
+// input. `context` is the measured chat.z.ai transport window (not the
+// theoretical 1M GLM-5.3 paper context). `output` is the completion clamp.
 const ZAI_MODELS = {
-  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: true, maxTokens: 98304 },
-  "glm-5.3": { name: "GLM-5.3", thinking: true, vision: false, maxTokens: 98304 },
-  "glm-5.2": { name: "GLM-5.2", thinking: true, vision: false, maxTokens: 98304 }
+  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: true, context: 98304, output: 16384 },
+  "glm-5.3": { name: "GLM-5.3", thinking: true, vision: false, context: 98304, output: 16384 },
+  "glm-5.2": { name: "GLM-5.2", thinking: true, vision: false, context: 98304, output: 16384 }
 };
 
 function unprefixedModelId(modelId) {
@@ -72,7 +72,7 @@ export function modelCatalogEntry(modelId) {
     toolCall: false,
     attachment: caps.vision,
     modalities: { input: caps.vision ? ["text", "image"] : ["text"], output: ["text"] },
-    limit: { context: caps.maxTokens, output: caps.maxTokens }
+    limit: { context: caps.context, output: caps.output }
   };
 }
 
@@ -263,7 +263,8 @@ function estimatePromptTokens(messages, toolsChars) {
 }
 
 // The consumer models expose an effort selector but no non-thinking mode, so
-// a client asking for "none"/"off" still gets thinking, at the lowest effort.
+// a client asking for "none"/"off" still gets thinking, at the lowest effort
+// the model actually supports (low on 5.3, high on 5.2). Never map off→max.
 function resolveThinking(modelId, payload) {
   const caps = getModelCapabilities(modelId);
   if (!caps || !caps.thinking)
@@ -275,7 +276,15 @@ function resolveThinking(modelId, payload) {
       ? reasoning.effort.trim().toLowerCase()
       : "";
   const supportsLow = capabilityModelId(modelId) !== "glm-5.2";
-  const effort = raw === "low" && supportsLow ? "low" : raw === "low" || raw === "medium" || raw === "high" ? "high" : "max";
+  let effort;
+  if (!raw || raw === "none" || raw === "off" || raw === "nothink" || raw === "low")
+    effort = supportsLow ? "low" : "high";
+  else if (raw === "medium" || raw === "high")
+    effort = "high";
+  else if (raw === "max" || raw === "xhigh")
+    effort = "max";
+  else
+    effort = supportsLow ? "low" : "high";
   return { enabled: true, effort, effortSupported: true };
 }
 
@@ -386,7 +395,7 @@ function buildCompletionBody(input) {
       params[key] = input.body[key];
   const caps = getModelCapabilities(input.modelId);
   if (params.max_tokens !== undefined && caps)
-    params.max_tokens = Math.min(Number(params.max_tokens) || 0, caps.maxTokens);
+    params.max_tokens = Math.min(Number(params.max_tokens) || 0, caps.output);
   const features = {
     image_generation: false,
     web_search: false,

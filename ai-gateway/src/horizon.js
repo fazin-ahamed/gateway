@@ -193,13 +193,25 @@ export function generateActions(candidates, taskIR, world) {
       mvc: mvcOf(cand, taskIR, phase),
       tiny: isTinySlug(cand.slug) || !!cand.tiny,
       workhorse: !!cand.workhorse,
-      capable: cand.capable !== false
+      capable: cand.capable !== false,
+      context: Number(cand.context) || 0,
+      output: Number(cand.output) || 0
     });
   }
-  if (world && world.turns >= 6)
-    actions.push({ type: "compact", slug: null, role: "compact", mvc: 1.8, cost: 0 });
   actions.push({ type: "stop", slug: null, role: "stop", mvc: 0.05, cost: 0 });
   return actions.sort((a, b) => b.mvc - a.mvc);
+}
+export function usableContextWindow(context, output, requestedOutput) {
+  const model = Number(context) || 0;
+  if (model <= 0) return 0;
+  const out = Math.max(Number(output) || 0, Number(requestedOutput) || 0, 4096);
+  const safety = Math.min(8192, Math.max(2048, Math.floor(model * 0.02)));
+  return Math.max(1024, model - out - safety);
+}
+export function shouldCompact(reqTokens, context, output, requestedOutput) {
+  const usable = usableContextWindow(context, output, requestedOutput);
+  if (!usable) return false;
+  return Number(reqTokens) > 0.82 * usable;
 }
 
 export function pickAction(actions, taskIR) {
@@ -258,7 +270,8 @@ export function planHorizon({ payload, candidates, picked, need, reqTokens, cx }
       chosen = { type: "model", slug: picked.slug, role: "answer", mvc: 0, speed: "deliberative" };
   }
   const queue = chosen && chosen.type === "model" ? buildQueue(actions, chosen, chosen.speed === "reflex" ? 1 : 2) : [];
-  const compact = actions.some((a) => a.type === "compact" && a.mvc > (chosen && chosen.mvc || 0));
+  const ctx = Number((chosen && chosen.context) || (picked && picked.context) || 0);
+  const out = Number((chosen && chosen.output) || (picked && picked.output) || 0);
   return {
     slug: (chosen && chosen.slug) || (picked && picked.slug) || null,
     role: (chosen && chosen.role) || "answer",
@@ -267,9 +280,11 @@ export function planHorizon({ payload, candidates, picked, need, reqTokens, cx }
     queue,
     taskIR,
     world,
-    compact: !!compact || (Number(reqTokens) > 24000),
+    compact: shouldCompact(reqTokens, ctx, out, payload && payload.max_tokens),
     hopsMax: (chosen && chosen.speed === "reflex") ? 1 : 1 + queue.length,
-    phase: phaseOf(taskIR)
+    phase: phaseOf(taskIR),
+    context: ctx,
+    output: out
   };
 }
 
@@ -298,21 +313,17 @@ export function shouldStop(plan) {
 export function renderHorizonState(plan) {
   const ir = plan && plan.taskIR || {};
   const w = plan && plan.world || {};
+  const files = (w.artifacts && w.artifacts.files) || [];
+  const urls = (w.artifacts && w.artifacts.urls) || [];
   const lines = [
-    "You are an actuator of HORIZON-Ω. Stay inside the current computational stage.",
-    "TASKIR:",
-    "- goal: " + (ir.goal || "(none)"),
-    "- families: " + ((ir.families || []).join(", ") || "chat"),
-    "- stages: " + ((ir.stages || []).join(" → ") || "answer"),
-    "- difficulty: " + Number(ir.difficulty || 0).toFixed(2) + "  verify: " + Number(ir.verification || 0).toFixed(2),
-    "- success: " + ((ir.success || []).join("; ") || "answer"),
-    "WORLD:",
-    (w.facts || []).map((f) => "- fact " + f.k + "=" + f.v + " (" + f.conf + ")").join("\n"),
-    (w.beliefs || []).map((f) => "- belief " + f.k + "=" + f.v + " (" + f.conf + ")").join("\n"),
-    (w.unknowns || []).length ? "- unknown: " + w.unknowns.join("; ") : "",
-    "ACTION: " + (plan.role || "answer") + " via " + (plan.slug || "?") + " [" + (plan.speed || "deliberative") + " mvc=" + Number(plan.mvc || 0).toFixed(2) + "]",
-    plan.queue && plan.queue.length ? "- reroute_if_fail: " + plan.queue.join(", ") : "",
-    "Rules: do not promote beliefs to facts. Prefer the cheapest action that can falsify a claim. If context was compacted, trust TASKIR/WORLD over forgotten turns."
+    "ROLE: " + (plan.role || "answer"),
+    "Goal: " + (ir.goal || "(none)"),
+    "Success: " + ((ir.success || []).join("; ") || "answer"),
+    (w.facts || []).length ? "Verified facts:\n" + (w.facts || []).map((f) => "- " + f.k + "=" + f.v).join("\n") : "",
+    (w.beliefs || []).length ? "Beliefs (not facts):\n" + (w.beliefs || []).map((f) => "- " + f.k + "=" + f.v + " (" + f.conf + ")").join("\n") : "",
+    files.length || urls.length ? "Artifacts:\n" + [...files, ...urls].map((x) => "- " + x).join("\n") : "",
+    (w.unknowns || []).length ? "Unknowns: " + w.unknowns.join("; ") : "",
+    "Do not promote beliefs to facts. Prefer acting over restating. If earlier turns were compacted, trust this block over forgotten chatter."
   ];
   return lines.filter(Boolean).join("\n");
 }

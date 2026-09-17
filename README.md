@@ -47,11 +47,11 @@ Public defaults live in `.env.example`
 - `GET /health`, `GET /status` (admin) — liveness and route inventory
 - `/_gw` — operator console (Overview, Providers, Model routes, Tiers, Keys, Playground, Cache, Prices)
 
-`model: "auto"` is HORIZON-Ω, a compute kernel over **your enabled routes only**
-(GLM-5.3, DeepSeek V4, MiniMax, Qwen3.8, Grok 4.6, Laguna, Agnes). It never
-invents GPT-6 Astra. Easy asks take one cheap flash hop. Hard coding compiles
-to TaskIR, injects WORLD/TASKIR, ranks actions by marginal value of compute,
-and reroutes to an uncorrelated family on 5xx. Overflow turns compact.
+`model: "auto"` is HORIZON-Ω over **your enabled routes only**. Easy asks
+are one reflex hop. Hard coding compiles TaskIR, injects a worker lens
+(goal/facts/unknowns — not MVC/reroute), and reroutes to an uncorrelated
+family on 5xx. Compaction fires only when input exceeds 82% of the model's
+usable window (context minus output reserve), and keeps tool-call pairs.
 
 ## Provider state: enabled vs healthy
 

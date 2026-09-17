@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
-import { planHorizon, renderHorizonState, isTinySlug } from "./horizon.js";
+import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options");
@@ -63,15 +63,17 @@ function isCacheableRequest(payload, isStream, mode) {
     return false;
   if (mode !== "loose" && payload.temperature != null && Number(payload.temperature) !== 0)
     return false;
-  // Vision requests bypass the cache: base64 bodies make keys expensive and
-  // hits vanishingly rare; correctness then rests on exact byte matches.
   if (hasImageContent(payload))
     return false;
-  // Availability probes ("ping", "hi", max_tokens=1) are noise: never cache
-  // them, and never serve a cached answer for them.
   if (cacheablePromptLength(payload) < CACHE_MIN_PROMPT_CHARS)
     return false;
   if (payload.max_tokens != null && Number(payload.max_tokens) > 0 && Number(payload.max_tokens) <= CACHE_MAX_PROBE_TOKENS)
+    return false;
+  // Tool/function/search/action turns are not cache-safe: a replayed
+  // tool_calls payload can re-execute side effects on the client.
+  if (payload.tools || payload.functions || payload.function_call || payload.tool_choice)
+    return false;
+  if (payload.web_search || payload.web_search_options)
     return false;
   return true;
 }
@@ -105,6 +107,7 @@ async function serveCachedCompletion(c, { cached, key, slug, payload, started, s
 async function responseCacheKey(key, slug, payload) {
   const p = payload || {};
   const trimmed = {
+    v: 3,
     messages: p.messages ?? p.input ?? [],
     temperature: p.temperature ?? 0,
     max_tokens: p.max_tokens ?? null,
@@ -113,14 +116,32 @@ async function responseCacheKey(key, slug, payload) {
     seed: p.seed ?? null,
     response_format: p.response_format ?? null,
     tools: p.tools ?? null,
-    tool_choice: p.tool_choice ?? null
+    tool_choice: p.tool_choice ?? null,
+    functions: p.functions ?? null,
+    function_call: p.function_call ?? null,
+    reasoning: p.reasoning ?? null,
+    reasoning_effort: p.reasoning_effort ?? null,
+    presence_penalty: p.presence_penalty ?? null,
+    frequency_penalty: p.frequency_penalty ?? null,
+    logit_bias: p.logit_bias ?? null,
+    parallel_tool_calls: p.parallel_tool_calls ?? null,
+    modalities: p.modalities ?? null
   };
-  return "rc:c2:" + await sha256hex(String(key.key_id) + "\n" + String(slug) + "\n" + stableJson(trimmed));
+  return "rc:c3:" + await sha256hex(String(key.key_id) + "\n" + String(slug) + "\n" + stableJson(trimmed));
 }
 function isCacheableResponse(text) {
   try {
     const body = JSON.parse(text);
-    return !!(body && typeof body === "object" && !body.error && Array.isArray(body.choices));
+    if (!body || typeof body !== "object" || body.error || !Array.isArray(body.choices))
+      return false;
+    for (const ch of body.choices) {
+      const msg = ch && ch.message;
+      if (msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length)
+        return false;
+      if (ch && ch.finish_reason === "tool_calls")
+        return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -132,7 +153,7 @@ function cacheTtlSeconds(c) {
 function cacheExpiry(ttl) {
   return new Date(Date.now() + ttl * 1e3).toISOString().replace(".000", "");
 }
-var RESPONSE_CACHE_LEASE_MS = 2e4;
+var RESPONSE_CACHE_LEASE_MS = 12e4;
 var RESPONSE_CACHE_WAIT_MS = 15e3;
 function cacheLeaseExpiry() {
   return new Date(Date.now() + RESPONSE_CACHE_LEASE_MS).toISOString().replace(".000", "");
@@ -2100,28 +2121,62 @@ function compactMessages(messages, maxChars) {
     const m = msgs[i];
     if (m && (m.role === "system" || m.role === "developer")) continue;
     keepTail.unshift(m);
+    if (m && m.role === "tool") continue;
+    if (m && Array.isArray(m.tool_calls) && m.tool_calls.length) continue;
     if (m && m.role === "user") users++;
     if (users >= 3) break;
   }
   const keepSet = new Set(keepTail);
+  // Never orphan a tool result from its tool_call, or vice versa.
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (!m || keepSet.has(m)) continue;
+    if (m.role === "tool" && i > 0 && Array.isArray(msgs[i - 1] && msgs[i - 1].tool_calls) && msgs[i - 1].tool_calls.length) {
+      keepSet.add(msgs[i - 1]);
+      keepSet.add(m);
+    }
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length && i + 1 < msgs.length && msgs[i + 1] && msgs[i + 1].role === "tool") {
+      keepSet.add(m);
+      keepSet.add(msgs[i + 1]);
+    }
+  }
   const older = msgs.filter((m) => m && m.role !== "system" && m.role !== "developer" && !keepSet.has(m));
   if (!older.length) return msgs;
-  const digest = older.map((m) => (m.role || "?") + ": " + textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, 220)).join("\n").slice(0, 2400);
+  const blob = older.map(textOfMessage).join("\n");
+  const files = [...new Set((blob.match(/(?:[\w.-]+\/)+[\w.-]+\.[a-z0-9]{1,8}/gi) || [])).values()].slice(0, 16);
+  const urls = [...new Set((blob.match(/https?:\/\/[^\s)]+/gi) || [])).values()].slice(0, 8);
+  const nums = [...new Set((blob.match(/\b\d+(?:\.\d+)?\b/g) || [])).values()].slice(0, 12);
+  const facts = [];
+  if (files.length) facts.push("files: " + files.join(", "));
+  if (urls.length) facts.push("urls: " + urls.join(", "));
+  if (nums.length) facts.push("numbers: " + nums.join(", "));
+  const digest = older.map((m) => {
+    const t = textOfMessage(m).replace(/\s+/g, " ").trim();
+    if (m.role === "tool" || (m.tool_calls && m.tool_calls.length))
+      return (m.role || "?") + ": " + t.slice(0, 800);
+    return (m.role || "?") + ": " + t.slice(0, 280);
+  }).join("\n").slice(0, 6000);
   const out = [];
   for (const m of msgs) {
     if (m && (m.role === "system" || m.role === "developer")) out.push(m);
   }
-  out.push({ role: "system", content: "COMPACTED PRIOR TURNS:\n" + digest });
-  return out.concat(keepTail);
+  const header = facts.length ? "PRESERVED:\n" + facts.join("\n") + "\n\n" : "";
+  out.push({ role: "system", content: header + "COMPACTED PRIOR TURNS:\n" + digest });
+  for (const m of msgs) {
+    if (keepSet.has(m)) out.push(m);
+  }
+  return out;
 }
 function applyAutoHarness(payload, decision) {
   const msgs = Array.isArray(payload && payload.messages) ? payload.messages.slice() : [];
   const horizon = decision && decision.horizon;
   const state = horizon ? renderHorizonState(horizon) : renderWorldState(buildWorldModel(payload), decision);
-  const window = Number(decision && decision.context) || Number(horizon && horizon.taskIR && 128000) || 128000;
+  const window = Number(decision && decision.context) || Number(horizon && horizon.context) || 128000;
+  const output = Number(decision && decision.output) || Number(horizon && horizon.output) || 0;
   const tight = !!(horizon && horizon.compact);
-  const budgetChars = Math.max(tight ? 4000 : 8000, Math.floor(window * (tight ? 0.35 : 0.55) * 4));
-  const compacted = compactMessages(msgs.filter((m) => !(m && m.role === "system" && /WORLD STATE:|TASKIR:/.test(String(m.content || "")))), budgetChars);
+  const usable = usableContextWindow(window, output, payload && payload.max_tokens);
+  const budgetChars = Math.max(tight ? 8000 : 16000, Math.floor((usable || window * 0.55) * (tight ? 0.55 : 0.75) * 4));
+  const compacted = compactMessages(msgs.filter((m) => !(m && m.role === "system" && /WORLD STATE:|TASKIR:|^ROLE: /.test(String(m.content || "")))), budgetChars);
   compacted.unshift({ role: "system", content: state });
   return { ...payload, messages: compacted };
 }
@@ -2196,18 +2251,17 @@ function hasImageContent(payload) {
   }
   return false;
 }
-// Capability gate from the models.dev catalog entry. Unknown models (no
-// entry) stay permissive so private gateways keep working; known models
-// must actually fit the request.
+// Capability gate from the models.dev catalog entry. Unknown models are
+// conservative on auto: no assumed vision/tools, and a 32k context ceiling.
+// Known models: only an explicit toolCall=false blocks tools.
 function entryCapabilities(entry) {
   if (!entry)
-    return { context: 0, vision: true, tools: true, unknown: true };
+    return { context: 0, output: 0, vision: false, tools: false, unknown: true };
   const ctx = Number(entry.limit && entry.limit.context) || 0;
+  const output = Number(entry.limit && entry.limit.output) || 0;
   const input = entry.modalities && Array.isArray(entry.modalities.input) ? entry.modalities.input : null;
-  const vision = input ? input.some((m) => String(m).toLowerCase() === "image") : true;
-  // models.dev omits tool_call for many providers: only an explicit false
-  // blocks tools, otherwise the model stays eligible (OpenAI-compatible).
-  return { context: ctx, vision, tools: entry.toolCall === false ? false : true, unknown: false };
+  const vision = input ? input.some((m) => String(m).toLowerCase() === "image") : false;
+  return { context: ctx, output, vision, tools: entry.toolCall === false ? false : true, unknown: false };
 }
 async function autoSettings(c) {
   const enabled = (await settingValue(c, "auto_enabled", "on")) !== "off";
@@ -2276,10 +2330,10 @@ async function pickAutoModel(c, payload) {
     if (Number.isFinite(mult) && mult > 0)
       q *= Math.min(3, mult);
     const caps = entryCapabilities(entry);
-    const ctxOk = !caps.context || reqTokens <= Math.floor(caps.context * 0.9);
+    const ctxOk = caps.unknown ? reqTokens < 32000 : (!caps.context || reqTokens <= Math.floor(caps.context * 0.9));
     const ctxTight = !!(caps.context && reqTokens > caps.context * 0.55);
-    const visionOk = reqImages === 0 || caps.vision;
-    const toolsOk = !hasTools || caps.tools;
+    const visionOk = reqImages === 0 || (!caps.unknown && caps.vision);
+    const toolsOk = !hasTools || caps.tools || caps.unknown;
     const capable = ctxOk && visionOk && toolsOk;
     // Provider circuits are keyed by provider name; the router works per slug.
     const provNames = String(r.providers || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -2304,7 +2358,7 @@ async function pickAutoModel(c, payload) {
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
   }
   const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
   const strongWork = workhorseEligible.filter((x) => !x.tiny);
@@ -2361,7 +2415,7 @@ async function pickAutoModel(c, payload) {
   });
   const slug = (horizon && horizon.slug) || picked.slug;
   const chosen = candidates.find((x) => x.slug === slug) || picked;
-  return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, horizon, queue: (horizon && horizon.queue) || [] };
+  return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [] };
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -4157,7 +4211,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
