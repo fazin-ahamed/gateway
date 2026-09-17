@@ -1,4 +1,4 @@
-// Programmatic CAPTCHA minting for chat.z.ai — EXPERIMENTAL, NOT WIRED IN.
+// Programmatic CAPTCHA minting for chat.z.ai — experimental minted transport support.
 //
 // Status (measured against live Aliyun + chat.z.ai):
 //   ✓ Aliyun InitCaptchaV3 works (standard RPC signing; the published
@@ -13,10 +13,9 @@
 //     tryCompute (verified by running their code), which means the gap is the
 //     device-token provenance, not this port.
 //
-// Because of that, no gateway code imports this module: the working automated
-// route is the browser transport (`zaiwebbrowser`). Keep this file as the
-// documented half of the work — if the token provenance is solved, minting is
-// a fast path with no browser per request.
+// The `zaiminted` transport imports this module dynamically. It remains
+// experimental because device-token provenance can still make Aliyun reject
+// otherwise correctly shaped proofs.
 //
 // Background: chat.z.ai gates completions behind an Aliyun "FeiLin" captcha.
 // The proof is a base64 blob carrying a security token, minted by
@@ -27,6 +26,7 @@
 
 import { createHmac, randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
+import { zaiWaf } from "./zai-waf.js";
 
 // The Aliyun captcha credentials are NOT shipped here. Any deployment that
 // wants to try minting must supply its own pair; see .env.example. The
@@ -179,6 +179,9 @@ function baseParams(action) {
   };
 }
 async function aliyun(url, params, fetchImpl) {
+  // Aliyun captcha RPCs share the same egress pacing lane as chat.z.ai POSTs.
+  // callZaiMinted checks the WAF breaker before consuming its single-use token.
+  await zaiWaf.pace();
   const res = await (fetchImpl || fetch)(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },

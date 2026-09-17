@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 // Node-native chat.z.ai session.
 //
@@ -399,12 +400,58 @@ export class ZaiSession {
 // mirrored to a JSON file so a restart does not re-bootstrap every guest.
 const sessions = new Map();
 let storePath = "";
+let storeSecret = "";
 let saveTimer = null;
 let storeCache = null;
 
 function defaultStorePath() {
   const db = process.env.DB_PATH || "./data/gateway.db";
   return join(dirname(db), "zai-sessions.json");
+}
+
+function storeEncryptionKey() {
+  if (!storeSecret)
+    return null;
+  return createHash("sha256").update("zai-session-store-v1\0", "utf8").update(storeSecret, "utf8").digest();
+}
+
+function encodeStore(rows) {
+  const key = storeEncryptionKey();
+  if (!key)
+    throw new Error("Z.AI session persistence key is not configured");
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const plaintext = Buffer.from(JSON.stringify(rows), "utf8");
+  const data = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return JSON.stringify({
+    v: 1,
+    alg: "aes-256-gcm",
+    iv: iv.toString("base64url"),
+    tag: tag.toString("base64url"),
+    data: data.toString("base64url")
+  });
+}
+
+function decodeStore(raw) {
+  const parsed = JSON.parse(String(raw || "{}"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    return {};
+  if (parsed.v !== 1 || parsed.alg !== "aes-256-gcm")
+    return parsed; // legacy plaintext store; next successful save migrates it
+  const key = storeEncryptionKey();
+  if (!key)
+    throw new Error("encrypted Z.AI session store cannot be opened without a key");
+  const iv = Buffer.from(String(parsed.iv || ""), "base64url");
+  const tag = Buffer.from(String(parsed.tag || ""), "base64url");
+  const data = Buffer.from(String(parsed.data || ""), "base64url");
+  if (iv.length !== 12 || tag.length !== 16 || !data.length)
+    throw new Error("invalid Z.AI session store envelope");
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+  const rows = JSON.parse(plain);
+  return rows && typeof rows === "object" && !Array.isArray(rows) ? rows : {};
 }
 
 function loadStore() {
@@ -415,15 +462,17 @@ function loadStore() {
     return storeCache;
   }
   try {
-    storeCache = JSON.parse(readFileSync(storePath, "utf8")) || {};
+    storeCache = decodeStore(readFileSync(storePath, "utf8")) || {};
   } catch {
+    // Wrong/missing keys and corrupt files fail closed: do not expose or
+    // overwrite secrets until a fresh session is established.
     storeCache = {};
   }
   return storeCache;
 }
 
 function scheduleSave() {
-  if (!storePath)
+  if (!storePath || !storeSecret)
     return;
   if (saveTimer)
     return;
@@ -434,22 +483,34 @@ function scheduleSave() {
 }
 
 export function persistNow() {
-  if (!storePath)
+  if (!storePath || !storeSecret)
     return;
   const rows = {};
   for (const [id, session] of sessions)
     if (session.token || session.jar.cookies.size)
       rows[id] = session.persistRow();
-  storeCache = rows;
+  let tmp = "";
   try {
     mkdirSync(dirname(storePath), { recursive: true });
-    writeFileSync(storePath, JSON.stringify(rows), { mode: 0o600 });
+    const body = encodeStore(rows);
+    tmp = storePath + ".tmp-" + process.pid + "-" + randomBytes(6).toString("hex");
+    writeFileSync(tmp, body, { mode: 0o600, flag: "w" });
+    renameSync(tmp, storePath);
+    storeCache = rows;
   } catch {
+    if (tmp) {
+      try { rmSync(tmp, { force: true }); } catch {}
+    }
   }
 }
 
-export function configureSessionStore(path) {
+export function configureSessionStore(path, secret = "") {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
   storePath = path || "";
+  storeSecret = String(secret || "");
   storeCache = null;
 }
 
@@ -458,8 +519,10 @@ export function sessionFor({ fetcher, credential = "", key } = {}) {
   const existing = sessions.get(id);
   if (existing) {
     existing.fetcher = fetcher || existing.fetcher;
-    if (credential && credential !== existing.credential)
+    if (credential && credential !== existing.credential) {
       existing.credential = credential;
+      existing.invalidate("credential changed");
+    }
     return existing;
   }
   const session = new ZaiSession({ fetcher, credential, key: id });
@@ -486,4 +549,4 @@ function simpleHash(value) {
   return h.toString(16);
 }
 
-export const __sessionTest = { sessions, simpleHash, ZAI_BASE, defaultStorePath, loadStore };
+export const __sessionTest = { sessions, simpleHash, ZAI_BASE, defaultStorePath, loadStore, encodeStore, decodeStore };

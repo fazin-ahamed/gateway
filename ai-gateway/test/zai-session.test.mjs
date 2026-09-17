@@ -19,7 +19,7 @@ import {
   resetRegistries
 } from "../src/zai-models.js";
 import { __zaiTest, callZaiWeb } from "../src/zaiweb.js";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -248,15 +248,16 @@ test("registry falls back when the live call fails", async () => {
 
 test("a WAF/edge block is classified apart from a provider error", () => {
   assert.equal(__zaiTest.isWafChallenge(403, "<html><body>Aliyun WAF</body></html>"), true);
-  assert.equal(__zaiTest.isWafChallenge(503, '{"error":{"code":"F001"}}'), true);
+  assert.equal(__zaiTest.isWafChallenge(503, '{"error":{"code":"F001"}}'), false, "captcha proof failure is not evidence of an IP-wide WAF block");
   assert.equal(__zaiTest.isWafChallenge(500, '{"error":{"message":"model overloaded"}}'), false);
   assert.equal(__zaiTest.isWafChallenge(502, "upstream timeout"), false);
 });
 
-test("a session survives a process restart via the JSON store", async () => {
+test("a session survives a process restart via the encrypted store without plaintext secrets", async () => {
   const dir = mkdtempSync(join(tmpdir(), "zai-store-"));
   const path = join(dir, "zai-sessions.json");
-  configureSessionStore(path);
+  const secret = "unit-test-session-store-key";
+  configureSessionStore(path, secret);
   resetSessions();
   const token = jwt({ id: "persist-1" });
   const fetcher = async (url) => {
@@ -270,14 +271,48 @@ test("a session survives a process restart via the JSON store", async () => {
   const first = sessionFor({ fetcher, credential: token, key: "persist-key" });
   await first.acquire();
   persistNow();
-  const saved = JSON.parse(readFileSync(path, "utf8"));
-  assert.equal(saved["persist-key"].token, token);
-  assert.equal(saved["persist-key"].cookies.edge, "keep");
+
+  const raw = readFileSync(path, "utf8");
+  assert.equal(raw.includes(token), false, "JWT must not be stored in plaintext");
+  assert.equal(raw.includes("edge=keep"), false, "cookie value must not be stored in plaintext");
+  const envelope = JSON.parse(raw);
+  assert.equal(envelope.v, 1);
+  assert.equal(envelope.alg, "aes-256-gcm");
+  assert.equal(typeof envelope.iv, "string");
+  assert.equal(typeof envelope.tag, "string");
+  assert.equal(typeof envelope.data, "string");
+
   resetSessions();
+  configureSessionStore(path, secret);
   const second = sessionFor({ fetcher: async () => { throw new Error("must not hit network"); }, credential: token, key: "persist-key" });
   assert.equal(second.state, "VALID");
   assert.equal(second.token, token);
   assert.equal(second.jar.get("edge"), "keep");
+  configureSessionStore("");
+  resetSessions();
+});
+
+test("encrypted session store still reads the legacy plaintext format for migration", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zai-store-legacy-"));
+  const path = join(dir, "zai-sessions.json");
+  const token = jwt({ id: "legacy-1" });
+  writeFileSync(path, JSON.stringify({
+    "legacy-key": {
+      token,
+      userId: "legacy-1",
+      feVersion: "prod-fe-legacy",
+      source: "account",
+      cookies: { edge: "legacy-cookie" },
+      lastValidated: Date.now(),
+      generation: 2
+    }
+  }), { mode: 0o600 });
+  configureSessionStore(path, "new-encryption-key");
+  resetSessions();
+  const restored = sessionFor({ fetcher: async () => { throw new Error("must not hit network"); }, credential: token, key: "legacy-key" });
+  assert.equal(restored.state, "VALID");
+  assert.equal(restored.token, token);
+  assert.equal(restored.jar.get("edge"), "legacy-cookie");
   configureSessionStore("");
   resetSessions();
 });

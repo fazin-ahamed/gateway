@@ -26,6 +26,7 @@ export function guardOpenAiSse(source, modelHint = "") {
   let buffer = "";
   let sawToolCalls = false;
   let terminalSeen = false;
+  let sourceErrored = false;
   let model = modelHint;
 
   return new ReadableStream({
@@ -39,7 +40,7 @@ export function guardOpenAiSse(source, modelHint = "") {
         }
         const payload = line.slice(5).trim();
         if (payload === "[DONE]") {
-          if (sawToolCalls && !terminalSeen) {
+          if (sawToolCalls && !terminalSeen && !sourceErrored) {
             emit("data: " + JSON.stringify(terminalChunk(model, "tool_calls")) + "\n\n");
             terminalSeen = true;
           }
@@ -54,6 +55,7 @@ export function guardOpenAiSse(source, modelHint = "") {
           return;
         }
         if (obj && typeof obj.model === "string" && obj.model) model = obj.model;
+        if (obj && obj.error) sourceErrored = true;
         const choice = obj && Array.isArray(obj.choices) ? obj.choices[0] : null;
         const delta = choice && choice.delta;
         if (delta && Array.isArray(delta.tool_calls) && delta.tool_calls.length) sawToolCalls = true;
@@ -85,7 +87,7 @@ export function guardOpenAiSse(source, modelHint = "") {
         try {
           emit("data: " + JSON.stringify({
             error: {
-              message: "Upstream stream disconnected: " + String(err && err.message || err).slice(0, 240),
+              message: "Upstream stream disconnected",
               type: "upstream_stream_error",
               code: "upstream_socket_closed",
               retryable: true

@@ -7,9 +7,9 @@ import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 var app = new Hono();
 app.use("/*", async (c, next) => {
-  c.header("X-Content-Type-Options");
+  c.header("X-Content-Type-Options", "nosniff");
   c.header("Referrer-Policy", "no-referrer");
-  c.header("X-Frame-Options");
+  c.header("X-Frame-Options", "DENY");
   await next();
 });
 app.use("/v1/*", cors({
@@ -62,7 +62,9 @@ function isCacheableRequest(payload, isStream, mode) {
     return false;
   if (!payload)
     return false;
-  if (mode !== "loose" && payload.temperature != null && Number(payload.temperature) !== 0)
+  // Never assume an omitted provider default is deterministic. Normal cache mode
+  // requires an explicit temperature: 0; loose mode remains an operator opt-in.
+  if (mode !== "loose" && (payload.temperature == null || Number(payload.temperature) !== 0))
     return false;
   if (hasImageContent(payload))
     return false;
@@ -150,9 +152,9 @@ async function serveCachedCompletion(c, { cached, key, slug, payload, started, s
 async function responseCacheKey(key, slug, payload) {
   const p = payload || {};
   const trimmed = {
-    v: 3,
+    v: 4,
     messages: p.messages ?? p.input ?? [],
-    temperature: p.temperature ?? 0,
+    temperature: p.temperature ?? null,
     max_tokens: p.max_tokens ?? null,
     top_p: p.top_p ?? null,
     stop: p.stop ?? null,
@@ -170,7 +172,7 @@ async function responseCacheKey(key, slug, payload) {
     parallel_tool_calls: p.parallel_tool_calls ?? null,
     modalities: p.modalities ?? null
   };
-  return "rc:c3:" + await sha256hex(String(key.key_id) + "\n" + String(slug) + "\n" + stableJson(trimmed));
+  return "rc:c4:" + await sha256hex(String(key.key_id) + "\n" + String(slug) + "\n" + stableJson(trimmed));
 }
 function isCacheableResponse(text) {
   try {
@@ -473,14 +475,21 @@ async function providerKeys(c, providerId) {
 function orderKeys(keys, strategy, providerId) {
   if (!keys.length)
     return [];
-  if (strategy === "random")
-    return [keys[Math.floor(Math.random() * keys.length)]];
+  if (strategy === "random") {
+    const out = keys.slice();
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out;
+  }
   if (strategy === "round_robin") {
     const n = rrCounters.get(providerId) || 0;
     rrCounters.set(providerId, n + 1);
-    return [keys[n % keys.length]];
+    const start = n % keys.length;
+    return keys.slice(start).concat(keys.slice(0, start));
   }
-  return keys; // failover: all keys in order
+  return keys.slice(); // failover: all keys in configured order
 }
 // Rewrites one provider secret in place. Used when an upstream hands back a
 // rotated session credential (chat.z.ai) so the stored key never goes stale.
@@ -569,11 +578,16 @@ app.get("/v1/models", async (c) => {
   // providers are all disabled or all marked down would 503 on use, which is
   // exactly the "client picked a model that fails" trap.
   const routes = await c.env.DB.prepare(
-    "SELECT DISTINCT mr.slug FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug"
+    "SELECT mr.id AS route_id, mr.slug FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
   ).bind(...allowed).all();
+  const liveSlugs = new Set();
+  for (const r of routes.results || []) {
+    if (!circuitOpen("route:" + String(r.route_id)))
+      liveSlugs.add(r.slug);
+  }
   const data = [{ id: AUTO_SLUG, object: "model", created: 0, owned_by: "gateway" }];
-  for (const r of routes.results || [])
-    data.push({ id: r.slug, object: "model", created: 0, owned_by: "gateway" });
+  for (const slug of [...liveSlugs].sort())
+    data.push({ id: slug, object: "model", created: 0, owned_by: "gateway" });
   return c.json({ object: "list", data });
 });
 app.get("/status", async (c) => {
@@ -610,8 +624,8 @@ app.get("/status", async (c) => {
     } else {
       try {
         const r = await fetch(p.base_url + "/models", {
-          headers: { Authorization: "Bearer " + key }
-          // short timeout so status isn't slow
+          headers: { Authorization: "Bearer " + key },
+          signal: AbortSignal.timeout(5000)
         });
         code = r.status;
         ok = r.ok;
@@ -755,12 +769,14 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   try {
     let lastErr = null;
     let lastErrStatus = null;
+    let lastRetryAfter = null;
     let attempts = 0;
     for (const route of routes.results) {
       const liveSlug = route.public_slug || slug;
       if (payload.model !== liveSlug)
         payload = { ...payload, model: liveSlug };
-      if (circuitOpen(route.provider_name)) {
+      const routeCircuit = circuitKey(route);
+      if (circuitOpen(routeCircuit)) {
         blog("ROUTE skip provider=" + route.provider_name + " circuit-open");
         traj.steps.push({ provider: route.provider_name, rank: route.rank, error: "circuit open", ms: 0, slug: liveSlug });
         lastErr = "provider " + route.provider_name + " circuit open (recent failures)";
@@ -784,7 +800,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         continue;
       }
       const orderedKeys = orderKeys(allKeys, strategy, route.provider_id);
-      for (const k of orderedKeys) {
+      keyLoop: for (const k of orderedKeys) {
         // One extra in-place attempt for pre-header transport failures; after
         // that we move to the next credential, then the next route/slug.
         for (let transportAttempt = 0; transportAttempt < 2; transportAttempt++) {
@@ -800,11 +816,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const txt = await up.text();
             const why = classifyUpstreamFailure(txt);
             blog("FWD FAIL " + route.provider_name + " key=" + k.label + " -> HTTP " + up.status + " [" + why + "] " + String(txt).slice(0, 300));
-            circuitRecord(route.provider_name, false);
+            circuitRecordFailure(routeCircuit, { status: up.status, kind: why });
             lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + why + "]";
             attempts++;
             if (why === "auth" && orderedKeys.indexOf(k) < orderedKeys.length - 1)
-              continue; // next key on this provider
+              continue keyLoop; // next key on this provider
             break; // next route
           }
           if (!isStream) {
@@ -842,12 +858,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             if (cacheKey)
               hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
             blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
-            circuitRecord(route.provider_name, true);
+            circuitRecord(routeCircuit, true);
             traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart });
             await recordTrajectory(c, { ...traj, slug: liveSlug, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
             return new Response(clientTxt, { status: up.status, headers: hdrs });
           }
-          circuitRecord(route.provider_name, true);
+          circuitRecord(routeCircuit, true);
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
           const horizonHdrs = { "x-gateway-model": liveSlug };
@@ -856,27 +872,27 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs });
           return result;
         } catch (e) {
-          // Zai-web failures carry an actionable status and code (missing
-          // session, stale captcha, unsupported tools). Return them as-is —
-          // collapsing them into a 503 "no healthy route" would hide the fix.
-          // Client-side (4xx) faults skip the circuit breaker: the provider is
-          // healthy, the request was not.
+          // Adapter diagnostics stay internal. Only gateway-owned, provider-neutral
+          // errors may cross the public API boundary.
           if (e instanceof ZaiWebError) {
-            if (e.status >= 500)
-              circuitRecord(route.provider_name, false);
-            const safeMessage = sanitizeUpstreamResponse(e.message);
+            circuitRecordFailure(routeCircuit, { status: e.status, kind: e.code });
+            if (Number(e.retryAfterSec) > 0)
+              lastRetryAfter = Math.max(Number(lastRetryAfter) || 0, Math.ceil(Number(e.retryAfterSec)));
             blog("FWD ZAI " + route.provider_name + " -> " + e.status + " " + e.code + " " + e.message);
             traj.steps.push({ ...baseStep, error: e.code, key: k.label, http: e.status, ms: Date.now() - stepStart });
-            if (e.status < 500) {
-              await recordTrajectory(c, { ...traj, status: "fail", httpStatus: e.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
-              return c.json({ error: { message: safeMessage, type: "upstream_error", code: e.code } }, e.status, { "x-gateway-attempts": String(attempts + 1) });
+            if (isPublicRequestProviderError(e)) {
+              const pub = publicProviderError(e);
+              await recordTrajectory(c, { ...traj, status: "fail", httpStatus: pub.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
+              return c.json({ error: pub.error }, pub.status, { "x-gateway-attempts": String(attempts + 1) });
             }
-            lastErr = "provider " + route.provider_name + " -> " + e.code;
-            lastErrStatus = e.status;
             attempts++;
+            lastErr = "provider " + route.provider_name + " -> " + e.code;
+            lastErrStatus = e.status === 504 ? 504 : 503;
+            if (/auth|credential|session/i.test(String(e.code || "")) && orderedKeys.indexOf(k) < orderedKeys.length - 1)
+              continue keyLoop;
             break;
           }
-          circuitRecord(route.provider_name, false);
+          circuitRecord(routeCircuit, false);
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
           lastErr = "provider " + route.provider_name + " -> " + String(e.message || e) + " [" + transportLabel(routeTransport(route, c.env)) + "]";
           if (e && e.status)
@@ -897,7 +913,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     const errBody = lastErrStatus === 504
       ? { error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } }
       : genericUpstreamError();
-    return c.json(errBody, finalStatus, { "x-gateway-attempts": String(attempts || routes.results.length) });
+    const finalHeaders = { "x-gateway-attempts": String(attempts || routes.results.length) };
+    if (Number(lastRetryAfter) > 0) finalHeaders["retry-after"] = String(lastRetryAfter);
+    return c.json(errBody, finalStatus, finalHeaders);
   } finally {
     await releaseResponseCacheLease(c, cacheKey, cacheLeaseId);
   }
@@ -1961,6 +1979,13 @@ function matchModelsDevPrice(byId, slug) {
 // Circuit-breaker: three provider failures within a minute opens the
 // circuit for 60s; the auto router and route loop skip open providers.
 var circuitState = new Map();
+function circuitKey(route) {
+  if (route && route.id != null)
+    return "route:" + String(route.id);
+  const providerId = route && route.provider_id != null ? String(route.provider_id) : "unknown";
+  const model = route && route.upstream_model ? String(route.upstream_model) : "unknown";
+  return "route:" + providerId + ":" + model;
+}
 function circuitOpen(providerName) {
   const s = circuitState.get(providerName);
   return !!(s && s.openUntil && Date.now() < s.openUntil);
@@ -1970,15 +1995,35 @@ function circuitRecord(providerName, ok) {
   const s = circuitState.get(providerName) || { fails: 0, firstFail: 0, openUntil: 0 };
   if (ok) {
     s.fails = 0;
+    s.firstFail = 0;
     s.openUntil = 0;
   } else {
-    if (now - s.firstFail > 60000)
+    // A new rolling window must not inherit failures from an expired one.
+    if (!s.firstFail || now - s.firstFail > 60000) {
       s.firstFail = now;
+      s.fails = 0;
+    }
     s.fails++;
     if (s.fails >= 3)
       s.openUntil = now + 60000;
   }
   circuitState.set(providerName, s);
+}
+function circuitRecordFailure(providerName, failure = {}) {
+  const status = Number(failure.status) || 0;
+  const kind = String(failure.kind || "unknown");
+  // Client/request, credential, quota and model-route failures are not proof
+  // that the provider itself is unhealthy. Keep them out of the provider breaker.
+  if (["auth", "rate_limit", "model", "tool_schema", "request_size"].includes(kind))
+    return;
+  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|transport|unsupported)/i.test(kind))
+    return;
+  if (status >= 400 && status < 500 && status !== 408)
+    return;
+  circuitRecord(providerName, false);
+}
+function __resetCircuitState() {
+  circuitState.clear();
 }
 var AUTO_SLUG = "auto";
 var routerHealthCache = { at: 0, rows: [] };
@@ -2337,7 +2382,7 @@ async function pickAutoModel(c, payload, key) {
   const routes = await c.env.DB.prepare(
     `SELECT mr.slug,
             COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1 AND p2.enabled=1),0) AS healthy,
-            (SELECT GROUP_CONCAT(p3.name) FROM model_routes mr3 JOIN providers p3 ON p3.id=mr3.provider_id WHERE mr3.slug=mr.slug AND mr3.enabled=1 AND p3.enabled=1) AS providers
+            (SELECT GROUP_CONCAT(mr3.id) FROM model_routes mr3 JOIN providers p3 ON p3.id=mr3.provider_id WHERE mr3.slug=mr.slug AND mr3.enabled=1 AND p3.enabled=1 AND p3.healthy=1) AS route_ids
      FROM model_routes mr WHERE mr.enabled=1 GROUP BY mr.slug`
   ).all();
   let enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1 && !cfg.excluded.includes(r.slug));
@@ -2390,20 +2435,22 @@ async function pickAutoModel(c, payload, key) {
     const visionOk = reqImages === 0 || (!caps.unknown && caps.vision);
     const toolsOk = !hasTools || caps.tools || caps.unknown;
     const capable = ctxOk && visionOk && toolsOk;
-    // Provider circuits are keyed by provider name; the router works per slug.
-    const provNames = String(r.providers || "").split(",").map((s) => s.trim()).filter(Boolean);
+    // Runtime health is route-scoped: one model route cannot poison siblings
+    // that happen to share the same provider.
+    const routeIds = String(r.route_ids || "").split(",").map((s) => s.trim()).filter(Boolean);
     let openCount = 0;
     let wob = 0;
-    for (const name of provNames) {
-      if (circuitOpen(name))
+    for (const id of routeIds) {
+      const key = "route:" + id;
+      if (circuitOpen(key))
         openCount++;
       else {
-        const cs = circuitState.get(name);
+        const cs = circuitState.get(key);
         if (cs && cs.fails > 0)
           wob = Math.max(wob, cs.fails >= 2 ? 1.2 : 0.5);
       }
     }
-    const allOpen = provNames.length > 0 && openCount >= provNames.length;
+    const allOpen = routeIds.length > 0 && openCount >= routeIds.length;
     const h = healthBySlug.get(r.slug);
     const okRate = h ? Number(h.ok_rate) : 1;
     // Eligible if capable and not a known-bad integrity slug. Quality floor
@@ -2631,6 +2678,23 @@ function sanitizeUpstreamResponse(text) {
 }
 function genericUpstreamError() {
   return { error: { message: "The selected model is currently experiencing an outage. Please retry later.", type: "upstream_error" } };
+}
+function publicProviderError(err) {
+  const code = String(err && err.code || "");
+  if (code === "zai_tools_unsupported") {
+    return { status: 400, error: { message: "Tools are not supported by the selected model.", type: "invalid_request_error", code: "unsupported_tools" } };
+  }
+  if (code === "zai_vision_unsupported") {
+    return { status: 400, error: { message: "Image input is not supported by the selected model.", type: "invalid_request_error", code: "unsupported_image_input" } };
+  }
+  if (Number(err && err.status) === 504) {
+    return { status: 504, error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } };
+  }
+  return { status: 503, error: genericUpstreamError().error };
+}
+function isPublicRequestProviderError(err) {
+  const code = String(err && err.code || "");
+  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported";
 }
 function isGenericUpstreamErrorResponse(text) {
   try {
@@ -4273,7 +4337,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, shouldRetrySameKey };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, publicProviderError, shouldRetrySameKey, circuitKey, circuitOpen, circuitRecord, circuitRecordFailure, __resetCircuitState, orderKeys };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

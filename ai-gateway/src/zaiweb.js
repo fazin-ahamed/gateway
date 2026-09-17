@@ -10,6 +10,8 @@
 
 import { sessionFor } from "./zai-session.js";
 import { registryFor } from "./zai-models.js";
+import { createZaiFrameNormalizer } from "./zai-stream.js";
+import { isZaiWafBlock, zaiWaf, ZaiWafBlockedError } from "./zai-waf.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
@@ -426,72 +428,53 @@ function buildCompletionBody(input) {
   };
 }
 
-// One parsed delta from chat.z.ai: text and/or reasoning, plus terminal flags.
-function parseFrame(raw) {
-  if (!raw || typeof raw !== "object")
-    return null;
-  const frame = raw;
-  const data = frame.data && typeof frame.data === "object" ? frame.data : frame;
-  const rawError = frame.error ?? data.error;
-  if (rawError) {
-    const message = typeof rawError === "string" ? rawError : rawError.message || rawError.detail || rawError.msg || JSON.stringify(rawError);
-    return { content: "", reasoning: "", done: true, error: String(message).slice(0, 500) };
-  }
-  const choices = Array.isArray(frame.choices) ? frame.choices : null;
-  if (choices && choices.length) {
-    const delta = choices[0].delta || {};
-    return {
-      content: typeof delta.content === "string" ? delta.content : "",
-      reasoning: typeof delta.reasoning_content === "string" ? delta.reasoning_content : "",
-      done: choices[0].finish_reason != null
-    };
-  }
-  const phase = String(data.phase || "");
-  const deltaContent = data.delta_content ?? data.edit_content ?? data.content;
-  const done = data.done === true || phase === "done" || phase === "finish" || String(frame.type || "") === "chat:completion:finish";
-  if (typeof deltaContent === "string" && deltaContent)
-    return { content: phase === "thinking" ? "" : deltaContent, reasoning: phase === "thinking" ? deltaContent : "", done };
-  if (done)
-    return { content: "", reasoning: "", done: true };
-  return null;
-}
-
-// ch.at.z.ai streams SSE in the same frames whether or not the client asked
-// for streaming, so both response modes read through this reader.
-async function readDeltas(source, onDelta) {
+// chat.z.ai streams SSE in the same frames whether or not the client asked
+// for streaming. The normalizer maintains the authoritative snapshot so
+// edit_content rewrites never get mistaken for append-only deltas.
+async function readDeltas(source, onDelta, options = {}) {
   const reader = source.getReader();
   const decoder = new TextDecoder();
+  const normalizer = createZaiFrameNormalizer(options);
   let buffer = "";
+  let stopped = false;
+  const emit = (events) => {
+    for (const event of events) {
+      if (onDelta(event)) {
+        stopped = true;
+        return true;
+      }
+    }
+    return false;
+  };
   try {
-    for (; ;) {
+    for (; !stopped ;) {
       const { done, value } = await reader.read();
-      if (done)
-        break;
+      if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
-        if (!line.startsWith("data:"))
-          continue;
+        if (!line.startsWith("data:")) continue;
         const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]")
-          continue;
-        let frame = null;
+        if (!payload) continue;
+        if (payload === "[DONE]") {
+          emit(normalizer.finish());
+          stopped = true;
+          break;
+        }
+        let frame;
         try {
           frame = JSON.parse(payload);
         } catch {
           continue;
         }
-        const delta = parseFrame(frame);
-        if (delta && onDelta(delta))
-          return;
+        if (emit(normalizer.push(frame))) break;
       }
     }
+    if (!stopped)
+      emit(normalizer.finish());
   } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-    }
+    try { reader.releaseLock(); } catch {}
   }
 }
 
@@ -525,13 +508,17 @@ function toOpenAiStream(source, model, id) {
       try {
         await readDeltas(source, (delta) => {
           if (delta.error) {
-            send({ error: { message: "Z.ai stream failed: " + delta.error, type: "upstream_error", code: "zai_stream_error" } });
-            finish();
+            // Provider-originated stream details stay in internal logs only.
+            // Public SSE exposes a gateway-owned, provider-neutral failure and
+            // never follows it with a successful finish_reason.
+            finished = true;
+            send({ error: { message: "Upstream stream failed", type: "upstream_stream_error", code: "upstream_stream_error", retryable: true } });
+            controller.enqueue(enc.encode("data: [DONE]\n\n"));
             return true;
           }
           if (!started && (delta.content || delta.reasoning)) {
             started = true;
-            send(chunk(id, created, model, { role: "assistant", content: "" }));
+            send(chunk(id, created, model, { role: "assistant" }));
           }
           if (delta.reasoning)
             send(chunk(id, created, model, { reasoning_content: delta.reasoning }));
@@ -547,7 +534,7 @@ function toOpenAiStream(source, model, id) {
         });
         if (!finished) {
           if (!started)
-            send(chunk(id, created, model, { role: "assistant", content: "" }));
+            send(chunk(id, created, model, { role: "assistant" }));
           finish();
         }
         controller.close();
@@ -591,6 +578,30 @@ export class ZaiWebError extends Error {
     this.name = "ZaiWebError";
     this.status = status;
     this.code = code || "zai_error";
+    this.retryAfterSec = 0;
+  }
+}
+
+function asWafError(err) {
+  if (!(err instanceof ZaiWafBlockedError)) return err;
+  const out = new ZaiWebError(503, "The Z.AI edge is temporarily blocked for this gateway egress. Retry later.", "zai_waf");
+  out.retryAfterSec = err.retryAfterSec;
+  return out;
+}
+
+async function awaitWafSlot() {
+  try {
+    await zaiWaf.beforeRequest();
+  } catch (err) {
+    throw asWafError(err);
+  }
+}
+
+function assertWafAvailable() {
+  try {
+    zaiWaf.assertAvailable();
+  } catch (err) {
+    throw asWafError(err);
   }
 }
 
@@ -713,6 +724,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   const userMessageId = crypto.randomUUID();
 
   // 1. Create the remote chat the completion is attached to.
+  await awaitWafSlot();
   let created;
   try {
     created = await fetcher(ZAI_NEW_CHAT_URL, {
@@ -748,6 +760,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   //    once and replay, rather than surfacing an auth error the operator
   //    cannot act on.
   const postCompletion = async (useToken, useUserId) => {
+    await awaitWafSlot();
     const timestamp = Date.now();
     const requestId = crypto.randomUUID();
     const signature = await buildSignature({ prompt, requestId, timestamp, userId: useUserId });
@@ -797,6 +810,9 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
       return viaBrowser;
     throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
   }
+  // A healthy completion POST is the strongest evidence that the egress IP is
+  // no longer blocked. Reset any stale WAF backoff only here (not on GETs).
+  zaiWaf.recordSuccess();
 
   const id = "chatcmpl-zai-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) + images * IMAGE_TOKEN_ALLOWANCE;
@@ -806,7 +822,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   // The remote chat is single-use; once the stream drains, delete it so the
   // account doesn't accumulate dead conversations.
   const cleanup = () => {
-    if (!chatId) return Promise.resolve();
+    if (!chatId || zaiWaf.status().blocked) return Promise.resolve();
     return fetcher(ZAI_DELETE_CHAT_URL(chatId), {
       method: "DELETE",
       headers: session.headers({ Accept: "application/json" })
@@ -836,19 +852,21 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   return shaped;
 }
 export function isWafChallenge(status, body) {
-  const text = String(body || "").toLowerCase();
-  if (/aliyun|waf|challenge|captcha|security|f001|verify/.test(text))
-    return true;
-  return (status === 403 || status === 405) && /<html|<!doctype/i.test(text);
+  return isZaiWafBlock(status, body);
 }
 async function fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, status, text) {
   if (!isWafChallenge(status, text))
     return null;
   const browserRaw = (session && session.token) ? JSON.stringify({ token: session.token }) : rawKey;
   try {
-    return await callZaiBrowser(c, route, browserRaw, payload, isStream);
+    const result = await callZaiBrowser(c, route, browserRaw, payload, isStream);
+    zaiWaf.recordSuccess();
+    return result;
   } catch (e) {
-    throw new ZaiWebError(status || 403, "Z.ai rejected the signed request at the edge (challenge/WAF). Browser fallback failed: " + String(e && e.message || e).slice(0, 180), "zai_waf");
+    const state = zaiWaf.recordBlock("signed+browser");
+    const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge after browser fallback.", "zai_waf");
+    err.retryAfterSec = state.retryAfterSec;
+    throw err;
   }
 }
 
@@ -876,7 +894,7 @@ async function shapeFrameResponse(input) {
     if (delta.content)
       content += delta.content;
     return delta.done;
-  });
+  }, { holdback: Number.MAX_SAFE_INTEGER });
   if (failure)
     throw new ZaiWebError(502, "Z.ai stream failed: " + failure, "zai_stream_error");
   const message = { role: "assistant", content };
@@ -953,6 +971,8 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
 
   const { takeDeviceToken } = await import("./zai-tokens.js");
   const { mintCaptcha } = await import("./zai-captcha.js");
+  // Fail before consuming a single-use device token when the egress breaker is open.
+  assertWafAvailable();
   const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
 
   const thinking = resolveThinking(modelId, payload);
@@ -961,6 +981,7 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   const userMessageId = crypto.randomUUID();
 
   // 1. Create the chat.
+  await awaitWafSlot();
   let created;
   try {
     created = await fetcher(ZAI_NEW_CHAT_URL, {
@@ -1015,6 +1036,7 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
   let up;
   try {
+    await awaitWafSlot();
     up = await fetcher(completionUrl, {
       method: "POST",
       headers: buildHeaders(token, { accept: "text/event-stream", frontendVersion, signature }),
@@ -1036,8 +1058,17 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   } catch (e) {
     throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
   }
-  if (!up.ok || !up.body)
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + String(await up.text().catch(() => "")).slice(0, 300), "zai_completion");
+  if (!up.ok || !up.body) {
+    const text = String(await up.text().catch(() => "")).slice(0, 300);
+    if (isZaiWafBlock(up.status, text)) {
+      const state = zaiWaf.recordBlock("minted-completion");
+      const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge.", "zai_waf");
+      err.retryAfterSec = state.retryAfterSec;
+      throw err;
+    }
+    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
+  }
+  zaiWaf.recordSuccess();
 
   const id = "chatcmpl-zaim-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
@@ -1100,6 +1131,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   if (entry && entry.available === false)
     throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
 
+  assertWafAvailable();
   const { runBrowserTurn, ZaiBrowserUnavailable } = c && c.zaiRunBrowserTurn
     ? { runBrowserTurn: c.zaiRunBrowserTurn, ZaiBrowserUnavailable: class extends Error {} }
     : await import("./zaibrowser.js");
@@ -1112,6 +1144,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
     throw new ZaiWebError(502, "Z.AI browser transport failed: " + String(e && e.message || e).slice(0, 300), "zai_browser");
   }
 
+  zaiWaf.recordSuccess();
   const id = "chatcmpl-zaib-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
   // The frame converter reads a stream; wrap the captured response text.
@@ -1190,7 +1223,6 @@ export const __zaiTest = {
   getModelCapabilities,
   modelCatalogEntry,
   isZaiModel,
-  parseFrame,
   toOpenAiStream,
   estimatePromptTokens,
   parseCredential,
@@ -1198,3 +1230,5 @@ export const __zaiTest = {
   isWafChallenge,
   wrapUtlsFetcher
 };
+
+export const __test = { toOpenAiStream };

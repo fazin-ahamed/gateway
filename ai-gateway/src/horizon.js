@@ -194,6 +194,7 @@ export function generateActions(candidates, taskIR, world) {
       tiny: isTinySlug(cand.slug) || !!cand.tiny,
       workhorse: !!cand.workhorse,
       capable: cand.capable !== false,
+      cost: Number(cand.cost) || 0,
       context: Number(cand.context) || 0,
       output: Number(cand.output) || 0
     });
