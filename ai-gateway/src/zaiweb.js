@@ -821,35 +821,38 @@ export function wrapUtlsFetcher(fetcher) {
     });
   };
 }
-// JSON body, matching the { response, usage } contract of forwardToProvider.
-export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl) {
-  const fetcher = wrapUtlsFetcher(fetchImpl || c.upstreamFetch);
+// Pure-HTTP Z.AI engine, based on GLM-Free-API's proven serving flow.
+//
+// Crucial invariants:
+// - chat ids are client-generated UUIDs; no /api/v1/chats/new round-trip;
+// - CAPTCHA is minted immediately before the one completion POST;
+// - the HTTP wire uses the public model id (glm-5.3-flash), not the browser
+//   selector alias x-preview-l;
+// - request body stays minimal and matches the official web completion shape;
+// - every referenced chat is deleted after the response drains.
+async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options = {}) {
+  const baseFetcher = options.fetchImpl || (c && c.upstreamFetch) || globalThis.fetch;
+  const fetcher = wrapUtlsFetcher(baseFetcher);
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
-  const caps = getModelCapabilities(modelId);
-  if (!caps)
-    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  const images = countImages(payload.messages);
-  if (images)
-    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
+  const staticCaps = getModelCapabilities(modelId);
 
-  const { token: credentialToken, captcha } = parseCredential(rawKey, payload, c && c.req && typeof c.req.header === "function" ? {
-    get: (name) => c.req.header(name)
-  } : null);
-  if (!captcha)
-    throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion. Pass it as the x-zai-captcha request header (or providerSpecificData), or store one in the provider key. It is issued per completion, so the stored value only works once.", "zai_captcha");
+  const headerView = c && c.req && typeof c.req.header === "function"
+    ? { get: (name) => c.req.header(name) }
+    : null;
+  const parsed = parseCredential(rawKey, payload, headerView);
+  const credentialToken = parsed.token;
 
-  const prepared = prepareZaiTurn(payload);
-  const messages = prepared.messages;
-  const prompt = prepared.prompt;
-  if (!prompt && !images)
-    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
-
-  // Account token when the operator supplied one; guest session otherwise.
   const session = sessionFor({ fetcher, credential: credentialToken, key: route.zai_session_key });
   const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id) });
   const entry = await registry.resolve(modelId);
+  if (!entry && !staticCaps)
+    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not available in the live model catalog.', "zai_model");
   if (entry && entry.available === false)
     throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
+
+  // Reference flow rejects early during an IP/WAF block, before image uploads
+  // and before burning a single-use device token.
+  assertWafAvailable();
 
   const active = await session.acquire();
   let token = active.token;
@@ -859,155 +862,221 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (!session.feVersion)
     session.feVersion = await resolveFrontendVersion(fetcher);
 
-  const thinking = resolveThinking(modelId, payload);
-  const features = resolveFeatures(payload);
-  const userMessageId = crypto.randomUUID();
+  const imageCount = countImages(payload.messages);
+  const canVision = !!(entry && entry.attachment) || !!(staticCaps && staticCaps.vision);
+  if (imageCount && !canVision)
+    throw new ZaiWebError(400, 'Z.ai model "' + unprefixedModelId(modelId) + '" does not advertise image input.', "zai_vision_unsupported");
 
-  // 1. Create the remote chat the completion is attached to.
-  await awaitWafSlot();
-  let created;
+  // Pace Z.AI uploads through the same global lane, while arbitrary public
+  // image downloads only use the vision module's SSRF guard/timeouts.
+  const visionFetch = async (url, init) => {
+    let host = "";
+    try { host = new URL(String(url)).hostname; } catch {}
+    if (host === "chat.z.ai")
+      await awaitWafSlot();
+    return fetcher(url, init);
+  };
+
+  let vision;
   try {
-    created = await fetcher(ZAI_NEW_CHAT_URL, {
-      method: "POST",
-      headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" }),
-      body: JSON.stringify(buildNewChatBody({
-        messages,
-        modelId,
-        prompt,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        features
-      }).payload)
-    });
+    vision = imageCount
+      ? await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch })
+      : { messages: structuredClone(payload.messages || []), files: [], imageParts: [] };
   } catch (e) {
-    throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
+    const status = Number(e && e.status) || 400;
+    const code = String(e && e.code || "zai_vision");
+    throw new ZaiWebError(status, "Z.ai image processing failed: " + String(e && e.message || e).slice(0, 240), code);
   }
-  session.noteResponse(created.headers);
-  if (!created.ok) {
-    const text = String(await created.text().catch(() => "")).slice(0, 300);
-    const viaBrowser = await fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, created.status, text);
-    if (viaBrowser)
-      return viaBrowser;
-    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + text, "zai_chat_create");
-  }
-  const createdJson = await created.json().catch(() => null);
-  const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
-  if (!chatId)
-    throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
 
-  // 2. Signed completion. A 401 means the session aged out mid-flight: refresh
-  //    once and replay, rather than surfacing an auth error the operator
-  //    cannot act on.
-  const postCompletion = async (useToken, useUserId) => {
+  const prepared = prepareZaiTurn({ ...payload, messages: vision.messages });
+  let messages = prepared.messages;
+  if (prepared.shim.active && vision.imageParts.length)
+    messages = attachZaiImageParts(messages, vision.imageParts);
+  const prompt = prepared.shim.active ? prepared.prompt : referencePrompt(messages);
+  if (!prompt && !vision.files.length)
+    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
+
+  const thinking = resolveThinking(modelId, payload, entry);
+  const features = resolveFeatures(payload, prepared.shim.active);
+  const poolKey = String(route.zai_session_key || route.route_id || route.id || ("uid:" + userId));
+  const { chatId } = acquireZaiChatId(poolKey, route.zai_session_pool_size);
+
+  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
+  const proofMode = options.proofMode || "caller";
+
+  const getProof = async () => {
+    if (proofMode === "caller") {
+      if (!parsed.captcha)
+        throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion.", "zai_captcha");
+      return parsed.captcha;
+    }
+    const minted = await getZaiCaptchaProof({ storePath, fetchImpl: fetcher });
+    if (!minted || !minted.ok || !minted.param) {
+      const empty = minted && Number(minted.remaining) === 0;
+      throw new ZaiWebError(503,
+        empty
+          ? "Z.ai device-token store is empty or exhausted."
+          : "Z.ai captcha proof generation failed.",
+        empty ? "zai_tokens" : "zai_captcha");
+    }
+    return minted.param;
+  };
+
+  const postOnce = async (proof) => {
     await awaitWafSlot();
     const timestamp = Date.now();
     const requestId = crypto.randomUUID();
-    const signature = await buildSignature({ prompt, requestId, timestamp, userId: useUserId });
-    const completionUrl = buildCompletionUrl({ requestId, timestamp, token: useToken, userId: useUserId });
-    return fetcher(completionUrl, {
+    const signature = await buildSignature({ prompt, requestId, timestamp, userId });
+    const url = buildReferenceCompletionUrl({ requestId, timestamp, token, userId });
+    const body = buildReferenceCompletionBody({
+      captchaVerifyParam: proof,
+      chatId,
+      messages,
+      modelId,
+      prompt,
+      thinking,
+      features,
+      files: vision.files
+    });
+    return fetcher(url, {
       method: "POST",
-      headers: session.headers({ Accept: "text/event-stream", "Content-Type": "application/json", "X-Signature": signature }),
-      body: JSON.stringify(buildCompletionBody({
-        body: payload,
-        captchaVerifyParam: captcha,
-        chatId,
-        messages,
-        modelId,
-        prompt,
-        requestId,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        effortSupported: thinking.effortSupported,
-        features
-      }))
+      headers: session.headers({
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+        "X-Signature": signature,
+        "X-Region": "overseas"
+      }),
+      body: JSON.stringify(body)
     });
   };
 
-  let up;
+  let up = null;
+  let lastProof = "";
   try {
-    up = await postCompletion(token, userId);
-    if (up.status === 401) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      lastProof = await getProof();
+      up = await postOnce(lastProof);
+      session.noteResponse(up.headers);
+      if (up.status !== 401)
+        break;
+
+      // Match the reference: refresh auth once, then perform a fresh attempt.
+      // Minted mode obtains a NEW CAPTCHA on the next loop iteration because
+      // proofs are single-use. Caller-proof mode can only retry the supplied
+      // proof, which is still useful when the 401 rejected before captcha use.
       session.invalidate("completion 401");
       const again = await session.refresh("completion 401");
-      if (again && again.token && again.token !== token) {
-        token = again.token;
-        userId = again.userId || userIdFromToken(token) || userId;
-        if (again.feVersion)
-          session.feVersion = session.feVersion || again.feVersion;
-        up = await postCompletion(token, userId);
-      }
+      if (!again || !again.token)
+        break;
+      token = again.token;
+      userId = again.userId || userIdFromToken(token) || userId;
     }
   } catch (e) {
-    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
+    releaseZaiChatId(poolKey, chatId, () => Promise.resolve());
+    if (e instanceof ZaiWebError)
+      throw e;
+    if (e instanceof ZaiWafBlockedError)
+      throw asWafError(e);
+    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 240), "zai_unreachable");
   }
-  session.noteResponse(up.headers);
-  if (!up.ok || !up.body) {
-    const text = String(await up.text().catch(() => "")).slice(0, 300);
-    const viaBrowser = await fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, up.status, text);
-    if (viaBrowser)
-      return viaBrowser;
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
+
+  if (!up || !up.ok || !up.body) {
+    const status = Number(up && up.status) || 502;
+    const text = up ? String(await up.text().catch(() => "")).slice(0, 300) : "";
+    if (isZaiWafBlock(status, text)) {
+      const state = zaiWaf.recordBlock("reference-http");
+      const err = new ZaiWebError(503, "Z.ai temporarily blocked this gateway egress.", "zai_waf");
+      err.retryAfterSec = state.retryAfterSec;
+      throw err;
+    }
+    if (/captcha\s+verification\s+failed/i.test(text))
+      throw new ZaiWebError(502, "Z.ai rejected the freshly minted captcha proof.", "zai_captcha_rejected");
+    throw new ZaiWebError(status, "Z.ai completion error: " + text, "zai_completion");
   }
-  // A healthy completion POST is the strongest evidence that the egress IP is
-  // no longer blocked. Reset any stale WAF backoff only here (not on GETs).
+
   zaiWaf.recordSuccess();
 
+  // Adopt any token rotation captured by the session cookie jar. The provider
+  // key persistence layer above this adapter will reseal it after the call.
+  const recovered = session.token && session.token !== active.token ? session.token : null;
   const id = "chatcmpl-zai-" + Date.now().toString(36);
-  const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  // The session now owns the token chat.z.ai rotated during this request, so
-  // the stored provider key never keeps a credential the site already retired.
-  const recovered = session.token !== active.token ? session.token : rotatedToken(created.headers) || token;
-  // The remote chat is single-use; once the stream drains, delete it so the
-  // account doesn't accumulate dead conversations.
-  const cleanup = () => {
-    if (!chatId || zaiWaf.status().blocked) return Promise.resolve();
-    return fetcher(ZAI_DELETE_CHAT_URL(chatId), {
-      method: "DELETE",
-      headers: session.headers({ Accept: "application/json" })
-    }).catch(() => {});
+  const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) +
+    imageCount * IMAGE_TOKEN_ALLOWANCE;
+
+  const cleanup = async (idToDelete) => {
+    if (!idToDelete || zaiWaf.status().blocked)
+      return;
+    try {
+      await awaitWafSlot();
+      const res = await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
+        method: "DELETE",
+        headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
+      });
+      if (res.status === 401) {
+        session.invalidate("chat delete 401");
+        await session.refresh("chat delete 401").catch(() => {});
+        await awaitWafSlot();
+        await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
+          method: "DELETE",
+          headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
+        }).catch(() => {});
+      }
+    } catch {
+      // Stateless chat GC is best-effort and must never change the client result.
+    }
   };
-  if (isStream && up.body) {
-    // Tee the stream: client gets the shaped half; the discard half drives the
-    // stream to completion so cleanup fires even when the caller abandons it.
-    const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-    (async () => {
+
+  if (isStream) {
+    const [clientStream, drainStream] = up.body.tee();
+    const shaped = shapeFrameResponse({
+      id,
+      model: route.upstream_model || modelId,
+      source: clientStream,
+      promptTokens,
+      isStream,
+      recovered,
+      agent: prepared.shim.active,
+      tools: payload.tools || payload.functions || []
+    });
+    void (async () => {
       try {
-        const reader = discard.getReader();
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
+        const reader = drainStream.getReader();
+        while (!(await reader.read()).done) {}
       } catch {
       } finally {
-        await cleanup();
+        releaseZaiChatId(poolKey, chatId, cleanup);
       }
-    })().catch(() => {});
+    })();
     return shaped;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-  await cleanup();
-  return shaped;
+
+  try {
+    return await shapeFrameResponse({
+      id,
+      model: route.upstream_model || modelId,
+      source: up.body,
+      promptTokens,
+      isStream,
+      recovered,
+      agent: prepared.shim.active,
+      tools: payload.tools || payload.functions || []
+    });
+  } finally {
+    releaseZaiChatId(poolKey, chatId, cleanup);
+  }
 }
+
+// Caller-proof mode remains available for debugging/manual integrations, but
+// now uses the same proven HTTP wire as the automatic minted route.
+export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl) {
+  return runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
+    fetchImpl: fetchImpl || (c && c.upstreamFetch),
+    proofMode: "caller"
+  });
+}
+
 export function isWafChallenge(status, body) {
   return isZaiWafBlock(status, body);
-}
-async function fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, status, text) {
-  if (!isWafChallenge(status, text))
-    return null;
-  const browserRaw = (session && session.token) ? JSON.stringify({ token: session.token }) : rawKey;
-  try {
-    const result = await callZaiBrowser(c, route, browserRaw, payload, isStream);
-    zaiWaf.recordSuccess();
-    return result;
-  } catch (e) {
-    const state = zaiWaf.recordBlock("signed+browser");
-    const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge after browser fallback.", "zai_waf");
-    err.retryAfterSec = state.retryAfterSec;
-    throw err;
-  }
 }
 
 // One converter for both transports: the signed HTTP path and the browser path
@@ -1087,164 +1156,12 @@ export function isZaiMintedFormat(value) {
   return String(value || "").toLowerCase() === "zaiminted";
 }
 
-/**
- * Minted transport: pure HTTP, no browser and no caller-supplied captcha.
- *
- * One flow per request, matching what the reference bridge does:
- *   1. create the chat (chat.z.ai materializes it on first completion)
- *   2. mint a captcha proof from a harvested device token
- *   3. POST the completion with that proof
- *
- * Device tokens are single-use, so each request consumes one from the store.
- */
+/** Automatic pure-HTTP mode: GLM-Free-API style CAPTCHA mint + completion. */
 export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchImpl) {
-  const fetcher = fetchImpl || ((url, init) => upstreamFetch(c, url, init));
-  const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
-  const caps = getModelCapabilities(modelId);
-  if (!caps)
-    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  const images = countImages(payload.messages);
-  if (images)
-    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
-
-  const { token } = parseCredential(rawKey, payload);
-  const userId = userIdFromToken(token);
-  if (!token || !userId)
-    throw credentialError();
-
-  const prepared = prepareZaiTurn(payload);
-  const messages = prepared.messages;
-  const prompt = prepared.prompt;
-  if (!prompt && !images)
-    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
-
-  const { takeDeviceToken } = await import("./zai-tokens.js");
-  const { mintCaptcha } = await import("./zai-captcha.js");
-  // Fail before consuming a single-use device token when the egress breaker is open.
-  assertWafAvailable();
-  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
-
-  const thinking = resolveThinking(modelId, payload);
-  const features = resolveFeatures(payload);
-  const frontendVersion = await resolveFrontendVersion(fetcher);
-  const userMessageId = crypto.randomUUID();
-
-  // 1. Create the chat.
-  await awaitWafSlot();
-  let created;
-  try {
-    created = await fetcher(ZAI_NEW_CHAT_URL, {
-      method: "POST",
-      headers: buildHeaders(token, { accept: "application/json", frontendVersion }),
-      body: JSON.stringify(buildNewChatBody({
-        messages,
-        modelId,
-        prompt,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        features
-      }).payload)
-    });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  if (!created.ok)
-    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + String(await created.text().catch(() => "")).slice(0, 300), "zai_chat_create");
-  const createdJson = await created.json().catch(() => null);
-  const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
-  if (!chatId)
-    throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
-
-  // 2. Mint a proof, retrying with another token when Aliyun rejects one.
-  let proof = null;
-  let lastReason = "";
-  let remaining = 0;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const taken = await takeDeviceToken(storePath);
-    remaining = taken.remaining;
-    if (!taken.token)
-      break;
-    const minted = await mintCaptcha(taken.token, { fetchImpl: fetcher });
-    if (minted.ok) {
-      proof = minted.param;
-      break;
-    }
-    lastReason = minted.reason + (minted.detail ? ": " + String(minted.detail).slice(0, 160) : "");
-  }
-  if (!proof)
-    throw new ZaiWebError(503, remaining === 0
-      ? "Z.ai device-token store is empty (or exhausted). Harvest tokens and add them to the store; see docs/zai-minted.md."
-      : "Z.ai captcha minting failed for " + 5 + " device tokens (" + lastReason + ").",
-      "zai_tokens");
-
-  // 3. Completion with the minted proof.
-  const timestamp = Date.now();
-  const requestId = crypto.randomUUID();
-  const signature = await buildSignature({ prompt, requestId, timestamp, userId });
-  const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
-  let up;
-  try {
-    await awaitWafSlot();
-    up = await fetcher(completionUrl, {
-      method: "POST",
-      headers: buildHeaders(token, { accept: "text/event-stream", frontendVersion, signature }),
-      body: JSON.stringify(buildCompletionBody({
-        body: payload,
-        captchaVerifyParam: proof,
-        chatId,
-        messages,
-        modelId,
-        prompt,
-        requestId,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        effortSupported: thinking.effortSupported,
-        features
-      }))
-    });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  if (!up.ok || !up.body) {
-    const text = String(await up.text().catch(() => "")).slice(0, 300);
-    if (isZaiWafBlock(up.status, text)) {
-      const state = zaiWaf.recordBlock("minted-completion");
-      const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge.", "zai_waf");
-      err.retryAfterSec = state.retryAfterSec;
-      throw err;
-    }
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
-  }
-  zaiWaf.recordSuccess();
-
-  const id = "chatcmpl-zaim-" + Date.now().toString(36);
-  const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  const cleanup = () => fetcher(ZAI_DELETE_CHAT_URL(chatId), {
-    method: "DELETE",
-    headers: buildHeaders(token, { accept: "application/json", frontendVersion })
-  }).catch(() => {});
-  if (isStream && up.body) {
-    const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-    (async () => {
-      try {
-        const reader = discard.getReader();
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      } catch {
-      } finally {
-        await cleanup();
-      }
-    })().catch(() => {});
-    return shaped;
-  }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-  await cleanup();
-  return shaped;
+  return runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
+    fetchImpl: fetchImpl || ((url, init) => upstreamFetch(c, url, init)),
+    proofMode: "minted"
+  });
 }
 
 export function isZaiBrowserFormat(value) {
