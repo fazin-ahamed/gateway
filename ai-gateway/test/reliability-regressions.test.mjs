@@ -64,6 +64,14 @@ test("reflex pick prefers fast+reliable over cheap+slow, then cheapest among equ
   assert.equal(t.reflexPick([]), null);
 });
 
+test("reflex pick lets a free fast non-workhorse beat a pricier slower one at equal reliability", () => {
+  // The screenshot case: Atria (free, 1.3s) must beat DeepSeek (0.26/M, 3.1s)
+  // once the workhorse hard-prefilter is gone and both reach the optimizer.
+  const atria = { slug: "atria-dawn-preview", cost: 0, avgMs: 1309, lcb: 0.67 };
+  const deepseek = { slug: "deepseek/deepseek-v4-flash-0731", cost: 0.26, avgMs: 3087, lcb: 0.67 };
+  assert.equal(t.reflexPick([deepseek, atria]).slug, "atria-dawn-preview");
+});
+
 test("circuit window resets stale failure count instead of accumulating forever", () => {
   assert.equal(typeof t.__resetCircuitState, "function");
   assert.equal(typeof t.circuitRecord, "function");

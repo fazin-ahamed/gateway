@@ -2548,6 +2548,11 @@ async function autoSettings(c) {
 // Interactive/reflex latency budget. A route slower than this is dropped from
 // the easy-request pool unless nothing faster is eligible.
 var REFLEX_LATENCY_SLA_MS = 30000;
+// Soft priors, not hard filters: a proven workhorse gets a small edge and a
+// tiny model is discouraged on hard work, but neither decides pool membership.
+// All hard-eligible routes compete in the optimizer.
+var WORKHORSE_PRIOR_BONUS = 0.5;
+var TINY_HARD_TASK_PENALTY = 2;
 // Bayesian reliability floor. A route with real evidence whose lower-confidence
 // bound sits below this is degraded and cannot be a primary.
 var ROUTE_RELIABILITY_FLOOR = 0.6;
@@ -2695,9 +2700,10 @@ async function pickAutoModel(c, payload, key) {
     const rawMs = h ? Number(h.avg_ms) : 0;
     candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, hardEligible: eligible, samples: h ? Number(h.n) : 0, lcb: rel.lcb, relBand: relOk ? rel.band : "degraded", reason, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
   }
-  const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
-  const strongWork = workhorseEligible.filter((x) => !x.tiny);
-  const eligibleList = (need >= 2.5 && strongWork.length) ? strongWork : (workhorseEligible.length ? workhorseEligible : candidates.filter((x) => x.eligible));
+  // Every hard-eligible route competes. Workhorse/tiny are soft priors applied
+  // in scoring below, never a hard membership filter, so a fast reliable
+  // non-workhorse route can win an easy request.
+  const eligibleList = candidates.filter((x) => x.eligible);
   let picked;
   if (!eligibleList.length) {
     picked = null;
@@ -2718,7 +2724,9 @@ async function pickAutoModel(c, payload, key) {
       const overkill = cand.quality >= 5 && cand.quality > need + 1.2 ? (cand.quality - need - 1.2) * 0.7 : 0;
       const tight = cand.ctxTight ? 1.35 : 0;
       const costTerm = Math.pow(cand.cost / maxCost, 2) * 6;
-      const s = (1 - w) * cand.quality - w * costTerm - relPenalty - slowPenalty - wobbling - overkill - tight;
+      const workhorseBonus = cand.workhorse ? WORKHORSE_PRIOR_BONUS : 0;
+      const tinyHard = cand.tiny && need >= 2.5 ? TINY_HARD_TASK_PENALTY : 0;
+      const s = (1 - w) * cand.quality - w * costTerm - relPenalty - slowPenalty - wobbling - overkill - tight + workhorseBonus - tinyHard;
       if (s > bestScore) {
         bestScore = s;
         picked = cand;
