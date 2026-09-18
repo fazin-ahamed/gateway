@@ -1163,12 +1163,41 @@ export function isZaiMintedFormat(value) {
   return String(value || "").toLowerCase() === "zaiminted";
 }
 
-/** Automatic pure-HTTP mode: GLM-Free-API style CAPTCHA mint + completion. */
+/** Automatic pure-HTTP mode: GLM-Free-API style CAPTCHA mint + completion.
+ *
+ * Chromium is only a secondary escape hatch when the local proof infrastructure
+ * is unavailable/exhausted. Confirmed WAF blocks, model errors, request errors,
+ * and image requests never fall back to the browser.
+ */
 export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchImpl) {
-  return runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
-    fetchImpl: fetchImpl || ((url, init) => upstreamFetch(c, url, init)),
-    proofMode: "minted"
-  });
+  try {
+    return await runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
+      fetchImpl: fetchImpl || ((url, init) => upstreamFetch(c, url, init)),
+      proofMode: "minted"
+    });
+  } catch (primary) {
+    const browserFallback = String(process.env.ZAI_BROWSER_FALLBACK || "1").toLowerCase() !== "0" &&
+      String(process.env.ZAI_BROWSER_FALLBACK || "1").toLowerCase() !== "false";
+    const code = String(primary && primary.code || "");
+    const proofFailure = code === "zai_tokens" || code === "zai_captcha" ||
+      code === "zai_captcha_config" || code === "zai_captcha_rejected";
+    if (!browserFallback || !proofFailure || countImages(payload && payload.messages))
+      throw primary;
+
+    try {
+      return await callZaiBrowser(c, route, rawKey, payload, isStream);
+    } catch (fallback) {
+      const err = new ZaiWebError(
+        Number(primary && primary.status) || 503,
+        "Z.ai pure-HTTP proof path failed (" + code + "); browser fallback also failed (" +
+          String(fallback && fallback.code || "zai_browser") + ").",
+        "zai_http_fallback_failed"
+      );
+      err.primaryCode = code;
+      err.fallbackCode = String(fallback && fallback.code || "zai_browser");
+      throw err;
+    }
+  }
 }
 
 export function isZaiBrowserFormat(value) {
