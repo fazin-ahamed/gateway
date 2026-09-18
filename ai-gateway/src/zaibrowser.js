@@ -15,7 +15,8 @@ import { existsSync } from "node:fs";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
-const ZAI_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+const COMPOSER_SELS = ["#chat-input", "textarea#chat-input", "textarea[placeholder]", "[contenteditable='true']", "div[contenteditable='true']"];
+const SEND_SELS = ["#send-message-button", '[aria-label="Send Message"] button', 'button[type="submit"]'];
 const DEFAULT_TURN_TIMEOUT_MS = 120000;
 const PAGE_IDLE_CLOSE_MS = 300000;
 
@@ -146,10 +147,22 @@ async function getPool(token) {
   if (existing)
     return existing;
   const browser = await getBrowser();
-  const context = await browser.newContext({ userAgent: ZAI_USER_AGENT, locale: "en-US", viewport: { width: 1280, height: 800 } });
+  const chromMajor = String(browser.version() || "150").split(".")[0];
+  const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + chromMajor + ".0.0.0 Safari/537.36";
+  const context = await browser.newContext({
+    userAgent: ua,
+    locale: "en-US",
+    timezoneId: "America/New_York",
+    viewport: { width: 1280, height: 800 },
+    screen: { width: 1920, height: 1080 },
+    extraHTTPHeaders: { "Accept-Language": "en-US,en;q=0.9" }
+  });
   await context.addCookies([{ name: "token", value: token, domain: "chat.z.ai", path: "/" }]);
-  // Token in localStorage before any document script runs, so the first
-  // goto is already signed in. A post-load set + reload doubled cold time.
+  try {
+    const { buildStealthScript } = await import("../../scripts/zai-harvest-stealth.js");
+    await context.addInitScript({ content: buildStealthScript(chromMajor) });
+  } catch {
+  }
   await context.addInitScript((t) => {
     try { localStorage.setItem("token", t); } catch {}
   }, token);
@@ -181,6 +194,29 @@ async function startNewChat(page) {
   }
 }
 
+async function firstVisible(page, selectors, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible().catch(() => false))
+        return loc;
+    }
+    await page.waitForTimeout(250);
+  }
+  return null;
+}
+
+async function pageDump(page) {
+  let url = "", title = "", body = "";
+  try { url = page.url(); } catch {}
+  try { title = await page.title(); } catch {}
+  try {
+    body = await page.evaluate(() => (document.body && document.body.innerText || "").slice(0, 240));
+  } catch {}
+  return "url=" + url + " title=" + title + " body=" + JSON.stringify(body);
+}
+
 async function ensurePage(pool) {
   if (pool.idleTimer) {
     clearTimeout(pool.idleTimer);
@@ -188,8 +224,8 @@ async function ensurePage(pool) {
   }
   if (pool.page && !pool.page.isClosed()) {
     try {
-      const input = pool.page.locator("#chat-input").first();
-      if (await input.isVisible({ timeout: 1500 })) {
+      const input = await firstVisible(pool.page, COMPOSER_SELS, 1500);
+      if (input) {
         await startNewChat(pool.page);
         return pool.page;
       }
@@ -200,6 +236,8 @@ async function ensurePage(pool) {
   }
   const page = await pool.context.newPage();
   await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
+  // SPA hydration: #chat-input is not in the first HTML.
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   pool.page = page;
   return page;
 }
@@ -284,19 +322,19 @@ export async function runBrowserTurn(token, prompt, options = {}) {
     };
     page.on("response", onResponse);
     try {
-      const input = page.locator("#chat-input").first();
-      await input.waitFor({ state: "visible", timeout: 30000 });
-      // Transient FeiLin overlay; if none, this returns immediately.
-      await page.waitForFunction(() => {
-        const overlay = document.querySelector(".nc_wrapper, #aliyunCaptcha-window-embed, iframe[src*='captcha'], iframe[src*='aliyun']");
-        const box = document.querySelector("#chat-input");
-        return !!box && !overlay;
-      }, null, { timeout: 8000 }).catch(() => {});
+      const input = await firstVisible(page, COMPOSER_SELS, 15000);
+      if (!input)
+        throw new Error("composer never appeared (" + (await pageDump(page)) + ")");
       await input.click({ timeout: 8000 });
-      await input.fill("");
-      await input.fill(prompt);
-      const send = page.locator("#send-message-button").first();
-      await send.waitFor({ state: "visible", timeout: 10000 });
+      if (typeof input.fill === "function") {
+        await input.fill("").catch(() => {});
+        await input.fill(prompt);
+      } else {
+        await page.keyboard.type(prompt, { delay: 5 });
+      }
+      const send = await firstVisible(page, SEND_SELS, 8000);
+      if (!send)
+        throw new Error("send button never appeared (" + (await pageDump(page)) + ")");
       await send.click({ timeout: 8000, force: true });
       const result = await Promise.race([
         responsePromise,
