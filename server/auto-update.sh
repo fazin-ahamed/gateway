@@ -113,13 +113,16 @@ while :; do
     continue
   fi
   log "updating $LOCAL -> $REMOTE"
-  if git merge --ff-only "$REMOTE"; then
+  # The egg often has local edits (logs, generated files). --ff-only then
+  # leaves the process on a stale SHA forever. .env and data/ are gitignored,
+  # so a hard reset does not wipe secrets or the SQLite DB.
+  if git reset --hard "$REMOTE"; then
     if [ -f "$SERVER_DIR/package.json" ]; then
       (cd "$SERVER_DIR" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1) || log "npm install failed; restarting anyway"
     fi
     restart_server
     log "updated to $(current_head)"
   else
-    log "fast-forward failed; leaving process on $LOCAL"
+    log "reset --hard failed; leaving process on $LOCAL"
   fi
 done

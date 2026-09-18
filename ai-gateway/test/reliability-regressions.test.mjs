@@ -34,11 +34,18 @@ test("non-provider-health failures do not trip the provider breaker", () => {
     { status: 400, kind: "model" },
     { status: 400, kind: "tool_schema" },
     { status: 413, kind: "request_size" },
+    { status: 400, kind: "relay" },
+    { status: 400, kind: "unknown" },
     { status: 503, kind: "zai_model_unavailable" },
     { status: 503, kind: "zai_transport" }
   ];
   failures.forEach((f, i) => withFakeNow(i * 1000, () => t.circuitRecordFailure("p", f)));
   assert.equal(withFakeNow(10_000, () => t.circuitOpen("p")), false);
+});
+
+test("opaque Relbackend upstream_error is classified as relay, not unknown", () => {
+  const body = '{"error":{"code":"upstream_error","message":"upstream_error","param":"","type":"upstream_error"}}';
+  assert.equal(t.classifyUpstreamFailure(body), "relay");
 });
 
 test("circuit identity is route-scoped so one model route cannot poison siblings", () => {

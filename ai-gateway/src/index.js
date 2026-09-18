@@ -823,9 +823,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           attempts++;
           continue keyLoop;
         }
-        // One extra in-place attempt for pre-header transport failures; after
-        // that we move to the next credential, then the next route/slug.
-        for (let transportAttempt = 0; transportAttempt < 2; transportAttempt++) {
+        // Three in-place attempts for transport / 5xx / opaque relay errors;
+        // then the next credential, then the next route.
+        for (let transportAttempt = 0; transportAttempt < SAME_KEY_ATTEMPTS; transportAttempt++) {
         try {
           const res = await forwardToProvider(c, route, k.key, payload, isStream, requestId);
           const up = res.response;
@@ -860,11 +860,16 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               attempts++;
               break;
             }
+            // 4xx (except 408) and opaque Relbackend 400s are not provider-health.
             circuitRecordFailure(routeCircuit, { status: up.status, kind: why });
             lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + why + "]";
             lastErrStatus = up.status;
             attempts++;
-            break; // next route
+            if (shouldRetryHttp(transportAttempt, up.status, why)) {
+              blog("FWD RETRY " + route.provider_name + " key=" + k.label + " HTTP " + up.status + " [" + why + "] attempt=" + (transportAttempt + 1));
+              continue;
+            }
+            break; // next key/route
           }
           if (!isStream) {
             const txt = await up.text();
@@ -954,12 +959,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             attempts++;
             lastErr = "provider " + route.provider_name + " -> " + e.code;
             lastErrStatus = e.status === 504 ? 504 : 503;
-            break;
-            attempts++;
-            lastErr = "provider " + route.provider_name + " -> " + e.code;
-            lastErrStatus = e.status === 504 ? 504 : 503;
-            if (/auth|credential|session/i.test(String(e.code || "")) && orderedKeys.indexOf(k) < orderedKeys.length - 1)
-              continue keyLoop;
+            if (shouldRetryHttp(transportAttempt, e.status, e.code)) {
+              blog("FWD RETRY " + route.provider_name + " key=" + k.label + " zai HTTP " + e.status + " attempt=" + (transportAttempt + 1));
+              continue;
+            }
             break;
           }
           circuitRecordFailure(routeCircuit, { status: (e && e.status) || 0, kind: "unknown" });
@@ -2108,9 +2111,9 @@ function circuitRecordFailure(a, b, c) {
   const key = c !== undefined ? toKey(a, b) : toKey(a);
   const status = Number(f.status) || 0;
   const fkind = String(f.kind || "unknown");
-  if (["auth", "rate_limit", "model", "tool_schema", "request_size"].includes(fkind))
+  if (["auth", "rate_limit", "model", "tool_schema", "request_size", "relay"].includes(fkind))
     return;
-  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|unsupported)/i.test(fkind))
+  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|unsupported|relay)/i.test(fkind))
     return;
   if (status >= 400 && status < 500 && status !== 408)
     return;
@@ -2682,10 +2685,19 @@ async function pickAutoModel(c, payload, key) {
   const chosen = candidates.find((x) => x.slug === slug) || picked;
   return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [] };
 }
-// True only when it is safe to retry the same upstream call: pre-header
-// transport failure (no bytes sent back yet) on the first attempt.
+// Three in-place attempts on the same credential, then the next key/route.
+var SAME_KEY_ATTEMPTS = 3;
 function shouldRetrySameKey(transportAttempt, err) {
-  return transportAttempt === 0 && isRetryableTransportError(err);
+  return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
+}
+function shouldRetryHttp(transportAttempt, status, why) {
+  if (transportAttempt >= SAME_KEY_ATTEMPTS - 1)
+    return false;
+  const code = Number(status) || 0;
+  const kind = String(why || "");
+  if (code === 408 || code >= 500)
+    return true;
+  return kind === "relay" || kind === "unknown";
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -2883,6 +2895,11 @@ function isGenericUpstreamErrorResponse(text) {
 function classifyUpstreamFailure(body) {
   const text = String(body || "").toLowerCase();
   if (/bad (body|url|scheme)|key-mismatch|proxy error|upstream timeout/.test(text))
+    return "relay";
+  // Relbackend and similar wrappers collapse real upstream failures into a
+  // generic {"error":{"type":"upstream_error"}} 400. That is not proof the
+  // provider is down, and it is worth a same-key retry.
+  if (/"type"\s*:\s*"upstream_error"|upstream_error/.test(text) && !/model.+(not found|invalid)/.test(text))
     return "relay";
   if (/api[ _-]?key|authorization|unauthenticated|forbidden|invalid credential/.test(text))
     return "auth";
@@ -4514,7 +4531,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, shouldRetrySameKey, circuitKey, circuitOpen, circuitRecord, circuitRecordOk, circuitRecordFail, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, shouldRetrySameKey, circuitKey, circuitOpen, circuitRecord, circuitRecordOk, circuitRecordFail, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
