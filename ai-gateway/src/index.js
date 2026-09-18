@@ -3435,10 +3435,10 @@ app.get("/admin/proxy-health", async (c) => {
 var PROVIDER_PRESETS = [
   {
     id: "zai-minted",
-    label: "Z.AI web chat — automatic (no browser)",
-    summary: "Pure HTTP: the gateway mints the Aliyun captcha proof itself from a harvested device-token file. No browser, no packages. Needs the session token plus data/zai-device-tokens.txt.",
+    label: "Z.AI web chat — recommended (pure HTTP)",
+    summary: "GLM-Free-API-style pure HTTP transport: pre-minted Aliyun proofs, throwaway chat UUIDs, session cleanup, vision upload, tools and search. No browser or OS packages on the serving host.",
     fmt: "zaiminted",
-    name: "Z.AI web chat (minted)",
+    name: "Z.AI web chat (pure HTTP)",
     base_url: "https://chat.z.ai",
     transport: "direct",
     credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — captcha is minted automatically',
@@ -3450,8 +3450,8 @@ var PROVIDER_PRESETS = [
   },
   {
     id: "zai-browser",
-    label: "Z.AI web chat — automatic (browser)",
-    summary: "Drives chat.z.ai in a local Chromium so the page solves its own CAPTCHA. No token file, but needs Chromium and playwright installed on the host.",
+    label: "Z.AI web chat — browser fallback",
+    summary: "Fallback/debug transport. Drives the real chat.z.ai page in Chromium when the pure-HTTP proof path is unavailable. More resource-heavy and less reliable on restricted hosts.",
     fmt: "zaiwebbrowser",
     name: "Z.AI web chat (browser)",
     base_url: "https://chat.z.ai",
@@ -3466,7 +3466,7 @@ var PROVIDER_PRESETS = [
   {
     id: "zai-web",
     label: "Z.AI web chat (chat.z.ai, no API key)",
-    summary: "Consumer GLM-5.3 session. Needs the token from chat.z.ai Local Storage plus a captcha_verify_param; no tools.",
+    summary: "Manual pure-HTTP debug path. Same reference wire as the recommended transport, but the caller supplies a fresh captcha_verify_param per completion. Gateway-emulated tools remain supported.",
     fmt: "zaiweb",
     name: "Z.AI web chat",
     base_url: "https://chat.z.ai",
