@@ -2117,7 +2117,7 @@ function circuitRecordFailure(a, b, c) {
   const fkind = String(f.kind || "unknown");
   if (["auth", "rate_limit", "model", "tool_schema", "request_size", "relay"].includes(fkind))
     return;
-  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|unsupported|relay|browser_unavailable|model_unavailable)/i.test(fkind))
+  if (/(auth|credential|captcha|tokens?|rate|quota|model|tool|vision|request|unsupported|relay|browser_unavailable|model_unavailable|fallback_failed)/i.test(fkind))
     return;
   if (status >= 400 && status < 500 && status !== 408)
     return;
@@ -2694,7 +2694,7 @@ async function pickAutoModel(c, payload, key) {
 // a model the account cannot see, a dead session, a bad transport.
 var SAME_KEY_ATTEMPTS = 3;
 // Fatal config errors shouldn't retry, but transient zai_browser page load hiccups can self-heal on retry.
-var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|zai_model\b/;
+var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed|zai_model\b/;
 function shouldRetrySameKey(transportAttempt, err) {
   return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
 }
@@ -2875,6 +2875,9 @@ function publicProviderError(err) {
   if (code === "zai_captcha") {
     return { status: 503, error: { message: "This route needs a fresh captcha proof. Send one per request, or use a transport that acquires it automatically.", type: "unsupported_feature", code: "captcha_required" } };
   }
+  if (code === "zai_tokens" || code === "zai_captcha_config" || code === "zai_http_fallback_failed") {
+    return { status: 503, error: { message: "The selected route is temporarily unavailable. Please retry later or use another enabled route.", type: "service_unavailable", code: "route_unavailable" } };
+  }
   if (code === "zai_credentials" || code === "zai_browser_unavailable" || code === "zai_model" || code === "zai_model_unavailable") {
     return { status: 503, error: { message: "The selected model is not available on this route right now.", type: "model_unavailable", code: "model_unavailable" } };
   }
@@ -2893,7 +2896,8 @@ function publicProviderError(err) {
 // they may reach the client and never open a provider breaker.
 function isPublicRequestProviderError(err) {
   const code = String(err && err.code || "");
-  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported" || code === "zai_no_prompt" || code === "zai_captcha";
+  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported" || code === "zai_no_prompt" ||
+    code === "zai_captcha" || code === "zai_tokens" || code === "zai_captcha_config" || code === "zai_http_fallback_failed";
 }
 function isGenericUpstreamErrorResponse(text) {
   try {
