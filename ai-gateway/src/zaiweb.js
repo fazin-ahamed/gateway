@@ -811,7 +811,11 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
         throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion.", "zai_captcha");
       return parsed.captcha;
     }
-    const minted = await getZaiCaptchaProof({ storePath, fetchImpl: fetcher });
+    const minted = await getZaiCaptchaProof({
+      storePath,
+      fetchImpl: fetcher,
+      db: c && c.env && c.env.DB || null
+    });
     if (!minted || !minted.ok || !minted.param) {
       const reason = String(minted && minted.reason || "");
       const empty = reason !== "captcha-config" && minted && Number(minted.remaining) === 0;
