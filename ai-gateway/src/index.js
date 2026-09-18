@@ -5,6 +5,7 @@ import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
+import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options", "nosniff");
@@ -694,6 +695,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     const hz = autoDecision.horizon;
     blog("AUTO picked " + slug + " speed=" + ((hz && hz.speed) || "-") + " role=" + ((hz && hz.role) || "-") + " mvc=" + Number(hz && hz.mvc || 0).toFixed(2) + " quality=" + (autoDecision.quality || 0).toFixed(2) + " cost=" + autoDecision.cost.toFixed(3) + " need=" + (autoDecision.need || 0).toFixed(2) + (autoDecision.fallback ? " fallback" : "") + (autoDecision.queue && autoDecision.queue.length ? " queue=" + autoDecision.queue.join(",") : ""));
   }
+  // Tool repair guidance is injected only after auto-routing has scored the
+  // original request, so safety instructions never inflate task complexity.
+  payload = applyToolRepairPolicyToPayload(payload);
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
   const isStream = !!payload.stream;

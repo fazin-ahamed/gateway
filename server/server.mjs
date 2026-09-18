@@ -100,10 +100,24 @@ const { createApp } = await import("../ai-gateway/src/index.js");
 const app = createApp(env);
 
 const handler = async (req) => {
-  const response = await app.fetch(req, env, { waitUntil: () => {} });
   const path = new URL(req.url).pathname;
-  if (path === "/v1/chat/completions" || path === "/admin/playground/completions")
-    return guardToolLoopResponse(response);
+  const guardedPath = path === "/v1/chat/completions" || path === "/admin/playground/completions";
+  let modelHint = "";
+  let requestTools = [];
+  if (guardedPath) {
+    try {
+      const body = await req.clone().json();
+      modelHint = String(body && body.model || "");
+      requestTools = Array.isArray(body && body.tools)
+        ? body.tools
+        : Array.isArray(body && body.functions)
+          ? body.functions
+          : [];
+    } catch {}
+  }
+  const response = await app.fetch(req, env, { waitUntil: () => {} });
+  if (guardedPath)
+    return guardToolLoopResponse(response, modelHint, requestTools);
   return response;
 };
 
