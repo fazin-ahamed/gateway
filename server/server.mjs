@@ -113,9 +113,13 @@ try {
     // Composite (slug, provider_id) key so pricing can vary per provider.
     // Existing rows become the provider_id=0 default that applies to all.
     const carry = ["slug", "prompt_per_1m", "completion_per_1m", "actual_prompt_per_1m", "actual_completion_per_1m", "cache_read_per_1m", "cache_write_per_1m", "actual_mode", "actual_per_request", "currency", "updated_at"].filter((c) => names.has(c));
+    // COALESCE the NOT NULL targets: rows created before the mode/currency
+    // columns existed carry NULL, which would abort the whole rebuild.
+    const selExpr = carry.map((c) => c === "actual_mode" ? "COALESCE(actual_mode, 'per_1m')" : c === "currency" ? "COALESCE(currency, 'USD')" : c).join(", ");
+    db.exec("DROP TABLE IF EXISTS prices_new");
     db.exec("BEGIN");
     db.exec("CREATE TABLE prices_new (slug TEXT NOT NULL, provider_id INTEGER NOT NULL DEFAULT 0, prompt_per_1m REAL NOT NULL DEFAULT 0, completion_per_1m REAL NOT NULL DEFAULT 0, actual_prompt_per_1m REAL, actual_completion_per_1m REAL, cache_read_per_1m REAL, cache_write_per_1m REAL, actual_mode TEXT NOT NULL DEFAULT 'per_1m', actual_per_request REAL, currency TEXT NOT NULL DEFAULT 'USD', updated_at TEXT NOT NULL, PRIMARY KEY (slug, provider_id))");
-    db.exec("INSERT INTO prices_new (provider_id, " + carry.join(", ") + ") SELECT 0, " + carry.join(", ") + " FROM prices");
+    db.exec("INSERT INTO prices_new (provider_id, " + carry.join(", ") + ") SELECT 0, " + selExpr + " FROM prices");
     db.exec("DROP TABLE prices");
     db.exec("ALTER TABLE prices_new RENAME TO prices");
     db.exec("COMMIT");
