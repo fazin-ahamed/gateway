@@ -15,7 +15,6 @@ const TABLE_SQL = `CREATE TABLE IF NOT EXISTS zai_device_tokens (
   created_at TEXT NOT NULL
 )`;
 let mutex = Promise.resolve();
-const importedFiles = new Set();
 
 function withLock(fn) {
   const run = mutex.then(fn, fn);
@@ -53,9 +52,6 @@ async function sqliteCount(db) {
 
 async function importLegacyFile(db, storePath) {
   const path = resolve(storePath || DEFAULT_STORE);
-  if (importedFiles.has(path))
-    return 0;
-  importedFiles.add(path);
   const tokens = readTokens(path);
   if (!tokens.length)
     return 0;
@@ -144,6 +140,5 @@ export const __tokenStoreTest = {
   writeTokens,
   ensureTable,
   importLegacyFile,
-  TABLE_SQL,
-  importedFiles
+  TABLE_SQL
 };
