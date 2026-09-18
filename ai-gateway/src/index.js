@@ -2816,7 +2816,9 @@ async function ensurePriceColumns(db) {
       ["actual_prompt_per_1m", "ALTER TABLE prices ADD COLUMN actual_prompt_per_1m REAL"],
       ["actual_completion_per_1m", "ALTER TABLE prices ADD COLUMN actual_completion_per_1m REAL"],
       ["cache_read_per_1m", "ALTER TABLE prices ADD COLUMN cache_read_per_1m REAL"],
-      ["cache_write_per_1m", "ALTER TABLE prices ADD COLUMN cache_write_per_1m REAL"]
+      ["cache_write_per_1m", "ALTER TABLE prices ADD COLUMN cache_write_per_1m REAL"],
+      ["actual_mode", "ALTER TABLE prices ADD COLUMN actual_mode TEXT"],
+      ["actual_per_request", "ALTER TABLE prices ADD COLUMN actual_per_request REAL"]
     ];
     for (const [name, sql] of add) {
       if (!names.has(name))
@@ -2831,13 +2833,16 @@ function priceFromRow(row) {
   const equivalentCompletion = Number(row && row.completion_per_1m) || 0;
   const actualPrompt = numOrNull(row && row.actual_prompt_per_1m);
   const actualCompletion = numOrNull(row && row.actual_completion_per_1m);
+  const actualMode = (row && row.actual_mode) === "per_request" ? "per_request" : "per_1m";
   return {
     equivalentPrompt,
     equivalentCompletion,
     actualPrompt: actualPrompt == null ? equivalentPrompt : actualPrompt,
     actualCompletion: actualCompletion == null ? equivalentCompletion : actualCompletion,
     cacheRead: numOrNull(row && row.cache_read_per_1m),
-    cacheWrite: numOrNull(row && row.cache_write_per_1m)
+    cacheWrite: numOrNull(row && row.cache_write_per_1m),
+    actualMode,
+    actualPerRequest: numOrNull(row && row.actual_per_request) || 0
   };
 }
 function costFromRates(usage, promptRate, completionRate, cacheReadRate, cacheWriteRate) {
@@ -2854,7 +2859,7 @@ async function lookupPriceRow(c, slug) {
   if (!slug)
     return null;
   try {
-    return await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m FROM prices WHERE slug=?").bind(slug).first();
+    return await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, actual_mode, actual_per_request FROM prices WHERE slug=?").bind(slug).first();
   } catch {
     try {
       return await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m FROM prices WHERE slug=?").bind(slug).first();
@@ -2870,6 +2875,8 @@ async function computeCost(c, slug, usage) {
   const row = await lookupPriceRow(c, slug);
   if (row) {
     const rates = priceFromRow(row);
+    if (rates.actualMode === "per_request")
+      return rates.actualPerRequest;
     return costFromRates(usage, rates.actualPrompt, rates.actualCompletion, rates.cacheRead, rates.cacheWrite);
   }
   const catalog = modelsDevCache.catalog;
@@ -4562,7 +4569,7 @@ app.get("/admin/prices", async (c) => {
     return denied;
   await ensurePriceColumns(c.env.DB);
   const queries = [
-    "SELECT slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at FROM prices ORDER BY slug",
+    "SELECT slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, actual_mode, actual_per_request, currency, updated_at FROM prices ORDER BY slug",
     "SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug"
   ];
   for (const sql of queries) {
@@ -4624,13 +4631,15 @@ app.post("/admin/prices", async (c) => {
   const ac = numOrNull(b.actual_completion_per_1m);
   const cr = numOrNull(b.cache_read_per_1m);
   const cw = numOrNull(b.cache_write_per_1m);
+  const mode = b.actual_mode === "per_request" ? "per_request" : "per_1m";
+  const perReq = numOrNull(b.actual_per_request);
   await ensurePriceColumns(c.env.DB);
   try {
-    await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, actual_prompt_per_1m=excluded.actual_prompt_per_1m, actual_completion_per_1m=excluded.actual_completion_per_1m, cache_read_per_1m=excluded.cache_read_per_1m, cache_write_per_1m=excluded.cache_write_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, ap, ac, cr, cw, b.currency || "USD", nowIso()).run();
+    await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, actual_mode, actual_per_request, currency, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, actual_prompt_per_1m=excluded.actual_prompt_per_1m, actual_completion_per_1m=excluded.actual_completion_per_1m, cache_read_per_1m=excluded.cache_read_per_1m, cache_write_per_1m=excluded.cache_write_per_1m, actual_mode=excluded.actual_mode, actual_per_request=excluded.actual_per_request, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, ap, ac, cr, cw, mode, perReq, b.currency || "USD", nowIso()).run();
   } catch {
     await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, b.currency || "USD", nowIso()).run();
   }
-  return c.json({ ok: true, slug: b.slug, prompt_per_1m: p, completion_per_1m: ct, actual_prompt_per_1m: ap, actual_completion_per_1m: ac, cache_read_per_1m: cr, cache_write_per_1m: cw });
+  return c.json({ ok: true, slug: b.slug, prompt_per_1m: p, completion_per_1m: ct, actual_prompt_per_1m: ap, actual_completion_per_1m: ac, cache_read_per_1m: cr, cache_write_per_1m: cw, actual_mode: mode, actual_per_request: perReq });
 });
 app.delete("/admin/prices/:slug", async (c) => {
   const denied = await requireAdmin(c);

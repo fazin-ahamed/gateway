@@ -189,6 +189,15 @@ test("actual cost uses cache-read rate for cached prompt tokens", () => {
   assert.equal(row.cacheRead, 0.1);
 });
 
+test("priceFromRow exposes per-request actual basis", () => {
+  const perReq = t.priceFromRow({ prompt_per_1m: 3, completion_per_1m: 6, actual_mode: "per_request", actual_per_request: 0.004 });
+  assert.equal(perReq.actualMode, "per_request");
+  assert.equal(perReq.actualPerRequest, 0.004);
+  const perToken = t.priceFromRow({ prompt_per_1m: 3, completion_per_1m: 6 });
+  assert.equal(perToken.actualMode, "per_1m");
+  assert.equal(perToken.actualPerRequest, 0);
+});
+
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
   const actions = generateActions([
     { slug: "model-a-mini", cost: 3, eligible: true, capable: true },

@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS prices (
   actual_completion_per_1m REAL,
   cache_read_per_1m REAL,
   cache_write_per_1m REAL,
+  actual_mode TEXT NOT NULL DEFAULT 'per_1m',
+  actual_per_request REAL,
   currency TEXT NOT NULL DEFAULT 'USD',
   updated_at TEXT NOT NULL
 );

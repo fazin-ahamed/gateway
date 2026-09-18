@@ -99,6 +99,8 @@ try {
     add("actual_completion_per_1m", "ALTER TABLE prices ADD COLUMN actual_completion_per_1m REAL");
     add("cache_read_per_1m", "ALTER TABLE prices ADD COLUMN cache_read_per_1m REAL");
     add("cache_write_per_1m", "ALTER TABLE prices ADD COLUMN cache_write_per_1m REAL");
+    add("actual_mode", "ALTER TABLE prices ADD COLUMN actual_mode TEXT");
+    add("actual_per_request", "ALTER TABLE prices ADD COLUMN actual_per_request REAL");
   }
 } catch (e) {
   console.warn("[gateway] prices dual-rate migration skipped:", e.message);

@@ -312,16 +312,18 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-prices">
-    <div class="pagehead"><div><h2 class="sec">Model prices (USD / 1M tokens)</h2><p class="sub">Two tracks: <b>API-equivalent</b> (models.dev / public list price) and <b>actual</b> (what you pay). Leave actual blank to use the equivalent rate. Cache read/write are optional; blank cache read uses the prompt rate, blank cache write is $0.</p></div></div>
+    <div class="pagehead"><div><h2 class="sec">Model prices</h2><p class="sub">Two tracks: <b>API-equivalent</b> (models.dev / public list price, always per 1M tokens) and <b>actual</b> (what you pay). The actual track can be billed <b>per 1M tokens</b> or as a <b>flat per-request</b> fee. Leave actual token rates blank to reuse the equivalent rate; blank cache read uses the prompt rate, blank cache write is $0.</p></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Save price</h2></div><div class="panel-b">
       <div class="form-grid">
         <div><label>Slug</label><input id="pr-slug" placeholder="z-ai/glm-5.3"></div>
+        <div><label>Actual pricing basis</label><select id="pr-actual-mode"><option value="per_1m">Per 1M tokens</option><option value="per_request">Flat per request</option></select></div>
         <div><label>Equivalent prompt $/1M</label><input id="pr-prompt" type="number" step="0.0001" placeholder="0"></div>
         <div><label>Equivalent completion $/1M</label><input id="pr-completion" type="number" step="0.0001" placeholder="0"></div>
         <div><label>Actual prompt $/1M (optional)</label><input id="pr-actual-prompt" type="number" step="0.0001" placeholder="same as equivalent"></div>
         <div><label>Actual completion $/1M (optional)</label><input id="pr-actual-completion" type="number" step="0.0001" placeholder="same as equivalent"></div>
         <div><label>Cache read $/1M (optional)</label><input id="pr-cache-read" type="number" step="0.0001" placeholder="same as prompt"></div>
         <div><label>Cache write $/1M (optional)</label><input id="pr-cache-write" type="number" step="0.0001" placeholder="0"></div>
+        <div><label>Actual $/request (flat basis)</label><input id="pr-actual-request" type="number" step="0.0001" placeholder="0"></div>
       </div>
       <div class="form-actions"><button class="act" id="pr-save">Save price</button><button class="ghost" id="pr-sync">Sync equivalent from models.dev</button></div>
     </div></div>
@@ -1289,7 +1291,9 @@ document.getElementById('pr-save').onclick=async function(){
     actual_prompt_per_1m: document.getElementById('pr-actual-prompt').value,
     actual_completion_per_1m: document.getElementById('pr-actual-completion').value,
     cache_read_per_1m: document.getElementById('pr-cache-read').value,
-    cache_write_per_1m: document.getElementById('pr-cache-write').value
+    cache_write_per_1m: document.getElementById('pr-cache-write').value,
+    actual_mode: document.getElementById('pr-actual-mode').value,
+    actual_per_request: document.getElementById('pr-actual-request').value
   });
 };
 document.getElementById('pr-sync').onclick=async function(){
@@ -1314,7 +1318,9 @@ async function savePriceRow(p){
     actual_prompt_per_1m: optRate(p.actual_prompt_per_1m),
     actual_completion_per_1m: optRate(p.actual_completion_per_1m),
     cache_read_per_1m: optRate(p.cache_read_per_1m),
-    cache_write_per_1m: optRate(p.cache_write_per_1m)
+    cache_write_per_1m: optRate(p.cache_write_per_1m),
+    actual_mode: p.actual_mode==='per_request'?'per_request':'per_1m',
+    actual_per_request: optRate(p.actual_per_request)
   });
   const {status,data}=await api('/admin/prices',{method:'POST',body});
   if(status===200){ toast('price saved','ok'); loadPrices(); return true; }
@@ -1325,6 +1331,8 @@ function editPrice(slug){
   const p=priceCache.find(function(x){ return x.slug===slug; })||{ slug };
   const num=function(v){ return v==null||v===''?'':String(v); };
   openModal('Edit price · '+slug,[
+    { key:'actual_mode', label:'Actual pricing basis', type:'select', value:(p.actual_mode==='per_request'?'per_request':'per_1m'), options:[{value:'per_1m',label:'Per 1M tokens'},{value:'per_request',label:'Flat per request'}] },
+    { key:'actual_per_request', label:'Actual $/request (flat basis)', type:'number', value:num(p.actual_per_request), placeholder:'0' },
     { key:'prompt_per_1m', label:'Equivalent prompt $/1M', type:'number', value:num(p.prompt_per_1m), placeholder:'0' },
     { key:'completion_per_1m', label:'Equivalent completion $/1M', type:'number', value:num(p.completion_per_1m), placeholder:'0' },
     { key:'actual_prompt_per_1m', label:'Actual prompt $/1M (optional)', type:'number', value:num(p.actual_prompt_per_1m), placeholder:'same as equivalent' },
@@ -1332,7 +1340,7 @@ function editPrice(slug){
     { key:'cache_read_per_1m', label:'Cache read $/1M (optional)', type:'number', value:num(p.cache_read_per_1m), placeholder:'same as prompt' },
     { key:'cache_write_per_1m', label:'Cache write $/1M (optional)', type:'number', value:num(p.cache_write_per_1m), placeholder:'0' }
   ],async function(out){
-    const ok=await savePriceRow({ slug, prompt_per_1m: out.prompt_per_1m, completion_per_1m: out.completion_per_1m, actual_prompt_per_1m: out.actual_prompt_per_1m, actual_completion_per_1m: out.actual_completion_per_1m, cache_read_per_1m: out.cache_read_per_1m, cache_write_per_1m: out.cache_write_per_1m });
+    const ok=await savePriceRow({ slug, prompt_per_1m: out.prompt_per_1m, completion_per_1m: out.completion_per_1m, actual_prompt_per_1m: out.actual_prompt_per_1m, actual_completion_per_1m: out.actual_completion_per_1m, cache_read_per_1m: out.cache_read_per_1m, cache_write_per_1m: out.cache_write_per_1m, actual_mode: out.actual_mode, actual_per_request: out.actual_per_request });
     if(ok) closeModal();
   },'Save price');
 }
@@ -1342,18 +1350,22 @@ async function loadPrices(){
   let data; try{ const res=await api('/admin/prices'); data=res.data; }catch(e){ paintLoadError(el,'Could not load prices: '+e.message,loadPrices); return; }
   priceCache=(data&&data.prices)||[];
   const rows=priceCache.map(function(p){
+    const actualBasis=p.actual_mode==='per_request'
+      ? '<span class="pill acc">'+money(Number(p.actual_per_request||0))+'/req</span>'
+      : '<span class="small">per 1M</span>';
     return '<tr data-slug="'+esc(p.slug)+'">'+
       '<td class="mono">'+esc(p.slug)+'</td>'+
       '<td class="mono">'+money(Number(p.prompt_per_1m||0))+'/1M</td>'+
       '<td class="mono">'+money(Number(p.completion_per_1m||0))+'/1M</td>'+
+      '<td>'+actualBasis+'</td>'+
       '<td class="mono">'+dashRate(p.actual_prompt_per_1m)+'</td>'+
       '<td class="mono">'+dashRate(p.actual_completion_per_1m)+'</td>'+
       '<td class="mono">'+dashRate(p.cache_read_per_1m)+'</td>'+
       '<td class="mono">'+dashRate(p.cache_write_per_1m)+'</td>'+
       '<td>'+(p.currency||'USD')+'</td>'+
       '<td class="rowact"><button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="9"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Eq prompt</th><th>Eq completion</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
+  }).join('') || '<tr><td colspan="10"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Slug</th><th>Eq prompt</th><th>Eq completion</th><th>Actual basis</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
 }
 document.getElementById('pr-list').addEventListener('click',function(e){
   const b=e.target.closest('[data-act]'); if(!b) return;
