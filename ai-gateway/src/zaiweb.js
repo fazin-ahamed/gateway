@@ -930,7 +930,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     }
   };
 
-  const retire = () => retire();
+  const retire = () => releaseZaiChatId(poolKey, chatId, cleanup);
 
   const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
   const proofMode = options.proofMode || "caller";
@@ -1076,7 +1076,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       tools: payload.tools || payload.functions || []
     });
   } finally {
-    releaseZaiChatId(poolKey, chatId, cleanup);
+    retire();
   }
 }
 
