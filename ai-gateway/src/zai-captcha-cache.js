@@ -10,7 +10,7 @@
 // - process-wide Z.AI WAF pacing/breaker.
 
 import { takeDeviceToken } from "./zai-tokens.js";
-import { mintCaptcha } from "./zai-captcha.js";
+import { mintCaptcha, zaiCaptchaConfigured } from "./zai-captcha.js";
 import { zaiWaf } from "./zai-waf.js";
 
 const MAX_PARAMS = Math.max(1, Number(process.env.ZAI_CAPTCHA_CACHE_SIZE) || 2);
@@ -31,6 +31,8 @@ function sweep(cache, now = Date.now()) {
 
 async function computeProof(storePath, fetchImpl) {
   zaiWaf.assertAvailable();
+  if (!zaiCaptchaConfigured())
+    return { ok: false, remaining: null, reason: "captcha-config" };
   let lastReason = "";
   let remaining = 0;
   for (let attempt = 0; attempt < MAX_TOKEN_RETRIES; attempt++) {
