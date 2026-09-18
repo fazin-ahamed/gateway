@@ -235,8 +235,18 @@ async function ensurePage(pool) {
     pool.page = null;
   }
   const page = await pool.context.newPage();
-  await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
-  // SPA hydration: #chat-input is not in the first HTML.
+  try {
+    await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    const where = await pageDump(page).catch(() => "");
+    if (/timeout/i.test(msg)) {
+      throw new ZaiBrowserUnavailable(
+        "chat.z.ai never returned DOM content (CDN/Hyperlane block, stuck challenge, or network). " + where
+      );
+    }
+    throw e;
+  }
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   pool.page = page;
   return page;
