@@ -116,7 +116,8 @@ CREATE INDEX IF NOT EXISTS idx_login_attempts_ip
   ON admin_login_attempts(ip_hash, created_at);
 
 CREATE TABLE IF NOT EXISTS prices (
-  slug TEXT PRIMARY KEY,
+  slug TEXT NOT NULL,
+  provider_id INTEGER NOT NULL DEFAULT 0,
   prompt_per_1m REAL NOT NULL DEFAULT 0,
   completion_per_1m REAL NOT NULL DEFAULT 0,
   actual_prompt_per_1m REAL,
@@ -126,7 +127,8 @@ CREATE TABLE IF NOT EXISTS prices (
   actual_mode TEXT NOT NULL DEFAULT 'per_1m',
   actual_per_request REAL,
   currency TEXT NOT NULL DEFAULT 'USD',
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (slug, provider_id)
 );
 
 -- Per-request trajectory capture for review, RL, and SFT export.

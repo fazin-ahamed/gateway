@@ -316,6 +316,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-h"><h2 class="sec">Save price</h2></div><div class="panel-b">
       <div class="form-grid">
         <div><label>Slug</label><input id="pr-slug" placeholder="z-ai/glm-5.3"></div>
+        <div><label>Provider</label><select id="pr-provider"><option value="0">All providers (default)</option></select></div>
         <div><label>Actual pricing basis</label><select id="pr-actual-mode"><option value="per_1m">Per 1M tokens</option><option value="per_request">Flat per request</option></select></div>
         <div><label>Equivalent prompt $/1M</label><input id="pr-prompt" type="number" step="0.0001" placeholder="0"></div>
         <div><label>Equivalent completion $/1M</label><input id="pr-completion" type="number" step="0.0001" placeholder="0"></div>
@@ -1286,6 +1287,7 @@ document.getElementById('pr-save').onclick=async function(){
   if(!slug){ toast('slug required','err'); return; }
   await savePriceRow({
     slug,
+    provider_id: document.getElementById('pr-provider').value||'0',
     prompt_per_1m: document.getElementById('pr-prompt').value,
     completion_per_1m: document.getElementById('pr-completion').value,
     actual_prompt_per_1m: document.getElementById('pr-actual-prompt').value,
@@ -1313,6 +1315,7 @@ async function savePriceRow(p){
   if(!p.slug){ toast('slug required','err'); return false; }
   const body=JSON.stringify({
     slug: p.slug,
+    provider_id: Number(p.provider_id)||0,
     prompt_per_1m: p.prompt_per_1m||0,
     completion_per_1m: p.completion_per_1m||0,
     actual_prompt_per_1m: optRate(p.actual_prompt_per_1m),
@@ -1327,10 +1330,16 @@ async function savePriceRow(p){
   toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
   return false;
 }
-function editPrice(slug){
-  const p=priceCache.find(function(x){ return x.slug===slug; })||{ slug };
+function providerLabel(p){
+  if(!p.provider_id||Number(p.provider_id)===0) return '<span class="pill mut">all providers</span>';
+  return '<span class="pill acc">'+esc(p.provider_name||('#'+p.provider_id))+'</span>';
+}
+function editPrice(slug,providerId){
+  const pid=Number(providerId)||0;
+  const p=priceCache.find(function(x){ return x.slug===slug && (Number(x.provider_id)||0)===pid; })||{ slug, provider_id: pid };
   const num=function(v){ return v==null||v===''?'':String(v); };
-  openModal('Edit price · '+slug,[
+  const scope=pid===0?'all providers':(p.provider_name||('provider #'+pid));
+  openModal('Edit price · '+slug+' · '+scope,[
     { key:'actual_mode', label:'Actual pricing basis', type:'select', value:(p.actual_mode==='per_request'?'per_request':'per_1m'), options:[{value:'per_1m',label:'Per 1M tokens'},{value:'per_request',label:'Flat per request'}] },
     { key:'actual_per_request', label:'Actual $/request (flat basis)', type:'number', value:num(p.actual_per_request), placeholder:'0' },
     { key:'prompt_per_1m', label:'Equivalent prompt $/1M', type:'number', value:num(p.prompt_per_1m), placeholder:'0' },
@@ -1340,21 +1349,33 @@ function editPrice(slug){
     { key:'cache_read_per_1m', label:'Cache read $/1M (optional)', type:'number', value:num(p.cache_read_per_1m), placeholder:'same as prompt' },
     { key:'cache_write_per_1m', label:'Cache write $/1M (optional)', type:'number', value:num(p.cache_write_per_1m), placeholder:'0' }
   ],async function(out){
-    const ok=await savePriceRow({ slug, prompt_per_1m: out.prompt_per_1m, completion_per_1m: out.completion_per_1m, actual_prompt_per_1m: out.actual_prompt_per_1m, actual_completion_per_1m: out.actual_completion_per_1m, cache_read_per_1m: out.cache_read_per_1m, cache_write_per_1m: out.cache_write_per_1m, actual_mode: out.actual_mode, actual_per_request: out.actual_per_request });
+    const ok=await savePriceRow({ slug, provider_id: pid, prompt_per_1m: out.prompt_per_1m, completion_per_1m: out.completion_per_1m, actual_prompt_per_1m: out.actual_prompt_per_1m, actual_completion_per_1m: out.actual_completion_per_1m, cache_read_per_1m: out.cache_read_per_1m, cache_write_per_1m: out.cache_write_per_1m, actual_mode: out.actual_mode, actual_per_request: out.actual_per_request });
     if(ok) closeModal();
   },'Save price');
+}
+async function refreshPriceProviders(){
+  const sel=document.getElementById('pr-provider'); if(!sel) return;
+  const cur=sel.value;
+  try{
+    const opts=await providerOptions();
+    sel.innerHTML='<option value="0">All providers (default)</option>'+opts.map(function(o){ return '<option value="'+esc(o.value)+'">'+o.label+'</option>'; }).join('');
+    sel.value=cur||'0';
+  }catch(e){}
 }
 async function loadPrices(){
   const el=document.getElementById('pr-list');
   paintSkeleton(el);
+  refreshPriceProviders();
   let data; try{ const res=await api('/admin/prices'); data=res.data; }catch(e){ paintLoadError(el,'Could not load prices: '+e.message,loadPrices); return; }
   priceCache=(data&&data.prices)||[];
   const rows=priceCache.map(function(p){
+    const pid=Number(p.provider_id)||0;
     const actualBasis=p.actual_mode==='per_request'
       ? '<span class="pill acc">'+money(Number(p.actual_per_request||0))+'/req</span>'
       : '<span class="small">per 1M</span>';
-    return '<tr data-slug="'+esc(p.slug)+'">'+
+    return '<tr data-slug="'+esc(p.slug)+'" data-provider="'+pid+'">'+
       '<td class="mono">'+esc(p.slug)+'</td>'+
+      '<td>'+providerLabel(p)+'</td>'+
       '<td class="mono">'+money(Number(p.prompt_per_1m||0))+'/1M</td>'+
       '<td class="mono">'+money(Number(p.completion_per_1m||0))+'/1M</td>'+
       '<td>'+actualBasis+'</td>'+
@@ -1363,17 +1384,19 @@ async function loadPrices(){
       '<td class="mono">'+dashRate(p.cache_read_per_1m)+'</td>'+
       '<td class="mono">'+dashRate(p.cache_write_per_1m)+'</td>'+
       '<td>'+(p.currency||'USD')+'</td>'+
-      '<td class="rowact"><button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="10"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Eq prompt</th><th>Eq completion</th><th>Actual basis</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
+      '<td class="rowact"><button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'" data-provider="'+pid+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'" data-provider="'+pid+'">delete</button></td></tr>';
+  }).join('') || '<tr><td colspan="11"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Slug</th><th>Provider</th><th>Eq prompt</th><th>Eq completion</th><th>Actual basis</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
 }
 document.getElementById('pr-list').addEventListener('click',function(e){
   const b=e.target.closest('[data-act]'); if(!b) return;
   const act=b.getAttribute('data-act');
-  if(act==='predit'){ editPrice(b.dataset.slug); return; }
+  const pid=Number(b.dataset.provider)||0;
+  if(act==='predit'){ editPrice(b.dataset.slug,pid); return; }
   if(act==='prdel'){
-    confirmAction('Delete price','Remove the stored rates for '+b.dataset.slug+'?','Delete',async function(){
-      const {status,data}=await api('/admin/prices/'+encodeURIComponent(b.dataset.slug),{method:'DELETE'});
+    const scope=pid===0?'all providers':('provider #'+pid);
+    confirmAction('Delete price','Remove the '+scope+' rates for '+b.dataset.slug+'?','Delete',async function(){
+      const {status,data}=await api('/admin/prices/'+encodeURIComponent(b.dataset.slug)+'?provider_id='+pid,{method:'DELETE'});
       if(status===200){ toast('price deleted','ok'); loadPrices(); }
       else toast('delete failed: '+(data&&data.error&&data.error.message||status),'err');
     });

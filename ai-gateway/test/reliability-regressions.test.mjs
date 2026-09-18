@@ -198,6 +198,22 @@ test("priceFromRow exposes per-request actual basis", () => {
   assert.equal(perToken.actualPerRequest, 0);
 });
 
+test("actual pricing resolves per provider, then the provider_id=0 default", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const db = createDb(":memory:");
+  db.exec("CREATE TABLE prices (slug TEXT NOT NULL, provider_id INTEGER NOT NULL DEFAULT 0, prompt_per_1m REAL NOT NULL DEFAULT 0, completion_per_1m REAL NOT NULL DEFAULT 0, actual_prompt_per_1m REAL, actual_completion_per_1m REAL, cache_read_per_1m REAL, cache_write_per_1m REAL, actual_mode TEXT NOT NULL DEFAULT 'per_1m', actual_per_request REAL, currency TEXT, updated_at TEXT, PRIMARY KEY(slug, provider_id))");
+  const ins = (pid, ap, ac, mode, per) => db.prepare("INSERT INTO prices (slug, provider_id, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, actual_mode, actual_per_request, updated_at) VALUES ('m',?,10,20,?,?,?,?, 't')").bind(pid, ap, ac, mode || "per_1m", per == null ? null : per).run();
+  ins(0, 1, 2, "per_1m", null);          // default: $1 + $2 per 1M
+  ins(5, 3, 4, "per_1m", null);          // provider 5: $3 + $4 per 1M
+  ins(6, null, null, "per_request", 0.01); // provider 6: flat $0.01/request
+  t.__resetPricesSchema();
+  const c = { env: { DB: db } };
+  const usage = { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 };
+  assert.equal(await t.computeCost(c, "m", usage, 5), 7, "provider-specific rate wins");
+  assert.equal(await t.computeCost(c, "m", usage, 99), 3, "unpriced provider falls back to the default");
+  assert.equal(await t.computeCost(c, "m", usage, 6), 0.01, "per-request provider bills the flat fee");
+});
+
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
   const actions = generateActions([
     { slug: "model-a-mini", cost: 3, eligible: true, capable: true },
