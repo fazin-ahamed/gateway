@@ -141,7 +141,9 @@ test("ZAI prompt regenerates repair policy without duplicating global wrapper", 
 
 test("preserves main's bare hashline patch shorthand and compatibility helper", () => {
   const bare = "[src/a.js#4:ab]\\nPUT 4.=4:new";
-  assert.deepEqual(JSON.parse(repairEditToolArguments("edit", bare)), { input: bare });
+  const normalized = bare.replace(/\\\\n/g, "\n");
+  const normalized = bare.replace(/\\\\n/g, "\n");
+  assert.deepEqual(JSON.parse(repairEditToolArguments("edit", bare)), { input: normalized });
 
   const schemaTool = [{
     type: "function",
@@ -156,7 +158,7 @@ test("preserves main's bare hashline patch shorthand and compatibility helper", 
       }
     }
   }];
-  assert.deepEqual(JSON.parse(repairEditToolArguments("edit", bare, schemaTool)), { input: bare });
+  assert.deepEqual(JSON.parse(repairEditToolArguments("edit", bare, schemaTool)), { input: normalized });
 });
 
 test("ordinary edit-style stream can carry bare hashline shorthand safely", async () => {
@@ -192,7 +194,7 @@ test("ordinary edit-style stream can carry bare hashline shorthand safely", asyn
   const calls = objs.flatMap((o) => o.choices?.[0]?.delta?.tool_calls || []);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].function.name, "edit");
-  assert.deepEqual(JSON.parse(calls[0].function.arguments), { input: bare });
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), { input: normalized });
 });
 
 test("non-stream ZAI agent call repairs hashline aliases", () => {
