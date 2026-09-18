@@ -40,24 +40,34 @@ export function createZaiWafController(options = {}) {
   const now = typeof options.now === "function" ? options.now : () => Date.now();
   const sleep = typeof options.sleep === "function" ? options.sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const random = typeof options.random === "function" ? options.random : Math.random;
+  const probe = typeof options.probe === "function" ? options.probe : null;
+  const setTimer = typeof options.setTimer === "function" ? options.setTimer : setTimeout;
+  const clearTimer = typeof options.clearTimer === "function" ? options.clearTimer : clearTimeout;
   const baseCooldownMs = Math.max(1, Number(options.baseCooldownMs) || DEFAULT_BASE_COOLDOWN_MS);
   const maxCooldownMs = Math.max(baseCooldownMs, Number(options.maxCooldownMs) || DEFAULT_MAX_COOLDOWN_MS);
   const minPaceMs = Math.max(0, Number(options.minPaceMs) || DEFAULT_MIN_PACE_MS);
   const maxPaceMs = Math.max(minPaceMs, Number(options.maxPaceMs) || DEFAULT_MAX_PACE_MS);
 
   let blockCount = 0;
+  let breakerOpen = false;
   let openUntil = 0;
   let cooldownMs = 0;
   let lastReason = "";
   let nextAllowedAt = 0;
   let lane = Promise.resolve();
+  let probeTimer = null;
+  let probeGeneration = 0;
 
-  const retryAfterSec = () => openUntil > now() ? Math.max(1, Math.ceil((openUntil - now()) / 1000)) : 0;
+  const isBlocked = () => probe ? breakerOpen : openUntil > now();
+  const retryAfterSec = () => {
+    if (!isBlocked()) return 0;
+    return Math.max(1, Math.ceil(Math.max(0, openUntil - now()) / 1000));
+  };
 
   const status = () => ({
-    blocked: openUntil > now(),
+    blocked: isBlocked(),
     blockCount,
-    cooldownMs: openUntil > now() ? cooldownMs : (blockCount ? cooldownMs : 0),
+    cooldownMs: isBlocked() ? cooldownMs : (blockCount ? cooldownMs : 0),
     retryAfterSec: retryAfterSec(),
     lastReason
   });
@@ -68,15 +78,68 @@ export function createZaiWafController(options = {}) {
       throw new ZaiWafBlockedError(retry);
   };
 
+  const cancelProbe = () => {
+    probeGeneration++;
+    if (probeTimer != null) {
+      try { clearTimer(probeTimer); } catch {}
+      probeTimer = null;
+    }
+  };
+
+  const scheduleProbe = () => {
+    if (!probe || !breakerOpen)
+      return;
+    const gen = ++probeGeneration;
+    if (probeTimer != null) {
+      try { clearTimer(probeTimer); } catch {}
+    }
+    const delay = Math.max(1, openUntil - now());
+    probeTimer = setTimer(async () => {
+      probeTimer = null;
+      if (gen !== probeGeneration || !breakerOpen)
+        return;
+
+      let stillBlocked = true;
+      try {
+        stillBlocked = (await probe()) !== false;
+      } catch {
+        stillBlocked = true;
+      }
+      if (gen !== probeGeneration || !breakerOpen)
+        return;
+
+      if (!stillBlocked) {
+        breakerOpen = false;
+        blockCount = 0;
+        openUntil = 0;
+        cooldownMs = 0;
+        lastReason = "";
+        probeGeneration++;
+        return;
+      }
+
+      cooldownMs = Math.min(maxCooldownMs, Math.max(baseCooldownMs, cooldownMs * 2));
+      openUntil = now() + cooldownMs;
+      lastReason = "probe-blocked";
+      scheduleProbe();
+    }, delay);
+    if (probeTimer && typeof probeTimer.unref === "function")
+      probeTimer.unref();
+  };
+
   const recordBlock = (reason = "edge-block") => {
     blockCount++;
+    breakerOpen = true;
     cooldownMs = Math.min(maxCooldownMs, baseCooldownMs * (2 ** Math.max(0, blockCount - 1)));
     openUntil = now() + cooldownMs;
     lastReason = String(reason || "edge-block").slice(0, 80);
+    scheduleProbe();
     return status();
   };
 
   const recordSuccess = () => {
+    cancelProbe();
+    breakerOpen = false;
     blockCount = 0;
     openUntil = 0;
     cooldownMs = 0;
@@ -110,4 +173,24 @@ export function createZaiWafController(options = {}) {
   return { status, assertAvailable, recordBlock, recordSuccess, pace, beforeRequest };
 }
 
-export const zaiWaf = createZaiWafController();
+async function probeZaiCompletionEdge() {
+  try {
+    const res = await fetch("https://chat.z.ai/api/v2/chat/completions", {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+      },
+      body: "{}"
+    });
+    const body = String(await res.text().catch(() => "")).slice(0, 8192);
+    return isZaiWafBlock(res.status, body);
+  } catch {
+    // Transport failure is not evidence that the edge recovered.
+    return true;
+  }
+}
+
+export const zaiWaf = createZaiWafController({ probe: probeZaiCompletionEdge });
