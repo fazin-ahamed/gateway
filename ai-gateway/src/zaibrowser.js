@@ -308,6 +308,24 @@ function textOf(content) {
  * completion response. Returns the parsed frame stream as text, which the
  * shared frame parser turns into OpenAI chunks.
  */
+async function dismissOverlays(page) {
+  for (let i = 0; i < 3; i++) {
+    const blocked = await page.evaluate(() => {
+      const input = document.querySelector("#chat-input");
+      if (!input) return false;
+      const box = input.getBoundingClientRect();
+      const atPoint = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+      return !!(atPoint && !input.contains(atPoint) && !atPoint.contains(input));
+    }).catch(() => false);
+    if (!blocked) return true;
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(300);
+    await page.mouse.click(640, 200).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
 export async function runBrowserTurn(token, prompt, options = {}) {
   const timeoutMs = Number(options.turnTimeoutMs) || DEFAULT_TURN_TIMEOUT_MS;
   const key = poolKey(token);
@@ -335,17 +353,29 @@ export async function runBrowserTurn(token, prompt, options = {}) {
       const input = await firstVisible(page, COMPOSER_SELS, 15000);
       if (!input)
         throw new Error("composer never appeared (" + (await pageDump(page)) + ")");
-      await input.click({ timeout: 8000 });
+      await dismissOverlays(page);
+      // Direct focus / JS input prevents Playwright click timeouts when an invisible
+      // or floating element intercepts the hit test.
+      await input.focus().catch(() => {});
+      await input.click({ timeout: 3000, force: true }).catch(() => {});
+      await page.evaluate(({ prompt }) => {
+        const el = document.querySelector("#chat-input") || document.querySelector("textarea");
+        if (!el) return;
+        el.value = prompt;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }, { prompt }).catch(() => {});
       if (typeof input.fill === "function") {
-        await input.fill("").catch(() => {});
-        await input.fill(prompt);
-      } else {
-        await page.keyboard.type(prompt, { delay: 5 });
+        await input.fill(prompt).catch(() => {});
       }
       const send = await firstVisible(page, SEND_SELS, 8000);
       if (!send)
         throw new Error("send button never appeared (" + (await pageDump(page)) + ")");
-      await send.click({ timeout: 8000, force: true });
+      await page.evaluate(() => {
+        const btn = document.querySelector("#send-message-button") || document.querySelector('[aria-label="Send Message"] button');
+        if (btn) btn.click();
+      }).catch(() => {});
+      await send.click({ timeout: 5000, force: true }).catch(() => {});
       const result = await Promise.race([
         responsePromise,
         new Promise((resolve) => setTimeout(() => resolve({ status: 0, body: "", timeout: true }), timeoutMs))
