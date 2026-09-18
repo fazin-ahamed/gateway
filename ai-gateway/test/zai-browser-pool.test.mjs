@@ -7,18 +7,15 @@ import { __zaiTest } from "../src/zaiweb.js";
 const b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
 const jwt = (claims, sig) => [b64u({ alg: "HS256" }), b64u(claims), sig].join(".");
 
-test("rotated JWTs for the same ZAI account share one browser pool identity", () => {
+test("validated account identity keeps rotated JWTs in one browser pool", () => {
   const first = jwt({ id: "acct-123", exp: 1 }, "sig-one");
   const rotated = jwt({ id: "acct-123", exp: 2 }, "sig-two");
+  const stableId = __zaiTest.browserPoolIdForUserId("acct-123");
 
-  const firstId = __zaiTest.browserPoolIdForToken(first);
-  const rotatedId = __zaiTest.browserPoolIdForToken(rotated);
-
-  assert.equal(firstId, "uid:acct-123");
-  assert.equal(rotatedId, firstId);
+  assert.equal(stableId, "uid:acct-123");
   assert.equal(
-    __browserTest.poolKey(first, firstId),
-    __browserTest.poolKey(rotated, rotatedId),
+    __browserTest.poolKey(first, stableId),
+    __browserTest.poolKey(rotated, stableId),
     "token rotation must not cold-start a new browser context"
   );
 });
@@ -38,8 +35,8 @@ test("different ZAI accounts never share a browser pool", () => {
   const a = jwt({ id: "acct-a" }, "sig");
   const b = jwt({ id: "acct-b" }, "sig");
 
-  const aId = __zaiTest.browserPoolIdForToken(a);
-  const bId = __zaiTest.browserPoolIdForToken(b);
+  const aId = __zaiTest.browserPoolIdForUserId("acct-a");
+  const bId = __zaiTest.browserPoolIdForUserId("acct-b");
 
   assert.notEqual(aId, bId);
   assert.notEqual(
