@@ -259,7 +259,10 @@ function renderRecent(messages) {
 }
 
 export function buildAgentPrompt(messages, tools) {
-  const msgs = Array.isArray(messages) ? messages : [];
+  const msgs = (Array.isArray(messages) ? messages : []).filter((m) => {
+    const text = textOf(m && m.content);
+    return !text.includes("<gateway_tool_repair>");
+  });
   const toolList = Array.isArray(tools) ? tools : [];
   let out = SYSTEM_PREFIX + "\n\n<tools>\n" + renderTools(toolList) + "\n</tools>\n\n";
   const repairPolicy = buildToolRepairPolicy(msgs, toolList);
