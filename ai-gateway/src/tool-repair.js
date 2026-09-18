@@ -252,6 +252,6 @@ export function applyToolRepairPolicyToPayload(payload) {
   const messages = payload.messages.slice();
   const existing = messages.findIndex((m) => m && (m.role === "developer" || m.role === "system") && typeof m.content === "string" && m.content.includes(marker));
   if (existing >= 0) messages[existing] = { ...messages[existing], content: guidance };
-  else messages.unshift({ role: "developer", content: guidance });
+  else messages.unshift({ role: "system", content: guidance });
   return { ...payload, messages };
 }
