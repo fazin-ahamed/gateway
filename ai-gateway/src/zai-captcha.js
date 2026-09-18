@@ -5,10 +5,8 @@
 // explicit operator-supplied Aliyun credentials retained.
 //
 // Status (measured against live Aliyun + chat.z.ai):
-//   ✓ Aliyun InitCaptchaV3 works (standard RPC signing; the published
-//     reference's percent-everything encoder is rejected with
-//     "Specified signature is not matched", so this file uses standard
-//     encoding and gets a CertifyId back).
+//   ✓ Aliyun InitCaptchaV3 works with the same RFC3986-style RPC signing
+//     used by the reference implementation.
 //   ✓ The payload primitives are byte-identical to the published Go reference:
 //     generateArg, the tracking JSON, and aliHash all match exactly.
 //   ✓ Stealth-harvested device tokens can produce VerifyCode T001 and a real
@@ -157,9 +155,8 @@ export function buildTrackPayload(certifyId, startTime) {
 }
 
 // ---------- Aliyun RPC ----------
-// Standard Aliyun percent-encoding (unreserved characters stay literal). The
-// published reference percent-encodes every byte, which the live endpoint
-// rejects with "Specified signature is not matched".
+// Same RFC3986-style Aliyun encoding as GLM-Free-API: alnum and -_.~ stay
+// literal; all other bytes are percent-encoded before canonical signing.
 function pct(value) {
   return encodeURIComponent(String(value)).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
