@@ -214,6 +214,33 @@ test("actual pricing resolves per provider, then the provider_id=0 default", asy
   assert.equal(await t.computeCost(c, "m", usage, 6), 0.01, "per-request provider bills the flat fee");
 });
 
+test("migratePrices rebuilds a slug-only table with NULL actual_mode into (slug, provider_id)", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { migratePrices } = await import("../../server/migrations.mjs");
+  const db = createDb(":memory:");
+  db.exec("CREATE TABLE prices (slug TEXT PRIMARY KEY, prompt_per_1m REAL NOT NULL DEFAULT 0, completion_per_1m REAL NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'USD', updated_at TEXT NOT NULL)");
+  db.exec("ALTER TABLE prices ADD COLUMN actual_mode TEXT");
+  db.exec("ALTER TABLE prices ADD COLUMN actual_per_request REAL");
+  db.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES ('glm',1,2,'USD','t')").run();
+  db.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_mode, actual_per_request, currency, updated_at) VALUES ('qwen',3,4,'per_request',0.02,'USD','t')").run();
+  migratePrices(db);
+  const cols = db.prepare("PRAGMA table_info(prices)").all();
+  const list = Array.isArray(cols) ? cols : (cols && cols.results) || [];
+  assert.ok(list.some((x) => x.name === "provider_id"), "provider_id column added");
+  const rows = (db.prepare("SELECT slug, provider_id, actual_mode, actual_per_request FROM prices ORDER BY slug").all().results) || [];
+  const glm = rows.find((r) => r.slug === "glm");
+  assert.equal(glm.provider_id, 0, "existing rows become the provider_id=0 default");
+  assert.equal(glm.actual_mode, "per_1m", "NULL actual_mode coalesces instead of aborting the rebuild");
+  const qwen = rows.find((r) => r.slug === "qwen");
+  assert.equal(qwen.actual_mode, "per_request");
+  assert.equal(qwen.actual_per_request, 0.02);
+  db.prepare("INSERT INTO prices (slug, provider_id, prompt_per_1m, completion_per_1m, actual_mode, actual_prompt_per_1m, updated_at) VALUES ('glm',5,1,2,'per_1m',0.9,'t')").run();
+  const glmRows = (db.prepare("SELECT provider_id FROM prices WHERE slug='glm' ORDER BY provider_id").all().results) || [];
+  assert.deepEqual(glmRows.map((r) => r.provider_id), [0, 5], "composite key admits a provider override beside the default");
+  migratePrices(db);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM prices").all().results)[0].n, 3, "re-running the migration is a no-op");
+});
+
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
   const actions = generateActions([
     { slug: "model-a-mini", cost: 3, eligible: true, capable: true },

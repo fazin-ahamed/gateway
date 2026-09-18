@@ -4623,6 +4623,8 @@ app.post("/admin/prices/sync-models-dev", async (c) => {
   } catch (e) {
     return c.json({ error: { message: "models.dev fetch failed: " + String(e.message || e) } }, 502);
   }
+  await ensurePriceColumns(c.env.DB);
+  const hasProv = await pricesHasProvider(c);
   const byId = flattenModelsDevCatalog(catalog);
   const slugs = await c.env.DB.prepare("SELECT DISTINCT slug FROM model_routes").all();
   const list = slugs.results || [];
@@ -4639,7 +4641,10 @@ app.post("/admin/prices/sync-models-dev", async (c) => {
         missing.push(slug);
       continue;
     }
-    await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(slug, hit.prompt_per_1m, hit.completion_per_1m, "USD", ts).run();
+    if (hasProv)
+      await c.env.DB.prepare("INSERT INTO prices (slug, provider_id, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,0,?,?,?,?) ON CONFLICT(slug, provider_id) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(slug, hit.prompt_per_1m, hit.completion_per_1m, "USD", ts).run();
+    else
+      await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(slug, hit.prompt_per_1m, hit.completion_per_1m, "USD", ts).run();
     matched++;
     updated.push({ slug, prompt_per_1m: hit.prompt_per_1m, completion_per_1m: hit.completion_per_1m, source: hit.id });
   }
