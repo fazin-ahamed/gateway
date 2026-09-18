@@ -892,7 +892,6 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const txt = await up.text();
             const usage = res.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
             const costUsd = await computeCost(c, liveSlug, usage, route.provider_id);
-            _att.success = 1; _att.prompt = Number(usage.prompt_tokens) || 0; _att.completion = Number(usage.completion_tokens) || 0; _att.cost = costUsd;
             const clientTxt = sanitizeClientResponse(txt, liveSlug);
             if (isGenericUpstreamErrorResponse(clientTxt)) {
               _att.why = "malformed";
@@ -903,6 +902,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               attempts++;
               break;
             }
+            _att.success = 1; _att.prompt = Number(usage.prompt_tokens) || 0; _att.completion = Number(usage.completion_tokens) || 0; _att.cost = costUsd;
             await recordUsage(c, key, { ...usage, cost_usd: costUsd });
             await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
             if (cacheKey && isCacheableResponse(clientTxt)) {
@@ -939,11 +939,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
           _att.recorded = true;
-          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: attempts, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 1, http_status: up.status });
+          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: attempts, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 1, http_status: up.status, deferPosterior: true });
           const horizonHdrs = { "x-gateway-model": liveSlug };
           if (autoDecision && autoDecision.horizon)
             horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
-          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs, attemptId: _streamAttemptId, attemptStart: _attStart });
+          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs, attemptId: _streamAttemptId, attemptStart: _attStart, attemptTaskType });
           return result;
         } catch (e) {
           // Adapter diagnostics stay internal; only gateway-owned errors cross
@@ -1828,10 +1828,22 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
     if (extra && extra.attemptId) {
+      const ok = !streamError;
+      const attLatency = Date.now() - (extra.attemptStart || started);
       try {
-        await c.env.DB.prepare("UPDATE route_attempts SET latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(Date.now() - (extra.attemptStart || started), Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
+        await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(ok ? 1 : 0, ok ? "success" : "stream_error", attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
       } catch (e) {
         blog("route_attempt stream patch failed: " + String(e.message || e));
+      }
+      // Posterior was deferred at handoff; observe the real terminal outcome
+      // now (a mid-stream failure is an operational failure, not a win).
+      try {
+        const scopeId = "route:" + (route.id ?? "?");
+        await updateRouterStat(c, "route", scopeId, "", ok, attLatency, costUsd);
+        if (extra.attemptTaskType)
+          await updateRouterStat(c, "route_task", scopeId, extra.attemptTaskType, ok, attLatency, costUsd);
+      } catch (e) {
+        blog("route_attempt stream posterior failed: " + String(e.message || e));
       }
     }
     if (extra && extra.traj) {
@@ -3032,20 +3044,30 @@ function classifyAttempt(status, why, errKind) {
     return noimp("caller");
   if (/captcha|credentials|browser_unavailable|config/.test(w))
     return noimp("capability");
-  if (w === "auth" || s === 401 || s === 403)
+  if (w === "auth")
     return noimp("auth");
-  if (w === "rate_limit" || s === 429)
+  if (w === "rate_limit")
     return noimp("rate_limit");
-  if (s === 400 || s === 404 || s === 422)
-    return noimp("caller");
-  if (/timeout|timed out/.test(w) || s === 408 || s === 504)
+  // Operational classes matched on the known `why` BEFORE any status fallback,
+  // so a Relbackend opaque-upstream 400 (why="relay") is bad_upstream_response
+  // (health_impact=1), not a caller 400.
+  if (w === "relay" || /relay|bad_upstream|malformed|stream_error/.test(w))
+    return op("bad_upstream_response");
+  if (/timeout|timed out/.test(w))
     return op("timeout");
   if (/reset|econnreset|socket|connect/.test(w))
     return op("connect");
   if (/waf/.test(w))
     return op("waf");
-  if (w === "relay" || /relay|bad_upstream|malformed|stream_error/.test(w))
-    return op("bad_upstream_response");
+  // Status-only fallbacks.
+  if (s === 401 || s === 403)
+    return noimp("auth");
+  if (s === 429)
+    return noimp("rate_limit");
+  if (s === 408 || s === 504)
+    return op("timeout");
+  if (s === 400 || s === 404 || s === 422)
+    return noimp("caller");
   if (s >= 500 || s === 0)
     return op("upstream_5xx");
   return op("upstream_5xx");
@@ -3088,7 +3110,7 @@ async function recordRouteAttempt(c, a) {
       a.ttft_ms ?? null, a.latency_ms ?? null, a.prompt_tokens ?? 0, a.completion_tokens ?? 0,
       a.estimated_cost_usd ?? null, a.actual_cost_usd ?? null, a.fallback_from_route_id ?? null, a.rescue_used ? 1 : 0
     ).run();
-    if (a.success || a.health_impact) {
+    if ((a.success || a.health_impact) && !a.deferPosterior) {
       const ok = !!a.success;
       const scopeId = "route:" + (a.route_id ?? "?");
       await updateRouterStat(c, "route", scopeId, "", ok, a.latency_ms, a.actual_cost_usd);

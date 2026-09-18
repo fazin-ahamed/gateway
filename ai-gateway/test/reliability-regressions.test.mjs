@@ -248,7 +248,8 @@ test("classifyAttempt marks only operational failures for route health", () => {
   assert.equal(imp(0, "request_size"), 0);
   assert.equal(imp(401, "auth"), 0, "a dead key is credential, not route health");
   assert.equal(imp(429, "rate_limit"), 0);
-  assert.equal(imp(400, "unknown"), 0);
+  assert.equal(imp(400, "unknown"), 0, "an opaque 400 with no known cause is a caller error");
+  assert.equal(imp(400, "relay"), 1, "a Relbackend opaque-upstream 400 is operational, matched by why before status");
   assert.equal(imp(404, ""), 0);
   assert.equal(imp(500, "unknown"), 1);
   assert.equal(imp(504, ""), 1);
@@ -256,6 +257,10 @@ test("classifyAttempt marks only operational failures for route health", () => {
   assert.equal(imp(0, null, "ECONNRESET"), 1);
   assert.equal(t.classifyAttempt(500, "unknown").failure_class, "upstream_5xx");
   assert.equal(t.classifyAttempt(0, "relay").failure_class, "bad_upstream_response");
+  assert.equal(t.classifyAttempt(400, "relay").failure_class, "bad_upstream_response");
+  const malformed = t.classifyAttempt(200, "malformed");
+  assert.equal(malformed.failure_class, "bad_upstream_response", "a 200 with a generic error body is a bad upstream response");
+  assert.equal(malformed.health_impact, 1);
 });
 
 test("recordRouteAttempt writes one row per attempt and moves the posterior only on operational outcomes", async () => {
@@ -273,6 +278,15 @@ test("recordRouteAttempt writes one row per attempt and moves the posterior only
   const stat = db.prepare("SELECT success_alpha, failure_beta FROM router_stats WHERE scope='route' AND scope_id='route:7' AND task_type=''").all().results[0];
   assert.ok(stat.success_alpha > 8 && stat.success_alpha < 10, "one operational success raised alpha");
   assert.ok(stat.failure_beta > 2 && stat.failure_beta < 4, "one operational failure raised beta; the caller error did not");
+  // A deferred (streaming handoff) record writes the row but must not move the
+  // posterior until the stream's terminal outcome is known.
+  const before = db.prepare("SELECT success_alpha, failure_beta FROM router_stats WHERE scope='route' AND scope_id='route:9' AND task_type=''").all().results[0];
+  assert.equal(before, undefined, "no stat for a fresh route yet");
+  await t.recordRouteAttempt(c, { ...base, request_id: "r4", route_id: 9, success: 1, health_impact: 1, http_status: 200, deferPosterior: true });
+  const rows9 = db.prepare("SELECT COUNT(*) AS n FROM route_attempts WHERE route_id=9").all().results[0].n;
+  assert.equal(rows9, 1, "deferred record still writes the attempt row");
+  const stat9 = db.prepare("SELECT success_alpha FROM router_stats WHERE scope='route' AND scope_id='route:9' AND task_type=''").all().results[0];
+  assert.equal(stat9, undefined, "deferred posterior is not observed at handoff");
 });
 
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
