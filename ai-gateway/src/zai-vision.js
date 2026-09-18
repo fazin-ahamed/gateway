@@ -253,7 +253,7 @@ export async function processZaiVision({ messages, session, fetcher, imageFetch 
   }
 
   if (!found.length)
-    return { messages: cloned, files: [], imageCount: 0 };
+    return { messages: cloned, files: [], imageParts: [], imageCount: 0 };
   if (found.length > MAX_IMAGES)
     throw new Error("too many images: " + found.length + " provided, max " + MAX_IMAGES);
 
@@ -277,8 +277,35 @@ export async function processZaiVision({ messages, session, fetcher, imageFetch 
   return {
     messages: cloned,
     files: uploaded.map((x) => x.entry),
+    imageParts: uploaded.map((x) => ({ type: "image_url", image_url: { url: x.file.id } })),
     imageCount: uploaded.length
   };
+}
+
+export function attachZaiImageParts(messages, imageParts) {
+  const parts = Array.isArray(imageParts) ? imageParts : [];
+  const out = JSON.parse(JSON.stringify(Array.isArray(messages) ? messages : []));
+  if (!parts.length || !out.length)
+    return out;
+  let target = -1;
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i] && out[i].role === "user") {
+      target = i;
+      break;
+    }
+  }
+  if (target < 0)
+    target = out.length - 1;
+  const msg = out[target] || { role: "user", content: "" };
+  const current = msg.content;
+  if (Array.isArray(current))
+    msg.content = current.concat(parts);
+  else if (typeof current === "string" && current)
+    msg.content = [{ type: "text", text: current }, ...parts];
+  else
+    msg.content = parts.slice();
+  out[target] = msg;
+  return out;
 }
 
 export const __visionTest = {
