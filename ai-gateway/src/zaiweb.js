@@ -62,19 +62,23 @@ function getModelCapabilities(modelId) {
 
 // Shape a catalog row like the models.dev entries the auto-router consumes:
 // the gateway's router gates on context/vision/tools without a special case.
-export function modelCatalogEntry(modelId) {
+export function modelCatalogEntry(modelId, format = "") {
   const id = capabilityModelId(modelId);
   const caps = ZAI_MODELS[id];
   if (!caps)
     return null;
+  // Vision upload exists only on the pure-HTTP engine. The browser fallback
+  // still cannot attach bytes, so it must never advertise vision to HORIZON.
+  const browser = String(format || "").toLowerCase() === "zaiwebbrowser";
+  const vision = !!caps.vision && !browser;
   return {
     id: "zai-web/" + id,
     reasoning: caps.thinking,
     // Caller tools are supported through the gateway's agent shim + repair
     // layer even though chat.z.ai itself does not expose native OpenAI tools.
     toolCall: true,
-    attachment: caps.vision,
-    modalities: { input: caps.vision ? ["text", "image"] : ["text"], output: ["text"] },
+    attachment: vision,
+    modalities: { input: vision ? ["text", "image"] : ["text"], output: ["text"] },
     limit: { context: caps.context, output: caps.output }
   };
 }
@@ -191,9 +195,8 @@ function userIdFromToken(token) {
   }
 }
 
-function browserPoolIdForToken(token) {
-  const userId = userIdFromToken(token);
-  return userId ? "uid:" + userId : "";
+function browserPoolIdForRoute(route) {
+  return String(route && route.zai_session_key || "");
 }
 
 function textContent(content) {
@@ -679,7 +682,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const credentialToken = parsed.token;
 
   const session = sessionFor({ fetcher, credential: credentialToken, key: route.zai_session_key });
-  const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id) });
+  const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id, route.fmt) });
   const entry = await registry.resolve(modelId);
   if (!entry && !staticCaps)
     throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not available in the live model catalog.', "zai_model");
@@ -719,7 +722,15 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       vision = { messages: structuredClone(payload.messages || []), files: [], imageParts: [] };
     } else {
       try {
-        vision = await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch });
+        vision = await processZaiVisionMessages(payload.messages || [], {
+          token,
+          fetchImpl: visionFetch,
+          onResponse: (headers) => session.noteResponse(headers)
+        });
+        if (session.token && session.token !== token) {
+          token = session.token;
+          userId = session.userId || userIdFromToken(token) || userId;
+        }
       } catch (first) {
         // GLM-Free-API retries file upload once after re-initializing auth on
         // 401. Do the same here, but keep session refresh in the gateway's
@@ -732,7 +743,15 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
           throw first;
         token = again.token;
         userId = again.userId || userIdFromToken(token) || userId;
-        vision = await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch });
+        vision = await processZaiVisionMessages(payload.messages || [], {
+          token,
+          fetchImpl: visionFetch,
+          onResponse: (headers) => session.noteResponse(headers)
+        });
+        if (session.token && session.token !== token) {
+          token = session.token;
+          userId = session.userId || userIdFromToken(token) || userId;
+        }
       }
     }
   } catch (e) {
@@ -780,7 +799,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     }
   };
 
-  const retire = () => releaseZaiChatId(poolKey, chatId, cleanup);
+  let completionAttempted = false;
+  const retire = () => releaseZaiChatId(poolKey, chatId, completionAttempted ? cleanup : undefined);
 
   const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
   const proofMode = options.proofMode || "caller";
@@ -823,6 +843,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       features,
       files: vision.files
     });
+    completionAttempted = true;
     return fetcher(url, {
       method: "POST",
       headers: session.headers({
@@ -1084,7 +1105,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
 
   const registryFetcher = (c && c.upstreamFetch) || globalThis.fetch;
   const session = sessionFor({ fetcher: registryFetcher, credential: token, key: route.zai_session_key });
-  const registry = registryFor({ session, fetcher: registryFetcher, fallback: (id) => modelCatalogEntry(id) });
+  const registry = registryFor({ session, fetcher: registryFetcher, fallback: (id) => modelCatalogEntry(id, "zaiwebbrowser") });
   const entry = await registry.resolve(modelId);
   if (entry && entry.available === false)
     throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
@@ -1099,7 +1120,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
       turnTimeoutMs: Number(payload.turn_timeout_ms) || 0,
       // chat.z.ai rotates the JWT after successful turns. Pooling by the raw
       // token makes every next request cold-start a new browser context.
-      poolId: browserPoolIdForToken(token)
+      poolId: browserPoolIdForRoute(route)
     });
   } catch (e) {
     if (e instanceof ZaiBrowserUnavailable)
@@ -1191,7 +1212,7 @@ export const __zaiTest = {
   captureFromHeaders,
   isWafChallenge,
   wrapUtlsFetcher,
-  browserPoolIdForToken
+  browserPoolIdForRoute
 };
 
 export const __test = { toOpenAiStream };
