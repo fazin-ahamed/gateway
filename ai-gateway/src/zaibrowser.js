@@ -157,10 +157,8 @@ async function syncPoolToken(pool, token) {
 async function getPool(token, stableId = "") {
   const key = poolKey(token, stableId);
   const existing = pools.get(key);
-  if (existing) {
-    await syncPoolToken(existing, token);
+  if (existing)
     return existing;
-  }
   const browser = await getBrowser();
   const chromMajor = String(browser.version() || "150").split(".")[0];
   const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + chromMajor + ".0.0.0 Safari/537.36";
@@ -365,6 +363,9 @@ export async function runBrowserTurn(token, prompt, options = {}) {
   const stableId = String(options.poolId || "");
   const pool = await getPool(token, stableId);
   return withLock(pool, async () => {
+    // Auth state belongs to the same mutex as page interaction. A rotated
+    // token must never mutate cookies/localStorage while another turn is live.
+    await syncPoolToken(pool, token);
     const page = await ensurePage(pool);
     let resolveResponse;
     const responsePromise = new Promise((resolve) => {
