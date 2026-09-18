@@ -31,11 +31,12 @@ function sha256hexSync(str) {
   return createHash("sha256").update(String(str)).digest("hex");
 }
 
-function poolKey(token) {
+function poolKey(token, stableId = "") {
+  const basis = stableId ? "stable:" + String(stableId) : "token:" + String(token);
   try {
-    return "zai:" + sha256hexSync(token).slice(0, 32);
+    return "zai:" + sha256hexSync(basis).slice(0, 32);
   } catch {
-    return "zai:" + String(token).length + ":" + String(token).slice(0, 8);
+    return "zai:" + basis.length + ":" + basis.slice(0, 8);
   }
 }
 
@@ -141,11 +142,25 @@ async function getBrowser() {
   return browserPromise;
 }
 
-async function getPool(token) {
-  const key = poolKey(token);
+async function syncPoolToken(pool, token) {
+  if (!pool || !token || pool.token === token)
+    return;
+  pool.token = token;
+  await pool.context.addCookies([{ name: "token", value: token, domain: "chat.z.ai", path: "/" }]).catch(() => {});
+  if (pool.page && !pool.page.isClosed()) {
+    await pool.page.evaluate((t) => {
+      try { localStorage.setItem("token", t); } catch {}
+    }, token).catch(() => {});
+  }
+}
+
+async function getPool(token, stableId = "") {
+  const key = poolKey(token, stableId);
   const existing = pools.get(key);
-  if (existing)
+  if (existing) {
+    await syncPoolToken(existing, token);
     return existing;
+  }
   const browser = await getBrowser();
   const chromMajor = String(browser.version() || "150").split(".")[0];
   const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + chromMajor + ".0.0.0 Safari/537.36";
@@ -163,10 +178,16 @@ async function getPool(token) {
     await context.addInitScript({ content: buildStealthScript(chromMajor) });
   } catch {
   }
-  await context.addInitScript((t) => {
-    try { localStorage.setItem("token", t); } catch {}
-  }, token);
-  const pool = { context, page: null, lock: Promise.resolve(), idleTimer: null, lastUsed: Date.now() };
+  const pool = {
+    context,
+    page: null,
+    lock: Promise.resolve(),
+    idleTimer: null,
+    lastUsed: Date.now(),
+    token,
+    key,
+    stableId: String(stableId || "")
+  };
   pools.set(key, pool);
   return pool;
 }
@@ -235,6 +256,10 @@ async function ensurePage(pool) {
     pool.page = null;
   }
   const page = await pool.context.newPage();
+  // Keep localStorage in sync with the latest rotated token for every new page.
+  await page.addInitScript((t) => {
+    try { localStorage.setItem("token", t); } catch {}
+  }, pool.token).catch(() => {});
   // On cold start, chat.z.ai CDN / TLS negotiation or SPA hydration occasionally
   // stalls before domcontentloaded or networkidle. Retry once in-place with 'load'
   // and commit-level navigation so first requests don't fail immediately.
@@ -260,7 +285,7 @@ async function ensurePage(pool) {
   pool.page = page;
   return page;
 }
-function armIdleClose(pool, key) {
+function armIdleClose(pool) {
   if (pool.idleTimer)
     clearTimeout(pool.idleTimer);
   pool.idleTimer = setTimeout(async () => {
@@ -268,7 +293,8 @@ function armIdleClose(pool, key) {
       await pool.context.close();
     } catch {
     }
-    pools.delete(key);
+    if (pools.get(pool.key) === pool)
+      pools.delete(pool.key);
   }, PAGE_IDLE_CLOSE_MS);
 }
 
@@ -336,8 +362,8 @@ async function dismissOverlays(page) {
 
 export async function runBrowserTurn(token, prompt, options = {}) {
   const timeoutMs = Number(options.turnTimeoutMs) || DEFAULT_TURN_TIMEOUT_MS;
-  const key = poolKey(token);
-  const pool = await getPool(token);
+  const stableId = String(options.poolId || "");
+  const pool = await getPool(token, stableId);
   return withLock(pool, async () => {
     const page = await ensurePage(pool);
     let resolveResponse;
@@ -400,10 +426,12 @@ export async function runBrowserTurn(token, prompt, options = {}) {
       } catch {
       }
       result.recovered = recovered || null;
+      if (recovered)
+        await syncPoolToken(pool, recovered);
       return result;
     } finally {
       page.off("response", onResponse);
-      armIdleClose(pool, key);
+      armIdleClose(pool);
     }
   });
 }
