@@ -192,8 +192,10 @@ export class ZaiModelRegistry {
       id: "zai-web/" + id,
       wireId: live.id,
       reasoning: live.reasoning || (base ? base.reasoning : false),
-      toolCall: live.toolCall || false,
-      attachment: live.attachment || false,
+      // The gateway can emulate caller tool calls through the Z.AI agent
+      // shim even when chat.z.ai does not advertise native function calling.
+      toolCall: live.toolCall || (base ? base.toolCall : false) || false,
+      attachment: live.attachment || (base ? base.attachment : false) || false,
       modalities: live.modalities,
       limit: {
         context: live.limit.context || (base ? base.limit.context : 0),
