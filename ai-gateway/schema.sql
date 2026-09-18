@@ -228,3 +228,13 @@ CREATE TABLE IF NOT EXISTS model_usage (
   value REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (slug, kind, bucket)
 );
+
+-- Single-use Aliyun device tokens for the canonical pure-HTTP Z.AI transport.
+-- FIFO consumption mirrors GLM-Free-API and prevents token reuse.
+CREATE TABLE IF NOT EXISTS zai_device_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_zai_device_tokens_fifo
+  ON zai_device_tokens(id);
