@@ -1,3 +1,5 @@
+import { buildToolRepairPolicy, canonicalToolName, collectToolFeedback, isHashlineEditTool, isRepeatSafeTool, repairToolCall } from "./tool-repair.js";
+
 // Modern agent shim for chat.z.ai.
 //
 // chat.z.ai does not accept OpenAI `tools` / system / assistant / tool roles
@@ -33,6 +35,7 @@ RULES:
 - Never narrate an action in words; the block IS the action. Stop right after <<<END_TOOL_CALL>>> and wait for the <tool_result>.
 - Never invent results. Never call a tool not listed in <tools>.
 - NO REPEATS: never re-issue a call listed in <already_called>; change the call instead. If the last tool result already answers this step, advance to the next step or give the final answer.
+- Treat <tool_result> as live state. Obey <tool_repair_policy> and <tool_feedback> when present; do not blindly replay a failed call.
 - Task fully done → answer in plain text, no block.
 </system>`;
 
@@ -202,14 +205,18 @@ function extractToolExchanges(messages) {
   return { old, recent: messages.slice(split) };
 }
 
-function alreadyCalled(messages) {
+function alreadyCalled(messages, tools) {
   const lines = [];
   const seen = new Set();
+  const feedback = new Map(collectToolFeedback(messages).map((item) => [item.callId, item.kind]));
   for (const m of messages) {
     if (m.role !== "assistant") continue;
     for (const call of m.tool_calls || []) {
       const name = call.function && call.function.name;
       if (!name) continue;
+      if (isRepeatSafeTool(name, tools)) continue;
+      const resultKind = call.id ? feedback.get(call.id) : null;
+      if (resultKind && resultKind !== "success") continue;
       const args = parseArgs(call.function.arguments);
       const key = name + "\n" + args;
       if (seen.has(key)) continue;
@@ -218,7 +225,7 @@ function alreadyCalled(messages) {
     }
   }
   if (!lines.length) return "";
-  return "<already_called>\nCalls already made in this conversation (do NOT re-issue any of them):\n" + lines.join("\n") + "\n</already_called>";
+  return "<already_called>\nSuccessful/pending side-effect calls already made (do NOT replay the identical call):\n" + lines.join("\n") + "\n</already_called>";
 }
 
 function renderRecent(messages) {
@@ -255,6 +262,8 @@ export function buildAgentPrompt(messages, tools) {
   const msgs = Array.isArray(messages) ? messages : [];
   const toolList = Array.isArray(tools) ? tools : [];
   let out = SYSTEM_PREFIX + "\n\n<tools>\n" + renderTools(toolList) + "\n</tools>\n\n";
+  const repairPolicy = buildToolRepairPolicy(msgs, toolList);
+  if (repairPolicy) out += repairPolicy + "\n\n";
   const example = exampleCall(toolList);
   if (example) out += example + "\n\n";
   const { old, recent } = extractToolExchanges(msgs);
@@ -264,7 +273,7 @@ export function buildAgentPrompt(messages, tools) {
     out += "</history_summary>\n\n";
   }
   if (recent.length) out += "<recent>\n" + renderRecent(recent) + "</recent>\n\n";
-  const already = alreadyCalled(msgs);
+  const already = alreadyCalled(msgs, toolList);
   if (already) out += already + "\n\n";
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i] && msgs[i].role === "user") {
@@ -380,28 +389,20 @@ function randomCallId() {
   return "call_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
 }
 
-export function parseAgentToolCalls(text) {
+export function parseAgentToolCalls(text, tools = []) {
   const spans = findAgentSpans(String(text || ""));
   const calls = [];
   for (const span of spans) {
     const parsed = looseParse(text.slice(span.bodyStart, span.bodyEnd));
     if (!parsed) continue;
-    let args = parsed.arguments;
-    if (String(parsed.name).toLowerCase().includes("edit") || String(parsed.name).toLowerCase() === "hashline") {
-      let trimmed = typeof args === "string" ? args.trim() : JSON.stringify(args);
-      if (trimmed.startsWith("[") && trimmed.includes("#")) {
-        args = JSON.stringify({ input: trimmed });
-      }
-    }
-    calls.push({
+    calls.push(repairToolCall({
       id: randomCallId(),
       type: "function",
-      function: { name: parsed.name, arguments: args }
-    });
+      function: { name: parsed.name, arguments: parsed.arguments }
+    }, tools));
   }
   return calls;
 }
-
 export function stripAgentToolCalls(text) {
   const src = String(text || "");
   const spans = findAgentSpans(src);
@@ -512,7 +513,8 @@ function runeSafeCut(s) {
 }
 
 export class AgentStreamInterceptor {
-  constructor() {
+  constructor(tools = []) {
+    this.tools = Array.isArray(tools) ? tools : [];
     this.buffer = "";
     this.offset = 0;
     this.callIndex = 0;
@@ -625,12 +627,12 @@ export class AgentStreamInterceptor {
         const end = this.offset + idx;
         const parsed = looseParse(this.buffer.slice(this.offset, end));
         if (parsed) {
-          toolCalls.push({
+          toolCalls.push(repairToolCall({
             index: this.callIndex,
             id: randomCallId(),
             type: "function",
             function: { name: parsed.name, arguments: parsed.arguments }
-          });
+          }, this.tools));
           this.callIndex++;
         } else {
           content.push(this.buffer.slice(this.tcBlockStart, end + markerLen));
@@ -642,8 +644,12 @@ export class AgentStreamInterceptor {
       if (!this.tcNameFound) {
         const name = streamExtractName(body);
         if (name) {
-          this.tcName = name;
+          this.tcName = canonicalToolName(name, this.tools);
           this.tcNameFound = true;
+          if (isHashlineEditTool(this.tcName, this.tools)) {
+            this.tcFallback = true;
+            continue;
+          }
         } else {
           const [idx] = findAgentMarker(body, END_WORD, final);
           if (idx >= 0 || final) { this.tcFallback = true; continue; }
