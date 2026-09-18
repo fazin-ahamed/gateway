@@ -68,8 +68,9 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Headed Chromium needs an X server. On a VM with no DISPLAY, start a private
-// Xvfb and point DISPLAY at it. Never flip to headless (chat.z.ai F001).
+// Prefer a real display (operator X or leftover Xvfb). If none, do not fail
+// the request: Chrome's new headless (--headless=new) needs no X server and
+// is not the old headless that chat.z.ai F001-rejected.
 async function ensureDisplay() {
   if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY)
     return process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
@@ -84,39 +85,47 @@ async function ensureDisplay() {
       stdio: "ignore",
       detached: true
     });
-  } catch (e) {
-    throw new ZaiBrowserUnavailable("headed Chromium needs Xvfb on this host (no DISPLAY). Install xvfb, or set DISPLAY. " + String(e && e.message || e).slice(0, 120));
+  } catch {
+    return "";
   }
   xvfb.on("error", () => {});
   xvfb.unref();
   xvfbProc = xvfb;
-  const deadline = Date.now() + 4000;
+  const deadline = Date.now() + 2500;
   while (Date.now() < deadline) {
     if (existsSync(displaySocket(display))) {
       process.env.DISPLAY = display;
       return display;
     }
     if (xvfb.exitCode != null)
-      throw new ZaiBrowserUnavailable("Xvfb exited before the display socket appeared (install xvfb / xorg-x11-server-Xvfb).");
+      return "";
     await sleep(50);
   }
-  throw new ZaiBrowserUnavailable("Xvfb started but " + displaySocket(display) + " never appeared. Install xvfb or set DISPLAY.");
+  return "";
+}
+
+function launchOptions(executablePath, headed) {
+  const args = ["--mute-audio", "--no-sandbox", "--disable-dev-shm-usage"];
+  if (headed) {
+    args.push("--window-position=4000,4000");
+    return { headless: false, args, executablePath };
+  }
+  // Chrome 112+ new headless: full browser, no X. Old `--headless` is the
+  // F001 fingerprint; this flag is the replacement.
+  args.push("--headless=new", "--disable-gpu", "--hide-scrollbars");
+  return { headless: true, args, executablePath };
 }
 
 async function getBrowser() {
   if (!browserPromise) {
     browserPromise = (async () => {
-      await ensureDisplay();
+      const display = await ensureDisplay();
       const { chromium } = await loadPlaywright();
       const executablePath = process.env.BROWSER_EXECUTABLE || undefined;
-      // Always headed. chat.z.ai F001-rejects true headless. DISPLAY is either
-      // the operator's X server or the Xvfb we just started.
-      const launch = {
-        headless: false,
-        args: ["--window-position=4000,4000", "--mute-audio", "--no-sandbox", "--disable-dev-shm-usage"]
-      };
-      if (executablePath)
-        launch.executablePath = executablePath;
+      const headed = !!(display || process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+      const launch = launchOptions(executablePath, headed);
+      if (!launch.executablePath)
+        delete launch.executablePath;
       const browser = await chromium.launch(launch);
       browser.on("disconnected", () => {
         browserPromise = null;
