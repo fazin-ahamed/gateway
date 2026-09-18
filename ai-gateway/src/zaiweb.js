@@ -13,6 +13,9 @@ import { registryFor } from "./zai-models.js";
 import { createZaiFrameNormalizer } from "./zai-stream.js";
 import { isZaiWafBlock, zaiWaf, ZaiWafBlockedError } from "./zai-waf.js";
 import { applyAgentShim, parseAgentToolCalls, stripAgentToolCalls, AgentStreamInterceptor } from "./zai-agent.js";
+import { acquireZaiChatId, releaseZaiChatId } from "./zai-session-pool.js";
+import { getZaiCaptchaProof } from "./zai-captcha-cache.js";
+import { attachZaiImageParts, processZaiVisionMessages } from "./zai-vision.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
@@ -38,10 +41,10 @@ const IMAGE_TOKEN_ALLOWANCE = 500;
 // input. `context` is the measured chat.z.ai transport window (not the
 // theoretical 1M GLM-5.3 paper context). `output` is the completion clamp.
 const ZAI_MODELS = {
-  // vision=false until we actually upload image bytes; "[image: URL]" text is
-  // not multimodal input. Advertising it would make the router send images
-  // the model never sees.
-  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: false, context: 98304, output: 16384 },
+  // GLM-Free-API's proven web flow uploads image bytes to /api/v1/files/
+  // and attaches the returned file objects. The flash route is therefore
+  // genuinely multimodal now instead of forwarding image URLs as text.
+  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: true, context: 98304, output: 16384 },
   "glm-5.3": { name: "GLM-5.3", thinking: true, vision: false, context: 98304, output: 16384 },
   "glm-5.2": { name: "GLM-5.2", thinking: true, vision: false, context: 98304, output: 16384 }
 };
@@ -245,13 +248,24 @@ function latestUserPrompt(messages) {
   return "";
 }
 
+// GLM-Free-API signs the concatenation of all message text, not only the
+// newest user turn. This matters because signature_prompt must match the
+// exact conversation payload the completion carries.
+function referencePrompt(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .map((m) => textContent(m && m.content))
+    .filter((x) => x !== "")
+    .join("\n\n")
+    .trim();
+}
+
 // chat.z.ai only accepts role=user. When the caller sent OpenAI tools, fold
 // the whole conversation + tool contract into one user prompt and parse
 // <<<TOOL_CALL>>> blocks on the way out. Never forward raw `tools`.
 function prepareZaiTurn(payload) {
   const shim = applyAgentShim(payload);
   const messages = Array.isArray(shim.payload.messages) ? shim.payload.messages : [];
-  const prompt = shim.active ? shim.prompt : latestUserPrompt(messages);
+  const prompt = shim.active ? shim.prompt : referencePrompt(messages);
   return { shim, messages, prompt };
 }
 
@@ -287,30 +301,42 @@ function estimatePromptTokens(messages, toolsChars) {
 // data only advertises buckets the account actually has; sending an
 // unsupported value can corrupt the response. Keep to high/max for now;
 // more granular levels require live capability discovery.
-function resolveThinking(modelId, payload) {
+function resolveThinking(modelId, payload, liveEntry = null) {
   const caps = getModelCapabilities(modelId);
-  if (!caps || !caps.thinking)
+  const supportsThinking = liveEntry ? liveEntry.reasoning !== false : !!(caps && caps.thinking);
+  if (!supportsThinking)
     return { enabled: false, effort: "high", effortSupported: false };
+
   const reasoning = payload && payload.reasoning;
+  const thinking = payload && payload.thinking;
+  if (reasoning === false || thinking && thinking.type === "disabled")
+    return { enabled: false, effort: "high", effortSupported: true };
+
   const raw = typeof payload?.reasoning_effort === "string"
     ? payload.reasoning_effort.trim().toLowerCase()
     : typeof reasoning?.effort === "string"
       ? reasoning.effort.trim().toLowerCase()
       : "";
-  let effort;
-  if (raw === "max" || raw === "xhigh")
-    effort = "max";
-  else
-    effort = "high";
+  const effort = raw === "max" || raw === "xhigh" ? "max" : "high";
   return { enabled: true, effort, effortSupported: true };
 }
 
 // Web search / tools switches shown in the site UI. Defaults off: the gateway
 // never silently upgrades a request into a search or agent turn.
-function resolveFeatures(payload) {
+function resolveFeatures(payload, agentMode = false) {
   const opt = (key) => payload && (payload[key] !== undefined ? payload[key] : payload.features?.[key]);
-  const webSearch = opt("web_search") ?? opt("auto_web_search");
-  return { toolsEnabled: opt("vlm_tools_enable") === true, webSearchEnabled: webSearch === true };
+  const webSearch = opt("web_search") ?? opt("auto_web_search") ?? opt("webSearch") ?? opt("search");
+  const advancedSearch = opt("advancedSearch") ?? opt("advanced_search");
+  // Z.AI's own search/MCP tools and caller-provided agent tools share the
+  // model's action channel; the reference disables internal search in agent
+  // mode to prevent marker/tool conflicts.
+  if (agentMode)
+    return { toolsEnabled: false, webSearchEnabled: false, advancedSearchEnabled: false };
+  return {
+    toolsEnabled: opt("vlm_tools_enable") === true,
+    webSearchEnabled: webSearch === true || advancedSearch === true,
+    advancedSearchEnabled: advancedSearch === true
+  };
 }
 
 function buildHeaders(token, options) {
@@ -327,6 +353,8 @@ function buildHeaders(token, options) {
     headers["X-FE-Version"] = options.frontendVersion;
   if (options.signature)
     headers["X-Signature"] = options.signature;
+  if (options.region !== false)
+    headers["X-Region"] = "overseas";
   return headers;
 }
 
@@ -374,6 +402,64 @@ function buildCompletionUrl(input) {
     signature_timestamp: String(input.timestamp)
   });
   return ZAI_CHAT_URL + "?" + params.toString();
+}
+
+// Reference pure-HTTP wire shape from GLM-Free-API. Keep this separate from
+// the browser's opaque x-preview-l model selector and from the legacy chat
+// creation payload: the proven HTTP completion uses the public model id,
+// a client-generated chat UUID, and a deliberately minimal body.
+function referenceHttpModelId(modelId) {
+  return capabilityModelId(modelId);
+}
+
+function buildReferenceCompletionUrl(input) {
+  const params = new URLSearchParams({
+    timestamp: String(input.timestamp),
+    requestId: input.requestId,
+    user_id: input.userId,
+    version: CLIENT_PROTOCOL_VERSION,
+    platform: "web",
+    token: input.token,
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+    language: "en-US",
+    screen_resolution: "1920x1080",
+    viewport_size: "1920x1080",
+    timezone: "Europe/Paris",
+    timezone_offset: "-60",
+    signature_timestamp: String(input.timestamp)
+  });
+  return ZAI_CHAT_URL + "?" + params.toString();
+}
+
+function buildReferenceFeatures({ thinking, features }) {
+  const out = {
+    enable_thinking: !!thinking.enabled,
+    flags: [],
+    image_generation: false,
+    web_search: false
+  };
+  if (features.webSearchEnabled)
+    out.auto_web_search = true;
+  if (thinking.enabled && thinking.effortSupported)
+    out.reasoning_effort = thinking.effort;
+  return out;
+}
+
+function buildReferenceCompletionBody(input) {
+  const body = {
+    model: referenceHttpModelId(input.modelId),
+    chat_id: input.chatId,
+    messages: input.messages,
+    signature_prompt: input.prompt,
+    stream: true,
+    captcha_verify_param: input.captchaVerifyParam,
+    features: buildReferenceFeatures({ thinking: input.thinking, features: input.features })
+  };
+  if (input.files && input.files.length)
+    body.files = input.files;
+  if (input.features.advancedSearchEnabled)
+    body.mcp_servers = ["advanced-search"];
+  return body;
 }
 
 function buildNewChatBody(input) {
