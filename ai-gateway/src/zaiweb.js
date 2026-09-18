@@ -191,9 +191,9 @@ function userIdFromToken(token) {
   }
 }
 
-function browserPoolIdForToken(token) {
-  const userId = userIdFromToken(token);
-  return userId ? "uid:" + userId : "";
+function browserPoolIdForUserId(userId) {
+  const id = String(userId || "").trim();
+  return id ? "uid:" + id : "";
 }
 
 function textContent(content) {
@@ -302,7 +302,7 @@ function resolveFeatures(payload, agentMode = false) {
     return { toolsEnabled: false, webSearchEnabled: false, advancedSearchEnabled: false };
   return {
     toolsEnabled: opt("vlm_tools_enable") === true,
-    webSearchEnabled: webSearch === true || advancedSearch === true,
+    webSearchEnabled: webSearch === true,
     advancedSearchEnabled: advancedSearch === true
   };
 }
@@ -679,6 +679,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const credentialToken = parsed.token;
 
   const session = sessionFor({ fetcher, credential: credentialToken, key: route.zai_session_key });
+  assertWafAvailable();
   const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id) });
   const entry = await registry.resolve(modelId);
   if (!entry && !staticCaps)
@@ -692,6 +693,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
 
   const active = await session.acquire();
   let token = active.token;
+  if (typeof options.onActiveToken === "function" && token)
+    options.onActiveToken(token);
   let userId = active.userId || userIdFromToken(token);
   if (!token || !userId)
     throw credentialError();
@@ -702,6 +705,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const canVision = !!(entry && entry.attachment) || !!(staticCaps && staticCaps.vision);
   if (imageCount && !canVision)
     throw new ZaiWebError(400, 'Z.ai model "' + unprefixedModelId(modelId) + '" does not advertise image input.', "zai_vision_unsupported");
+  if (imageCount && active.source !== "account")
+    throw new ZaiWebError(400, "Z.ai image upload requires a signed-in account session.", "zai_vision_account_required");
 
   // Pace Z.AI uploads through the same global lane, while arbitrary public
   // image downloads only use the vision module's SSRF guard/timeouts.
@@ -780,7 +785,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     }
   };
 
-  const retire = () => releaseZaiChatId(poolKey, chatId, cleanup);
+  let completionAttempted = false;
+  const retire = () => releaseZaiChatId(poolKey, chatId, completionAttempted ? cleanup : undefined);
 
   const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
   const proofMode = options.proofMode || "caller";
@@ -823,6 +829,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       features,
       files: vision.files
     });
+    completionAttempted = true;
     return fetcher(url, {
       method: "POST",
       headers: session.headers({
@@ -855,6 +862,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
         break;
       token = again.token;
       userId = again.userId || userIdFromToken(token) || userId;
+      if (typeof options.onActiveToken === "function" && token)
+        options.onActiveToken(token);
     }
   } catch (e) {
     retire();
@@ -1027,10 +1036,12 @@ export function isZaiMintedFormat(value) {
  * and image requests never fall back to the browser.
  */
 export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchImpl) {
+  let fallbackToken = parseCredential(rawKey, payload).token || "";
   try {
     return await runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
       fetchImpl: fetchImpl || ((url, init) => upstreamFetch(c, url, init)),
-      proofMode: "minted"
+      proofMode: "minted",
+      onActiveToken: (token) => { fallbackToken = token || fallbackToken; }
     });
   } catch (primary) {
     const browserFallbackValue = String(process.env.ZAI_BROWSER_FALLBACK || "").trim().toLowerCase();
@@ -1042,7 +1053,8 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
       throw primary;
 
     try {
-      return await callZaiBrowser(c, route, rawKey, payload, isStream);
+      const fallbackKey = fallbackToken ? withRotatedToken(rawKey, fallbackToken) : rawKey;
+      return await callZaiBrowser(c, route, fallbackKey, payload, isStream);
     } catch (fallback) {
       const err = new ZaiWebError(
         Number(primary && primary.status) || 503,
@@ -1073,8 +1085,6 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
     throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
 
   const { token } = parseCredential(rawKey, payload);
-  if (!token || !userIdFromToken(token))
-    throw credentialError();
 
   const prepared = prepareZaiTurn(payload);
   const messages = prepared.messages;
@@ -1084,22 +1094,26 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
 
   const registryFetcher = (c && c.upstreamFetch) || globalThis.fetch;
   const session = sessionFor({ fetcher: registryFetcher, credential: token, key: route.zai_session_key });
+  assertWafAvailable();
+  const active = await session.acquire();
+  const browserToken = active.token;
+  const browserUserId = active.userId || userIdFromToken(browserToken);
+  if (!browserToken || !browserUserId)
+    throw credentialError();
+
   const registry = registryFor({ session, fetcher: registryFetcher, fallback: (id) => modelCatalogEntry(id) });
   const entry = await registry.resolve(modelId);
   if (entry && entry.available === false)
     throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
-
-  assertWafAvailable();
   const { runBrowserTurn, ZaiBrowserUnavailable } = c && c.zaiRunBrowserTurn
     ? { runBrowserTurn: c.zaiRunBrowserTurn, ZaiBrowserUnavailable: class extends Error {} }
     : await import("./zaibrowser.js");
   let turn;
   try {
-    turn = await runBrowserTurn(token, prompt, {
+    turn = await runBrowserTurn(browserToken, prompt, {
       turnTimeoutMs: Number(payload.turn_timeout_ms) || 0,
-      // chat.z.ai rotates the JWT after successful turns. Pooling by the raw
-      // token makes every next request cold-start a new browser context.
-      poolId: browserPoolIdForToken(token)
+      // Use the account id only after chat.z.ai validated the session.
+      poolId: browserPoolIdForUserId(browserUserId)
     });
   } catch (e) {
     if (e instanceof ZaiBrowserUnavailable)
@@ -1191,7 +1205,7 @@ export const __zaiTest = {
   captureFromHeaders,
   isWafChallenge,
   wrapUtlsFetcher,
-  browserPoolIdForToken
+  browserPoolIdForUserId
 };
 
 export const __test = { toOpenAiStream };
