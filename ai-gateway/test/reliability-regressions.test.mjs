@@ -116,6 +116,18 @@ test("response cache does not treat missing temperature as deterministic zero", 
   assert.equal(t.isCacheableRequest({ messages: [{ role: "user", content: "this is long enough to cache" }], temperature: 0 }, false, "true"), true);
 });
 
+test("actual cost uses cache-read rate for cached prompt tokens", () => {
+  const usage = { prompt_tokens: 1_000_000, cached_tokens: 250_000, completion_tokens: 500_000 };
+  const noCache = t.costFromRates(usage, 1, 2, null, null);
+  assert.equal(noCache, 2);
+  const withCache = t.costFromRates(usage, 1, 2, 0.1, 0);
+  assert.equal(withCache, 0.75 + 0.025 + 1);
+  const row = t.priceFromRow({ prompt_per_1m: 3, completion_per_1m: 6, actual_prompt_per_1m: 1, actual_completion_per_1m: 2, cache_read_per_1m: 0.1 });
+  assert.equal(row.equivalentPrompt, 3);
+  assert.equal(row.actualPrompt, 1);
+  assert.equal(row.cacheRead, 0.1);
+});
+
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
   const actions = generateActions([
     { slug: "model-a-mini", cost: 3, eligible: true, capable: true },

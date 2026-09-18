@@ -2734,23 +2734,58 @@ async function fetchModelsDevCatalog() {
     clearTimeout(t);
   }
 }
+function numOrNull(value) {
+  if (value === void 0 || value === null || value === "")
+    return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+function priceFromRow(row) {
+  const equivalentPrompt = Number(row && row.prompt_per_1m) || 0;
+  const equivalentCompletion = Number(row && row.completion_per_1m) || 0;
+  const actualPrompt = numOrNull(row && row.actual_prompt_per_1m);
+  const actualCompletion = numOrNull(row && row.actual_completion_per_1m);
+  return {
+    equivalentPrompt,
+    equivalentCompletion,
+    actualPrompt: actualPrompt == null ? equivalentPrompt : actualPrompt,
+    actualCompletion: actualCompletion == null ? equivalentCompletion : actualCompletion,
+    cacheRead: numOrNull(row && row.cache_read_per_1m),
+    cacheWrite: numOrNull(row && row.cache_write_per_1m)
+  };
+}
+function costFromRates(usage, promptRate, completionRate, cacheReadRate, cacheWriteRate) {
+  const prompt = Number(usage && usage.prompt_tokens) || 0;
+  const completion = Number(usage && usage.completion_tokens) || 0;
+  const cached = Math.max(0, Math.min(prompt, Number(usage && (usage.cached_tokens || usage.cache_read_tokens || usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens)) || 0));
+  const cacheWrite = Math.max(0, Number(usage && (usage.cache_write_tokens || usage.prompt_tokens_details && usage.prompt_tokens_details.cache_write_tokens)) || 0);
+  const uncached = Math.max(0, prompt - cached);
+  const readRate = cacheReadRate == null ? promptRate : cacheReadRate;
+  const writeRate = cacheWriteRate == null ? 0 : cacheWriteRate;
+  return uncached / 1e6 * promptRate + cached / 1e6 * readRate + cacheWrite / 1e6 * writeRate + completion / 1e6 * completionRate;
+}
+async function lookupPriceRow(c, slug) {
+  if (!slug)
+    return null;
+  try {
+    return await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m FROM prices WHERE slug=?").bind(slug).first();
+  } catch {
+    try {
+      return await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m FROM prices WHERE slug=?").bind(slug).first();
+    } catch {
+      return null;
+    }
+  }
+}
 async function computeCost(c, slug, usage) {
   const pt = Number(usage && usage.cost_usd) || 0;
   if (pt > 0)
     return pt;
-  if (!slug)
-    return 0;
-  try {
-    const row = await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m FROM prices WHERE slug=?").bind(slug).first();
-    if (row) {
-      const p = Number(row.prompt_per_1m) || 0;
-      const ct = Number(row.completion_per_1m) || 0;
-      return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * p + (Number(usage && usage.completion_tokens) || 0) / 1e6 * ct;
-    }
-  } catch {
+  const row = await lookupPriceRow(c, slug);
+  if (row) {
+    const rates = priceFromRow(row);
+    return costFromRates(usage, rates.actualPrompt, rates.actualCompletion, rates.cacheRead, rates.cacheWrite);
   }
-  // Fallback: the models.dev catalog if it is already loaded in memory. Never
-  // block a completion on a live fetch; a background refresh keeps it warm.
   const catalog = modelsDevCache.catalog;
   if (!catalog) {
     fetchModelsDevCatalog().catch((e) => blog("MODELS_DEV warm failed: " + String(e.message || e)));
@@ -2758,7 +2793,7 @@ async function computeCost(c, slug, usage) {
   }
   const hit = matchModelsDevPrice(flattenModelsDevCatalog(catalog), slug);
   if (hit)
-    return (Number(usage && usage.prompt_tokens) || 0) / 1e6 * hit.prompt_per_1m + (Number(usage && usage.completion_tokens) || 0) / 1e6 * hit.completion_per_1m;
+    return costFromRates(usage, hit.prompt_per_1m, hit.completion_per_1m, null, null);
   return 0;
 }
 async function lookupResponseCache(c, cacheKey) {
@@ -4439,8 +4474,10 @@ app.get("/admin/prices", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const rows = await c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug").all();
-  return c.json({ prices: rows.results || [] });
+  const rows = await c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at FROM prices ORDER BY slug").all().catch(() =>
+    c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug").all()
+  );
+  return c.json({ prices: (rows && rows.results) || [] });
 });
 app.post("/admin/prices/sync-models-dev", async (c) => {
   const denied = await requireAdmin(c);
@@ -4488,8 +4525,12 @@ app.post("/admin/prices", async (c) => {
     return c.json({ error: { message: "slug required" } }, 400);
   const p = Number(b.prompt_per_1m) || 0;
   const ct = Number(b.completion_per_1m) || 0;
-  await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, b.currency || "USD", nowIso()).run();
-  return c.json({ ok: true, slug: b.slug, prompt_per_1m: p, completion_per_1m: ct });
+  const ap = numOrNull(b.actual_prompt_per_1m);
+  const ac = numOrNull(b.actual_completion_per_1m);
+  const cr = numOrNull(b.cache_read_per_1m);
+  const cw = numOrNull(b.cache_write_per_1m);
+  await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, actual_prompt_per_1m=excluded.actual_prompt_per_1m, actual_completion_per_1m=excluded.actual_completion_per_1m, cache_read_per_1m=excluded.cache_read_per_1m, cache_write_per_1m=excluded.cache_write_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, ap, ac, cr, cw, b.currency || "USD", nowIso()).run();
+  return c.json({ ok: true, slug: b.slug, prompt_per_1m: p, completion_per_1m: ct, actual_prompt_per_1m: ap, actual_completion_per_1m: ac, cache_read_per_1m: cr, cache_write_per_1m: cw });
 });
 app.delete("/admin/prices/:slug", async (c) => {
   const denied = await requireAdmin(c);
@@ -4550,7 +4591,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, genericUpstreamError, shouldRetrySameKey, circuitKey, circuitOpen, circuitRecord, circuitRecordOk, circuitRecordFail, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

@@ -119,6 +119,10 @@ CREATE TABLE IF NOT EXISTS prices (
   slug TEXT PRIMARY KEY,
   prompt_per_1m REAL NOT NULL DEFAULT 0,
   completion_per_1m REAL NOT NULL DEFAULT 0,
+  actual_prompt_per_1m REAL,
+  actual_completion_per_1m REAL,
+  cache_read_per_1m REAL,
+  cache_write_per_1m REAL,
   currency TEXT NOT NULL DEFAULT 'USD',
   updated_at TEXT NOT NULL
 );

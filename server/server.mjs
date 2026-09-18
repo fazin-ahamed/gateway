@@ -84,6 +84,24 @@ try {
 } catch (e) {
   console.warn("[gateway] provider_keys migration skipped:", e.message);
 }
+try {
+  const cols = db.prepare("PRAGMA table_info(prices)").all();
+  const names = new Set((cols.results || []).map((c) => c.name));
+  if (names.size) {
+    const add = (name, sql) => {
+      if (!names.has(name)) {
+        db.exec(sql);
+        console.warn("[gateway] migration: added prices." + name);
+      }
+    };
+    add("actual_prompt_per_1m", "ALTER TABLE prices ADD COLUMN actual_prompt_per_1m REAL");
+    add("actual_completion_per_1m", "ALTER TABLE prices ADD COLUMN actual_completion_per_1m REAL");
+    add("cache_read_per_1m", "ALTER TABLE prices ADD COLUMN cache_read_per_1m REAL");
+    add("cache_write_per_1m", "ALTER TABLE prices ADD COLUMN cache_write_per_1m REAL");
+  }
+} catch (e) {
+  console.warn("[gateway] prices dual-rate migration skipped:", e.message);
+}
 const env = {
   DB: db,
   ADMIN_TOKEN,

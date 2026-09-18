@@ -311,14 +311,18 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-prices">
-    <div class="pagehead"><div><h2 class="sec">Model prices (USD / 1M tokens)</h2><p class="sub">Used to compute cost_usd when the upstream doesn't return a cost. Sync pulls <span class="mono">models.dev</span> rates for every routed slug. Manual rows override the catalog.</p></div></div>
+    <div class="pagehead"><div><h2 class="sec">Model prices (USD / 1M tokens)</h2><p class="sub">Two tracks: <b>API-equivalent</b> (models.dev / public list price) and <b>actual</b> (what you pay). Leave actual blank to use the equivalent rate. Cache read/write are optional; blank cache read uses the prompt rate, blank cache write is $0.</p></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Save price</h2></div><div class="panel-b">
       <div class="form-grid">
         <div><label>Slug</label><input id="pr-slug" placeholder="z-ai/glm-5.3"></div>
-        <div><label>Prompt $/1M</label><input id="pr-prompt" type="number" step="0.0001" placeholder="0"></div>
-        <div><label>Completion $/1M</label><input id="pr-completion" type="number" step="0.0001" placeholder="0"></div>
+        <div><label>Equivalent prompt $/1M</label><input id="pr-prompt" type="number" step="0.0001" placeholder="0"></div>
+        <div><label>Equivalent completion $/1M</label><input id="pr-completion" type="number" step="0.0001" placeholder="0"></div>
+        <div><label>Actual prompt $/1M (optional)</label><input id="pr-actual-prompt" type="number" step="0.0001" placeholder="same as equivalent"></div>
+        <div><label>Actual completion $/1M (optional)</label><input id="pr-actual-completion" type="number" step="0.0001" placeholder="same as equivalent"></div>
+        <div><label>Cache read $/1M (optional)</label><input id="pr-cache-read" type="number" step="0.0001" placeholder="same as prompt"></div>
+        <div><label>Cache write $/1M (optional)</label><input id="pr-cache-write" type="number" step="0.0001" placeholder="0"></div>
       </div>
-      <div class="form-actions"><button class="act" id="pr-save">Save price</button><button class="ghost" id="pr-sync">Sync from models.dev</button></div>
+      <div class="form-actions"><button class="act" id="pr-save">Save price</button><button class="ghost" id="pr-sync">Sync equivalent from models.dev</button></div>
     </div></div>
     <div class="panel"><div class="panel-b flush" id="pr-list"></div></div>
   </section>
@@ -1278,7 +1282,16 @@ document.getElementById('cache-purge').onclick=function(){ confirmAction('Purge 
 document.getElementById('pr-save').onclick=async function(){
   const slug=document.getElementById('pr-slug').value.trim();
   if(!slug){ toast('slug required','err'); return; }
-  const body=JSON.stringify({ slug, prompt_per_1m: document.getElementById('pr-prompt').value||0, completion_per_1m: document.getElementById('pr-completion').value||0 });
+  const opt=function(id){ const v=document.getElementById(id).value.trim(); return v===''?null:v; };
+  const body=JSON.stringify({
+    slug,
+    prompt_per_1m: document.getElementById('pr-prompt').value||0,
+    completion_per_1m: document.getElementById('pr-completion').value||0,
+    actual_prompt_per_1m: opt('pr-actual-prompt'),
+    actual_completion_per_1m: opt('pr-actual-completion'),
+    cache_read_per_1m: opt('pr-cache-read'),
+    cache_write_per_1m: opt('pr-cache-write')
+  });
   const {status,data}=await api('/admin/prices',{method:'POST',body});
   if(status===200){ toast('price saved','ok'); loadPrices(); }
   else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
@@ -1288,19 +1301,20 @@ document.getElementById('pr-sync').onclick=async function(){
   btn.disabled=true;
   try{
     const {status,data}=await api('/admin/prices/sync-models-dev',{method:'POST'});
-    if(status===200){ toast('synced '+(data.matched||0)+' prices'+(data.unmatched?' · '+data.unmatched+' unmatched':''),'ok'); loadPrices(); }
+    if(status===200){ toast('synced '+(data.matched||0)+' equivalent prices'+(data.unmatched?' · '+data.unmatched+' unmatched':''),'ok'); loadPrices(); }
     else toast('sync failed: '+(data&&data.error&&data.error.message||status),'err');
   }catch(e){ toast('sync failed: '+e.message,'err'); }
   finally{ btn.disabled=false; }
 };
+function dashRate(v){ return v==null||v===''?'—':Number(v); }
 async function loadPrices(){
   const el=document.getElementById('pr-list');
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/prices'); data=res.data; }catch(e){ paintLoadError(el,'Could not load prices: '+e.message,loadPrices); return; }
   const rows=(data&&data.prices||[]).map(function(p){
-    return '<tr><td class="mono">'+esc(p.slug)+'</td><td>'+Number(p.prompt_per_1m||0)+'</td><td>'+Number(p.completion_per_1m||0)+'</td><td>'+(p.currency||'USD')+'</td><td><button class="ghost" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="5"><div class="empty">No prices set. Costs will be 0 unless the upstream returns them.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Prompt $/1M</th><th>Completion $/1M</th><th>Cur</th><th></th></tr>'+rows+'</table>';
+    return '<tr><td class="mono">'+esc(p.slug)+'</td><td>'+Number(p.prompt_per_1m||0)+'</td><td>'+Number(p.completion_per_1m||0)+'</td><td>'+dashRate(p.actual_prompt_per_1m)+'</td><td>'+dashRate(p.actual_completion_per_1m)+'</td><td>'+dashRate(p.cache_read_per_1m)+'</td><td>'+dashRate(p.cache_write_per_1m)+'</td><td>'+(p.currency||'USD')+'</td><td><button class="ghost" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
+  }).join('') || '<tr><td colspan="9"><div class="empty">No prices set. Costs will be 0 unless the upstream returns them.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Slug</th><th>Eq prompt</th><th>Eq completion</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
 }
 document.getElementById('pr-list').addEventListener('click',function(e){
   const b=e.target.closest('[data-act="prdel"]'); if(!b) return;
