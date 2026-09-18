@@ -16,6 +16,7 @@ graphify-out/
 # Relay binaries
 /relay/relay
 /relay/cmd/relay/relay
+/server/bin/zaihttp
 
 # Environment and credential files
 .env

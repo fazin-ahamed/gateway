@@ -121,7 +121,7 @@ const handler = async (req) => {
   return response;
 };
 
-console.log(`[gateway] listening on http://${HOST}:${PORT} (db=${DB_PATH})`);
+console.log(`[gateway] listening on http://${HOST}:${PORT} (db=${DB_PATH} utls=${process.env.ZAI_UTLS_PROXY || "none"})`);
 // Huge-context requests upload megabytes of JSON and slow models take
 // minutes before first byte. Node's defaults (requestTimeout 300s,
 // headersTimeout 60s) kill the socket mid-stream — the "socket closed

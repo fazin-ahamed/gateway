@@ -10,6 +10,7 @@
 #   POLL_SECONDS   git fetch interval (default: 30)
 #   GATEWAY_LOG    node stdout (default: /tmp/gateway.log)
 #   UPDATE_LOG     watcher stdout (default: /tmp/gateway-update.log)
+#   ZAIHTTP_LOG    uTLS helper stdout (default: /tmp/zaihttp.log)
 
 set -eu
 
@@ -19,9 +20,12 @@ PORT=${GATEWAY_PORT:-30012}
 POLL=${POLL_SECONDS:-30}
 LOG=${GATEWAY_LOG:-/tmp/gateway.log}
 UPDATE_LOG=${UPDATE_LOG:-/tmp/gateway-update.log}
+ZAIHTTP_LOG=${ZAIHTTP_LOG:-/tmp/zaihttp.log}
 ENV_FILE="$ROOT/.env"
 SERVER_DIR="$ROOT/server"
 SERVER_JS="$SERVER_DIR/server.mjs"
+ZAIHTTP_BIN="$SERVER_DIR/bin/zaihttp"
+ZAIHTTP_ADDR=${ZAI_HTTP_ADDR:-127.0.0.1:8477}
 
 log() {
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$UPDATE_LOG"
@@ -40,8 +44,59 @@ command -v node >/dev/null || die "node not on PATH"
 cd "$ROOT"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a git repo"
 
+start_zaihttp() {
+  stop_zaihttp
+  unset ZAI_UTLS_PROXY
+  ZAIHTTP_DIR="$ROOT/relay/cmd/zaihttp"
+  RUN_BIN=""
+  if command -v go >/dev/null 2>&1 && [ -f "$ZAIHTTP_DIR/main.go" ]; then
+    cd "$ZAIHTTP_DIR"
+    if go build -o /tmp/gateway-zaihttp . >>"$ZAIHTTP_LOG" 2>&1; then
+      RUN_BIN=/tmp/gateway-zaihttp
+      log "built zaihttp helper -> $RUN_BIN"
+    else
+      log "go build zaihttp failed; see $ZAIHTTP_LOG"
+    fi
+    cd "$ROOT"
+  fi
+  if [ -z "$RUN_BIN" ] && [ -x "$ZAIHTTP_BIN" ]; then
+    RUN_BIN="$ZAIHTTP_BIN"
+  fi
+  if [ -z "$RUN_BIN" ]; then
+    log "zaihttp helper missing (no go, no $ZAIHTTP_BIN); Node TLS will be used"
+    return 0
+  fi
+  ZAI_HTTP_ADDR="$ZAIHTTP_ADDR" nohup "$RUN_BIN" >>"$ZAIHTTP_LOG" 2>&1 &
+  echo $! > /tmp/zaihttp.pid
+  log "started zaihttp pid=$! addr=$ZAIHTTP_ADDR log=$ZAIHTTP_LOG"
+  i=0
+  while [ "$i" -lt 40 ]; do
+    if node -e 'fetch("http://'"$ZAIHTTP_ADDR"'/healthz").then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})' >/dev/null 2>&1; then
+      export ZAI_UTLS_PROXY="http://$ZAIHTTP_ADDR"
+      log "zaihttp ready proxy=$ZAI_UTLS_PROXY"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  log "zaihttp did not become ready; continuing without uTLS"
+}
+
+stop_zaihttp() {
+  if [ -f /tmp/zaihttp.pid ]; then
+    kill "$(cat /tmp/zaihttp.pid)" 2>/dev/null || true
+    rm -f /tmp/zaihttp.pid
+  fi
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -f "/tmp/gateway-zaihttp" 2>/dev/null || true
+    pkill -f "relay/cmd/zaihttp" 2>/dev/null || true
+    pkill -f "$ZAIHTTP_BIN" 2>/dev/null || true
+  fi
+}
+
 start_server() {
   mkdir -p "$SERVER_DIR"
+  start_zaihttp
   cd "$SERVER_DIR"
   # zaiwebbrowser launches headed Chromium. On a VM with no DISPLAY, wrap
   # Node in xvfb-run so Playwright has an X server. If DISPLAY is already
@@ -53,12 +108,17 @@ start_server() {
   elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     log "no DISPLAY and xvfb-run missing; zaiwebbrowser will fail until Xvfb is installed"
   fi
-  PORT="$PORT" nohup $CMD >>"$LOG" 2>&1 &
-  log "started node pid=$! port=$PORT log=$LOG"
+  if [ -n "${ZAI_UTLS_PROXY:-}" ]; then
+    PORT="$PORT" ZAI_UTLS_PROXY="$ZAI_UTLS_PROXY" nohup $CMD >>"$LOG" 2>&1 &
+  else
+    PORT="$PORT" nohup $CMD >>"$LOG" 2>&1 &
+  fi
+  log "started node pid=$! port=$PORT log=$LOG utls=${ZAI_UTLS_PROXY:-none}"
   cd "$ROOT"
 }
 
 stop_server() {
+  stop_zaihttp
   if command -v pkill >/dev/null 2>&1; then
     pkill -f "[n]ode .*server\\.mjs" 2>/dev/null || true
   else

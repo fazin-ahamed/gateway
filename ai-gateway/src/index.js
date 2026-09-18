@@ -2699,7 +2699,8 @@ async function pickAutoModel(c, payload, key) {
 // a model the account cannot see, a dead session, a bad transport.
 var SAME_KEY_ATTEMPTS = 3;
 // Fatal config errors shouldn't retry, but transient zai_browser page load hiccups can self-heal on retry.
-var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed|zai_model\b/;
+// zai_completion 500s are Z.AI payload/TLS rejects; retrying burns another single-use CAPTCHA.
+var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed|zai_model\b|zai_completion|zai_unreachable/;
 function shouldRetrySameKey(transportAttempt, err) {
   return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
 }
