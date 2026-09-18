@@ -49,4 +49,7 @@ test("same-key retry is three in-place attempts, then the next credential", () =
   assert.equal(t.shouldRetryHttp(0, 503, "zai_browser_unavailable"), false);
   assert.equal(t.shouldRetryHttp(0, 502, "zai_browser"), true);
   assert.equal(t.shouldRetryHttp(0, 503, "zai_model_unavailable"), false);
+  assert.equal(t.shouldRetryHttp(0, 503, "zai_tokens"), false);
+  assert.equal(t.shouldRetryHttp(0, 503, "zai_captcha_config"), false);
+  assert.equal(t.shouldRetryHttp(0, 503, "zai_http_fallback_failed"), false);
 });
