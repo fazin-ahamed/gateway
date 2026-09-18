@@ -45,7 +45,12 @@ var PLAYGROUND_HTML = `<!doctype html>
   button.ghost{background:transparent;border:1px solid var(--line-hi);color:var(--muted);padding:7px 11px}button.ghost:hover{border-color:var(--accent);color:var(--accent)}
   button.danger{background:transparent;border:1px solid transparent;color:var(--bad);padding:6px 10px}button.danger:hover{background:rgba(228,91,91,.1);border-color:rgba(228,91,91,.4)}
   table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#t-list{overflow-x:auto;border-radius:var(--radius-sm)}#t-list table{min-width:880px}th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:middle}th{position:sticky;top:0;background:var(--surface-deep);color:var(--muted);font:9px/1.3 var(--mono);letter-spacing:.08em;text-transform:uppercase}tbody tr:hover{background:var(--surface-deep)}tbody tr:last-child td{border-bottom:0}
-  #pr-list{overflow-x:auto}#pr-list table{min-width:1100px}#pr-list input.rate{width:92px;min-width:72px;padding:5px 7px;font:11px/1.2 var(--mono)}#pr-list td.rate{padding:6px 8px}#pr-list tbody tr{cursor:pointer}
+  #pr-list{overflow-x:auto}#pr-list tbody tr:hover{background:var(--surface-deep)}
+  .price-editor h3.sec{margin:18px 0 8px;font-size:11px;padding-bottom:6px;border-bottom:1px solid var(--line)}.price-editor h3.sec:first-child{margin-top:0}
+  .price-editor .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .pe-ov{border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;background:var(--surface-deep)}
+  .pe-ov-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .pe-add{display:flex;gap:8px;align-items:flex-end;margin-top:8px}.pe-add>div{flex:1}
   .mono{font-family:var(--mono);font-size:11px;word-break:break-all}.pill{padding:2px 7px;border:1px solid transparent;border-radius:var(--r-pill);font:9px/1.2 var(--mono);letter-spacing:.04em;text-transform:uppercase;display:inline-block}.pill.ok{background:rgba(62,201,140,.12);border-color:rgba(62,201,140,.24);color:var(--good)}.pill.bad{background:rgba(228,91,91,.12);border-color:rgba(228,91,91,.24);color:var(--bad)}.pill.warn{background:rgba(220,174,79,.12);border-color:rgba(220,174,79,.24);color:var(--warn)}.pill.mut{background:rgba(95,109,130,.1);border-color:rgba(95,109,130,.2);color:var(--muted)}.pill.acc{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
   .stat{position:relative;min-height:88px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px 16px}.stat:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}.stat .k{color:var(--muted);font-size:10px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.stat .v{font:600 22px/1.1 var(--mono);margin-top:10px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}.stat .v.acc{color:var(--accent)}.stat .v.ok{color:var(--good)}.stat .v.bad{color:var(--bad)}
   .grid{display:grid;gap:12px}.grid.s4{grid-template-columns:repeat(4,minmax(0,1fr))}.grid.s3{grid-template-columns:repeat(3,minmax(0,1fr))}.grid.s2{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -312,11 +317,10 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-prices">
-    <div class="pagehead"><div><h2 class="sec">Model prices</h2><p class="sub">Two tracks: <b>API-equivalent</b> (models.dev / public list price, always per 1M tokens) and <b>actual</b> (what you pay). The actual track can be billed <b>per 1M tokens</b> or as a <b>flat per-request</b> fee. Leave actual token rates blank to reuse the equivalent rate; blank cache read uses the prompt rate, blank cache write is $0.</p></div></div>
-    <div class="panel"><div class="panel-h"><h2 class="sec">Save price</h2></div><div class="panel-b">
+    <div class="pagehead"><div><h2 class="sec">Model prices</h2><p class="sub">Add a model's <b>default</b> pricing here (applies to every provider). Use <b>Edit</b> on a row to set per-provider actual rates. <b>Equivalent</b> is the public list price (per 1M tokens); <b>actual</b> is what you pay and can be per 1M tokens or a flat per-request fee. Blank actual token rates reuse the equivalent.</p></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Add / update default price</h2></div><div class="panel-b">
       <div class="form-grid">
         <div><label>Slug</label><input id="pr-slug" placeholder="z-ai/glm-5.3"></div>
-        <div><label>Provider</label><select id="pr-provider"><option value="0">All providers (default)</option></select></div>
         <div><label>Actual pricing basis</label><select id="pr-actual-mode"><option value="per_1m">Per 1M tokens</option><option value="per_request">Flat per request</option></select></div>
         <div><label>Equivalent prompt $/1M</label><input id="pr-prompt" type="number" step="0.0001" placeholder="0"></div>
         <div><label>Equivalent completion $/1M</label><input id="pr-completion" type="number" step="0.0001" placeholder="0"></div>
@@ -326,7 +330,7 @@ var PLAYGROUND_HTML = `<!doctype html>
         <div><label>Cache write $/1M (optional)</label><input id="pr-cache-write" type="number" step="0.0001" placeholder="0"></div>
         <div><label>Actual $/request (flat basis)</label><input id="pr-actual-request" type="number" step="0.0001" placeholder="0"></div>
       </div>
-      <div class="form-actions"><button class="act" id="pr-save">Save price</button><button class="ghost" id="pr-sync">Sync equivalent from models.dev</button></div>
+      <div class="form-actions"><button class="act" id="pr-save">Save default</button><button class="ghost" id="pr-sync">Sync equivalent from models.dev</button></div>
     </div></div>
     <div class="panel"><div class="panel-b flush" id="pr-list"></div></div>
   </section>
@@ -1287,7 +1291,7 @@ document.getElementById('pr-save').onclick=async function(){
   if(!slug){ toast('slug required','err'); return; }
   await savePriceRow({
     slug,
-    provider_id: document.getElementById('pr-provider').value||'0',
+    provider_id: 0,
     prompt_per_1m: document.getElementById('pr-prompt').value,
     completion_per_1m: document.getElementById('pr-completion').value,
     actual_prompt_per_1m: document.getElementById('pr-actual-prompt').value,
@@ -1311,8 +1315,7 @@ document.getElementById('pr-sync').onclick=async function(){
 function optRate(v){ const s=String(v==null?'':v).trim(); return s===''?null:s; }
 function dashRate(v){ return v==null||v===''?'<span class="small">—</span>':money(Number(v))+'/1M'; }
 let priceCache=[];
-async function savePriceRow(p){
-  if(!p.slug){ toast('slug required','err'); return false; }
+async function postPrice(p){
   const body=JSON.stringify({
     slug: p.slug,
     provider_id: Number(p.provider_id)||0,
@@ -1325,80 +1328,142 @@ async function savePriceRow(p){
     actual_mode: p.actual_mode==='per_request'?'per_request':'per_1m',
     actual_per_request: optRate(p.actual_per_request)
   });
-  const {status,data}=await api('/admin/prices',{method:'POST',body});
+  return api('/admin/prices',{method:'POST',body});
+}
+async function savePriceRow(p){
+  if(!p.slug){ toast('slug required','err'); return false; }
+  const {status,data}=await postPrice(p);
   if(status===200){ toast('price saved','ok'); loadPrices(); return true; }
   toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
   return false;
 }
-function providerLabel(p){
-  if(!p.provider_id||Number(p.provider_id)===0) return '<span class="pill mut">all providers</span>';
-  return '<span class="pill acc">'+esc(p.provider_name||('#'+p.provider_id))+'</span>';
+// ----- consolidated per-slug editor (default + provider overrides) -----
+function peActualBlock(prefix, d){
+  d=d||{};
+  const v=function(x){ return x==null||x===''?'':String(x); };
+  const mode=d.actual_mode==='per_request'?'per_request':'per_1m';
+  return '<div class="form-grid">'
+    +'<div><label>Actual basis</label><select id="'+prefix+'-mode"><option value="per_1m"'+(mode==='per_1m'?' selected':'')+'>Per 1M tokens</option><option value="per_request"'+(mode==='per_request'?' selected':'')+'>Flat per request</option></select></div>'
+    +'<div><label>Actual $/request</label><input id="'+prefix+'-req" type="number" step="0.0001" value="'+v(d.actual_per_request)+'" placeholder="0"></div>'
+    +'<div><label>Actual prompt $/1M</label><input id="'+prefix+'-ap" type="number" step="0.0001" value="'+v(d.actual_prompt_per_1m)+'" placeholder="= equivalent"></div>'
+    +'<div><label>Actual completion $/1M</label><input id="'+prefix+'-ac" type="number" step="0.0001" value="'+v(d.actual_completion_per_1m)+'" placeholder="= equivalent"></div>'
+    +'<div><label>Cache read $/1M</label><input id="'+prefix+'-cr" type="number" step="0.0001" value="'+v(d.cache_read_per_1m)+'" placeholder="= prompt"></div>'
+    +'<div><label>Cache write $/1M</label><input id="'+prefix+'-cw" type="number" step="0.0001" value="'+v(d.cache_write_per_1m)+'" placeholder="0"></div>'
+    +'</div>';
 }
-function editPrice(slug,providerId){
-  const pid=Number(providerId)||0;
-  const p=priceCache.find(function(x){ return x.slug===slug && (Number(x.provider_id)||0)===pid; })||{ slug, provider_id: pid };
-  const num=function(v){ return v==null||v===''?'':String(v); };
-  const scope=pid===0?'all providers':(p.provider_name||('provider #'+pid));
-  openModal('Edit price · '+slug+' · '+scope,[
-    { key:'actual_mode', label:'Actual pricing basis', type:'select', value:(p.actual_mode==='per_request'?'per_request':'per_1m'), options:[{value:'per_1m',label:'Per 1M tokens'},{value:'per_request',label:'Flat per request'}] },
-    { key:'actual_per_request', label:'Actual $/request (flat basis)', type:'number', value:num(p.actual_per_request), placeholder:'0' },
-    { key:'prompt_per_1m', label:'Equivalent prompt $/1M', type:'number', value:num(p.prompt_per_1m), placeholder:'0' },
-    { key:'completion_per_1m', label:'Equivalent completion $/1M', type:'number', value:num(p.completion_per_1m), placeholder:'0' },
-    { key:'actual_prompt_per_1m', label:'Actual prompt $/1M (optional)', type:'number', value:num(p.actual_prompt_per_1m), placeholder:'same as equivalent' },
-    { key:'actual_completion_per_1m', label:'Actual completion $/1M (optional)', type:'number', value:num(p.actual_completion_per_1m), placeholder:'same as equivalent' },
-    { key:'cache_read_per_1m', label:'Cache read $/1M (optional)', type:'number', value:num(p.cache_read_per_1m), placeholder:'same as prompt' },
-    { key:'cache_write_per_1m', label:'Cache write $/1M (optional)', type:'number', value:num(p.cache_write_per_1m), placeholder:'0' }
-  ],async function(out){
-    const ok=await savePriceRow({ slug, provider_id: pid, prompt_per_1m: out.prompt_per_1m, completion_per_1m: out.completion_per_1m, actual_prompt_per_1m: out.actual_prompt_per_1m, actual_completion_per_1m: out.actual_completion_per_1m, cache_read_per_1m: out.cache_read_per_1m, cache_write_per_1m: out.cache_write_per_1m, actual_mode: out.actual_mode, actual_per_request: out.actual_per_request });
-    if(ok) closeModal();
-  },'Save price');
+function peReadActual(prefix){
+  const g=function(s){ const el=document.getElementById(prefix+s); return el?el.value:''; };
+  return { actual_mode:g('-mode'), actual_per_request:g('-req'), actual_prompt_per_1m:g('-ap'), actual_completion_per_1m:g('-ac'), cache_read_per_1m:g('-cr'), cache_write_per_1m:g('-cw') };
 }
-async function refreshPriceProviders(){
-  const sel=document.getElementById('pr-provider'); if(!sel) return;
-  const cur=sel.value;
-  try{
-    const opts=await providerOptions();
-    sel.innerHTML='<option value="0">All providers (default)</option>'+opts.map(function(o){ return '<option value="'+esc(o.value)+'">'+o.label+'</option>'; }).join('');
-    sel.value=cur||'0';
-  }catch(e){}
+function peOverrideBlock(pid, name, d){
+  return '<div class="pe-ov" data-pid="'+pid+'"><div class="pe-ov-head"><b>'+esc(name||('provider #'+pid))+'</b>'
+    +'<button class="danger" type="button" data-act="pe-rm">remove</button></div>'+peActualBlock('pe-ov-'+pid, d)+'</div>';
+}
+async function editPrice(slug){
+  const rows=priceCache.filter(function(x){ return x.slug===slug; });
+  const def=rows.find(function(x){ return (Number(x.provider_id)||0)===0; })||{ slug, provider_id: 0 };
+  const overrides=rows.filter(function(x){ return (Number(x.provider_id)||0)!==0; });
+  let provOpts=[]; try{ provOpts=await providerOptions(); }catch(e){}
+  const nameOf=function(pid){ const o=provOpts.find(function(x){ return String(x.value)===String(pid); }); return o?o.label:('provider #'+pid); };
+  const v=function(x){ return x==null||x===''?'':String(x); };
+  const originalPids=overrides.map(function(o){ return Number(o.provider_id)||0; });
+  document.querySelector('.modal').classList.add('wide');
+  document.getElementById('modal-title').textContent='Pricing · '+slug;
+  document.getElementById('modal-title').style.color='';
+  const body=document.getElementById('modal-body');
+  body.innerHTML='<div class="price-editor">'
+    +'<h3 class="sec">Equivalent · list price (per 1M tokens)</h3>'
+    +'<div class="form-grid"><div><label>Prompt $/1M</label><input id="pe-eq-prompt" type="number" step="0.0001" value="'+v(def.prompt_per_1m)+'" placeholder="0"></div>'
+    +'<div><label>Completion $/1M</label><input id="pe-eq-completion" type="number" step="0.0001" value="'+v(def.completion_per_1m)+'" placeholder="0"></div></div>'
+    +'<h3 class="sec">Default actual pricing · applies to every provider</h3>'
+    +peActualBlock('pe-def', def)
+    +'<h3 class="sec">Per-provider actual overrides</h3>'
+    +'<p class="small" style="margin:0 0 8px">Overrides replace the default when that provider serves the request. Blank token rates fall back to the equivalent list price.</p>'
+    +'<div id="pe-overrides">'+overrides.map(function(o){ return peOverrideBlock(Number(o.provider_id)||0, nameOf(o.provider_id), o); }).join('')+'</div>'
+    +'<div class="pe-add"><div><label>Add provider override</label><select id="pe-add-provider"></select></div><button class="ghost" type="button" id="pe-add-btn">Add</button></div>'
+    +'</div>';
+  function renderAddSelect(){
+    const used=new Set(Array.from(body.querySelectorAll('.pe-ov')).map(function(el){ return el.getAttribute('data-pid'); }));
+    const opts=provOpts.filter(function(o){ return !used.has(String(o.value)); });
+    const sel=document.getElementById('pe-add-provider');
+    sel.innerHTML=opts.length?opts.map(function(o){ return '<option value="'+esc(o.value)+'">'+o.label+'</option>'; }).join(''):'<option value="">every provider has an override</option>';
+    document.getElementById('pe-add-btn').disabled=!opts.length;
+  }
+  renderAddSelect();
+  document.getElementById('pe-add-btn').onclick=function(){
+    const sel=document.getElementById('pe-add-provider'); const pid=sel.value; if(!pid) return;
+    document.getElementById('pe-overrides').insertAdjacentHTML('beforeend', peOverrideBlock(Number(pid), nameOf(pid), {}));
+    renderAddSelect();
+  };
+  body.onclick=function(e){
+    const rm=e.target.closest('[data-act="pe-rm"]'); if(!rm) return;
+    const blk=rm.closest('.pe-ov'); if(blk){ blk.remove(); renderAddSelect(); }
+  };
+  const save=document.getElementById('modal-save');
+  save.textContent='Save all'; save.style.display=''; save.classList.remove('danger'); save.classList.add('act');
+  modalSubmit=async function(){
+    const eqP=document.getElementById('pe-eq-prompt').value||0;
+    const eqC=document.getElementById('pe-eq-completion').value||0;
+    const jobs=[];
+    jobs.push(postPrice(Object.assign({ slug, provider_id:0, prompt_per_1m:eqP, completion_per_1m:eqC }, peReadActual('pe-def'))));
+    const domPids=[];
+    Array.from(body.querySelectorAll('.pe-ov')).forEach(function(el){
+      const pid=Number(el.getAttribute('data-pid'))||0; if(!pid) return; domPids.push(pid);
+      jobs.push(postPrice(Object.assign({ slug, provider_id:pid, prompt_per_1m:eqP, completion_per_1m:eqC }, peReadActual('pe-ov-'+pid))));
+    });
+    originalPids.filter(function(pid){ return domPids.indexOf(pid)<0; }).forEach(function(pid){
+      jobs.push(api('/admin/prices/'+encodeURIComponent(slug)+'?provider_id='+pid,{method:'DELETE'}));
+    });
+    try{
+      const results=await Promise.all(jobs);
+      const bad=results.find(function(r){ return r&&r.status&&r.status!==200; });
+      if(bad){ toast('save failed: '+((bad.data&&bad.data.error&&bad.data.error.message)||bad.status),'err'); return; }
+      toast('pricing saved','ok'); closeModal(); loadPrices();
+    }catch(e){ toast('save failed: '+e.message,'err'); }
+  };
+  document.getElementById('overlay').classList.add('show');
 }
 async function loadPrices(){
   const el=document.getElementById('pr-list');
   paintSkeleton(el);
-  refreshPriceProviders();
   let data; try{ const res=await api('/admin/prices'); data=res.data; }catch(e){ paintLoadError(el,'Could not load prices: '+e.message,loadPrices); return; }
   priceCache=(data&&data.prices)||[];
-  const rows=priceCache.map(function(p){
-    const pid=Number(p.provider_id)||0;
-    const actualBasis=p.actual_mode==='per_request'
-      ? '<span class="pill acc">'+money(Number(p.actual_per_request||0))+'/req</span>'
-      : '<span class="small">per 1M</span>';
-    return '<tr data-slug="'+esc(p.slug)+'" data-provider="'+pid+'">'+
-      '<td class="mono">'+esc(p.slug)+'</td>'+
-      '<td>'+providerLabel(p)+'</td>'+
-      '<td class="mono">'+money(Number(p.prompt_per_1m||0))+'/1M</td>'+
-      '<td class="mono">'+money(Number(p.completion_per_1m||0))+'/1M</td>'+
-      '<td>'+actualBasis+'</td>'+
-      '<td class="mono">'+dashRate(p.actual_prompt_per_1m)+'</td>'+
-      '<td class="mono">'+dashRate(p.actual_completion_per_1m)+'</td>'+
-      '<td class="mono">'+dashRate(p.cache_read_per_1m)+'</td>'+
-      '<td class="mono">'+dashRate(p.cache_write_per_1m)+'</td>'+
-      '<td>'+(p.currency||'USD')+'</td>'+
-      '<td class="rowact"><button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'" data-provider="'+pid+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'" data-provider="'+pid+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="11"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Provider</th><th>Eq prompt</th><th>Eq completion</th><th>Actual basis</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
+  const bySlug=new Map();
+  priceCache.forEach(function(p){ if(!bySlug.has(p.slug)) bySlug.set(p.slug,[]); bySlug.get(p.slug).push(p); });
+  const slugs=Array.from(bySlug.keys()).sort();
+  const rows=slugs.map(function(s){
+    const list=bySlug.get(s);
+    const def=list.find(function(x){ return (Number(x.provider_id)||0)===0; })||list[0]||{};
+    const ov=list.filter(function(x){ return (Number(x.provider_id)||0)!==0; }).length;
+    const ovPill=ov?' <span class="pill mut" title="per-provider overrides">'+ov+' override'+(ov>1?'s':'')+'</span>':'';
+    const actual=def.actual_mode==='per_request'
+      ? '<span class="pill acc">'+money(Number(def.actual_per_request||0))+'/req</span>'
+      : ((def.actual_prompt_per_1m!=null||def.actual_completion_per_1m!=null)
+          ? '<span class="mono small">'+dashRate(def.actual_prompt_per_1m)+' · '+dashRate(def.actual_completion_per_1m)+'</span>'
+          : '<span class="small">= equivalent</span>');
+    return '<tr data-slug="'+esc(s)+'">'
+      +'<td class="mono">'+esc(s)+ovPill+'</td>'
+      +'<td class="mono">'+money(Number(def.prompt_per_1m||0))+'/1M</td>'
+      +'<td class="mono">'+money(Number(def.completion_per_1m||0))+'/1M</td>'
+      +'<td>'+actual+'</td>'
+      +'<td>'+(def.currency||'USD')+'</td>'
+      +'<td class="rowact"><button class="ghost" data-act="predit" data-slug="'+esc(s)+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(s)+'">delete</button></td></tr>';
+  }).join('') || '<tr><td colspan="6"><div class="empty">No prices set. Add a default above, or sync equivalent rates from models.dev.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Model</th><th>Eq prompt</th><th>Eq completion</th><th>Actual (default)</th><th>Cur</th><th></th></tr>'+rows+'</table>';
 }
 document.getElementById('pr-list').addEventListener('click',function(e){
   const b=e.target.closest('[data-act]'); if(!b) return;
   const act=b.getAttribute('data-act');
-  const pid=Number(b.dataset.provider)||0;
-  if(act==='predit'){ editPrice(b.dataset.slug,pid); return; }
+  if(act==='predit'){ editPrice(b.dataset.slug); return; }
   if(act==='prdel'){
-    const scope=pid===0?'all providers':('provider #'+pid);
-    confirmAction('Delete price','Remove the '+scope+' rates for '+b.dataset.slug+'?','Delete',async function(){
-      const {status,data}=await api('/admin/prices/'+encodeURIComponent(b.dataset.slug)+'?provider_id='+pid,{method:'DELETE'});
-      if(status===200){ toast('price deleted','ok'); loadPrices(); }
-      else toast('delete failed: '+(data&&data.error&&data.error.message||status),'err');
+    const list=priceCache.filter(function(x){ return x.slug===b.dataset.slug; });
+    const pids=list.map(function(x){ return Number(x.provider_id)||0; });
+    const ov=pids.filter(function(p){ return p!==0; }).length;
+    confirmAction('Delete pricing','Remove all pricing for '+b.dataset.slug+(ov?' (default + '+ov+' provider override'+(ov>1?'s':'')+')':'')+'?','Delete',async function(){
+      try{
+        await Promise.all((pids.length?pids:[0]).map(function(pid){ return api('/admin/prices/'+encodeURIComponent(b.dataset.slug)+'?provider_id='+pid,{method:'DELETE'}); }));
+        toast('pricing deleted','ok'); loadPrices();
+      }catch(err){ toast('delete failed: '+err.message,'err'); }
     });
   }
 });
