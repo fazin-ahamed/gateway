@@ -1194,7 +1194,13 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
     : await import("./zaibrowser.js");
   let turn;
   try {
-    turn = await runBrowserTurn(token, prompt, { turnTimeoutMs: Number(payload.turn_timeout_ms) || 0 });
+    const stableUserId = userIdFromToken(token);
+    turn = await runBrowserTurn(token, prompt, {
+      turnTimeoutMs: Number(payload.turn_timeout_ms) || 0,
+      // chat.z.ai rotates the JWT after successful turns. Pooling by the raw
+      // token makes every next request cold-start a new browser context.
+      poolId: stableUserId ? "uid:" + stableUserId : ""
+    });
   } catch (e) {
     if (e instanceof ZaiBrowserUnavailable)
       throw new ZaiWebError(e.status || 503, e.message, e.code || "zai_browser_unavailable");
