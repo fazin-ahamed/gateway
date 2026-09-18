@@ -181,8 +181,7 @@ function complementary(a, b) {
 export function generateActions(candidates, taskIR, world) {
   const phase = phaseOf(taskIR);
   const actions = [];
-  const eligible = (candidates || []).filter((c) => c && c.slug && !isHorizonLuxury(c.slug) && (c.eligible || c.capable || c.workhorse));
-  const pool = eligible.length ? eligible : (candidates || []).filter((c) => c && c.slug && !isHorizonLuxury(c.slug));
+  const pool = (candidates || []).filter((c) => c && c.slug && !isHorizonLuxury(c.slug) && c.eligible === true);
   for (const cand of pool) {
     const role = phase === "debug" ? "debug" : phase === "code" ? "code" : "answer";
     actions.push({
@@ -195,6 +194,7 @@ export function generateActions(candidates, taskIR, world) {
       tiny: isTinySlug(cand.slug) || !!cand.tiny,
       workhorse: !!cand.workhorse,
       capable: cand.capable !== false,
+      eligible: true,
       context: Number(cand.context) || 0,
       output: Number(cand.output) || 0
     });
@@ -216,7 +216,7 @@ export function shouldCompact(reqTokens, context, output, requestedOutput) {
 }
 
 export function pickAction(actions, taskIR) {
-  const models = (actions || []).filter((a) => a.type === "model" && a.capable !== false);
+  const models = (actions || []).filter((a) => a.type === "model" && a.eligible === true && a.capable !== false);
   const fam = (taskIR && taskIR.families) || [];
   const reflex = !!(taskIR && taskIR.difficulty < 0.32 && taskIR.toolComplexity < 0.15 && !fam.includes("longctx") && !fam.includes("vision") && !fam.includes("coding") && !fam.includes("debug"));
   if (reflex && models.length) {
@@ -231,13 +231,13 @@ export function pickAction(actions, taskIR) {
   }
   const strong = models.filter((a) => !a.tiny);
   const pool = ((fam.includes("coding") || fam.includes("debug")) && strong.length) ? strong : models;
-  const deliberative = pool[0] || models[0] || (actions || [])[0] || null;
+  const deliberative = pool[0] || models[0] || null;
   return deliberative ? { ...deliberative, speed: "deliberative" } : null;
 }
 export function buildQueue(actions, chosen, limit) {
   const n = Math.max(1, Math.min(3, limit || 2));
   const phase = (chosen && chosen.role === "debug") ? "debug" : (chosen && chosen.role === "code") ? "code" : "plan";
-  let models = (actions || []).filter((a) => a.type === "model" && a.slug && a.slug !== (chosen && chosen.slug) && a.capable !== false && !isHorizonLuxury(a.slug));
+  let models = (actions || []).filter((a) => a.type === "model" && a.eligible === true && a.slug && a.slug !== (chosen && chosen.slug) && a.capable !== false && !isHorizonLuxury(a.slug));
   const strong = models.filter((a) => !isTinySlug(a.slug) && (capabilityTensor(a.slug)[phase] || 0) >= 0.75);
   if (chosen && !isTinySlug(chosen.slug) && strong.length) models = strong;
   const out = [];
@@ -264,17 +264,18 @@ export function planHorizon({ payload, candidates, picked, need, reqTokens, cx }
   const world = initWorld(payload, taskIR);
   const actions = generateActions(candidates || [], taskIR, world);
   let chosen = pickAction(actions, taskIR);
-  if (!chosen && picked)
-    chosen = { type: "model", slug: picked.slug, role: "answer", mvc: 0, speed: "deliberative" };
+  const pickedOk = picked && picked.eligible === true && !isHorizonLuxury(picked.slug);
+  if (!chosen && pickedOk)
+    chosen = { type: "model", slug: picked.slug, role: "answer", mvc: 0, speed: "deliberative", eligible: true };
   if (!chosen || chosen.type !== "model") {
-    if (picked && !isHorizonLuxury(picked.slug))
-      chosen = { type: "model", slug: picked.slug, role: "answer", mvc: 0, speed: "deliberative" };
+    if (pickedOk)
+      chosen = { type: "model", slug: picked.slug, role: "answer", mvc: 0, speed: "deliberative", eligible: true };
   }
   const queue = chosen && chosen.type === "model" ? buildQueue(actions, chosen, chosen.speed === "reflex" ? 1 : 2) : [];
   const ctx = Number((chosen && chosen.context) || (picked && picked.context) || 0);
   const out = Number((chosen && chosen.output) || (picked && picked.output) || 0);
   return {
-    slug: (chosen && chosen.slug) || (picked && picked.slug) || null,
+    slug: (chosen && chosen.slug) || (pickedOk && picked && picked.slug) || null,
     role: (chosen && chosen.role) || "answer",
     speed: (chosen && chosen.speed) || "deliberative",
     mvc: chosen ? Number(chosen.mvc) || 0 : 0,

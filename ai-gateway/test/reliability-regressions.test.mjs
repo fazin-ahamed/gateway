@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { __test as t } from "../src/index.js";
 import { guardToolLoopResponse } from "../../server/tool-loop-guard.mjs";
-import { generateActions, pickAction } from "../src/horizon.js";
+import { generateActions, pickAction, planHorizon } from "../src/horizon.js";
 
 function withFakeNow(ms, fn) {
   const realNow = Date.now;
@@ -124,6 +124,28 @@ test("HORIZON reflex actions carry candidate cost before comparing cheapest", ()
   const picked = pickAction(actions, { difficulty: 0.1, toolComplexity: 0, families: ["chat"] });
   assert.equal(picked.slug, "model-b-mini");
   assert.equal(picked.cost, 1);
+});
+
+test("ineligible candidate can never be selected by HORIZON", () => {
+  const actions = generateActions([
+    { slug: "z-ai/glm-5.3-flash", eligible: false, capable: true, workhorse: true, cost: 0.1, tiny: true },
+    { slug: "alibaba/qwen3.8-flash-next", eligible: true, capable: true, workhorse: true, cost: 0.7, tiny: true }
+  ], { families: ["chat"], difficulty: 0.1, toolComplexity: 0 }, {});
+  const models = actions.filter((a) => a.type === "model");
+  assert.equal(models.length, 1);
+  assert.equal(models[0].slug, "alibaba/qwen3.8-flash-next");
+  const plan = planHorizon({
+    payload: { messages: [{ role: "user", content: "Hi" }] },
+    candidates: [
+      { slug: "z-ai/glm-5.3-flash", eligible: false, capable: true, workhorse: true, cost: 0.1, tiny: true },
+      { slug: "alibaba/qwen3.8-flash-next", eligible: true, capable: true, workhorse: true, cost: 0.7, tiny: true }
+    ],
+    picked: { slug: "z-ai/glm-5.3-flash", eligible: false, cost: 0.1 },
+    need: 1,
+    reqTokens: 10,
+    cx: { score: 0, estInputTokens: 10, images: 0 }
+  });
+  assert.equal(plan.slug, "alibaba/qwen3.8-flash-next");
 });
 
 test("outer SSE guard never exposes raw source exception text", async () => {

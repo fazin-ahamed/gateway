@@ -47,7 +47,7 @@ function diversePair(routes) {
 }
 
 export function candidatePolicies(routes, taskIR) {
-  const usable = (routes || []).filter((r) => r && r.slug && r.capable !== false && !r.luxury);
+  const usable = (routes || []).filter((r) => r && r.slug && r.hardEligible === true && !r.luxury);
   const cheap = usable.filter((r) => isTinyModel(r.slug) || r.workhorse).sort((a, b) => costOf(a) - costOf(b));
   const strong = usable.filter((r) => !isTinyModel(r.slug)).sort((a, b) => successOf(b, taskIR) - successOf(a, taskIR));
   const primary = cheap[0] || usable[0];
@@ -139,7 +139,7 @@ export function pickPolicy(policies, preference = 70, taskIR = null) {
   const front = pareto(policies);
   if (!front.length) return null;
   const w = Math.max(0, Math.min(1, Number(preference) / 100));
-  const easy = taskIR && taskIR.difficulty < 0.32 && taskIR.verificationNeed < 0.3 && !taskIR.tools.required;
+  const easy = taskIR && taskIR.difficulty < 0.32 && taskIR.verificationNeed < 0.3 && !(taskIR.tools && taskIR.tools.required);
   let best = null;
   let bestScore = -Infinity;
   for (const p of front) {

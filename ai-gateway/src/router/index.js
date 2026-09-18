@@ -36,6 +36,7 @@ export function routesFromV1Candidates(candidates) {
     luxury: !!c.luxury,
     tiny: !!c.tiny,
     eligible: !!c.eligible,
+    hardEligible: c.hardEligible === true || c.eligible === true,
     posterior: posteriorFromCandidate(c),
     key: routeKey({ slug: c.slug, upstream_model: c.slug })
   }));

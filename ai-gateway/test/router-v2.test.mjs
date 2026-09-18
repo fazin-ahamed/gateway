@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { compileTaskIR, classifyTask } from "../src/router/task-ir.js";
 import { normalizeModelId, routeKey } from "../src/router/identity.js";
-import { observe, lcb, mean, seedBeta, summarize } from "../src/router/posterior.js";
+import { age, observe, lcb, mean, seedBeta, summarize } from "../src/router/posterior.js";
 import { candidatePolicies, pareto, pickPolicy, shadowDecide } from "../src/router/policies.js";
 import { ROUTER_V2_MODE, shadowFromV1 } from "../src/router/index.js";
 import { generateActions } from "../src/horizon.js";
@@ -55,8 +55,8 @@ test("dominated policies are pruned from the frontier", () => {
 
 test("easy chat prefers reflex over rescue", () => {
   const routes = [
-    { slug: "glm-5.3-flash", cost: 0.01, avgMs: 800, workhorse: true, capable: true, posterior: seedBeta() },
-    { slug: "glm-5.3", cost: 0.2, avgMs: 4000, workhorse: true, capable: true, posterior: seedBeta() }
+    { slug: "glm-5.3-flash", cost: 0.01, avgMs: 800, workhorse: true, capable: true, hardEligible: true, posterior: seedBeta() },
+    { slug: "glm-5.3", cost: 0.2, avgMs: 4000, workhorse: true, capable: true, hardEligible: true, posterior: seedBeta() }
   ];
   const taskIR = compileTaskIR({ messages: [{ role: "user", content: "hi" }] });
   const picked = pickPolicy(candidatePolicies(routes, taskIR), 70, taskIR);
@@ -73,7 +73,7 @@ test("V2 shadow does not change V1 picked slug", () => {
     const shadow = shadowFromV1({
       payload: { messages: [{ role: "user", content: "hi" }] },
       candidates: [
-        { slug: v1Slug, cost: 0.01, avgMs: 900, samples: 10, okRate: 0.9, capable: true, workhorse: true }
+        { slug: v1Slug, cost: 0.01, avgMs: 900, samples: 10, okRate: 0.9, capable: true, workhorse: true, eligible: true, hardEligible: true }
       ],
       preference: 70
     });
@@ -100,8 +100,8 @@ test("shadowDecide returns explainable policy for a cheap pool", () => {
   const taskIR = compileTaskIR({ messages: [{ role: "user", content: "hi" }] });
   const decision = shadowDecide({
     routes: [
-      { slug: "glm-5.3-flash", cost: 0.01, avgMs: 700, workhorse: true, capable: true, posterior: seedBeta() },
-      { slug: "qwen3-flash", cost: 0.012, avgMs: 650, workhorse: true, capable: true, posterior: seedBeta() }
+      { slug: "glm-5.3-flash", cost: 0.01, avgMs: 700, workhorse: true, capable: true, hardEligible: true, posterior: seedBeta() },
+      { slug: "qwen3-flash", cost: 0.012, avgMs: 650, workhorse: true, capable: true, hardEligible: true, posterior: seedBeta() }
     ],
     taskIR,
     preference: 80
@@ -110,4 +110,46 @@ test("shadowDecide returns explainable policy for a cheap pool", () => {
   assert.ok(decision.picked);
   assert.ok(decision.explain);
   assert.equal(decision.explain.task, "chat:casual");
+});
+
+test("hi with twenty attached tools stays chat:casual", () => {
+  const tools = Array.from({ length: 20 }, (_, i) => ({ type: "function", function: { name: "t" + i } }));
+  const ir = compileTaskIR({ messages: [{ role: "user", content: "Hi" }], tools });
+  assert.equal(ir.task, "chat:casual");
+  assert.equal(ir.tools.required, false);
+  assert.equal(ir.tools.available, 20);
+});
+
+test("implement a parser classifies as code:generation", () => {
+  const ir = compileTaskIR({ messages: [{ role: "user", content: "Implement a function that parses this format" }] });
+  assert.equal(ir.task, "code:generation");
+});
+
+test("stale prior-turn keywords do not classify the current turn", () => {
+  const ir = compileTaskIR({
+    messages: [
+      { role: "user", content: "Debug this Rust race condition" },
+      { role: "assistant", content: "Looking at the lock." },
+      { role: "user", content: "Thanks. Now write me a short email." }
+    ]
+  });
+  assert.equal(ir.task, "writing:professional");
+});
+
+test("long idle posterior converges to prior, not zero", () => {
+  const hot = { kind: "route", alpha: 20, beta: 10, updatedAt: 0 };
+  const cooled = age(hot, 10 * 365 * 86400000);
+  assert.ok(Math.abs(mean(cooled) - mean(seedBeta("route"))) < 0.02);
+  assert.ok(cooled.alpha > 7);
+  assert.ok(cooled.beta < 3);
+});
+
+test("ineligible route never enters V2 policies", () => {
+  const taskIR = compileTaskIR({ messages: [{ role: "user", content: "hi" }] });
+  const policies = candidatePolicies([
+    { slug: "z-ai/glm-5.3-flash", hardEligible: false, capable: true, workhorse: true, cost: 0.01, posterior: seedBeta() },
+    { slug: "qwen-flash", hardEligible: true, capable: true, workhorse: true, cost: 0.7, posterior: seedBeta() }
+  ], taskIR);
+  assert.ok(policies.every((p) => p.primary !== "z-ai/glm-5.3-flash"));
+  assert.ok(policies.some((p) => p.primary === "qwen-flash"));
 });

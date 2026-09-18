@@ -2633,22 +2633,14 @@ async function pickAutoModel(c, payload, key) {
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, hardEligible: eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
   }
   const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
   const strongWork = workhorseEligible.filter((x) => !x.tiny);
   const eligibleList = (need >= 2.5 && strongWork.length) ? strongWork : (workhorseEligible.length ? workhorseEligible : candidates.filter((x) => x.eligible));
   let picked;
   if (!eligibleList.length) {
-    const poolBase = candidates.some((x) => x.capable) ? candidates.filter((x) => x.capable) : candidates;
-    const poolWork = poolBase.filter((x) => x.workhorse);
-    const pool = poolWork.length ? poolWork : poolBase;
-    let best = null;
-    for (const cand of pool) {
-      if (!best || cand.quality > best.quality || cand.quality === best.quality && cand.cost < best.cost)
-        best = cand;
-    }
-    picked = best ? { ...best, fallback: true } : null;
+    picked = null;
   } else if (need <= 2.1) {
     let best = null;
     for (const cand of eligibleList) {
@@ -2688,8 +2680,10 @@ async function pickAutoModel(c, payload, key) {
     reqTokens,
     cx: { score, estInputTokens: reqTokens, images: reqImages }
   });
-  const slug = (horizon && horizon.slug) || picked.slug;
-  const chosen = candidates.find((x) => x.slug === slug) || picked;
+  const horizonSlug = horizon && horizon.slug;
+  const horizonOk = horizonSlug && candidates.some((c) => c.slug === horizonSlug && c.eligible);
+  const slug = horizonOk ? horizonSlug : picked.slug;
+  const chosen = candidates.find((x) => x.slug === slug && x.eligible) || picked;
   let v2 = null;
   try {
     v2 = shadowFromV1({ payload, candidates, preference: cfg.preference });

@@ -15,20 +15,31 @@ export function seedBeta(kind = "route") {
 export function decayMass(mass, elapsedMs, halfLifeMs) {
   const m = Number(mass) || 0;
   const hl = Number(halfLifeMs) || 0;
-  if (m <= 0 || hl <= 0) return m;
+  if (m <= 0 || hl <= 0) return Math.max(0, m);
   const dt = Math.max(0, Number(elapsedMs) || 0);
   return m * Math.exp(-dt * LN2 / hl);
 }
 
-export function observe(state, success, at = Date.now(), halfLifeMs = 3 * 86400000) {
+export function age(state, at = Date.now(), halfLifeMs = 3 * 86400000, kind = "route") {
   const prev = state || {};
-  const last = Number(prev.updatedAt) || at;
+  const useKind = prev.kind || kind;
+  const prior = seedBeta(useKind);
+  const last = Number.isFinite(Number(prev.updatedAt)) ? Number(prev.updatedAt) : at;
   const elapsed = Math.max(0, at - last);
-  const alpha = decayMass(prev.alpha ?? seedBeta().alpha, elapsed, halfLifeMs);
-  const beta = decayMass(prev.beta ?? seedBeta().beta, elapsed, halfLifeMs);
   return {
-    alpha: alpha + (success ? 1 : 0),
-    beta: beta + (success ? 0 : 1),
+    kind: useKind,
+    alpha: prior.alpha + Math.max(0, decayMass((prev.alpha ?? prior.alpha) - prior.alpha, elapsed, halfLifeMs)),
+    beta: prior.beta + Math.max(0, decayMass((prev.beta ?? prior.beta) - prior.beta, elapsed, halfLifeMs)),
+    updatedAt: at
+  };
+}
+
+export function observe(state, success, at = Date.now(), halfLifeMs = 3 * 86400000, kind = "route") {
+  const aged = age(state, at, halfLifeMs, kind);
+  return {
+    kind: aged.kind,
+    alpha: aged.alpha + (success ? 1 : 0),
+    beta: aged.beta + (success ? 0 : 1),
     updatedAt: at
   };
 }
@@ -53,7 +64,7 @@ export function lcb(state, z = 1.28) {
 export function samples(state) {
   const a = Number(state && state.alpha) || 0;
   const b = Number(state && state.beta) || 0;
-  const seed = seedBeta();
+  const seed = seedBeta(state && state.kind || "route");
   return Math.max(0, a + b - seed.alpha - seed.beta);
 }
 

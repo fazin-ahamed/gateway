@@ -53,79 +53,102 @@ export function extractFeatures(payload) {
   const live = msgs.filter((m) => m && m.role !== "system" && m.role !== "developer");
   const blob = live.map(textOf).join("\n");
   const ask = lastUserText(payload);
-  const lower = (ask + "\n" + blob).toLowerCase();
+  const askLower = ask.toLowerCase();
   const tools = payload && (payload.tools || payload.functions);
   const toolCount = Array.isArray(tools) ? tools.length : (tools ? 1 : 0);
   let imageCount = 0;
   let textChars = 0;
-  for (const m of live) {
+  let systemChars = 0;
+  for (const m of msgs) {
     const c = m && m.content;
-    if (typeof c === "string") textChars += c.length;
-    else if (Array.isArray(c)) {
+    const add = (part) => {
+      if (typeof part === "string") return part.length;
+      if (part && typeof part.text === "string") return part.text.length;
+      return 0;
+    };
+    if (typeof c === "string") {
+      if (m.role === "system" || m.role === "developer") systemChars += c.length;
+      else textChars += c.length;
+    } else if (Array.isArray(c)) {
       for (const p of c) {
-        if (p && typeof p.text === "string") textChars += p.text.length;
+        const n = add(p);
+        if (m.role === "system" || m.role === "developer") systemChars += n;
+        else textChars += n;
         if (p && (p.type === "image_url" || p.type === "image")) imageCount++;
       }
     }
   }
+  let toolSchemaChars = 0;
+  try {
+    if (tools) toolSchemaChars = JSON.stringify(tools).length;
+  } catch {}
   const turns = live.filter((m) => m && m.role === "user").length;
   const words = ask.trim() ? ask.trim().split(/\s+/).length : 0;
-  const files = (blob.match(/(?:[\w.-]+\/)+[\w.-]+\.[a-z0-9]{1,8}/gi) || []).length;
-  const urls = (blob.match(/https?:\/\/[^\s)]+/gi) || []).length;
-  const tokens = Math.ceil(textChars / 4) + toolCount * 40 + imageCount * 500;
+  const files = (ask.match(/(?:[\w.-]+\/)+[\w.-]+\.[a-z0-9]{1,8}/gi) || []).length;
+  const urls = (ask.match(/https?:\/\/[^\s)]+/gi) || []).length;
+  const semanticTokens = Math.ceil(ask.length / 4) + imageCount * 500;
+  const contextTokens = Math.ceil((textChars + systemChars + toolSchemaChars) / 4) + imageCount * 500;
+  const hasImplement = /\b(implement|build a|create a|code a|develop a)\b/i.test(ask);
+  const asksTools = /\b(use (the )?tools?|call \w+|search the web|browse|run (the )?tests?|patch|edit the file|look this up)\b/i.test(askLower)
+    || hasImplement && toolCount > 0 && files > 0;
   return {
     words,
     turns,
-    tokens,
+    tokens: semanticTokens,
+    semanticTokens,
+    contextTokens,
     toolCount,
+    toolsAvailable: toolCount,
+    toolsRequired: asksTools,
     imageCount,
     files,
     urls,
-    hasCodeFence: /```/.test(blob),
-    hasDiff: /^(diff --git|@@ |\+{3} |\-{3} )/m.test(blob),
-    hasStack: /\b(stack trace|traceback|typeerror|nullpointer|panic:|exception in)\b/i.test(lower),
+    hasCodeFence: /```/.test(ask),
+    hasDiff: /^(diff --git|@@ |\+{3} |\-{3} )/m.test(ask),
+    hasStack: /\b(stack trace|traceback|typeerror|nullpointer|panic:|exception in)\b/i.test(askLower),
     hasFilePath: files > 0,
-    hasJson: /```json|\{\s*"[^"]+"\s*:/.test(blob),
-    hasMath: /[=∑∫√∞]|\\frac|\b(integral|theorem|prove|derive|lemma)\b/i.test(lower),
-    hasProof: /\b(prove|proof|qed|induction)\b/i.test(lower),
-    hasContest: /\b(olympiad|imo|contest|competition math)\b/i.test(lower),
-    hasDebug: /\b(debug|root cause|regression|race condition|memory leak|repro)\b/i.test(lower),
-    hasArch: /\b(architecture|refactor|migrate|system design)\b/i.test(lower),
-    hasReview: /\b(review|pr\b|pull request|lgtm|nit:)\b/i.test(lower),
-    hasRewrite: /\b(rewrite|rephrase|edit this|make this)\b/i.test(lower),
-    hasCreative: /\b(story|poem|lyrics|fiction|screenplay)\b/i.test(lower),
-    hasProse: /\b(email|memo|cover letter|proposal|professional)\b/i.test(lower),
-    hasExtract: /\b(extract|parse|json schema|csv|table)\b/i.test(lower),
-    hasAnalysis: /\b(analy[sz]e|trend|correlat|statist)/i.test(lower),
-    hasLookup: /\b(who is|what is|when did|cite|source|look up)\b/i.test(lower),
-    hasSynth: /\b(compare|synthesi[sz]e|survey|literature)\b/i.test(lower),
-    hasPlan: /\b(plan|roadmap|step by step|break down)\b/i.test(lower),
-    hasOcr: imageCount > 0 && /\b(read|ocr|transcribe|text in (the )?image)\b/i.test(lower),
-    shortAsk: words > 0 && words < 4 && tokens < 4000 && !toolCount && !imageCount
+    hasJson: /```json|\{\s*"[^"]+"\s*:/.test(ask),
+    hasMath: /[=∑∫√∞]|\\frac|\b(integral|theorem|prove|derive|lemma)\b/i.test(askLower),
+    hasProof: /\b(prove|proof|qed|induction)\b/i.test(askLower),
+    hasContest: /\b(olympiad|imo|contest|competition math)\b/i.test(askLower),
+    hasDebug: /\b(debug|root cause|regression|race condition|memory leak|repro)\b/i.test(askLower),
+    hasArch: /\b(architecture|refactor|migrate|system design)\b/i.test(askLower),
+    hasImplement,
+    hasReview: /\b(review|pr\b|pull request|lgtm|nit:)\b/i.test(askLower),
+    hasRewrite: /\b(rewrite|rephrase|edit this|make this)\b/i.test(askLower),
+    hasCreative: /\b(story|poem|lyrics|fiction|screenplay)\b/i.test(askLower),
+    hasProse: /\b(email|memo|cover letter|proposal|professional)\b/i.test(askLower),
+    hasExtract: /\b(extract|parse|json schema|csv|table)\b/i.test(askLower),
+    hasAnalysis: /\b(analy[sz]e|trend|correlat|statist)/i.test(askLower),
+    hasLookup: /\b(who is|what is|when did|cite|source|look up)\b/i.test(askLower),
+    hasSynth: /\b(compare|synthesi[sz]e|survey|literature)\b/i.test(askLower),
+    hasPlan: /\b(plan|roadmap|step by step|break down)\b/i.test(askLower),
+    hasOcr: imageCount > 0 && /\b(read|ocr|transcribe|text in (the )?image)\b/i.test(askLower),
+    shortAsk: words > 0 && words < 4 && semanticTokens < 4000 && !imageCount,
+    sessionBlob: blob
   };
 }
 
 function scores(f) {
   const s = Object.fromEntries(TASKS.map((t) => [t, 0]));
-  s["chat:casual"] = 0.8 + (f.shortAsk ? 2.2 : 0) + (f.words < 8 && !f.toolCount && !f.hasCodeFence ? 0.6 : 0);
-  s["chat:knowledge"] = 0.4 + (f.hasLookup ? 2.4 : 0) + (f.words > 6 && !f.hasCodeFence && !f.toolCount ? 0.5 : 0);
+  s["chat:casual"] = 0.8 + (f.shortAsk ? 2.2 : 0) + (f.words < 8 && !f.hasCodeFence ? 0.6 : 0);
+  s["chat:knowledge"] = 0.4 + (f.hasLookup ? 2.4 : 0) + (f.words > 6 && !f.hasCodeFence ? 0.5 : 0);
   s["writing:rewrite"] = f.hasRewrite ? 3.2 : 0.1;
   s["writing:creative"] = f.hasCreative ? 3.0 : 0.05;
   s["writing:professional"] = f.hasProse ? 2.8 : 0.05;
-  s["code:generation"] = (f.hasCodeFence ? 1.4 : 0) + (f.hasFilePath ? 0.8 : 0) + (/\b(implement|write (a |the )?(function|class|module))\b/i.test(String(f.hasArch)) ? 0 : 0);
-  s["code:generation"] += (f.hasCodeFence && !f.hasDebug && !f.hasReview ? 1.6 : 0);
+  s["code:generation"] = (f.hasImplement ? 3.2 : 0) + (f.hasCodeFence && !f.hasDebug && !f.hasReview ? 1.6 : 0) + (f.hasFilePath && f.hasImplement ? 0.8 : 0);
   s["code:debug"] = (f.hasDebug ? 3.4 : 0) + (f.hasStack ? 2.6 : 0);
   s["code:review"] = f.hasReview ? 3.1 : (f.hasDiff ? 1.8 : 0.05);
   s["code:architecture"] = f.hasArch ? 3.3 : 0.05;
-  s["agent:tool_single"] = f.toolCount === 1 ? 2.4 : (f.toolCount > 0 && f.toolCount < 4 ? 1.1 : 0);
-  s["agent:multi_step"] = f.toolCount >= 4 ? 2.8 : (f.toolCount >= 2 ? 1.4 : 0);
-  s["agent:repo_edit"] = (f.toolCount && (f.hasFilePath || f.hasDiff) ? 3.2 : 0) + (f.hasFilePath && f.hasDebug ? 1.2 : 0);
+  s["agent:tool_single"] = f.toolsRequired && f.toolsAvailable === 1 ? 2.4 : (f.toolsRequired && f.toolsAvailable > 0 && f.toolsAvailable < 4 ? 1.1 : 0);
+  s["agent:multi_step"] = f.toolsRequired && f.toolsAvailable >= 4 ? 2.8 : (f.toolsRequired && f.toolsAvailable >= 2 ? 1.4 : 0);
+  s["agent:repo_edit"] = (f.toolsRequired && (f.hasFilePath || f.hasDiff) ? 3.2 : 0) + (f.hasFilePath && f.hasDebug ? 1.2 : 0);
   s["research:lookup"] = f.hasLookup && f.urls ? 2.6 : (f.hasLookup ? 1.4 : 0.1);
   s["research:synthesis"] = f.hasSynth ? 3.0 : 0.05;
   s["math:simple"] = f.hasMath && !f.hasProof && !f.hasContest ? 2.4 : 0.05;
   s["math:proof"] = f.hasProof ? 3.4 : 0.02;
   s["math:competition"] = f.hasContest ? 3.5 : 0.02;
-  s["reasoning:logic"] = (!f.hasCodeFence && !f.toolCount && f.words > 20 ? 0.8 : 0.1);
+  s["reasoning:logic"] = (!f.hasCodeFence && f.words > 20 ? 0.8 : 0.1);
   s["reasoning:planning"] = f.hasPlan ? 2.6 : 0.1;
   s["data:extract"] = f.hasExtract || f.hasJson ? 2.5 : 0.05;
   s["data:analysis"] = f.hasAnalysis ? 2.7 : 0.05;
@@ -135,11 +158,7 @@ function scores(f) {
     s["chat:casual"] -= 1.5;
     s["code:generation"] -= 0.4;
   }
-  if (f.toolCount) {
-    s["chat:casual"] -= 1.8;
-    s["chat:knowledge"] -= 0.6;
-  }
-  if (f.tokens > 40000) {
+  if (f.contextTokens > 40000) {
     s["code:architecture"] += 0.4;
     s["agent:repo_edit"] += 0.5;
     s["chat:casual"] -= 1;
@@ -190,7 +209,7 @@ export function compileTaskIR(payload) {
     (coding ? 0.55 : 0) + (math ? 0.7 : 0) + (agent ? 0.45 : 0) + (f.hasJson ? 0.2 : 0) + difficulty * 0.2
   );
   const decomposition = clamp01((coding || agent ? 0.45 : 0.1) + difficulty);
-  const agenticDepth = clamp01((f.toolCount ? 0.35 : 0) + (f.toolCount >= 4 ? 0.3 : 0) + (f.hasFilePath ? 0.2 : 0));
+  const agenticDepth = clamp01((f.toolsRequired ? 0.35 : 0) + (f.toolsRequired && f.toolsAvailable >= 4 ? 0.3 : 0) + (f.hasFilePath && f.toolsRequired ? 0.2 : 0));
   const expectedOutputTokens = Math.max(64, Math.min(8000,
     coding ? 1600 : agent ? 900 : math ? 700 : vision ? 400 : 280
   ));
@@ -204,12 +223,14 @@ export function compileTaskIR(payload) {
     decomposition,
     verificationNeed,
     agenticDepth,
-    contextTokens: f.tokens,
+    contextTokens: f.contextTokens,
+    semanticTokens: f.semanticTokens,
     expectedOutputTokens,
     tools: {
-      required: f.toolCount > 0,
-      count: f.toolCount,
-      mutation: task === "agent:repo_edit" || f.hasDiff
+      available: f.toolsAvailable,
+      required: !!f.toolsRequired,
+      count: f.toolsAvailable,
+      mutation: task === "agent:repo_edit" || (f.hasDiff && f.toolsRequired)
     },
     modalities: f.imageCount ? ["text", "image"] : ["text"],
     latencyClass: f.tokens > 40000 || difficulty > 0.7 ? "batch" : "interactive",
