@@ -1,4 +1,11 @@
-import { canonicalToolName, isHashlineEditTool, repairToolCall } from "../ai-gateway/src/tool-repair.js";
+import { canonicalToolName, isHashlineEditTool, repairEditToolArguments as repairEditToolArgumentsCore, repairToolCall } from "../ai-gateway/src/tool-repair.js";
+
+// Compatibility export retained from main. Callers/tests that used the earlier
+// helper still work, but the implementation now delegates to the schema-aware
+// repair core when tool definitions are available.
+export function repairEditToolArguments(name, rawArgs, tools = []) {
+  return repairEditToolArgumentsCore(name, rawArgs, tools);
+}
 
 const enc = new TextEncoder();
 
@@ -111,7 +118,12 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
               const prev = pendingEdits.get(key);
               const rawName = original.function && original.function.name || prev && prev.name || "";
               const name = canonicalToolName(rawName, tools);
-              const mustBuffer = !!prev || isHashlineEditTool(name, tools);
+              // Preserve the existing "edit"/"hashline" shorthand behavior
+              // from main. Any edit-like call is buffered until complete so
+              // bare [PATH#TAG] PUT/CUT/REM syntax or malformed JSON can be
+              // normalized safely as a whole rather than fragment-by-fragment.
+              const mustBuffer = !!prev || isHashlineEditTool(name, tools) ||
+                /edit|hashline/i.test(String(name || ""));
 
               if (mustBuffer) {
                 const p = prev || {
