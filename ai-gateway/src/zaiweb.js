@@ -715,9 +715,26 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
 
   let vision;
   try {
-    vision = imageCount
-      ? await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch })
-      : { messages: structuredClone(payload.messages || []), files: [], imageParts: [] };
+    if (!imageCount) {
+      vision = { messages: structuredClone(payload.messages || []), files: [], imageParts: [] };
+    } else {
+      try {
+        vision = await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch });
+      } catch (first) {
+        // GLM-Free-API retries file upload once after re-initializing auth on
+        // 401. Do the same here, but keep session refresh in the gateway's
+        // session object instead of duplicating auth state inside vision.js.
+        if (String(first && first.code || "") !== "zai_vision_auth")
+          throw first;
+        session.invalidate("vision upload 401");
+        const again = await session.refresh("vision upload 401");
+        if (!again || !again.token)
+          throw first;
+        token = again.token;
+        userId = again.userId || userIdFromToken(token) || userId;
+        vision = await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch });
+      }
+    }
   } catch (e) {
     const status = Number(e && e.status) || 400;
     const code = String(e && e.code || "zai_vision");
