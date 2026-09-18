@@ -2869,8 +2869,14 @@ function publicProviderError(err) {
   if (code === "zai_tools_unsupported") {
     return { status: 400, error: { message: "Tools are not supported by the selected model.", type: "invalid_request_error", code: "unsupported_tools" } };
   }
-  if (code === "zai_vision_unsupported") {
-    return { status: 400, error: { message: "Image input is not supported by the selected model.", type: "invalid_request_error", code: "unsupported_image_input" } };
+  if (code === "zai_vision_unsupported" || code === "zai_vision_account_required") {
+    return { status: 400, error: { message: "Image input is not available on the selected route.", type: "invalid_request_error", code: "unsupported_image_input" } };
+  }
+  if (code === "zai_vision" || code === "zai_vision_limit") {
+    return { status: 400, error: { message: "The image input is invalid or exceeds the supported limits.", type: "invalid_request_error", code: "invalid_image_input" } };
+  }
+  if (code === "zai_vision_auth") {
+    return { status: 503, error: { message: "Image input is temporarily unavailable on the selected route.", type: "service_unavailable", code: "route_unavailable" } };
   }
   if (code === "zai_captcha") {
     return { status: 503, error: { message: "This route needs a fresh captcha proof. Send one per request, or use a transport that acquires it automatically.", type: "unsupported_feature", code: "captcha_required" } };
@@ -2896,7 +2902,8 @@ function publicProviderError(err) {
 // they may reach the client and never open a provider breaker.
 function isPublicRequestProviderError(err) {
   const code = String(err && err.code || "");
-  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported" || code === "zai_no_prompt" ||
+  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported" || code === "zai_vision_account_required" ||
+    code === "zai_vision" || code === "zai_vision_limit" || code === "zai_vision_auth" || code === "zai_no_prompt" ||
     code === "zai_captcha" || code === "zai_tokens" || code === "zai_captcha_config" || code === "zai_http_fallback_failed";
 }
 function isGenericUpstreamErrorResponse(text) {
