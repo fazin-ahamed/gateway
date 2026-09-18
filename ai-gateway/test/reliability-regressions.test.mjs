@@ -37,6 +37,7 @@ test("non-provider-health failures do not trip the provider breaker", () => {
     { status: 400, kind: "relay" },
     { status: 400, kind: "unknown" },
     { status: 503, kind: "zai_model_unavailable" },
+    { status: 503, kind: "zai_browser_unavailable" },
     { status: 503, kind: "zai_transport" }
   ];
   failures.forEach((f, i) => withFakeNow(i * 1000, () => t.circuitRecordFailure("p", f)));

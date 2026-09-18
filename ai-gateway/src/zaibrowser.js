@@ -61,9 +61,22 @@ async function getBrowser() {
     browserPromise = (async () => {
       const { chromium } = await loadPlaywright();
       const executablePath = process.env.BROWSER_EXECUTABLE || undefined;
-      // Headed but off-screen: chat.z.ai rejects true headless Chromium with
-      // F001, the same reason omniRoute drives a headed browser.
-      const launch = { headless: false, args: ["--window-position=4000,4000", "--mute-audio", "--no-sandbox", "--disable-dev-shm-usage"] };
+      const hasDisplay = !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+      // Headed when a display exists (chat.z.ai F001-rejects true headless).
+      // On a headless VM, headed launch dies immediately ("Target page,
+      // context or browser has been closed"); use new headless instead.
+      const launch = {
+        headless: hasDisplay ? false : true,
+        args: [
+          "--mute-audio",
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--hide-scrollbars"
+        ]
+      };
+      if (hasDisplay)
+        launch.args.push("--window-position=4000,4000");
       if (executablePath)
         launch.executablePath = executablePath;
       const browser = await chromium.launch(launch);

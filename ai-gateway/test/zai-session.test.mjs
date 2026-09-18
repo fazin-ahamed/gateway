@@ -234,6 +234,19 @@ test("registry marks an unseen model unavailable for the account", async () => {
   assert.equal(unknown.available, false, "model the account cannot see is unavailable");
 });
 
+test("registry maps glm-5.3-flash to live x-preview-l instead of marking it unavailable", async () => {
+  resetRegistries();
+  const fetcher = async () => new Response(JSON.stringify([{ id: "x-preview-l", display_name: "GLM-5.3-Flash", capabilities: { thinking: true } }]), { status: 200 });
+  const registry = new ZaiModelRegistry({
+    fetcher,
+    fallback: (id) => ({ id: "zai-web/" + id, reasoning: true, toolCall: false, attachment: false, modalities: { input: ["text"] }, limit: { context: 98304, output: 16384 } })
+  });
+  const flash = await registry.resolve("glm-5.3-flash");
+  assert.equal(flash.available, true);
+  assert.equal(flash.source, "live");
+  assert.equal(flash.wireId, "x-preview-l");
+});
+
 test("registry falls back when the live call fails", async () => {
   const fetcher = async () => { throw new Error("network down"); };
   const registry = new ZaiModelRegistry({

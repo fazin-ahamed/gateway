@@ -2113,7 +2113,7 @@ function circuitRecordFailure(a, b, c) {
   const fkind = String(f.kind || "unknown");
   if (["auth", "rate_limit", "model", "tool_schema", "request_size", "relay"].includes(fkind))
     return;
-  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|unsupported|relay)/i.test(fkind))
+  if (/(auth|credential|captcha|rate|quota|model|tool|vision|request|unsupported|relay|browser_unavailable|model_unavailable)/i.test(fkind))
     return;
   if (status >= 400 && status < 500 && status !== 408)
     return;

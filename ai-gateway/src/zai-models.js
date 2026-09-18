@@ -84,7 +84,16 @@ export function normalizeModels(payload) {
   }
   return out;
 }
-
+function modelAliases(id) {
+  const raw = String(id || "").trim();
+  const lower = raw.toLowerCase();
+  const out = [raw];
+  if (lower === "glm-5.3-flash" || lower === "glm-5-3-flash")
+    out.push("x-preview-l", "GLM-5.3-Flash");
+  if (lower === "x-preview-l")
+    out.push("glm-5.3-flash", "GLM-5.3-Flash");
+  return [...new Set(out)];
+}
 export class ZaiModelRegistry {
   constructor({ session, fetcher, ttlMs = DEFAULT_TTL_MS, fallback = () => null } = {}) {
     this.session = session;
@@ -149,13 +158,32 @@ export class ZaiModelRegistry {
   }
 
   // Live entry wins; the static fallback only covers fields the site omits.
+  // chat.z.ai lists glm-5.3-flash as the opaque id x-preview-l, so look up
+  // both the public slug and the wire id before declaring the account
+  // cannot see the model.
   async resolve(modelId) {
     const id = String(modelId || "").split("/").pop().trim();
-    const base = this.fallback(id) || null;
+    const aliases = modelAliases(id);
+    const base = this.fallback(id) || this.fallback(aliases[0]) || null;
     const catalog = await this.list();
-    const live = catalog ? catalog.get(id) : null;
+    let live = null;
+    if (catalog) {
+      for (const alias of aliases) {
+        live = catalog.get(alias);
+        if (live) break;
+      }
+      if (!live) {
+        const want = id.toLowerCase();
+        for (const [key, row] of catalog) {
+          const name = String(row.displayName || "").toLowerCase();
+          if (key.toLowerCase() === want || name.replace(/\s+/g, "-") === want || name.includes("flash") && want.includes("flash")) {
+            live = row;
+            break;
+          }
+        }
+      }
+    }
     if (!live && catalog && catalog.size) {
-      // The account cannot see this model; say so instead of pretending.
       return base ? { ...base, available: false, source: "live" } : null;
     }
     if (!live)
