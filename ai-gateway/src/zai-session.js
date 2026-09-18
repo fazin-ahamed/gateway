@@ -16,9 +16,9 @@ const ZAI_BASE = "https://chat.z.ai";
 const ZAI_GUEST_URL = ZAI_BASE + "/api/v1/auths/guest";
 const ZAI_AUTHS_URL = ZAI_BASE + "/api/v1/auths/";
 const ZAI_HOME_URL = ZAI_BASE + "/";
-const DEFAULT_FE_VERSION = "prod-fe-1.1.92";
+const DEFAULT_FE_VERSION = "prod-fe-1.1.93";
 const FE_VERSION_TTL_MS = 15 * 60 * 1000;
-const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
 export const looksLikeJwt = (value) => {
   if (typeof value !== "string")
