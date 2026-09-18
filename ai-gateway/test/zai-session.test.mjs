@@ -19,6 +19,7 @@ import {
   resetRegistries
 } from "../src/zai-models.js";
 import { __zaiTest, callZaiWeb } from "../src/zaiweb.js";
+import { zaiWaf } from "../src/zai-waf.js";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -355,12 +356,15 @@ test("wrapUtlsFetcher only proxies chat.z.ai and is a no-op without the env", as
   }
 });
 
-test("a WAF block on chat-create falls back to the browser transport", async () => {
+test("reference HTTP path skips chat-create and a confirmed WAF block does not switch transports", async () => {
   resetSessions();
+  resetRegistries();
   configureSessionStore("");
+  zaiWaf.recordSuccess();
   const token = jwt({ id: "waf-1" });
   const credential = JSON.stringify({ token, captcha_verify_param: "proof" });
   const calls = [];
+  let browserCalled = false;
   const fetcher = async (url, init = {}) => {
     const u = String(url);
     calls.push((init.method || "GET") + " " + u);
@@ -371,18 +375,25 @@ test("a WAF block on chat-create falls back to the browser transport", async () 
       return new Response(JSON.stringify({ id: "waf-1" }), { status: 200 });
     if (path === "/api/models")
       return new Response(JSON.stringify([{ id: "glm-5.3", capabilities: { thinking: true } }]), { status: 200 });
-    if (path === "/api/v1/chats/new")
+    if (path === "/api/v2/chat/completions")
       return new Response("<html>Aliyun WAF</html>", { status: 403, headers: { "content-type": "text/html" } });
     return new Response("unexpected " + u, { status: 500 });
   };
   const c = {
-    zaiRunBrowserTurn: async () => ({
-      status: 200,
-      body: "data: " + JSON.stringify({ data: { delta_content: "via-browser", phase: "answer" } }) + "\ndata: " + JSON.stringify({ data: { done: true, phase: "done" } }) + "\n"
-    })
+    zaiRunBrowserTurn: async () => {
+      browserCalled = true;
+      throw new Error("browser must not run for a confirmed WAF block");
+    }
   };
-  const shaped = await callZaiWeb(c, { upstream_model: "glm-5.3" }, credential, { model: "glm-5.3", messages: [{ role: "user", content: "hi" }] }, false, fetcher);
-  const text = await shaped.response.text();
-  assert.match(text, /via-browser/);
-  assert.ok(calls.some((x) => x.includes("/api/v1/chats/new")), "signed path was attempted first");
+  try {
+    await assert.rejects(
+      callZaiWeb(c, { upstream_model: "glm-5.3" }, credential, { model: "glm-5.3", messages: [{ role: "user", content: "hi" }] }, false, fetcher),
+      (err) => err && err.code === "zai_waf"
+    );
+    assert.equal(browserCalled, false);
+    assert.equal(calls.some((x) => x.includes("/api/v1/chats/new")), false, "reference flow must not create a chat first");
+    assert.equal(calls.filter((x) => x.includes("/api/v2/chat/completions")).length, 1, "one completion POST should carry the throwaway chat UUID");
+  } finally {
+    zaiWaf.recordSuccess();
+  }
 });
