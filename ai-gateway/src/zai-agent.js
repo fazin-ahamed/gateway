@@ -386,10 +386,17 @@ export function parseAgentToolCalls(text) {
   for (const span of spans) {
     const parsed = looseParse(text.slice(span.bodyStart, span.bodyEnd));
     if (!parsed) continue;
+    let args = parsed.arguments;
+    if (String(parsed.name).toLowerCase().includes("edit") || String(parsed.name).toLowerCase() === "hashline") {
+      let trimmed = typeof args === "string" ? args.trim() : JSON.stringify(args);
+      if (trimmed.startsWith("[") && trimmed.includes("#")) {
+        args = JSON.stringify({ input: trimmed });
+      }
+    }
     calls.push({
       id: randomCallId(),
       type: "function",
-      function: { name: parsed.name, arguments: parsed.arguments }
+      function: { name: parsed.name, arguments: args }
     });
   }
   return calls;

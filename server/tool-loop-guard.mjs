@@ -1,3 +1,44 @@
+// Tool Repair & Hashline Normalizer:
+// Handles agentic edit tools that use hashline format (`[PATH#TAG]`, `PUT N.=M:`, `PUT N*:`, etc.)
+// or JSON payloads, normalizing and repairing malformed tool call arguments on the fly.
+export function repairEditToolArguments(name, rawArgs) {
+  if (!rawArgs || typeof rawArgs !== "string") return rawArgs;
+  const tool = String(name || "").toLowerCase();
+  if (tool !== "edit" && tool !== "hashline" && !tool.includes("edit")) return rawArgs;
+  
+  let trimmed = rawArgs.trim();
+  // If the model output a bare hashline patch instead of { input: "..." }
+  if (trimmed.startsWith("[") && trimmed.includes("#") && (trimmed.includes("PUT ") || trimmed.includes("CUT ") || trimmed.includes("REM"))) {
+    return JSON.stringify({ input: trimmed });
+  }
+  
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      // Normalize alternative parameter keys to standard 'input'
+      if (!parsed.input && (parsed.patch || parsed.content || parsed.text || parsed.diff)) {
+        parsed.input = parsed.patch || parsed.content || parsed.text || parsed.diff;
+      }
+      // Ensure hashline block tags inside input don't get malformed by escaped quotes
+      if (typeof parsed.input === "string") {
+        parsed.input = parsed.input.replace(/\\n/g, "\n").replace(/\r\n/g, "\n");
+      }
+      return JSON.stringify(parsed);
+    }
+  } catch {
+    // If JSON parsing fails but it contains hashline markers inside unescaped JSON
+    const inputMatch = trimmed.match(/["']?input["']?\s*:\s*([\s\S]+)/i);
+    if (inputMatch) {
+      let content = inputMatch[1].trim();
+      if (content.startsWith('"') && content.endsWith('"')) {
+        try { content = JSON.parse(content); } catch {}
+      }
+      return JSON.stringify({ input: content });
+    }
+  }
+  return rawArgs;
+}
+
 const enc = new TextEncoder();
 
 export function normalizeTerminalFinishReason(reason, sawToolCalls, cleanDone = true) {
@@ -59,7 +100,14 @@ export function guardOpenAiSse(source, modelHint = "") {
           streamFailed = true;
         const choice = obj && Array.isArray(obj.choices) ? obj.choices[0] : null;
         const delta = choice && choice.delta;
-        if (delta && Array.isArray(delta.tool_calls) && delta.tool_calls.length) sawToolCalls = true;
+        if (delta && Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+          sawToolCalls = true;
+          for (const tc of delta.tool_calls) {
+            if (tc && tc.function && tc.function.arguments) {
+              tc.function.arguments = repairEditToolArguments(tc.function.name, tc.function.arguments);
+            }
+          }
+        }
         if (choice && choice.finish_reason != null) {
           const fixed = normalizeTerminalFinishReason(choice.finish_reason, sawToolCalls, !streamFailed);
           choice.finish_reason = fixed;
@@ -107,16 +155,18 @@ export function guardOpenAiSse(source, modelHint = "") {
     }
   });
 }
-
 export function guardToolLoopResponse(response, modelHint = "") {
-  if (!(response instanceof Response) || !response.body) return response;
-  const ct = response.headers.get("content-type") || "";
-  if (!ct.toLowerCase().includes("text/event-stream")) return response;
-  const headers = new Headers(response.headers);
-  headers.set("cache-control", "no-cache, no-store");
-  return new Response(guardOpenAiSse(response.body, modelHint), {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
+  if (!(response instanceof Response)) return response;
+  const ct = (response.headers.get("content-type") || "").toLowerCase();
+  if (ct.includes("text/event-stream") || !ct.includes("application/json")) {
+    if (!response.body) return response;
+    const headers = new Headers(response.headers);
+    headers.set("cache-control", "no-cache, no-store");
+    return new Response(guardOpenAiSse(response.body, modelHint), {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  }
+  return response;
 }
