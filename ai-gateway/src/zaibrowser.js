@@ -148,6 +148,11 @@ async function getPool(token) {
   const browser = await getBrowser();
   const context = await browser.newContext({ userAgent: ZAI_USER_AGENT, locale: "en-US", viewport: { width: 1280, height: 800 } });
   await context.addCookies([{ name: "token", value: token, domain: "chat.z.ai", path: "/" }]);
+  // Token in localStorage before any document script runs, so the first
+  // goto is already signed in. A post-load set + reload doubled cold time.
+  await context.addInitScript((t) => {
+    try { localStorage.setItem("token", t); } catch {}
+  }, token);
   const pool = { context, page: null, lock: Promise.resolve(), idleTimer: null, lastUsed: Date.now() };
   pools.set(key, pool);
   return pool;
@@ -159,22 +164,42 @@ function withLock(pool, fn) {
   pool.lock = prev.then(() => gate, () => gate);
   return prev.catch(() => {}).then(fn).finally(() => release());
 }
-async function openFreshPage(pool, token) {
+async function startNewChat(page) {
+  const sels = [
+    '[aria-label="New Chat"]',
+    '[aria-label="New chat"]',
+    'button:has-text("New Chat")',
+    'a[href="/"]',
+    'button:has-text("New conversation")'
+  ];
+  for (const sel of sels) {
+    const loc = page.locator(sel).first();
+    if (await loc.count().catch(() => 0)) {
+      await loc.click({ timeout: 2500 }).catch(() => {});
+      return;
+    }
+  }
+}
+
+async function ensurePage(pool) {
   if (pool.idleTimer) {
     clearTimeout(pool.idleTimer);
     pool.idleTimer = null;
   }
-  if (pool.page)
-    await Promise.resolve(pool.page.close().catch(() => {})).catch(() => {});
-  const page = await pool.context.newPage();
-  await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.evaluate(([t]) => {
+  if (pool.page && !pool.page.isClosed()) {
     try {
-      localStorage.setItem("token", t);
+      const input = pool.page.locator("#chat-input").first();
+      if (await input.isVisible({ timeout: 1500 })) {
+        await startNewChat(pool.page);
+        return pool.page;
+      }
     } catch {
     }
-  }, [token]);
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+    await pool.page.close().catch(() => {});
+    pool.page = null;
+  }
+  const page = await pool.context.newPage();
+  await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
   pool.page = page;
   return page;
 }
@@ -240,7 +265,7 @@ export async function runBrowserTurn(token, prompt, options = {}) {
   const key = poolKey(token);
   const pool = await getPool(token);
   return withLock(pool, async () => {
-    const page = await openFreshPage(pool, token);
+    const page = await ensurePage(pool);
     let resolveResponse;
     const responsePromise = new Promise((resolve) => {
       resolveResponse = resolve;
@@ -261,28 +286,18 @@ export async function runBrowserTurn(token, prompt, options = {}) {
     try {
       const input = page.locator("#chat-input").first();
       await input.waitFor({ state: "visible", timeout: 30000 });
-      // FeiLin/Aliyun captcha iframes sit on top of the composer. Wait them
-      // out (or a login wall) before typing, otherwise fill succeeds and
-      // click times out on a covered send button.
+      // Transient FeiLin overlay; if none, this returns immediately.
       await page.waitForFunction(() => {
         const overlay = document.querySelector(".nc_wrapper, #aliyunCaptcha-window-embed, iframe[src*='captcha'], iframe[src*='aliyun']");
-        const login = document.querySelector("input[type='password'], button[type='submit'][class*='login']");
         const box = document.querySelector("#chat-input");
-        return !!box && !overlay && !login;
-      }, null, { timeout: 45000 }).catch(() => {});
-      await input.click({ timeout: 10000 });
+        return !!box && !overlay;
+      }, null, { timeout: 8000 }).catch(() => {});
+      await input.click({ timeout: 8000 });
       await input.fill("");
       await input.fill(prompt);
       const send = page.locator("#send-message-button").first();
-      await send.waitFor({ state: "visible", timeout: 15000 });
-      await page.waitForFunction(() => {
-        const btn = document.querySelector("#send-message-button");
-        if (!btn || btn.disabled) return false;
-        const r = btn.getBoundingClientRect();
-        const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        return !!top && (top === btn || btn.contains(top) || top.closest("#send-message-button"));
-      }, null, { timeout: 20000 }).catch(() => {});
-      await send.click({ timeout: 10000, force: true });
+      await send.waitFor({ state: "visible", timeout: 10000 });
+      await send.click({ timeout: 8000, force: true });
       const result = await Promise.race([
         responsePromise,
         new Promise((resolve) => setTimeout(() => resolve({ status: 0, body: "", timeout: true }), timeoutMs))
@@ -290,8 +305,6 @@ export async function runBrowserTurn(token, prompt, options = {}) {
       pool.lastUsed = Date.now();
       if (!result.status && result.timeout)
         throw new Error("the page did not issue a completion within " + timeoutMs + "ms");
-      // chat.z.ai rotates its session token during turns; pull the current one
-      // so the stored credential ages with the browser, not against it.
       let recovered = "";
       try {
         const cookies = await pool.context.cookies("https://chat.z.ai");
@@ -304,8 +317,6 @@ export async function runBrowserTurn(token, prompt, options = {}) {
       return result;
     } finally {
       page.off("response", onResponse);
-      await Promise.resolve(page.close().catch(() => {})).catch(() => {});
-      pool.page = null;
       armIdleClose(pool, key);
     }
   });
