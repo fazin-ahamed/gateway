@@ -9,7 +9,7 @@ import {
   repairToolCall
 } from "../src/tool-repair.js";
 import { AgentStreamInterceptor, buildAgentPrompt, parseAgentToolCalls } from "../src/zai-agent.js";
-import { guardOpenAiSse } from "../../server/tool-loop-guard.mjs";
+import { guardOpenAiSse, repairEditToolArguments } from "../../server/tool-loop-guard.mjs";
 
 const hashTools = [
   {
@@ -137,6 +137,62 @@ test("ZAI prompt regenerates repair policy without duplicating global wrapper", 
   const prompt = buildAgentPrompt(payload.messages, hashTools);
   assert.match(prompt, /<tool_repair_policy mode="hashline">/);
   assert.doesNotMatch(prompt, /<gateway_tool_repair>/);
+});
+
+test("preserves main's bare hashline patch shorthand and compatibility helper", () => {
+  const bare = "[src/a.js#4:ab]\\nPUT 4.=4:new";
+  assert.deepEqual(JSON.parse(repairEditToolArguments("edit", bare)), { input: bare });
+
+  const schemaTool = [{
+    type: "function",
+    function: {
+      name: "edit",
+      description: "Apply a hashline patch",
+      parameters: {
+        type: "object",
+        properties: { input: { type: "string" } },
+        required: ["input"],
+        additionalProperties: false
+      }
+    }
+  }];
+  assert.deepEqual(JSON.parse(repairEditToolArguments("edit", bare, schemaTool)), { input: bare });
+});
+
+test("ordinary edit-style stream can carry bare hashline shorthand safely", async () => {
+  const tools = [{
+    type: "function",
+    function: {
+      name: "edit",
+      description: "Apply edits",
+      parameters: {
+        type: "object",
+        properties: { input: { type: "string" } },
+        required: ["input"],
+        additionalProperties: false
+      }
+    }
+  }];
+  const bare = "[src/a.js#4:ab]\\nPUT 4.=4:new";
+  const frames = [
+    {
+      id: "x", model: "m", choices: [{ index: 0, delta: {
+        tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "edit", arguments: bare.slice(0, 12) } }]
+      }, finish_reason: null }]
+    },
+    {
+      id: "x", model: "m", choices: [{ index: 0, delta: {
+        tool_calls: [{ index: 0, function: { arguments: bare.slice(12) } }]
+      }, finish_reason: null }]
+    },
+    { id: "x", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }
+  ];
+  const text = await new Response(guardOpenAiSse(sse(frames), "m", tools)).text();
+  const objs = text.split("\n").filter((l) => l.startsWith("data: {")).map((l) => JSON.parse(l.slice(6)));
+  const calls = objs.flatMap((o) => o.choices?.[0]?.delta?.tool_calls || []);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].function.name, "edit");
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), { input: bare });
 });
 
 test("non-stream ZAI agent call repairs hashline aliases", () => {
