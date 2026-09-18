@@ -3435,23 +3435,24 @@ app.get("/admin/proxy-health", async (c) => {
 var PROVIDER_PRESETS = [
   {
     id: "zai-minted",
-    label: "Z.AI web chat — automatic (no browser)",
-    summary: "Pure HTTP: the gateway mints the Aliyun captcha proof itself from a harvested device-token file. No browser, no packages. Needs the session token plus data/zai-device-tokens.txt.",
+    label: "Z.AI web chat — recommended pure HTTP",
+    summary: "Primary Z.AI path based on GLM-Free-API: pure HTTP, SQLite FIFO device tokens, cached CAPTCHA proofs, throwaway chat IDs, vision uploads, live models and browser fallback. No Chromium in the normal request path.",
     fmt: "zaiminted",
-    name: "Z.AI web chat (minted)",
+    name: "Z.AI web chat (pure HTTP)",
     base_url: "https://chat.z.ai",
     transport: "direct",
-    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — captcha is minted automatically',
+    credential_hint: 'Optional signed-in chat.z.ai token. CAPTCHA is minted automatically; guest text sessions are also supported when available.',
     credential_format: "provider_credential",
     routes: [
       { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
-      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
+      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" },
+      { slug: "z-ai/glm-5.2", upstream_model: "glm-5.2" }
     ]
   },
   {
     id: "zai-browser",
-    label: "Z.AI web chat — automatic (browser)",
-    summary: "Drives chat.z.ai in a local Chromium so the page solves its own CAPTCHA. No token file, but needs Chromium and playwright installed on the host.",
+    label: "Z.AI web chat — browser fallback",
+    summary: "Fallback/debug transport only. Drives chat.z.ai in Chromium when the pure-HTTP CAPTCHA/token path is unavailable.",
     fmt: "zaiwebbrowser",
     name: "Z.AI web chat (browser)",
     base_url: "https://chat.z.ai",
