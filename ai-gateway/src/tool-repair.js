@@ -76,7 +76,7 @@ export function canonicalToolName(name, tools) {
 
 function looksLikeBareHashlinePatch(raw) {
   const t = String(raw || "").trim();
-  return t.startsWith("[") && t.includes("#") && /\b(?:PUT|CUT|REM)\b/.test(t);
+  return t.startsWith("[") && t.includes("#") && /(?:PUT|CUT|REM)(?:\s|$)/.test(t);
 }
 
 function normalizePatchText(raw) {
