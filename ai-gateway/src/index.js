@@ -2622,8 +2622,6 @@ async function pickAutoModel(c, payload, key) {
         if (cs && cs.fails > 0)
           wob = Math.max(wob, cs.fails >= 2 ? 1.2 : 0.5);
       }
-      if (snap.fails > 0)
-        wob = Math.max(wob, snap.fails >= 2 ? 1.2 : 0.5);
     }
     const allOpen = routeIds.length > 0 && openCount >= routeIds.length;
     const h = healthBySlug.get(r.slug);

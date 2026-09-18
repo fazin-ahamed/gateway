@@ -65,6 +65,35 @@ test("circuit identity is route-scoped so one model route cannot poison siblings
   assert.equal(t.circuitOpen(b), false);
 });
 
+test("pickAutoModel does not throw on healthy zaiminted routes", async () => {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("offline"); };
+  try {
+    t.__resetCircuitState();
+    const db = {
+      prepare(sql) {
+        const stmt = {
+          bind() { return stmt; },
+          async first() { return null; },
+          async all() {
+            if (sql.includes("route_ids"))
+              return { results: [{ slug: "zai/glm-5.3-flash", healthy: 1, route_ids: "1" }] };
+            if (sql.includes("upstream_model"))
+              return { results: [{ slug: "zai/glm-5.3-flash", fmt: "zaiminted", upstream_model: "glm-5.3-flash" }] };
+            return { results: [] };
+          }
+        };
+        return stmt;
+      }
+    };
+    const decision = await t.pickAutoModel({ env: { DB: db } }, { messages: [{ role: "user", content: "hi" }] }, null);
+    assert.ok(decision);
+    assert.equal(decision.slug, "zai/glm-5.3-flash");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test("round_robin orders every enabled key so a dead credential can fail over", () => {
   assert.equal(typeof t.orderKeys, "function");
   const keys = [{ id: 1 }, { id: 2 }, { id: 3 }];
