@@ -4474,10 +4474,18 @@ app.get("/admin/prices", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const rows = await c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at FROM prices ORDER BY slug").all().catch(() =>
-    c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug").all()
-  );
-  return c.json({ prices: (rows && rows.results) || [] });
+  const queries = [
+    "SELECT slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at FROM prices ORDER BY slug",
+    "SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug"
+  ];
+  for (const sql of queries) {
+    try {
+      const rows = await c.env.DB.prepare(sql).all();
+      return c.json({ prices: (rows && rows.results) || [] });
+    } catch {
+    }
+  }
+  return c.json({ prices: [] });
 });
 app.post("/admin/prices/sync-models-dev", async (c) => {
   const denied = await requireAdmin(c);
@@ -4529,7 +4537,11 @@ app.post("/admin/prices", async (c) => {
   const ac = numOrNull(b.actual_completion_per_1m);
   const cr = numOrNull(b.cache_read_per_1m);
   const cw = numOrNull(b.cache_write_per_1m);
-  await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, actual_prompt_per_1m=excluded.actual_prompt_per_1m, actual_completion_per_1m=excluded.actual_completion_per_1m, cache_read_per_1m=excluded.cache_read_per_1m, cache_write_per_1m=excluded.cache_write_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, ap, ac, cr, cw, b.currency || "USD", nowIso()).run();
+  try {
+    await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, actual_prompt_per_1m=excluded.actual_prompt_per_1m, actual_completion_per_1m=excluded.actual_completion_per_1m, cache_read_per_1m=excluded.cache_read_per_1m, cache_write_per_1m=excluded.cache_write_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, ap, ac, cr, cw, b.currency || "USD", nowIso()).run();
+  } catch {
+    await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, currency, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, b.currency || "USD", nowIso()).run();
+  }
   return c.json({ ok: true, slug: b.slug, prompt_per_1m: p, completion_per_1m: ct, actual_prompt_per_1m: ap, actual_completion_per_1m: ac, cache_read_per_1m: cr, cache_write_per_1m: cw });
 });
 app.delete("/admin/prices/:slug", async (c) => {

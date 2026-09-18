@@ -11,6 +11,32 @@ function withFakeNow(ms, fn) {
   try { return fn(); } finally { Date.now = realNow; }
 }
 
+test("GET /admin/prices falls back when extra price columns are missing", async () => {
+  const { createApp } = await import("../src/index.js");
+  const db = {
+    prepare(sql) {
+      return {
+        bind() { return this; },
+        first() { return null; },
+        all() {
+          if (String(sql).includes("actual_prompt_per_1m"))
+            throw new Error("no such column: actual_prompt_per_1m");
+          if (String(sql).includes("FROM prices"))
+            return { results: [{ slug: "z-ai/glm-5.3", prompt_per_1m: 1, completion_per_1m: 2, currency: "USD", updated_at: "t" }] };
+          return { results: [] };
+        },
+        run() { return { meta: { changes: 0 } }; }
+      };
+    }
+  };
+  const app = createApp({ DB: db, ADMIN_TOKEN: "secret" });
+  const res = await app.fetch(new Request("http://gw/admin/prices", { headers: { authorization: "Bearer secret" } }));
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.prices[0].slug, "z-ai/glm-5.3");
+  assert.equal(body.prices[0].prompt_per_1m, 1);
+});
+
 test("circuit window resets stale failure count instead of accumulating forever", () => {
   assert.equal(typeof t.__resetCircuitState, "function");
   assert.equal(typeof t.circuitRecord, "function");

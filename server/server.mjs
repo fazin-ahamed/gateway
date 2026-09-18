@@ -86,8 +86,9 @@ try {
 }
 try {
   const cols = db.prepare("PRAGMA table_info(prices)").all();
-  const names = new Set((cols.results || []).map((c) => c.name));
-  if (names.size) {
+  const list = Array.isArray(cols) ? cols : (cols && cols.results) || [];
+  const names = new Set(list.map((c) => c.name));
+  if (names.has("prompt_per_1m")) {
     const add = (name, sql) => {
       if (!names.has(name)) {
         db.exec(sql);
