@@ -1303,10 +1303,8 @@ document.getElementById('pr-sync').onclick=async function(){
   finally{ btn.disabled=false; }
 };
 function optRate(v){ const s=String(v==null?'':v).trim(); return s===''?null:s; }
-function rateInput(name, value, placeholder){
-  const v=value==null||value===''?'':value;
-  return '<input class="rate" data-f="'+name+'" type="number" step="0.0001" value="'+esc(String(v))+'" placeholder="'+esc(placeholder||'')+'">';
-}
+function dashRate(v){ return v==null||v===''?'<span class="small">—</span>':money(Number(v))+'/1M'; }
+let priceCache=[];
 async function savePriceRow(p){
   if(!p.slug){ toast('slug required','err'); return false; }
   const body=JSON.stringify({
@@ -1323,59 +1321,51 @@ async function savePriceRow(p){
   toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
   return false;
 }
-function fillPriceForm(p){
-  document.getElementById('pr-slug').value=p.slug||'';
-  document.getElementById('pr-prompt').value=p.prompt_per_1m==null?'':p.prompt_per_1m;
-  document.getElementById('pr-completion').value=p.completion_per_1m==null?'':p.completion_per_1m;
-  document.getElementById('pr-actual-prompt').value=p.actual_prompt_per_1m==null?'':p.actual_prompt_per_1m;
-  document.getElementById('pr-actual-completion').value=p.actual_completion_per_1m==null?'':p.actual_completion_per_1m;
-  document.getElementById('pr-cache-read').value=p.cache_read_per_1m==null?'':p.cache_read_per_1m;
-  document.getElementById('pr-cache-write').value=p.cache_write_per_1m==null?'':p.cache_write_per_1m;
-  document.getElementById('pr-slug').focus();
+function editPrice(slug){
+  const p=priceCache.find(function(x){ return x.slug===slug; })||{ slug };
+  const num=function(v){ return v==null||v===''?'':String(v); };
+  openModal('Edit price · '+slug,[
+    { key:'prompt_per_1m', label:'Equivalent prompt $/1M', type:'number', value:num(p.prompt_per_1m), placeholder:'0' },
+    { key:'completion_per_1m', label:'Equivalent completion $/1M', type:'number', value:num(p.completion_per_1m), placeholder:'0' },
+    { key:'actual_prompt_per_1m', label:'Actual prompt $/1M (optional)', type:'number', value:num(p.actual_prompt_per_1m), placeholder:'same as equivalent' },
+    { key:'actual_completion_per_1m', label:'Actual completion $/1M (optional)', type:'number', value:num(p.actual_completion_per_1m), placeholder:'same as equivalent' },
+    { key:'cache_read_per_1m', label:'Cache read $/1M (optional)', type:'number', value:num(p.cache_read_per_1m), placeholder:'same as prompt' },
+    { key:'cache_write_per_1m', label:'Cache write $/1M (optional)', type:'number', value:num(p.cache_write_per_1m), placeholder:'0' }
+  ],async function(out){
+    const ok=await savePriceRow({ slug, prompt_per_1m: out.prompt_per_1m, completion_per_1m: out.completion_per_1m, actual_prompt_per_1m: out.actual_prompt_per_1m, actual_completion_per_1m: out.actual_completion_per_1m, cache_read_per_1m: out.cache_read_per_1m, cache_write_per_1m: out.cache_write_per_1m });
+    if(ok) closeModal();
+  },'Save price');
 }
 async function loadPrices(){
   const el=document.getElementById('pr-list');
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/prices'); data=res.data; }catch(e){ paintLoadError(el,'Could not load prices: '+e.message,loadPrices); return; }
-  const rows=(data&&data.prices||[]).map(function(p){
+  priceCache=(data&&data.prices)||[];
+  const rows=priceCache.map(function(p){
     return '<tr data-slug="'+esc(p.slug)+'">'+
       '<td class="mono">'+esc(p.slug)+'</td>'+
-      '<td class="rate">'+rateInput('prompt_per_1m', p.prompt_per_1m, '0')+'</td>'+
-      '<td class="rate">'+rateInput('completion_per_1m', p.completion_per_1m, '0')+'</td>'+
-      '<td class="rate">'+rateInput('actual_prompt_per_1m', p.actual_prompt_per_1m, 'eq')+'</td>'+
-      '<td class="rate">'+rateInput('actual_completion_per_1m', p.actual_completion_per_1m, 'eq')+'</td>'+
-      '<td class="rate">'+rateInput('cache_read_per_1m', p.cache_read_per_1m, 'prompt')+'</td>'+
-      '<td class="rate">'+rateInput('cache_write_per_1m', p.cache_write_per_1m, '0')+'</td>'+
+      '<td class="mono">'+money(Number(p.prompt_per_1m||0))+'/1M</td>'+
+      '<td class="mono">'+money(Number(p.completion_per_1m||0))+'/1M</td>'+
+      '<td class="mono">'+dashRate(p.actual_prompt_per_1m)+'</td>'+
+      '<td class="mono">'+dashRate(p.actual_completion_per_1m)+'</td>'+
+      '<td class="mono">'+dashRate(p.cache_read_per_1m)+'</td>'+
+      '<td class="mono">'+dashRate(p.cache_write_per_1m)+'</td>'+
       '<td>'+(p.currency||'USD')+'</td>'+
-      '<td class="rowact"><button class="act" data-act="prsave" data-slug="'+esc(p.slug)+'">save</button> <button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
+      '<td class="rowact"><button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
   }).join('') || '<tr><td colspan="9"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
   el.innerHTML='<table><tr><th>Slug</th><th>Eq prompt</th><th>Eq completion</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
-}
-function priceFromRowEl(tr){
-  const out={ slug: tr.getAttribute('data-slug') };
-  tr.querySelectorAll('input[data-f]').forEach(function(inp){ out[inp.getAttribute('data-f')]=inp.value; });
-  return out;
 }
 document.getElementById('pr-list').addEventListener('click',function(e){
   const b=e.target.closest('[data-act]'); if(!b) return;
   const act=b.getAttribute('data-act');
-  const tr=b.closest('tr');
-  if(act==='prsave'){ e.preventDefault(); savePriceRow(priceFromRowEl(tr)); return; }
-  if(act==='predit'){ e.preventDefault(); fillPriceForm(priceFromRowEl(tr)); return; }
+  if(act==='predit'){ editPrice(b.dataset.slug); return; }
   if(act==='prdel'){
-    e.preventDefault();
     confirmAction('Delete price','Remove the stored rates for '+b.dataset.slug+'?','Delete',async function(){
       const {status,data}=await api('/admin/prices/'+encodeURIComponent(b.dataset.slug),{method:'DELETE'});
       if(status===200){ toast('price deleted','ok'); loadPrices(); }
       else toast('delete failed: '+(data&&data.error&&data.error.message||status),'err');
     });
   }
-});
-document.getElementById('pr-list').addEventListener('keydown',function(e){
-  if(e.key!=='Enter') return;
-  const inp=e.target.closest('input[data-f]'); if(!inp) return;
-  e.preventDefault();
-  savePriceRow(priceFromRowEl(inp.closest('tr')));
 });
 
 // ---------- LOGS ----------
