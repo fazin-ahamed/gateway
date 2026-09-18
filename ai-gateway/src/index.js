@@ -2698,7 +2698,7 @@ async function pickAutoModel(c, payload, key) {
 var SAME_KEY_ATTEMPTS = 3;
 // Fatal config errors shouldn't retry, but transient zai_browser page load hiccups can self-heal on retry.
 // zai_completion 500s are Z.AI payload/TLS rejects; retrying burns another single-use CAPTCHA.
-var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed|zai_model\b|zai_completion|zai_unreachable/;
+var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed|zai_model\b|zai_completion|zai_unreachable|zai_stream_error/;
 function shouldRetrySameKey(transportAttempt, err) {
   return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
 }

@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"log"
@@ -112,9 +113,18 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rebuild the upstream request: same path/query, caller's headers minus
-	// hop headers, original body.
-	upReq, err := http.NewRequestWithContext(ctx, method, target.String(), r.Body)
+	body := io.Reader(r.Body)
+	contentLength := r.ContentLength
+	if contentLength < 0 {
+		buf, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		body = bytes.NewReader(buf)
+		contentLength = int64(len(buf))
+	}
+	upReq, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 	if err != nil {
 		http.Error(w, "request: "+err.Error(), http.StatusBadRequest)
 		return
@@ -128,7 +138,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	upReq.Host = targetHost
-
+	upReq.ContentLength = contentLength
+	upReq.TransferEncoding = nil
 	if err := upReq.Write(tlsConn); err != nil {
 		http.Error(w, "write: "+err.Error(), http.StatusBadGateway)
 		return
@@ -142,6 +153,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	for name, values := range resp.Header {
+		if hopHeaders[strings.ToLower(name)] {
+			continue
+		}
 		for _, v := range values {
 			w.Header().Add(name, v)
 		}

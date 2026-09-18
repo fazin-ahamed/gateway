@@ -311,13 +311,13 @@ function resolveFeatures(payload, agentMode = false) {
   };
 }
 
-// Reference pure-HTTP wire shape from GLM-Free-API. Keep this separate from
-// the browser's opaque x-preview-l model selector and from the legacy chat
-// creation payload: the proven HTTP completion uses the public model id,
-// a client-generated chat UUID, and a deliberately minimal body.
-function referenceHttpModelId(modelId) {
-  const id = unprefixedModelId(modelId);
-  return id.toLowerCase() === "x-preview-l" ? "glm-5.3-flash" : id;
+// Wire model id: the live catalog id wins. chat.z.ai lists Flash as
+// x-preview-l; rewriting that to glm-5.3-flash is an Internal Server Error.
+function referenceHttpModelId(modelId, liveEntry = null) {
+  const live = liveEntry && liveEntry.wireId;
+  if (live)
+    return unprefixedModelId(live);
+  return unprefixedModelId(modelId);
 }
 
 function buildReferenceCompletionUrl(input) {
@@ -355,7 +355,7 @@ function buildReferenceFeatures({ thinking, features }) {
 
 function buildReferenceCompletionBody(input) {
   const body = {
-    model: referenceHttpModelId(input.modelId),
+    model: referenceHttpModelId(input.modelId, input.liveEntry),
     chat_id: input.chatId,
     messages: input.messages,
     signature_prompt: input.prompt,
@@ -641,6 +641,16 @@ export function wrapUtlsFetcher(fetcher) {
   if (!proxy || typeof fetcher !== "function")
     return fetcher;
   const base = String(proxy).replace(/\/+$/, "");
+  const asHeaderObject = (value) => {
+    if (!value)
+      return {};
+    if (typeof value.forEach === "function") {
+      const out = {};
+      value.forEach((v, k) => { out[k] = v; });
+      return out;
+    }
+    return { ...value };
+  };
   return async (url, init = {}) => {
     let host = "";
     try {
@@ -654,7 +664,7 @@ export function wrapUtlsFetcher(fetcher) {
       ...init,
       method: "POST",
       headers: {
-        ...(init.headers || {}),
+        ...asHeaderObject(init.headers),
         "X-Target-Url": String(url),
         "X-Target-Method": String(init.method || "GET").toUpperCase()
       }
@@ -666,8 +676,7 @@ export function wrapUtlsFetcher(fetcher) {
 // Crucial invariants:
 // - chat ids are client-generated UUIDs; no /api/v1/chats/new round-trip;
 // - CAPTCHA is minted immediately before the one completion POST;
-// - the HTTP wire uses the public model id (glm-5.3-flash), not the browser
-//   selector alias x-preview-l;
+// - the HTTP wire uses the live catalog id (x-preview-l for Flash);
 // - request body stays minimal and matches the official web completion shape;
 // - every referenced chat is deleted after the response drains.
 async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options = {}) {
@@ -843,6 +852,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       chatId,
       messages,
       modelId,
+      liveEntry: entry,
       prompt,
       thinking,
       features,
@@ -969,6 +979,13 @@ export function isWafChallenge(status, body) {
   return isZaiWafBlock(status, body);
 }
 
+function classifyZaiStreamFailure(text) {
+  const raw = String(text || "");
+  if (/not available for current user level/i.test(raw))
+    return { status: 403, code: "zai_model_unavailable" };
+  return { status: 502, code: "zai_stream_error" };
+}
+
 // One converter for both transports: the signed HTTP path and the browser path
 // hand over the same chat.z.ai frame stream, so the OpenAI mapping lives here
 // rather than twice.
@@ -994,8 +1011,11 @@ async function shapeFrameResponse(input) {
       content += delta.content;
     return delta.done;
   }, { holdback: Number.MAX_SAFE_INTEGER });
-  if (failure)
-    throw new ZaiWebError(502, "Z.ai stream failed: " + failure, "zai_stream_error");
+  if (failure) {
+    const text = String(failure);
+    const classified = classifyZaiStreamFailure(text);
+    throw new ZaiWebError(classified.status, "Z.ai stream failed: " + text, classified.code);
+  }
   let finishReason = "stop";
   const message = { role: "assistant", content };
   if (agent) {
@@ -1217,6 +1237,7 @@ export const __zaiTest = {
   captureFromHeaders,
   isWafChallenge,
   wrapUtlsFetcher,
+  classifyZaiStreamFailure,
   browserPoolIdForRoute
 };
 

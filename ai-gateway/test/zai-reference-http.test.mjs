@@ -20,9 +20,20 @@ import {
   processZaiVisionMessages
 } from "../src/zai-vision.js";
 
-test("reference HTTP model id keeps public glm slug instead of browser alias", () => {
+test("reference HTTP model id prefers live catalog wireId", () => {
   assert.equal(__zaiTest.referenceHttpModelId("zai/glm-5.3-flash"), "glm-5.3-flash");
-  assert.equal(__zaiTest.referenceHttpModelId("x-preview-l"), "glm-5.3-flash");
+  assert.equal(__zaiTest.referenceHttpModelId("glm-5.3-flash", { wireId: "x-preview-l" }), "x-preview-l");
+  const body = __zaiTest.buildReferenceCompletionBody({
+    captchaVerifyParam: "proof",
+    chatId: "chat-1",
+    messages: [{ role: "user", content: "hello" }],
+    modelId: "glm-5.3-flash",
+    liveEntry: { wireId: "x-preview-l" },
+    prompt: "hello",
+    thinking: { enabled: true, effort: "high", effortSupported: false },
+    features: {}
+  });
+  assert.equal(body.model, "x-preview-l");
 });
 
 test("reference completion body stays minimal and supports files + advanced search", () => {
@@ -81,6 +92,14 @@ test("default Flash thinking omits reasoning_effort unless catalog allows and re
     features: {}
   });
   assert.equal(body2.features.reasoning_effort, "high");
+});
+
+test("user-level stream errors are model-unavailable, not retryable stream failures", () => {
+  const classified = __zaiTest.classifyZaiStreamFailure("Model not available for current user level");
+  assert.equal(classified.code, "zai_model_unavailable");
+  assert.equal(classified.status, 403);
+  const other = __zaiTest.classifyZaiStreamFailure("timeout");
+  assert.equal(other.code, "zai_stream_error");
 });
 
 test("reference signature prompt is all message text in order", () => {
