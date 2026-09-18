@@ -1,12 +1,11 @@
 // Z.ai consumer chat (chat.z.ai) provider adapter.
 //
-// An OpenAI-compatible front for Z.ai's web chat. Session state (cookies,
-// guest/account token, frontend version) lives in the Node-native
-// ZaiSession, so the signed path no longer depends on a hand-pasted JWT and
-// a browser-issued CAPTCHA proof is the only per-request input.
-//
-// Wire shape ported from OmniRoute (open-sse/executors/zai-web) so both
-// gateways speak the identical protocol.
+// OpenAI-compatible front for Z.ai's consumer web chat. The canonical HTTP
+// lifecycle is adapted from GLM-Free-API (MIT, see THIRD_PARTY_NOTICES.md):
+// live session/model state -> optional file upload -> local throwaway chat UUID
+// -> fresh CAPTCHA proof -> one signed completion POST -> SSE normalization ->
+// best-effort chat deletion. Gateway-specific routing, WAF isolation, tool
+// repair, key state and public error handling remain layered around it.
 
 import { sessionFor } from "./zai-session.js";
 import { registryFor } from "./zai-models.js";
@@ -18,7 +17,6 @@ import { getZaiCaptchaProof } from "./zai-captcha-cache.js";
 import { attachZaiImageParts, processZaiVisionMessages } from "./zai-vision.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
-const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
 const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
 const ZAI_SETTINGS_URL = ZAI_BASE_URL + "/api/v1/users/user/settings";
 const ZAI_DELETE_CHAT_URL = (chatId) => ZAI_BASE_URL + "/api/v1/chats/" + encodeURIComponent(chatId);
@@ -56,12 +54,6 @@ function unprefixedModelId(modelId) {
 function capabilityModelId(modelId) {
   const id = unprefixedModelId(modelId).toLowerCase();
   return id === "x-preview-l" ? "glm-5.3-flash" : id;
-}
-
-// Public slug → the opaque id chat.z.ai expects on the wire.
-function upstreamModelId(modelId) {
-  const id = unprefixedModelId(modelId);
-  return id.toLowerCase() === "glm-5.3-flash" ? "x-preview-l" : id;
 }
 
 function getModelCapabilities(modelId) {
@@ -187,21 +179,6 @@ async function buildSignature(input) {
   return hmacSha256(derivedKey, sortedPayload + "|" + encodedPrompt + "|" + timestamp);
 }
 
-// The site hands back a refreshed session token as a cookie on chat creation;
-// picking it up keeps a long-lived route alive without a manual re-paste.
-function rotatedToken(headers) {
-  if (!headers || typeof headers.get !== "function")
-    return "";
-  const cookie = headers.get("set-cookie");
-  if (!cookie)
-    return "";
-  const match = cookie.match(/(?:^|[;\s])token=([^;,\s]+)/);
-  if (!match)
-    return "";
-  const value = extractToken(match[1]);
-  return value && value.split(".").length === 3 ? value : "";
-}
-
 function userIdFromToken(token) {
   const payload = String(token).split(".")[1];
   if (!payload)
@@ -243,13 +220,6 @@ function textContent(content) {
   return parts.join("\n");
 }
 
-function latestUserPrompt(messages) {
-  for (let i = messages.length - 1; i >= 0; i--)
-    if (messages[i] && messages[i].role === "user")
-      return textContent(messages[i].content);
-  return "";
-}
-
 // GLM-Free-API signs the concatenation of all message text, not only the
 // newest user turn. This matters because signature_prompt must match the
 // exact conversation payload the completion carries.
@@ -269,10 +239,6 @@ function prepareZaiTurn(payload) {
   const messages = Array.isArray(shim.payload.messages) ? shim.payload.messages : [];
   const prompt = shim.active ? shim.prompt : referencePrompt(messages);
   return { shim, messages, prompt };
-}
-
-function foldMessages(messages) {
-  return (messages || []).map((m) => ({ role: m && m.role || "user", content: textContent(m && m.content) }));
 }
 
 function countImages(messages) {
@@ -341,71 +307,6 @@ function resolveFeatures(payload, agentMode = false) {
   };
 }
 
-function buildHeaders(token, options) {
-  const headers = {
-    "Content-Type": "application/json",
-    Accept: options.accept,
-    "Accept-Language": "en-US",
-    "User-Agent": ZAI_USER_AGENT,
-    Origin: ZAI_BASE_URL,
-    Referer: ZAI_BASE_URL + "/",
-    Authorization: "Bearer " + token
-  };
-  if (options.frontendVersion)
-    headers["X-FE-Version"] = options.frontendVersion;
-  if (options.signature)
-    headers["X-Signature"] = options.signature;
-  if (options.region !== false)
-    headers["X-Region"] = "overseas";
-  return headers;
-}
-
-// The completion URL carries the client telemetry chat.z.ai expects. Static
-// screen/timezone values are intentional: they are part of the signed shape.
-function buildCompletionUrl(input) {
-  const now = new Date(input.timestamp);
-  const params = new URLSearchParams({
-    timestamp: String(input.timestamp),
-    requestId: input.requestId,
-    user_id: input.userId,
-    version: CLIENT_PROTOCOL_VERSION,
-    platform: "web",
-    token: input.token,
-    user_agent: ZAI_USER_AGENT,
-    language: "en-US",
-    languages: "en-US,en",
-    timezone: "UTC",
-    cookie_enabled: "true",
-    screen_width: "1280",
-    screen_height: "800",
-    screen_resolution: "1280x800",
-    viewport_height: "800",
-    viewport_width: "1280",
-    viewport_size: "1280x800",
-    color_depth: "24",
-    pixel_ratio: "1",
-    current_url: ZAI_BASE_URL + "/",
-    pathname: "/",
-    search: "",
-    hash: "",
-    host: "chat.z.ai",
-    hostname: "chat.z.ai",
-    protocol: "https:",
-    referrer: "",
-    title: "Z.ai - Advanced AI Chatbot & Agent powered by GLM-5.3",
-    timezone_offset: "0",
-    local_time: now.toISOString(),
-    utc_time: now.toUTCString(),
-    is_mobile: "false",
-    is_touch: "false",
-    max_touch_points: "0",
-    browser_name: "Chrome",
-    os_name: "Mac OS",
-    signature_timestamp: String(input.timestamp)
-  });
-  return ZAI_CHAT_URL + "?" + params.toString();
-}
-
 // Reference pure-HTTP wire shape from GLM-Free-API. Keep this separate from
 // the browser's opaque x-preview-l model selector and from the legacy chat
 // creation payload: the proven HTTP completion uses the public model id,
@@ -463,74 +364,6 @@ function buildReferenceCompletionBody(input) {
   if (input.features.advancedSearchEnabled)
     body.mcp_servers = ["advanced-search"];
   return body;
-}
-
-function buildNewChatBody(input) {
-  const { userMessageId } = input;
-  const model = upstreamModelId(input.modelId);
-  const body = {
-    chat: {
-      id: "",
-      title: "New Chat",
-      models: [model],
-      params: {},
-      history: { messages: { [userMessageId]: { id: userMessageId, parentId: null, childrenIds: [], role: "user", content: input.prompt, timestamp: Math.floor(Date.now() / 1000), models: [model] } }, currentId: userMessageId },
-      tags: [],
-      flags: [],
-      // chat.z.ai accepts features:[] for both guest and signed-in accounts; the
-      // tool-selector placeholder the web client sends is rejected on stricter
-      // accounts and surfaced as an upstream outage, so omit it.
-      features: [],
-      mcp_servers: [],
-      enable_thinking: input.enableThinking,
-      reasoning_effort: input.reasoningEffort,
-      auto_web_search: input.features.webSearchEnabled,
-      message_version: 1,
-      extra: { vlm_tools_enable: input.features.toolsEnabled, vlm_web_search_enable: false, vlm_website_mode: false },
-      timestamp: Date.now(),
-      type: "default"
-    }
-  };
-  return { userMessageId, payload: { chat: body.chat } };
-}
-
-function buildCompletionBody(input) {
-  const params = {};
-  for (const key of ["temperature", "top_p", "max_tokens", "stop"])
-    if (input.body && input.body[key] !== undefined)
-      params[key] = input.body[key];
-  const caps = getModelCapabilities(input.modelId);
-  if (params.max_tokens !== undefined && caps)
-    params.max_tokens = Math.min(Number(params.max_tokens) || 0, caps.output);
-  const features = {
-    image_generation: false,
-    web_search: false,
-    auto_web_search: input.features.webSearchEnabled,
-    preview_mode: true,
-    flags: [],
-    vlm_tools_enable: input.features.toolsEnabled,
-    vlm_web_search_enable: false,
-    vlm_website_mode: false,
-    enable_thinking: input.enableThinking
-  };
-  if (input.enableThinking && input.effortSupported)
-    features.reasoning_effort = input.reasoningEffort;
-  return {
-    stream: true,
-    model: upstreamModelId(input.modelId),
-    messages: foldMessages(input.messages),
-    signature_prompt: input.prompt,
-    params,
-    extra: { vlm_tools_enable: input.features.toolsEnabled, vlm_web_search_enable: false, vlm_website_mode: false },
-    features,
-    variables: {},
-    chat_id: input.chatId,
-    id: input.requestId,
-    current_user_message_id: input.userMessageId,
-    current_user_message_parent_id: null,
-    background_tasks: { title_generation: true, tags_generation: true },
-    captcha_verify_param: input.captchaVerifyParam
-  };
 }
 
 // chat.z.ai streams SSE in the same frames whether or not the client asked
@@ -1325,19 +1158,13 @@ export const __zaiTest = {
   captureVerifyParam,
   userIdFromToken,
   buildSignature,
-  buildCompletionUrl,
   buildReferenceCompletionUrl,
   buildReferenceCompletionBody,
   buildReferenceFeatures,
   referenceHttpModelId,
-  buildNewChatBody,
-  buildCompletionBody,
-  foldMessages,
-  latestUserPrompt,
   referencePrompt,
   resolveThinking,
   resolveFeatures,
-  upstreamModelId,
   getModelCapabilities,
   modelCatalogEntry,
   isZaiModel,
