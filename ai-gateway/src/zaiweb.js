@@ -12,6 +12,7 @@ import { sessionFor } from "./zai-session.js";
 import { registryFor } from "./zai-models.js";
 import { createZaiFrameNormalizer } from "./zai-stream.js";
 import { isZaiWafBlock, zaiWaf, ZaiWafBlockedError } from "./zai-waf.js";
+import { applyAgentShim, parseAgentToolCalls, stripAgentToolCalls, AgentStreamInterceptor } from "./zai-agent.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
@@ -237,6 +238,16 @@ function latestUserPrompt(messages) {
     if (messages[i] && messages[i].role === "user")
       return textContent(messages[i].content);
   return "";
+}
+
+// chat.z.ai only accepts role=user. When the caller sent OpenAI tools, fold
+// the whole conversation + tool contract into one user prompt and parse
+// <<<TOOL_CALL>>> blocks on the way out. Never forward raw `tools`.
+function prepareZaiTurn(payload) {
+  const shim = applyAgentShim(payload);
+  const messages = Array.isArray(shim.payload.messages) ? shim.payload.messages : [];
+  const prompt = shim.active ? shim.prompt : latestUserPrompt(messages);
+  return { shim, messages, prompt };
 }
 
 function foldMessages(messages) {
@@ -487,44 +498,83 @@ function chunk(id, created, model, delta, finish, usage) {
 
 // Convert the upstream frame stream into an OpenAI SSE stream. Emits at most
 // one finish chunk, and never a contentless frame (strict clients index
-// choices[0] and choke on `choices: []`).
-function toOpenAiStream(source, model, id) {
+// choices[0] and choke on `choices: []`). When agent=true, <<<TOOL_CALL>>>
+// blocks become incremental tool_calls deltas and finish_reason=tool_calls.
+function toOpenAiStream(source, model, id, agent = false) {
   const created = Math.floor(Date.now() / 1000);
   const enc = new TextEncoder();
   let started = false;
   let finished = false;
   let chars = 0;
+  let sawToolCalls = false;
+  const interceptor = agent ? new AgentStreamInterceptor() : null;
   return new ReadableStream({
     async start(controller) {
       const send = (obj) => controller.enqueue(enc.encode("data: " + JSON.stringify(obj) + "\n\n"));
-      const finish = () => {
+      const emitToolCalls = (toolCalls) => {
+        if (!toolCalls || !toolCalls.length) return;
+        if (!started) {
+          started = true;
+          send(chunk(id, created, model, { role: "assistant" }));
+        }
+        sawToolCalls = true;
+        send(chunk(id, created, model, { tool_calls: toolCalls }));
+      };
+      const finish = (reason) => {
         if (finished)
           return;
         finished = true;
+        if (interceptor) {
+          const tail = interceptor.finish();
+          if (tail.content) {
+            chars += tail.content.length;
+            if (!started) {
+              started = true;
+              send(chunk(id, created, model, { role: "assistant" }));
+            }
+            send(chunk(id, created, model, { content: tail.content }));
+          }
+          emitToolCalls(tail.toolCalls);
+        }
         const usage = { prompt_tokens: 0, completion_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), total_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), cost_usd: 0 };
-        send(chunk(id, created, model, {}, "stop", usage));
+        send(chunk(id, created, model, {}, reason || (sawToolCalls ? "tool_calls" : "stop"), usage));
         controller.enqueue(enc.encode("data: [DONE]\n\n"));
       };
       try {
         await readDeltas(source, (delta) => {
           if (delta.error) {
-            // Provider-originated stream details stay in internal logs only.
-            // Public SSE exposes a gateway-owned, provider-neutral failure and
-            // never follows it with a successful finish_reason.
             finished = true;
             send({ error: { message: "Upstream stream failed", type: "upstream_stream_error", code: "upstream_stream_error", retryable: true } });
             controller.enqueue(enc.encode("data: [DONE]\n\n"));
             return true;
           }
-          if (!started && (delta.content || delta.reasoning)) {
-            started = true;
-            send(chunk(id, created, model, { role: "assistant" }));
-          }
-          if (delta.reasoning)
+          if (delta.reasoning) {
+            if (!started) {
+              started = true;
+              send(chunk(id, created, model, { role: "assistant" }));
+            }
             send(chunk(id, created, model, { reasoning_content: delta.reasoning }));
+          }
           if (delta.content) {
-            chars += delta.content.length;
-            send(chunk(id, created, model, { content: delta.content }));
+            if (interceptor) {
+              const parsed = interceptor.feed(delta.content);
+              if (parsed.content) {
+                chars += parsed.content.length;
+                if (!started) {
+                  started = true;
+                  send(chunk(id, created, model, { role: "assistant" }));
+                }
+                send(chunk(id, created, model, { content: parsed.content }));
+              }
+              emitToolCalls(parsed.toolCalls);
+            } else {
+              if (!started) {
+                started = true;
+                send(chunk(id, created, model, { role: "assistant" }));
+              }
+              chars += delta.content.length;
+              send(chunk(id, created, model, { content: delta.content }));
+            }
           }
           if (delta.done) {
             finish();
@@ -687,8 +737,6 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   const caps = getModelCapabilities(modelId);
   if (!caps)
     throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  if (payload.tools || payload.functions)
-    throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
   const images = countImages(payload.messages);
   if (images)
     throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
@@ -699,8 +747,9 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (!captcha)
     throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion. Pass it as the x-zai-captcha request header (or providerSpecificData), or store one in the provider key. It is issued per completion, so the stored value only works once.", "zai_captcha");
 
-  const messages = Array.isArray(payload.messages) ? payload.messages : [];
-  const prompt = latestUserPrompt(messages);
+  const prepared = prepareZaiTurn(payload);
+  const messages = prepared.messages;
+  const prompt = prepared.prompt;
   if (!prompt && !images)
     throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
 
@@ -832,7 +881,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
     // Tee the stream: client gets the shaped half; the discard half drives the
     // stream to completion so cleanup fires even when the caller abandons it.
     const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered });
+    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered, agent: prepared.shim.active });
     (async () => {
       try {
         const reader = discard.getReader();
@@ -847,7 +896,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
     })().catch(() => {});
     return shaped;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered });
+  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered, agent: prepared.shim.active });
   await cleanup();
   return shaped;
 }
@@ -874,10 +923,10 @@ async function fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session
 // hand over the same chat.z.ai frame stream, so the OpenAI mapping lives here
 // rather than twice.
 async function shapeFrameResponse(input) {
-  const { id, model, source, promptTokens, isStream, recovered } = input;
+  const { id, model, source, promptTokens, isStream, recovered, agent } = input;
   if (isStream) {
     const headers = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };
-    return { response: new Response(toOpenAiStream(source, model, id), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
+    return { response: new Response(toOpenAiStream(source, model, id, !!agent), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
   }
 
   // Non-streaming: drain the same frame stream into a single completion body.
@@ -897,7 +946,17 @@ async function shapeFrameResponse(input) {
   }, { holdback: Number.MAX_SAFE_INTEGER });
   if (failure)
     throw new ZaiWebError(502, "Z.ai stream failed: " + failure, "zai_stream_error");
+  let finishReason = "stop";
   const message = { role: "assistant", content };
+  if (agent) {
+    const calls = parseAgentToolCalls(content);
+    content = stripAgentToolCalls(content);
+    message.content = content;
+    if (calls.length) {
+      message.tool_calls = calls;
+      finishReason = "tool_calls";
+    }
+  }
   if (reasoning)
     message.reasoning_content = reasoning;
   const completionTokens = Math.ceil(content.length / OUTPUT_CHARS_PER_TOKEN);
@@ -907,7 +966,7 @@ async function shapeFrameResponse(input) {
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, message, finish_reason: "stop" }],
+    choices: [{ index: 0, message, finish_reason: finishReason }],
     usage: { prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, total_tokens: usage.total_tokens }
   };
   return { response: new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } }), usage, recovered };
@@ -953,8 +1012,6 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   const caps = getModelCapabilities(modelId);
   if (!caps)
     throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  if (payload.tools || payload.functions)
-    throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
   const images = countImages(payload.messages);
   if (images)
     throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
@@ -964,8 +1021,9 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   if (!token || !userId)
     throw credentialError();
 
-  const messages = Array.isArray(payload.messages) ? payload.messages : [];
-  const prompt = latestUserPrompt(messages);
+  const prepared = prepareZaiTurn(payload);
+  const messages = prepared.messages;
+  const prompt = prepared.prompt;
   if (!prompt && !images)
     throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
 
@@ -1078,7 +1136,7 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   }).catch(() => {});
   if (isStream && up.body) {
     const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null });
+    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null, agent: prepared.shim.active });
     (async () => {
       try {
         const reader = discard.getReader();
@@ -1093,7 +1151,7 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
     })().catch(() => {});
     return shaped;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null });
+  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null, agent: prepared.shim.active });
   await cleanup();
   return shaped;
 }
@@ -1109,8 +1167,6 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   const caps = getModelCapabilities(modelId);
   if (!caps)
     throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  if (payload.tools || payload.functions)
-    throw new ZaiWebError(400, "Z.ai consumer models do not accept caller-supplied tools; use an API-key Z.AI provider for tool calling.", "zai_tools_unsupported");
   const images = countImages(payload.messages);
   if (images)
     throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
@@ -1119,8 +1175,9 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   if (!token || !userIdFromToken(token))
     throw credentialError();
 
-  const messages = Array.isArray(payload.messages) ? payload.messages : [];
-  const prompt = foldPrompt(messages, payload.system);
+  const prepared = prepareZaiTurn(payload);
+  const messages = prepared.messages;
+  const prompt = prepared.shim.active ? prepared.prompt : foldPrompt(payload.messages || [], payload.system);
   if (!prompt)
     throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
 
@@ -1149,7 +1206,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
   // The frame converter reads a stream; wrap the captured response text.
   const source = new Response(turn.body).body || new Response("").body;
-  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: turn.recovered || null });
+  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: turn.recovered || null, agent: prepared.shim.active });
 }
 
 // Rebuild the caller's conversation into one prompt for the browser transport.

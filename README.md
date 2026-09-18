@@ -147,8 +147,9 @@ fresh page (no cross-conversation state), serialized by a per-credential mutex.
   ~2.4 s, no captcha input at any point.
 - One browser context is pooled per credential and reused, so consecutive
   requests stay warm; idle contexts are closed after 5 minutes.
-- Same gates as `zaiweb`: no caller-supplied tools (`zai_tools_unsupported`),
-  images only on `glm-5.3-flash`, model access still per account tier.
+  OpenAI `tools` are folded into a user-only agent prompt (GLM-Free-API
+  modern shim) and `<<<TOOL_CALL>>>` blocks come back as native `tool_calls`.
+  Images only on `glm-5.3-flash`. Model access is still per account tier.
 - Memory: a Chromium process runs alongside the gateway (roughly 300–500 MB).
   On a small VM set `SESSION_POOL_SIZE`/limits accordingly, or use an API-key
   provider where a browser is not needed at all.
@@ -351,12 +352,13 @@ Behavior and limits:
   still works exactly once for a smoke test. Missing proof returns a typed 503
   (`zai_captcha`) naming the header. Treat this provider as a bursty,
   captcha-gated route; an API-key provider has no such limitation.
-- Thinking is always on (the consumer models expose no non-thinking mode).
+  Thinking is always on (the consumer models expose no non-thinking mode).
   `reasoning_effort` (`low`/`medium`/`high`/`max`) is forwarded; `glm-5.2`
   has no `low`, so it clamps to `high`. Reasoning arrives as
   `reasoning_content` deltas.
-- Caller-supplied `tools` are refused with a 400 (`zai_tools_unsupported`).
-  These models cannot call tools; silently dropping them would break agents.
+- OpenAI `tools` are not forwarded to chat.z.ai. They are folded into a
+  user-only agent prompt; the model emits `<<<TOOL_CALL>>>` blocks, which
+  the gateway converts to native OpenAI `tool_calls` (streamed incrementally).
 - Images are accepted only on `glm-5.3-flash`; anything else returns 400
   (`zai_vision_unsupported`). Image parts are forwarded as `[image: <url>]`
   markers — uploading attachments is not implemented.
