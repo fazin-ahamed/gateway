@@ -915,12 +915,16 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     }
     const minted = await getZaiCaptchaProof({ storePath, fetchImpl: fetcher });
     if (!minted || !minted.ok || !minted.param) {
-      const empty = minted && Number(minted.remaining) === 0;
+      const reason = String(minted && minted.reason || "");
+      const empty = reason !== "captcha-config" && minted && Number(minted.remaining) === 0;
+      const configMissing = reason === "captcha-config";
       throw new ZaiWebError(503,
-        empty
-          ? "Z.ai device-token store is empty or exhausted."
-          : "Z.ai captcha proof generation failed.",
-        empty ? "zai_tokens" : "zai_captcha");
+        configMissing
+          ? "Z.ai captcha minting is not configured on this host."
+          : empty
+            ? "Z.ai device-token store is empty or exhausted."
+            : "Z.ai captcha proof generation failed.",
+        configMissing ? "zai_captcha_config" : empty ? "zai_tokens" : "zai_captcha");
     }
     return minted.param;
   };
