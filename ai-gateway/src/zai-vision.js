@@ -162,7 +162,12 @@ async function downloadImage(rawUrl) {
       // Pin the socket to the exact address that passed the SSRF check. The
       // URL hostname remains unchanged, preserving Host and HTTPS SNI while
       // eliminating the DNS-rebinding gap between validation and connect.
-      lookup: (_hostname, _options, callback) => callback(null, address, family)
+      lookup: (_hostname, options, callback) => {
+        if (options && options.all)
+          callback(null, [{ address, family }]);
+        else
+          callback(null, address, family);
+      }
     }, (res) => {
       const status = Number(res.statusCode || 0);
       if (status < 200 || status >= 300) {
