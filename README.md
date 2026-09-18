@@ -157,7 +157,9 @@ The key details are intentional:
   `captcha_verify_param`, `features`, plus optional `files` and
   `mcp_servers`.
 - A tiny CAPTCHA cache keeps fresh proofs while the route is active and pauses
-  after inactivity. Device tokens are still single-use.
+  after inactivity. Device tokens are single-use and consumed FIFO from the
+  gateway SQLite database, matching GLM-Free-API. The old newline token file
+  is automatically imported whenever the DB queue is empty and then cleared.
 - WAF state is checked **before** image upload or consuming a device token.
 - Every used chat is throwaway and best-effort deleted after the response
   finishes. The local chat-id pool costs no upstream warmup.
@@ -170,7 +172,8 @@ The key details are intentional:
 - Vision is real attachment upload now: image parts are uploaded to
   `/api/v1/files/`, their `image_url` values are rewritten to the returned
   file ids, and web-client-style `files[]` entries are attached. Remote image
-  downloads are protected by a public-IP/DNS SSRF guard.
+  downloads are protected by a public-IP/DNS SSRF guard, connection-time IP
+  pinning (DNS rebinding safe), and a streaming byte limit.
 
 Setup on the serving host:
 
@@ -181,7 +184,10 @@ Setup on the serving host:
    node scripts/harvest-zai-tokens.mjs --token "<chat.z.ai token>" --count 300
    ```
 3. Copy the token file to the gateway host (default
-   `./data/zai-device-tokens.txt`).
+   `./data/zai-device-tokens.txt`). On the next proof request it is imported
+   into the gateway's SQLite `zai_device_tokens` FIFO and cleared. You can
+   later refill the same file path; it will be imported again when the DB queue
+   runs dry.
 4. Set your own `ZAI_CAPTCHA_ACCESS_KEY`,
    `ZAI_CAPTCHA_SECRET_KEY`, and `ZAI_CAPTCHA_SCENE_ID`; the repository
    deliberately ships no shared CAPTCHA credentials.
