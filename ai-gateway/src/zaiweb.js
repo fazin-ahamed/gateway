@@ -904,6 +904,34 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const poolKey = String(route.zai_session_key || route.route_id || route.id || ("uid:" + userId));
   const { chatId } = acquireZaiChatId(poolKey, route.zai_session_pool_size);
 
+  // Match the reference's defer-style retirement: once a completion may have
+  // referenced this UUID, every terminal path retires it. WAF blocks skip the
+  // DELETE because poking a blocked edge only extends the problem.
+  const cleanup = async (idToDelete) => {
+    if (!idToDelete || zaiWaf.status().blocked)
+      return;
+    try {
+      await awaitWafSlot();
+      const res = await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
+        method: "DELETE",
+        headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
+      });
+      if (res.status === 401) {
+        session.invalidate("chat delete 401");
+        await session.refresh("chat delete 401").catch(() => {});
+        await awaitWafSlot();
+        await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
+          method: "DELETE",
+          headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
+        }).catch(() => {});
+      }
+    } catch {
+      // Stateless chat GC is best-effort and must never change the client result.
+    }
+  };
+
+  const retire = () => retire();
+
   const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
   const proofMode = options.proofMode || "caller";
 
@@ -979,7 +1007,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       userId = again.userId || userIdFromToken(token) || userId;
     }
   } catch (e) {
-    releaseZaiChatId(poolKey, chatId, () => Promise.resolve());
+    retire();
     if (e instanceof ZaiWebError)
       throw e;
     if (e instanceof ZaiWafBlockedError)
@@ -992,10 +1020,12 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     const text = up ? String(await up.text().catch(() => "")).slice(0, 300) : "";
     if (isZaiWafBlock(status, text)) {
       const state = zaiWaf.recordBlock("reference-http");
+      retire();
       const err = new ZaiWebError(503, "Z.ai temporarily blocked this gateway egress.", "zai_waf");
       err.retryAfterSec = state.retryAfterSec;
       throw err;
     }
+    retire();
     if (/captcha\s+verification\s+failed/i.test(text))
       throw new ZaiWebError(502, "Z.ai rejected the freshly minted captcha proof.", "zai_captcha_rejected");
     throw new ZaiWebError(status, "Z.ai completion error: " + text, "zai_completion");
@@ -1009,29 +1039,6 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const id = "chatcmpl-zai-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) +
     imageCount * IMAGE_TOKEN_ALLOWANCE;
-
-  const cleanup = async (idToDelete) => {
-    if (!idToDelete || zaiWaf.status().blocked)
-      return;
-    try {
-      await awaitWafSlot();
-      const res = await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
-        method: "DELETE",
-        headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
-      });
-      if (res.status === 401) {
-        session.invalidate("chat delete 401");
-        await session.refresh("chat delete 401").catch(() => {});
-        await awaitWafSlot();
-        await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
-          method: "DELETE",
-          headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
-        }).catch(() => {});
-      }
-    } catch {
-      // Stateless chat GC is best-effort and must never change the client result.
-    }
-  };
 
   if (isStream) {
     const [clientStream, drainStream] = up.body.tee();
@@ -1051,7 +1058,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
         while (!(await reader.read()).done) {}
       } catch {
       } finally {
-        releaseZaiChatId(poolKey, chatId, cleanup);
+        retire();
       }
     })();
     return shaped;
