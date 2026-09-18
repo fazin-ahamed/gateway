@@ -75,9 +75,11 @@ export function normalizeModels(payload) {
       displayName: String(pick(row, ["display_name", "displayName", "label", "title", "name"]) || id),
       available,
       reasoning: thinking === true,
+      reasoningKnown: thinking !== undefined,
       toolCall: asBool(pick(caps, ["tools", "tool_call", "function_calling"])) === true,
       attachment: vision === true,
-      modalities: { input: vision === true ? ["text", "image"] : ["text"], output: ["text"] },
+      attachmentKnown: vision !== undefined,
+      modalities: vision === undefined ? null : { input: vision === true ? ["text", "image"] : ["text"], output: ["text"] },
       limit: { context: context || 0, output: output || 0 },
       raw: row
     });
@@ -191,12 +193,16 @@ export class ZaiModelRegistry {
     return {
       id: "zai-web/" + id,
       wireId: live.id,
-      reasoning: live.reasoning || (base ? base.reasoning : false),
-      // The gateway can emulate caller tool calls through the Z.AI agent
-      // shim even when chat.z.ai does not advertise native function calling.
+      reasoning: live.reasoningKnown ? live.reasoning : (base ? base.reasoning : live.reasoning || false),
+      // Tool support is a gateway capability: the agent shim can emulate it
+      // even when chat.z.ai itself reports no native function calling.
       toolCall: live.toolCall || (base ? base.toolCall : false) || false,
-      attachment: live.attachment || (base ? base.attachment : false) || false,
-      modalities: live.modalities,
+      // A live explicit vision=false is authoritative. Static fallback is
+      // only used when the live catalog omitted the capability entirely.
+      attachment: live.attachmentKnown ? live.attachment : (base ? base.attachment : false),
+      modalities: live.attachmentKnown
+        ? live.modalities
+        : (base ? base.modalities : live.modalities),
       limit: {
         context: live.limit.context || (base ? base.limit.context : 0),
         output: live.limit.output || (base ? base.limit.output : 0)

@@ -831,7 +831,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         // then the next credential, then the next route.
         for (let transportAttempt = 0; transportAttempt < SAME_KEY_ATTEMPTS; transportAttempt++) {
         try {
-          const res = await forwardToProvider(c, route, k.key, payload, isStream, requestId);
+          // Stable Z.AI session/browser identity must be server-controlled and
+          // credential-specific. Never derive pool identity from JWT claims.
+          const attemptRoute = isZaiWebFormat(route.fmt)
+            ? { ...route, zai_session_key: "provider:" + route.provider_id + ":key:" + k.keyId }
+            : route;
+          const res = await forwardToProvider(c, attemptRoute, k.key, payload, isStream, requestId);
           const up = res.response;
           // chat.z.ai retires its session cookie as it issues a new one; keep
           // the stored secret current so the route survives past the rotation.
@@ -2569,7 +2574,7 @@ async function pickAutoModel(c, payload, key) {
   for (const r of routes2.results || []) {
     if (!isZaiWebFormat(r.fmt))
       continue;
-    const local = modelCatalogEntry(r.upstream_model);
+    const local = modelCatalogEntry(r.upstream_model, r.fmt);
     // Local capability row keyed by the public slug: models.dev carries no
     // chat.z.ai consumer entries, so without this the router would treat the
     // route as unknown (permissive) instead of gating tools/vision/context.

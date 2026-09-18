@@ -6,7 +6,8 @@
 //
 // Gateway-specific pieces retained:
 // - no embedded Aliyun credentials;
-// - the existing file-backed token store (works on restricted ecli eggs);
+// - SQLite FIFO token consumption, with the old text file auto-imported as a
+//   compatibility path (still no extra OS packages on restricted ecli eggs);
 // - process-wide Z.AI WAF pacing/breaker.
 
 import { takeDeviceToken } from "./zai-tokens.js";
@@ -29,7 +30,7 @@ function sweep(cache, now = Date.now()) {
   cache.params = cache.params.filter((p) => now - p.at < TTL_MS);
 }
 
-async function computeProof(storePath, fetchImpl) {
+async function computeProof(storePath, fetchImpl, db) {
   zaiWaf.assertAvailable();
   if (!zaiCaptchaConfigured())
     return { ok: false, remaining: null, reason: "captcha-config" };
@@ -37,7 +38,7 @@ async function computeProof(storePath, fetchImpl) {
   let remaining = 0;
   for (let attempt = 0; attempt < MAX_TOKEN_RETRIES; attempt++) {
     zaiWaf.assertAvailable();
-    const taken = await takeDeviceToken(storePath);
+    const taken = await takeDeviceToken(storePath, db);
     remaining = taken.remaining;
     if (!taken.token)
       break;
@@ -68,7 +69,7 @@ async function refill(cache) {
     cache.generating++;
     void (async () => {
       try {
-        const minted = await computeProof(cache.storePath, cache.fetchImpl);
+        const minted = await computeProof(cache.storePath, cache.fetchImpl, cache.db);
         if (minted.ok) {
           sweep(cache);
           if (cache.params.length < MAX_PARAMS)
@@ -84,7 +85,7 @@ async function refill(cache) {
   }
 }
 
-function getCache(storePath, fetchImpl) {
+function getCache(storePath, fetchImpl, db) {
   const key = cacheKey(storePath);
   let cache = caches.get(key);
   if (!cache) {
@@ -92,21 +93,23 @@ function getCache(storePath, fetchImpl) {
       key,
       storePath,
       fetchImpl,
+      db: db || null,
       params: [],
       generating: 0,
       lastActive: 0,
       timer: null
     };
     caches.set(key, cache);
-  } else if (fetchImpl) {
-    cache.fetchImpl = fetchImpl;
+  } else {
+    if (fetchImpl) cache.fetchImpl = fetchImpl;
+    if (db) cache.db = db;
   }
   ensureRunner(cache);
   return cache;
 }
 
-export async function getZaiCaptchaProof({ storePath, fetchImpl } = {}) {
-  const cache = getCache(storePath, fetchImpl);
+export async function getZaiCaptchaProof({ storePath, fetchImpl, db } = {}) {
+  const cache = getCache(storePath, fetchImpl, db);
   cache.lastActive = Date.now();
   sweep(cache);
   const hit = cache.params.shift();
@@ -116,7 +119,7 @@ export async function getZaiCaptchaProof({ storePath, fetchImpl } = {}) {
     return { ok: true, param: hit.value, cached: true };
 
   // Cache miss: compute synchronously so the current request can continue.
-  const minted = await computeProof(storePath, fetchImpl);
+  const minted = await computeProof(storePath, fetchImpl, db);
   cache.lastActive = Date.now();
   void refill(cache);
   return { ...minted, cached: false };
