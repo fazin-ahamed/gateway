@@ -59,3 +59,49 @@ test("WAF classifier recognizes the Aliyun block page but not generic security p
   assert.equal(isZaiWafBlock(403, JSON.stringify({ error: "security policy forbids this model" })), false);
   assert.equal(isZaiWafBlock(400, "captcha_verify_param is invalid"), false);
 });
+
+
+test("probe-backed WAF breaker stays closed to user traffic until completion edge recovers", async () => {
+  let now = 1_000;
+  let timer = null;
+  const probeResults = [true, false];
+  let probes = 0;
+
+  const waf = createZaiWafController({
+    now: () => now,
+    sleep: async () => {},
+    random: () => 0,
+    baseCooldownMs: 100,
+    maxCooldownMs: 800,
+    minPaceMs: 0,
+    maxPaceMs: 0,
+    probe: async () => {
+      probes++;
+      return probeResults.shift();
+    },
+    setTimer: (fn, ms) => {
+      timer = { fn, ms, unref() {} };
+      return timer;
+    },
+    clearTimer: () => {}
+  });
+
+  waf.recordBlock("completion");
+  assert.equal(waf.status().blocked, true);
+  assert.equal(timer.ms, 100);
+
+  now += 100;
+  assert.throws(() => waf.assertAvailable(), (err) => err?.code === "zai_waf_blocked");
+
+  await timer.fn();
+  assert.equal(probes, 1);
+  assert.equal(waf.status().blocked, true);
+  assert.equal(waf.status().cooldownMs, 200);
+  assert.equal(timer.ms, 200);
+
+  now += 200;
+  await timer.fn();
+  assert.equal(probes, 2);
+  assert.equal(waf.status().blocked, false);
+  assert.doesNotThrow(() => waf.assertAvailable());
+});
