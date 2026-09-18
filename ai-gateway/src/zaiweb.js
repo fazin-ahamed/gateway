@@ -1183,8 +1183,8 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
       proofMode: "minted"
     });
   } catch (primary) {
-    const browserFallback = String(process.env.ZAI_BROWSER_FALLBACK || "1").toLowerCase() !== "0" &&
-      String(process.env.ZAI_BROWSER_FALLBACK || "1").toLowerCase() !== "false";
+    const browserFallbackValue = String(process.env.ZAI_BROWSER_FALLBACK || "").trim().toLowerCase();
+    const browserFallback = browserFallbackValue === "1" || browserFallbackValue === "true";
     const code = String(primary && primary.code || "");
     const proofFailure = code === "zai_tokens" || code === "zai_captcha" ||
       code === "zai_captcha_config" || code === "zai_captcha_rejected";
