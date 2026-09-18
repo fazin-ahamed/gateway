@@ -78,7 +78,9 @@ export function modelCatalogEntry(modelId) {
   return {
     id: "zai-web/" + id,
     reasoning: caps.thinking,
-    toolCall: false,
+    // Caller tools are supported through the gateway's agent shim + repair
+    // layer even though chat.z.ai itself does not expose native OpenAI tools.
+    toolCall: true,
     attachment: caps.vision,
     modalities: { input: caps.vision ? ["text", "image"] : ["text"], output: ["text"] },
     limit: { context: caps.context, output: caps.output }
