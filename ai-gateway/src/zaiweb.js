@@ -13,6 +13,9 @@ import { registryFor } from "./zai-models.js";
 import { createZaiFrameNormalizer } from "./zai-stream.js";
 import { isZaiWafBlock, zaiWaf, ZaiWafBlockedError } from "./zai-waf.js";
 import { applyAgentShim, parseAgentToolCalls, stripAgentToolCalls, AgentStreamInterceptor } from "./zai-agent.js";
+import { chatPoolFor } from "./zai-chat-pool.js";
+import { captchaPoolFor } from "./zai-captcha-pool.js";
+import { attachZaiImageParts, processZaiVision } from "./zai-vision.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
@@ -41,7 +44,7 @@ const ZAI_MODELS = {
   // vision=false until we actually upload image bytes; "[image: URL]" text is
   // not multimodal input. Advertising it would make the router send images
   // the model never sees.
-  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: false, context: 98304, output: 16384 },
+  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: true, context: 98304, output: 16384 },
   "glm-5.3": { name: "GLM-5.3", thinking: true, vision: false, context: 98304, output: 16384 },
   "glm-5.2": { name: "GLM-5.2", thinking: true, vision: false, context: 98304, output: 16384 }
 };
@@ -309,8 +312,13 @@ function resolveThinking(modelId, payload) {
 // never silently upgrades a request into a search or agent turn.
 function resolveFeatures(payload) {
   const opt = (key) => payload && (payload[key] !== undefined ? payload[key] : payload.features?.[key]);
-  const webSearch = opt("web_search") ?? opt("auto_web_search");
-  return { toolsEnabled: opt("vlm_tools_enable") === true, webSearchEnabled: webSearch === true };
+  const webSearch = opt("webSearch") ?? opt("search") ?? opt("web_search") ?? opt("auto_web_search");
+  const advancedSearch = opt("advancedSearch") ?? opt("advanced_search");
+  return {
+    toolsEnabled: opt("vlm_tools_enable") === true,
+    webSearchEnabled: webSearch === true || advancedSearch === true,
+    advancedSearch: advancedSearch === true
+  };
 }
 
 function buildHeaders(token, options) {
@@ -1011,154 +1019,337 @@ export function isZaiMintedFormat(value) {
  *
  * Device tokens are single-use, so each request consumes one from the store.
  */
+function referencePoolKey(route, session) {
+  return String(
+    route && (route.zai_session_key || route.provider_id || route.providerId) ||
+    session && session.key ||
+    "default"
+  );
+}
+
+function buildReferenceCompletionBody(input) {
+  const features = {
+    image_generation: false,
+    web_search: false,
+    flags: [],
+    enable_thinking: !!input.enableThinking
+  };
+  if (input.webSearchEnabled)
+    features.auto_web_search = true;
+  if (input.enableThinking && input.effortSupported)
+    features.reasoning_effort = input.reasoningEffort;
+
+  const body = {
+    model: upstreamModelId(input.modelId),
+    chat_id: input.chatId,
+    messages: input.messages,
+    signature_prompt: input.prompt,
+    stream: true,
+    captcha_verify_param: input.captchaVerifyParam,
+    features
+  };
+  if (Array.isArray(input.files) && input.files.length)
+    body.files = input.files;
+  if (input.advancedSearch)
+    body.mcp_servers = ["advanced-search"];
+  return body;
+}
+
+async function deleteReferenceChat(session, fetcher, chatId) {
+  if (!chatId || zaiWaf.status().blocked)
+    return;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let active;
+    try {
+      active = await session.acquire();
+      await zaiWaf.beforeRequest();
+    } catch {
+      return;
+    }
+    let res;
+    try {
+      res = await fetcher(ZAI_DELETE_CHAT_URL(chatId), {
+        method: "DELETE",
+        headers: session.headers({
+          Accept: "application/json",
+          Authorization: "Bearer " + active.token
+        })
+      });
+    } catch {
+      return;
+    }
+    session.noteResponse(res.headers);
+    const text = await res.text().catch(() => "");
+    if (res.status === 401 && attempt === 0) {
+      session.invalidate("chat delete 401");
+      await session.refresh("chat delete 401").catch(() => null);
+      continue;
+    }
+    if (res.ok || res.status === 404 || /could not find/i.test(text))
+      return;
+    return;
+  }
+}
+
+async function browserFallbackForHttp(c, route, token, payload, isStream) {
+  if (String(process.env.ZAI_BROWSER_FALLBACK || "1") === "0")
+    return null;
+  if (!token || countImages(payload.messages))
+    return null;
+  try {
+    return await callZaiBrowser(c, route, JSON.stringify({ token }), payload, isStream);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pure-HTTP Z.AI transport, modeled after GLM-Free-API's production path.
+ *
+ * Important differences from the old gateway minted path:
+ * - chat_id is a client-generated UUID; no /api/v1/chats/new round-trip
+ * - a standing local pool keeps throwaway ids ready
+ * - CAPTCHA proofs come from a short-lived two-entry background cache
+ * - messages/files use the same completion body shape as the web client
+ * - image_url inputs are uploaded to /api/v1/files/
+ * - Advanced Search is the top-level advanced-search MCP server
+ * - the existing gateway session, WAF, tool-repair, routing, error firewall,
+ *   and browser fallback layers remain in place.
+ */
 export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchImpl) {
-  const fetcher = fetchImpl || ((url, init) => upstreamFetch(c, url, init));
+  const baseFetcher = fetchImpl || ((url, init) => upstreamFetch(c, url, init));
+  const fetcher = wrapUtlsFetcher(baseFetcher);
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
   const caps = getModelCapabilities(modelId);
   if (!caps)
-    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  const images = countImages(payload.messages);
-  if (images)
-    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
+    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model.', "zai_model");
 
-  const { token } = parseCredential(rawKey, payload);
-  const userId = userIdFromToken(token);
-  if (!token || !userId)
+  const { token: credentialToken } = parseCredential(rawKey, payload);
+  const session = sessionFor({
+    fetcher,
+    credential: credentialToken,
+    key: route.zai_session_key || (route.provider_id ? "provider:" + route.provider_id : undefined)
+  });
+  const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id) });
+  const entry = await registry.resolve(modelId);
+  if (entry && entry.available === false)
+    throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
+
+  const initial = await session.acquire();
+  if (!initial.token || !(initial.userId || userIdFromToken(initial.token)))
     throw credentialError();
 
-  const prepared = prepareZaiTurn(payload);
-  const messages = prepared.messages;
+  let vision;
+  try {
+    vision = await processZaiVision({
+      messages: payload.messages || [],
+      session,
+      fetcher,
+      imageFetch: c && c.zaiImageFetch || globalThis.fetch
+    });
+  } catch (err) {
+    throw new ZaiWebError(400, "Z.ai image processing failed: " + String(err && err.message || err).slice(0, 260), "zai_vision");
+  }
+
+  const workingPayload = { ...payload, messages: vision.messages };
+  const prepared = prepareZaiTurn(workingPayload);
+  let messages = prepared.messages;
+  if (prepared.shim.active && vision.imageParts.length)
+    messages = attachZaiImageParts(messages, vision.imageParts);
   const prompt = prepared.prompt;
-  if (!prompt && !images)
+  if (!prompt && !vision.imageCount)
     throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
 
-  const { takeDeviceToken } = await import("./zai-tokens.js");
-  const { mintCaptcha } = await import("./zai-captcha.js");
-  // Fail before consuming a single-use device token when the egress breaker is open.
-  assertWafAvailable();
-  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
-
   const thinking = resolveThinking(modelId, payload);
-  const features = resolveFeatures(payload);
-  const frontendVersion = await resolveFrontendVersion(fetcher);
-  const userMessageId = crypto.randomUUID();
+  let requestFeatures = resolveFeatures(payload);
+  // Reference behavior: native Z.AI search/tool features are disabled while
+  // the OpenAI agent shim owns the tool loop, avoiding two competing agents.
+  if (prepared.shim.active) {
+    requestFeatures = {
+      toolsEnabled: false,
+      webSearchEnabled: false,
+      advancedSearch: false
+    };
+  }
 
-  // 1. Create the chat.
-  await awaitWafSlot();
-  let created;
+  const poolKey = referencePoolKey(route, session);
+  const chatPool = chatPoolFor(poolKey, {
+    size: process.env.ZAI_SESSION_POOL_SIZE || 5
+  });
+  const chatId = chatPool.acquire();
+  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
+  const captchaPool = captchaPoolFor(poolKey, {
+    db: c && c.env && c.env.DB || null,
+    storePath,
+    fetchImpl: fetcher
+  });
+
+  let up = null;
+  let usedActive = initial;
+  let lastError = null;
+
   try {
-    created = await fetcher(ZAI_NEW_CHAT_URL, {
-      method: "POST",
-      headers: buildHeaders(token, { accept: "application/json", frontendVersion }),
-      body: JSON.stringify(buildNewChatBody({
-        messages,
+    for (let attempt = 0; attempt < 2; attempt++) {
+      assertWafAvailable();
+
+      let minted;
+      try {
+        minted = await captchaPool.take();
+      } catch (err) {
+        throw asWafError(err);
+      }
+      if (!minted || !minted.ok || !minted.param) {
+        const fallback = await browserFallbackForHttp(c, route, session.token || initial.token, payload, isStream);
+        if (fallback)
+          return fallback;
+        throw new ZaiWebError(
+          503,
+          "Z.ai CAPTCHA proof cache is empty and no fresh proof could be minted (" +
+            String(minted && minted.reason || captchaPool.status().lastError || "device tokens exhausted") + ").",
+          "zai_tokens"
+        );
+      }
+
+      usedActive = await session.acquire();
+      const token = usedActive.token;
+      const userId = usedActive.userId || userIdFromToken(token);
+      if (!token || !userId)
+        throw credentialError();
+
+      const timestamp = Date.now();
+      const requestId = crypto.randomUUID();
+      const signature = await buildSignature({ prompt, requestId, timestamp, userId });
+      const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
+      const body = buildReferenceCompletionBody({
         modelId,
-        prompt,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        features
-      }).payload)
-    });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  if (!created.ok)
-    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + String(await created.text().catch(() => "")).slice(0, 300), "zai_chat_create");
-  const createdJson = await created.json().catch(() => null);
-  const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
-  if (!chatId)
-    throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
-
-  // 2. Mint a proof, retrying with another token when Aliyun rejects one.
-  let proof = null;
-  let lastReason = "";
-  let remaining = 0;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const taken = await takeDeviceToken(storePath);
-    remaining = taken.remaining;
-    if (!taken.token)
-      break;
-    const minted = await mintCaptcha(taken.token, { fetchImpl: fetcher });
-    if (minted.ok) {
-      proof = minted.param;
-      break;
-    }
-    lastReason = minted.reason + (minted.detail ? ": " + String(minted.detail).slice(0, 160) : "");
-  }
-  if (!proof)
-    throw new ZaiWebError(503, remaining === 0
-      ? "Z.ai device-token store is empty (or exhausted). Harvest tokens and add them to the store; see docs/zai-minted.md."
-      : "Z.ai captcha minting failed for " + 5 + " device tokens (" + lastReason + ").",
-      "zai_tokens");
-
-  // 3. Completion with the minted proof.
-  const timestamp = Date.now();
-  const requestId = crypto.randomUUID();
-  const signature = await buildSignature({ prompt, requestId, timestamp, userId });
-  const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
-  let up;
-  try {
-    await awaitWafSlot();
-    up = await fetcher(completionUrl, {
-      method: "POST",
-      headers: buildHeaders(token, { accept: "text/event-stream", frontendVersion, signature }),
-      body: JSON.stringify(buildCompletionBody({
-        body: payload,
-        captchaVerifyParam: proof,
         chatId,
         messages,
-        modelId,
         prompt,
-        requestId,
-        userMessageId,
+        captchaVerifyParam: minted.param,
+        files: vision.files,
         enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
         effortSupported: thinking.effortSupported,
-        features
-      }))
-    });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  if (!up.ok || !up.body) {
-    const text = String(await up.text().catch(() => "")).slice(0, 300);
-    if (isZaiWafBlock(up.status, text)) {
-      const state = zaiWaf.recordBlock("minted-completion");
-      const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge.", "zai_waf");
-      err.retryAfterSec = state.retryAfterSec;
-      throw err;
-    }
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
-  }
-  zaiWaf.recordSuccess();
+        reasoningEffort: thinking.effort,
+        webSearchEnabled: requestFeatures.webSearchEnabled,
+        advancedSearch: requestFeatures.advancedSearch
+      });
 
-  const id = "chatcmpl-zaim-" + Date.now().toString(36);
-  const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  const cleanup = () => fetcher(ZAI_DELETE_CHAT_URL(chatId), {
-    method: "DELETE",
-    headers: buildHeaders(token, { accept: "application/json", frontendVersion })
-  }).catch(() => {});
-  if (isStream && up.body) {
-    const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-    (async () => {
       try {
-        const reader = discard.getReader();
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      } catch {
-      } finally {
-        await cleanup();
+        await awaitWafSlot();
+        up = await fetcher(completionUrl, {
+          method: "POST",
+          headers: session.headers({
+            Accept: "text/event-stream",
+            "Content-Type": "application/json",
+            "X-Signature": signature,
+            "X-Region": "overseas",
+            Authorization: "Bearer " + token
+          }),
+          body: JSON.stringify(body)
+        });
+      } catch (err) {
+        lastError = err;
+        if (attempt === 0)
+          continue;
+        throw new ZaiWebError(502, "Z.ai completion request failed: " + String(err && err.message || err).slice(0, 260), "zai_unreachable");
       }
-    })().catch(() => {});
+
+      session.noteResponse(up.headers);
+
+      if (up.status === 401 && attempt === 0) {
+        try { await up.body?.cancel(); } catch {}
+        session.invalidate("completion 401");
+        await session.refresh("completion 401");
+        up = null;
+        continue;
+      }
+
+      if (!up.ok || !up.body) {
+        const text = String(await up.text().catch(() => "")).slice(0, 500);
+        if (isZaiWafBlock(up.status, text)) {
+          const state = zaiWaf.recordBlock("pure-http-completion");
+          const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge.", "zai_waf");
+          err.retryAfterSec = state.retryAfterSec;
+          throw err;
+        }
+
+        // A stale/expired single-use proof is recoverable once with another
+        // cached/minted proof, matching the reference's fresh-proof retry.
+        if (attempt === 0 && /captcha|verify.*fail|securitytoken/i.test(text)) {
+          up = null;
+          continue;
+        }
+
+        zaiWaf.recordSuccess();
+        lastError = new ZaiWebError(up.status || 502, "Z.ai completion error: " + text.slice(0, 260), "zai_completion");
+        throw lastError;
+      }
+
+      break;
+    }
+
+    if (!up || !up.body)
+      throw lastError || new ZaiWebError(502, "Z.ai pure-HTTP completion did not produce a response.", "zai_completion");
+
+    zaiWaf.recordSuccess();
+    const id = "chatcmpl-zaihttp-" + Date.now().toString(36);
+    const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) +
+      vision.imageCount * IMAGE_TOKEN_ALLOWANCE;
+    const recovered = session.token && session.token !== initial.token ? session.token : null;
+
+    const cleanup = async () => {
+      try {
+        await deleteReferenceChat(session, fetcher, chatId);
+      } finally {
+        chatPool.retire(chatId);
+      }
+    };
+
+    if (isStream && up.body) {
+      const [clientStream, discard] = up.body.tee();
+      const shaped = shapeFrameResponse({
+        id,
+        model: route.upstream_model || modelId,
+        source: clientStream,
+        promptTokens,
+        isStream,
+        recovered,
+        agent: prepared.shim.active,
+        tools: payload.tools || payload.functions || []
+      });
+      (async () => {
+        try {
+          const reader = discard.getReader();
+          while (true) {
+            const { done } = await reader.read();
+            if (done) break;
+          }
+        } catch {
+        } finally {
+          await cleanup();
+        }
+      })().catch(() => {});
+      return shaped;
+    }
+
+    const shaped = await shapeFrameResponse({
+      id,
+      model: route.upstream_model || modelId,
+      source: up.body,
+      promptTokens,
+      isStream,
+      recovered,
+      agent: prepared.shim.active,
+      tools: payload.tools || payload.functions || []
+    });
+    await cleanup();
     return shaped;
+  } catch (err) {
+    chatPool.retire(chatId);
+    // The id may have materialized before the failure; GC best-effort.
+    void deleteReferenceChat(session, fetcher, chatId).catch(() => {});
+    throw err;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-  await cleanup();
-  return shaped;
 }
 
 export function isZaiBrowserFormat(value) {
