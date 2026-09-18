@@ -41,7 +41,11 @@ test("non-provider-health failures do not trip the provider breaker", () => {
     { status: 503, kind: "zai_transport" },
     { status: 503, kind: "zai_tokens" },
     { status: 503, kind: "zai_captcha_config" },
-    { status: 503, kind: "zai_http_fallback_failed" }
+    { status: 503, kind: "zai_http_fallback_failed" },
+    { status: 400, kind: "zai_vision" },
+    { status: 400, kind: "zai_vision_limit" },
+    { status: 400, kind: "zai_vision_account_required" },
+    { status: 503, kind: "zai_vision_auth" }
   ];
   failures.forEach((f, i) => withFakeNow(i * 1000, () => t.circuitRecordFailure("p", f)));
   assert.equal(withFakeNow(10_000, () => t.circuitOpen("p")), false);
@@ -116,7 +120,10 @@ test("typed provider errors are converted to gateway-owned provider-neutral publ
     { status: 403, code: "zai_waf", message: "Z.ai edge rejected https://chat.z.ai/secret SECRET_PROVIDER_RELbackend" },
     { status: 401, code: "zai_auth", message: "provider Z.AI credential rejected" },
     { status: 400, code: "zai_tools_unsupported", message: "Z.ai consumer models do not accept caller-supplied tools" },
-    { status: 400, code: "zai_vision_unsupported", message: "Z.ai web transports do not upload images" }
+    { status: 400, code: "zai_vision_unsupported", message: "Z.ai web transports do not upload images" },
+    { status: 400, code: "zai_vision_limit", message: "Z.ai too many images from provider internals" },
+    { status: 400, code: "zai_vision_account_required", message: "Z.ai guest upload forbidden" },
+    { status: 503, code: "zai_vision_auth", message: "Z.ai upload authorization failed" }
   ];
   for (const input of cases) {
     const out = t.publicProviderError(input);
@@ -132,8 +139,11 @@ test("typed provider errors are converted to gateway-owned provider-neutral publ
   });
   assert.deepEqual(t.publicProviderError(cases[3]), {
     status: 400,
-    error: { message: "Image input is not supported by the selected model.", type: "invalid_request_error", code: "unsupported_image_input" }
+    error: { message: "Image input is not available on the selected route.", type: "invalid_request_error", code: "unsupported_image_input" }
   });
+  assert.equal(t.publicProviderError(cases[4]).status, 400);
+  assert.equal(t.publicProviderError(cases[5]).status, 400);
+  assert.equal(t.publicProviderError(cases[6]).status, 503);
   assert.equal(t.publicProviderError(cases[0]).status, 503);
   assert.equal(t.publicProviderError(cases[1]).status, 503);
 });
