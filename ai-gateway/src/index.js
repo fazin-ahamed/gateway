@@ -2686,15 +2686,20 @@ async function pickAutoModel(c, payload, key) {
   return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [] };
 }
 // Three in-place attempts on the same credential, then the next key/route.
+// Host/config 503s cannot recover on retry: Chromium missing a display,
+// a model the account cannot see, a dead session, a bad transport.
 var SAME_KEY_ATTEMPTS = 3;
+var NON_RETRYABLE_KINDS = /browser_unavailable|zai_browser\b|model_unavailable|credentials|captcha|transport|tokens|zai_model\b/;
 function shouldRetrySameKey(transportAttempt, err) {
   return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
 }
 function shouldRetryHttp(transportAttempt, status, why) {
   if (transportAttempt >= SAME_KEY_ATTEMPTS - 1)
     return false;
-  const code = Number(status) || 0;
   const kind = String(why || "");
+  if (NON_RETRYABLE_KINDS.test(kind))
+    return false;
+  const code = Number(status) || 0;
   if (code === 408 || code >= 500)
     return true;
   return kind === "relay" || kind === "unknown";

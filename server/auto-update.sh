@@ -43,7 +43,17 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a git r
 start_server() {
   mkdir -p "$SERVER_DIR"
   cd "$SERVER_DIR"
-  PORT="$PORT" nohup node --env-file="$ENV_FILE" "$SERVER_JS" >>"$LOG" 2>&1 &
+  # zaiwebbrowser launches headed Chromium. On a VM with no DISPLAY, wrap
+  # Node in xvfb-run so Playwright has an X server. If DISPLAY is already
+  # set (operator-provided Xvfb), leave it.
+  CMD="node --env-file=$ENV_FILE $SERVER_JS"
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
+    CMD="xvfb-run -a -s -screen 0 1280x800x24 $CMD"
+    log "no DISPLAY; wrapping node with xvfb-run"
+  elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    log "no DISPLAY and xvfb-run missing; zaiwebbrowser will fail until Xvfb is installed"
+  fi
+  PORT="$PORT" nohup $CMD >>"$LOG" 2>&1 &
   log "started node pid=$! port=$PORT log=$LOG"
   cd "$ROOT"
 }

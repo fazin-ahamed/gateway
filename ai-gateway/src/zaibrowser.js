@@ -61,22 +61,13 @@ async function getBrowser() {
     browserPromise = (async () => {
       const { chromium } = await loadPlaywright();
       const executablePath = process.env.BROWSER_EXECUTABLE || undefined;
-      const hasDisplay = !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
-      // Headed when a display exists (chat.z.ai F001-rejects true headless).
-      // On a headless VM, headed launch dies immediately ("Target page,
-      // context or browser has been closed"); use new headless instead.
+      // Always headed. chat.z.ai F001-rejects true headless. On a VM with no
+      // physical display, auto-update.sh starts Node under xvfb-run so
+      // DISPLAY is set. Do not silently flip to headless here.
       const launch = {
-        headless: hasDisplay ? false : true,
-        args: [
-          "--mute-audio",
-          "--no-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-          "--hide-scrollbars"
-        ]
+        headless: false,
+        args: ["--window-position=4000,4000", "--mute-audio", "--no-sandbox", "--disable-dev-shm-usage"]
       };
-      if (hasDisplay)
-        launch.args.push("--window-position=4000,4000");
       if (executablePath)
         launch.executablePath = executablePath;
       const browser = await chromium.launch(launch);
@@ -214,9 +205,28 @@ export async function runBrowserTurn(token, prompt, options = {}) {
     try {
       const input = page.locator("#chat-input").first();
       await input.waitFor({ state: "visible", timeout: 30000 });
+      // FeiLin/Aliyun captcha iframes sit on top of the composer. Wait them
+      // out (or a login wall) before typing, otherwise fill succeeds and
+      // click times out on a covered send button.
+      await page.waitForFunction(() => {
+        const overlay = document.querySelector(".nc_wrapper, #aliyunCaptcha-window-embed, iframe[src*='captcha'], iframe[src*='aliyun']");
+        const login = document.querySelector("input[type='password'], button[type='submit'][class*='login']");
+        const box = document.querySelector("#chat-input");
+        return !!box && !overlay && !login;
+      }, null, { timeout: 45000 }).catch(() => {});
+      await input.click({ timeout: 10000 });
+      await input.fill("");
       await input.fill(prompt);
-      const send = page.locator('[aria-label="Send Message"] button:not([disabled])').first();
-      await send.click({ timeout: 20000 });
+      const send = page.locator("#send-message-button").first();
+      await send.waitFor({ state: "visible", timeout: 15000 });
+      await page.waitForFunction(() => {
+        const btn = document.querySelector("#send-message-button");
+        if (!btn || btn.disabled) return false;
+        const r = btn.getBoundingClientRect();
+        const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return !!top && (top === btn || btn.contains(top) || top.closest("#send-message-button"));
+      }, null, { timeout: 20000 }).catch(() => {});
+      await send.click({ timeout: 10000, force: true });
       const result = await Promise.race([
         responsePromise,
         new Promise((resolve) => setTimeout(() => resolve({ status: 0, body: "", timeout: true }), timeoutMs))
