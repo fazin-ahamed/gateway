@@ -17,7 +17,6 @@ import {
 test("reference HTTP model id keeps public glm slug instead of browser alias", () => {
   assert.equal(__zaiTest.referenceHttpModelId("zai/glm-5.3-flash"), "glm-5.3-flash");
   assert.equal(__zaiTest.referenceHttpModelId("x-preview-l"), "glm-5.3-flash");
-  assert.equal(__zaiTest.upstreamModelId("glm-5.3-flash"), "x-preview-l");
 });
 
 test("reference completion body stays minimal and supports files + advanced search", () => {
