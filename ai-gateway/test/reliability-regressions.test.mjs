@@ -289,6 +289,18 @@ test("recordRouteAttempt writes one row per attempt and moves the posterior only
   assert.equal(stat9, undefined, "deferred posterior is not observed at handoff");
 });
 
+test("updateRouterStat serializes concurrent observations without losing any", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const c = { env: { DB: db } };
+  const N = 20;
+  await Promise.all(Array.from({ length: N }, () => t.updateRouterStat(c, "route", "route:1", "", true, 100, 0.001)));
+  const row = db.prepare("SELECT success_alpha FROM router_stats WHERE scope='route' AND scope_id='route:1' AND task_type=''").all().results[0];
+  assert.ok(row.success_alpha > 8 + N - 1, "all " + N + " concurrent successes observed (no lost read-modify-write); got alpha=" + row.success_alpha);
+});
+
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
   const actions = generateActions([
     { slug: "model-a-mini", cost: 3, eligible: true, capable: true },

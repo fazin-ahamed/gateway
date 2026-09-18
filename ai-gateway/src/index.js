@@ -5,6 +5,7 @@ import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1 } from "./router/index.js";
+import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 var app = new Hono();
@@ -790,7 +791,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     let lastErrStatus = null;
     let lastRetryAfter = null;
     let attempts = 0;
-    const attemptTaskType = (autoDecision && autoDecision.horizon && autoDecision.horizon.taskIR && autoDecision.horizon.taskIR.task) || "";
+    // Label every request from the canonical Router V2 TaskIR (not just auto
+    // traffic), so explicit-model calls also train route-task statistics.
+    let attemptTaskType = "";
+    try { attemptTaskType = (compileTaskIR(payload) || {}).task || ""; } catch {}
+    let realAttemptSeq = 0;
+    let previousRealRouteId = null;
     for (const route of routes.results) {
       const liveSlug = route.public_slug || slug;
       if (payload.model !== liveSlug)
@@ -834,6 +840,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         for (let transportAttempt = 0; transportAttempt < SAME_KEY_ATTEMPTS; transportAttempt++) {
         const _attStart = Date.now();
         const _attStartIso = nowIso();
+        const _attemptIndex = ++realAttemptSeq;
+        const _fallbackFrom = (previousRealRouteId != null && previousRealRouteId !== route.id) ? previousRealRouteId : null;
+        previousRealRouteId = route.id;
         const _att = { recorded: false, success: 0, status: null, why: null, errKind: null, ttft: null, prompt: 0, completion: 0, cost: null };
         try {
           // Stable Z.AI session/browser identity must be server-controlled and
@@ -939,7 +948,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
           _att.recorded = true;
-          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: attempts, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 1, http_status: up.status, deferPosterior: true });
+          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 0, http_status: up.status, fallback_from_route_id: _fallbackFrom, deferPosterior: true });
           const horizonHdrs = { "x-gateway-model": liveSlug };
           if (autoDecision && autoDecision.horizon)
             horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
@@ -1002,7 +1011,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         } finally {
           if (!_att.recorded) {
             const cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: attempts, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost });
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (_att.why || _att.errKind || null), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom });
           }
         }
         }
@@ -1813,6 +1822,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   let clientCancelled = false;
   let buf = "";
   let streamError = null;
+  let firstTokenAt = null;
   let lastUsage = usageHint || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
   let malformedSseSent = false;
   let contentBuf = "";
@@ -1828,22 +1838,38 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
     if (extra && extra.attemptId) {
-      const ok = !streamError;
       const attLatency = Date.now() - (extra.attemptStart || started);
+      const gotOutput = !!(contentBuf || reasoningBuf || toolCallsBuf.length);
+      // Terminal outcome is three/four-way, not just !streamError. A client
+      // cancel is not a route failure and must not train the posterior; an
+      // upstream that closed without a finish_reason is flagged incomplete.
+      let outcome;
+      if (clientCancelled)
+        outcome = { success: 0, failure_class: "cancelled", observe: false };
+      else if (streamError)
+        outcome = { success: 0, failure_class: "stream_error", observe: true };
+      else if (!finishSeen)
+        outcome = { success: gotOutput ? 1 : 0, failure_class: "stream_incomplete", observe: true };
+      else
+        outcome = { success: 1, failure_class: "success", observe: true };
+      const hi = outcome.observe ? 1 : 0;
+      const ttft = firstTokenAt ? (firstTokenAt - (extra.attemptStart || started)) : null;
       try {
-        await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(ok ? 1 : 0, ok ? "success" : "stream_error", attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
+        await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, health_impact=?, ttft_ms=COALESCE(?, ttft_ms), latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(outcome.success, outcome.failure_class, hi, ttft, attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
       } catch (e) {
         blog("route_attempt stream patch failed: " + String(e.message || e));
       }
-      // Posterior was deferred at handoff; observe the real terminal outcome
-      // now (a mid-stream failure is an operational failure, not a win).
-      try {
-        const scopeId = "route:" + (route.id ?? "?");
-        await updateRouterStat(c, "route", scopeId, "", ok, attLatency, costUsd);
-        if (extra.attemptTaskType)
-          await updateRouterStat(c, "route_task", scopeId, extra.attemptTaskType, ok, attLatency, costUsd);
-      } catch (e) {
-        blog("route_attempt stream posterior failed: " + String(e.message || e));
+      // Posterior deferred at handoff; observe the real terminal outcome once,
+      // and never for a client cancel.
+      if (outcome.observe) {
+        try {
+          const scopeId = "route:" + (route.id ?? "?");
+          await updateRouterStat(c, "route", scopeId, "", outcome.success === 1, attLatency, costUsd);
+          if (extra.attemptTaskType)
+            await updateRouterStat(c, "route_task", scopeId, extra.attemptTaskType, outcome.success === 1, attLatency, costUsd);
+        } catch (e) {
+          blog("route_attempt stream posterior failed: " + String(e.message || e));
+        }
       }
     }
     if (extra && extra.traj) {
@@ -1931,6 +1957,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             }
             const dc = choices && choices[0] && choices[0].delta;
             if (dc) {
+              if (firstTokenAt === null && (typeof dc.content === "string" || typeof (dc.reasoning_content ?? dc.reasoning ?? dc.thinking) === "string" || Array.isArray(dc.tool_calls)))
+                firstTokenAt = Date.now();
               if (typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
                 contentBuf += dc.content;
               const rc = dc.reasoning_content ?? dc.reasoning ?? dc.thinking;
@@ -2011,6 +2039,9 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     },
     cancel(reason) {
       clientCancelled = true;
+      // Stop the upstream generation so we do not keep paying for tokens the
+      // client abandoned.
+      try { reader.cancel(reason); } catch {}
       blog("Stream client cancelled id=" + requestId + " reason=" + String(reason || "unknown").slice(0, 160));
     }
   });
@@ -3072,24 +3103,37 @@ function classifyAttempt(status, why, errKind) {
     return op("upstream_5xx");
   return op("upstream_5xx");
 }
+var routerStatLocks = new Map();
+function withRouterStatLock(lockKey, fn) {
+  const prev = routerStatLocks.get(lockKey) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  routerStatLocks.set(lockKey, next.then(() => {}, () => {}));
+  return next;
+}
 // Persisted Beta(alpha,beta) posterior per scope, updated only by operational
-// outcomes. Time-decayed via the same observe() the shadow router uses.
+// outcomes. Time-decayed via the same observe() the shadow router uses. The
+// read-modify-write is serialized per (scope|scope_id|task_type) so concurrent
+// requests cannot lose an observation. router_stats is a derived cache;
+// route_attempts is the immutable source of truth if a rebuild is ever needed.
 async function updateRouterStat(c, scope, scopeId, taskType, success, latencyMs, costUsd) {
-  try {
-    const row = await c.env.DB.prepare("SELECT success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope=? AND scope_id=? AND task_type=?").bind(scope, scopeId, taskType || "").first();
-    const seed = seedBeta("route");
-    const prev = row
-      ? { alpha: Number(row.success_alpha) || seed.alpha, beta: Number(row.failure_beta) || seed.beta, updatedAt: Date.parse(row.updated_at) || Date.now(), kind: "route" }
-      : { ...seed, updatedAt: Date.now(), kind: "route" };
-    const next = betaObserve(prev, !!success);
-    const lat = Number(latencyMs);
-    const cost = Number(costUsd);
-    const emaL = row && row.latency_ema != null && Number.isFinite(lat) ? 0.8 * Number(row.latency_ema) + 0.2 * lat : (Number.isFinite(lat) ? lat : (row ? row.latency_ema : null));
-    const emaC = row && row.cost_ema != null && Number.isFinite(cost) ? 0.8 * Number(row.cost_ema) + 0.2 * cost : (Number.isFinite(cost) ? cost : (row ? row.cost_ema : null));
-    await c.env.DB.prepare("INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(scope, scope_id, task_type) DO UPDATE SET success_alpha=excluded.success_alpha, failure_beta=excluded.failure_beta, latency_ema=excluded.latency_ema, cost_ema=excluded.cost_ema, updated_at=excluded.updated_at").bind(scope, scopeId, taskType || "", next.alpha, next.beta, emaL == null ? null : emaL, emaC == null ? null : emaC, nowIso()).run();
-  } catch (e) {
-    blog("router_stats update failed: " + String(e.message || e));
-  }
+  const tt = taskType || "";
+  return withRouterStatLock(scope + "|" + scopeId + "|" + tt, async () => {
+    try {
+      const row = await c.env.DB.prepare("SELECT success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope=? AND scope_id=? AND task_type=?").bind(scope, scopeId, tt).first();
+      const seed = seedBeta("route");
+      const prev = row
+        ? { alpha: Number(row.success_alpha) || seed.alpha, beta: Number(row.failure_beta) || seed.beta, updatedAt: Date.parse(row.updated_at) || Date.now(), kind: "route" }
+        : { ...seed, updatedAt: Date.now(), kind: "route" };
+      const next = betaObserve(prev, !!success);
+      const lat = Number(latencyMs);
+      const cost = Number(costUsd);
+      const emaL = row && row.latency_ema != null && Number.isFinite(lat) ? 0.8 * Number(row.latency_ema) + 0.2 * lat : (Number.isFinite(lat) ? lat : (row ? row.latency_ema : null));
+      const emaC = row && row.cost_ema != null && Number.isFinite(cost) ? 0.8 * Number(row.cost_ema) + 0.2 * cost : (Number.isFinite(cost) ? cost : (row ? row.cost_ema : null));
+      await c.env.DB.prepare("INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(scope, scope_id, task_type) DO UPDATE SET success_alpha=excluded.success_alpha, failure_beta=excluded.failure_beta, latency_ema=excluded.latency_ema, cost_ema=excluded.cost_ema, updated_at=excluded.updated_at").bind(scope, scopeId, tt, next.alpha, next.beta, emaL == null ? null : emaL, emaC == null ? null : emaC, nowIso()).run();
+    } catch (e) {
+      blog("router_stats update failed: " + String(e.message || e));
+    }
+  });
 }
 // One row per real upstream attempt. Body-free. Returns the row id (for a
 // later streaming metric patch) or null. Updates the route posterior only for

@@ -280,7 +280,7 @@ CREATE TABLE IF NOT EXISTS route_attempts (
   started_at TEXT NOT NULL,
   finished_at TEXT,
   success INTEGER NOT NULL DEFAULT 0,
-  health_impact INTEGER NOT NULL DEFAULT 1,
+  health_impact INTEGER NOT NULL DEFAULT 0,
   http_status INTEGER,
   failure_class TEXT,
   failure_code TEXT,
