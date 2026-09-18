@@ -411,7 +411,8 @@ function buildCompletionUrl(input) {
 // creation payload: the proven HTTP completion uses the public model id,
 // a client-generated chat UUID, and a deliberately minimal body.
 function referenceHttpModelId(modelId) {
-  return capabilityModelId(modelId);
+  const id = unprefixedModelId(modelId);
+  return id.toLowerCase() === "x-preview-l" ? "glm-5.3-flash" : id;
 }
 
 function buildReferenceCompletionUrl(input) {
