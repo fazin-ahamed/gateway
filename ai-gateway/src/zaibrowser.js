@@ -224,7 +224,7 @@ async function ensurePage(pool) {
   }
   if (pool.page && !pool.page.isClosed()) {
     try {
-      const input = await firstVisible(pool.page, COMPOSER_SELS, 1500);
+      const input = await firstVisible(pool.page, COMPOSER_SELS, 2000);
       if (input) {
         await startNewChat(pool.page);
         return pool.page;
@@ -235,23 +235,31 @@ async function ensurePage(pool) {
     pool.page = null;
   }
   const page = await pool.context.newPage();
-  try {
-    await page.goto(ZAI_BASE_URL + "/", { waitUntil: "domcontentloaded", timeout: 60000 });
-  } catch (e) {
-    const msg = String(e && e.message || e);
-    const where = await pageDump(page).catch(() => "");
-    if (/timeout/i.test(msg)) {
-      throw new ZaiBrowserUnavailable(
-        "chat.z.ai never returned DOM content (CDN/Hyperlane block, stuck challenge, or network). " + where
-      );
+  // On cold start, chat.z.ai CDN / TLS negotiation or SPA hydration occasionally
+  // stalls before domcontentloaded or networkidle. Retry once in-place with 'load'
+  // and commit-level navigation so first requests don't fail immediately.
+  let loaded = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await page.goto(ZAI_BASE_URL + "/", { waitUntil: "commit", timeout: 25000 });
+      await page.waitForLoadState("domcontentloaded", { timeout: 35000 }).catch(() => {});
+      // Wait for any composer selector or main app container to mount
+      const ready = await firstVisible(page, [...COMPOSER_SELS, "main", "#app", "#root"], 15000);
+      if (ready) {
+        loaded = true;
+        break;
+      }
+    } catch (e) {
+      if (attempt === 1) {
+        const where = await pageDump(page).catch(() => "");
+        throw new ZaiBrowserUnavailable("chat.z.ai initial navigation stalled. " + where);
+      }
+      await page.waitForTimeout(1000);
     }
-    throw e;
   }
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   pool.page = page;
   return page;
 }
-
 function armIdleClose(pool, key) {
   if (pool.idleTimer)
     clearTimeout(pool.idleTimer);

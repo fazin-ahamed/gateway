@@ -2693,7 +2693,8 @@ async function pickAutoModel(c, payload, key) {
 // Host/config 503s cannot recover on retry: Chromium missing a display,
 // a model the account cannot see, a dead session, a bad transport.
 var SAME_KEY_ATTEMPTS = 3;
-var NON_RETRYABLE_KINDS = /browser_unavailable|zai_browser\b|model_unavailable|credentials|captcha|transport|tokens|zai_model\b/;
+// Fatal config errors shouldn't retry, but transient zai_browser page load hiccups can self-heal on retry.
+var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|zai_model\b/;
 function shouldRetrySameKey(transportAttempt, err) {
   return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
 }
@@ -2706,7 +2707,7 @@ function shouldRetryHttp(transportAttempt, status, why) {
   const code = Number(status) || 0;
   if (code === 408 || code >= 500)
     return true;
-  return kind === "relay" || kind === "unknown";
+  return kind === "relay" || kind === "unknown" || kind === "zai_browser";
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
