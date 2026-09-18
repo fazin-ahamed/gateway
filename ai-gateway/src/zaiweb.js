@@ -209,6 +209,11 @@ function userIdFromToken(token) {
   }
 }
 
+function browserPoolIdForToken(token) {
+  const userId = userIdFromToken(token);
+  return userId ? "uid:" + userId : "";
+}
+
 function textContent(content) {
   if (typeof content === "string")
     return content;
@@ -1194,7 +1199,12 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
     : await import("./zaibrowser.js");
   let turn;
   try {
-    turn = await runBrowserTurn(token, prompt, { turnTimeoutMs: Number(payload.turn_timeout_ms) || 0 });
+    turn = await runBrowserTurn(token, prompt, {
+      turnTimeoutMs: Number(payload.turn_timeout_ms) || 0,
+      // chat.z.ai rotates the JWT after successful turns. Pooling by the raw
+      // token makes every next request cold-start a new browser context.
+      poolId: browserPoolIdForToken(token)
+    });
   } catch (e) {
     if (e instanceof ZaiBrowserUnavailable)
       throw new ZaiWebError(e.status || 503, e.message, e.code || "zai_browser_unavailable");
@@ -1285,7 +1295,8 @@ export const __zaiTest = {
   parseCredential,
   captureFromHeaders,
   isWafChallenge,
-  wrapUtlsFetcher
+  wrapUtlsFetcher,
+  browserPoolIdForToken
 };
 
 export const __test = { toOpenAiStream };
