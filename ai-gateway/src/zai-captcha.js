@@ -1,21 +1,18 @@
-// Programmatic CAPTCHA minting for chat.z.ai — experimental minted transport support.
+// Programmatic CAPTCHA minting for chat.z.ai.
+//
+// The wire primitives are adapted from GLM-Free-API (MIT; see
+// THIRD_PARTY_NOTICES.md), with the gateway's live-verified RPC encoding and
+// explicit operator-supplied Aliyun credentials retained.
 //
 // Status (measured against live Aliyun + chat.z.ai):
-//   ✓ Aliyun InitCaptchaV3 works (standard RPC signing; the published
-//     reference's percent-everything encoder is rejected with
-//     "Specified signature is not matched", so this file uses standard
-//     encoding and gets a CertifyId back).
+//   ✓ Aliyun InitCaptchaV3 works with the same RFC3986-style RPC signing
+//     used by the reference implementation.
 //   ✓ The payload primitives are byte-identical to the published Go reference:
 //     generateArg, the tracking JSON, and aliHash all match exactly.
-//   ✗ VerifyCaptchaV3 answers VerifyCode F001 / VerifyResult=false for every
-//     device token harvested from the page, so no usable proof comes out.
-//     The same tokens fail the same way through the reference's own Go
-//     tryCompute (verified by running their code), which means the gap is the
-//     device-token provenance, not this port.
-//
-// The `zaiminted` transport imports this module dynamically. It remains
-// experimental because device-token provenance can still make Aliyun reject
-// otherwise correctly shaped proofs.
+//   ✓ Stealth-harvested device tokens can produce VerifyCode T001 and a real
+//     securityToken.
+//   ✓ The pure-HTTP transport now uses the reference completion lifecycle;
+//     browser automation is a fallback rather than the primary serving path.
 //
 // Background: chat.z.ai gates completions behind an Aliyun "FeiLin" captcha.
 // The proof is a base64 blob carrying a security token, minted by
@@ -37,6 +34,10 @@ const CAPTCHA_SECRET_KEY = process.env.ZAI_CAPTCHA_SECRET_KEY || "";
 const CAPTCHA_SCENE_ID = process.env.ZAI_CAPTCHA_SCENE_ID || "didk33e0";
 const CAPTCHA_INIT_URL = "https://no8xfe.captcha-open-southeast.aliyuncs.com/";
 const CAPTCHA_VERIFY_URL = "https://no8xfe-verify.captcha-open-southeast.aliyuncs.com/";
+
+export function zaiCaptchaConfigured() {
+  return !!(CAPTCHA_ACCESS_KEY && CAPTCHA_SECRET_KEY);
+}
 
 // ---------- RC4-like stream generator ----------
 // Two different keys drive the same table walk: one for the tracking payload
@@ -154,9 +155,8 @@ export function buildTrackPayload(certifyId, startTime) {
 }
 
 // ---------- Aliyun RPC ----------
-// Standard Aliyun percent-encoding (unreserved characters stay literal). The
-// published reference percent-encodes every byte, which the live endpoint
-// rejects with "Specified signature is not matched".
+// Same RFC3986-style Aliyun encoding as GLM-Free-API: alnum and -_.~ stay
+// literal; all other bytes are percent-encoded before canonical signing.
 function pct(value) {
   return encodeURIComponent(String(value)).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
@@ -202,6 +202,8 @@ async function aliyun(url, params, fetchImpl) {
  */
 export async function mintCaptcha(deviceToken, options = {}) {
   const fetchImpl = options.fetchImpl;
+  if (!zaiCaptchaConfigured())
+    return { ok: false, reason: "captcha-config", detail: "Aliyun captcha credentials are not configured" };
   if (!deviceToken)
     return { ok: false, reason: "no-device-token" };
   const init = await aliyun(CAPTCHA_INIT_URL, {
@@ -236,4 +238,4 @@ export async function mintCaptcha(deviceToken, options = {}) {
   return { ok: true, param: payload };
 }
 
-export const __captchaTest = { rc4Like, aliHash, generateArg, encryptPayload, buildTrackPayload, rpcBody, PERM_TABLE, ARG_KEY, PAYLOAD_KEY, CAPTCHA_SCENE_ID };
+export const __captchaTest = { rc4Like, aliHash, generateArg, encryptPayload, buildTrackPayload, rpcBody, PERM_TABLE, ARG_KEY, PAYLOAD_KEY, CAPTCHA_SCENE_ID, zaiCaptchaConfigured };

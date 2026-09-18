@@ -1,28 +1,29 @@
 // Z.ai consumer chat (chat.z.ai) provider adapter.
 //
-// An OpenAI-compatible front for Z.ai's web chat. Session state (cookies,
-// guest/account token, frontend version) lives in the Node-native
-// ZaiSession, so the signed path no longer depends on a hand-pasted JWT and
-// a browser-issued CAPTCHA proof is the only per-request input.
-//
-// Wire shape ported from OmniRoute (open-sse/executors/zai-web) so both
-// gateways speak the identical protocol.
+// OpenAI-compatible front for Z.ai's consumer web chat. The canonical HTTP
+// lifecycle is adapted from GLM-Free-API (MIT, see THIRD_PARTY_NOTICES.md):
+// live session/model state -> optional file upload -> local throwaway chat UUID
+// -> fresh CAPTCHA proof -> one signed completion POST -> SSE normalization ->
+// best-effort chat deletion. Gateway-specific routing, WAF isolation, tool
+// repair, key state and public error handling remain layered around it.
 
 import { sessionFor } from "./zai-session.js";
 import { registryFor } from "./zai-models.js";
 import { createZaiFrameNormalizer } from "./zai-stream.js";
 import { isZaiWafBlock, zaiWaf, ZaiWafBlockedError } from "./zai-waf.js";
 import { applyAgentShim, parseAgentToolCalls, stripAgentToolCalls, AgentStreamInterceptor } from "./zai-agent.js";
+import { acquireZaiChatId, releaseZaiChatId } from "./zai-session-pool.js";
+import { getZaiCaptchaProof } from "./zai-captcha-cache.js";
+import { attachZaiImageParts, processZaiVisionMessages } from "./zai-vision.js";
 
 const ZAI_BASE_URL = "https://chat.z.ai";
-const ZAI_NEW_CHAT_URL = ZAI_BASE_URL + "/api/v1/chats/new";
 const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
 const ZAI_SETTINGS_URL = ZAI_BASE_URL + "/api/v1/users/user/settings";
 const ZAI_DELETE_CHAT_URL = (chatId) => ZAI_BASE_URL + "/api/v1/chats/" + encodeURIComponent(chatId);
 const ZAI_DEFAULT_MODEL = "glm-5.3";
-const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.92";
+const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.93";
 const ZAI_FE_VERSION_CACHE_MS = 15 * 60 * 1000;
-const ZAI_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+const ZAI_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 const CLIENT_PROTOCOL_VERSION = "0.0.1";
 const SIGNATURE_KEY = "key-@@@@)))()((9))-xxxx&&&%%%%%";
 
@@ -38,10 +39,10 @@ const IMAGE_TOKEN_ALLOWANCE = 500;
 // input. `context` is the measured chat.z.ai transport window (not the
 // theoretical 1M GLM-5.3 paper context). `output` is the completion clamp.
 const ZAI_MODELS = {
-  // vision=false until we actually upload image bytes; "[image: URL]" text is
-  // not multimodal input. Advertising it would make the router send images
-  // the model never sees.
-  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: false, context: 98304, output: 16384 },
+  // GLM-Free-API's proven web flow uploads image bytes to /api/v1/files/
+  // and attaches the returned file objects. The flash route is therefore
+  // genuinely multimodal now instead of forwarding image URLs as text.
+  "glm-5.3-flash": { name: "GLM-5.3-Flash", thinking: true, vision: true, context: 98304, output: 16384 },
   "glm-5.3": { name: "GLM-5.3", thinking: true, vision: false, context: 98304, output: 16384 },
   "glm-5.2": { name: "GLM-5.2", thinking: true, vision: false, context: 98304, output: 16384 }
 };
@@ -53,12 +54,6 @@ function unprefixedModelId(modelId) {
 function capabilityModelId(modelId) {
   const id = unprefixedModelId(modelId).toLowerCase();
   return id === "x-preview-l" ? "glm-5.3-flash" : id;
-}
-
-// Public slug → the opaque id chat.z.ai expects on the wire.
-function upstreamModelId(modelId) {
-  const id = unprefixedModelId(modelId);
-  return id.toLowerCase() === "glm-5.3-flash" ? "x-preview-l" : id;
 }
 
 function getModelCapabilities(modelId) {
@@ -75,7 +70,9 @@ export function modelCatalogEntry(modelId) {
   return {
     id: "zai-web/" + id,
     reasoning: caps.thinking,
-    toolCall: false,
+    // Caller tools are supported through the gateway's agent shim + repair
+    // layer even though chat.z.ai itself does not expose native OpenAI tools.
+    toolCall: true,
     attachment: caps.vision,
     modalities: { input: caps.vision ? ["text", "image"] : ["text"], output: ["text"] },
     limit: { context: caps.context, output: caps.output }
@@ -182,21 +179,6 @@ async function buildSignature(input) {
   return hmacSha256(derivedKey, sortedPayload + "|" + encodedPrompt + "|" + timestamp);
 }
 
-// The site hands back a refreshed session token as a cookie on chat creation;
-// picking it up keeps a long-lived route alive without a manual re-paste.
-function rotatedToken(headers) {
-  if (!headers || typeof headers.get !== "function")
-    return "";
-  const cookie = headers.get("set-cookie");
-  if (!cookie)
-    return "";
-  const match = cookie.match(/(?:^|[;\s])token=([^;,\s]+)/);
-  if (!match)
-    return "";
-  const value = extractToken(match[1]);
-  return value && value.split(".").length === 3 ? value : "";
-}
-
 function userIdFromToken(token) {
   const payload = String(token).split(".")[1];
   if (!payload)
@@ -229,20 +211,24 @@ function textContent(content) {
         parts.push(text);
       continue;
     }
-    // chat.z.ai's signed API takes no inline image parts; keep the URL so the
-    // model at least sees that an image was referenced instead of silently
-    // losing it.
+    // Before the vision upload pass this preserves image references for
+    // prompt accounting/fallback text. The pure-HTTP vision path later
+    // rewrites image_url values to real uploaded Z.AI file ids.
     if (part.type === "image_url" && part.image_url && typeof part.image_url.url === "string")
       parts.push("[image: " + part.image_url.url.slice(0, 2048) + "]");
   }
   return parts.join("\n");
 }
 
-function latestUserPrompt(messages) {
-  for (let i = messages.length - 1; i >= 0; i--)
-    if (messages[i] && messages[i].role === "user")
-      return textContent(messages[i].content);
-  return "";
+// GLM-Free-API signs the concatenation of all message text, not only the
+// newest user turn. This matters because signature_prompt must match the
+// exact conversation payload the completion carries.
+function referencePrompt(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .map((m) => textContent(m && m.content))
+    .filter((x) => x !== "")
+    .join("\n\n")
+    .trim();
 }
 
 // chat.z.ai only accepts role=user. When the caller sent OpenAI tools, fold
@@ -251,12 +237,8 @@ function latestUserPrompt(messages) {
 function prepareZaiTurn(payload) {
   const shim = applyAgentShim(payload);
   const messages = Array.isArray(shim.payload.messages) ? shim.payload.messages : [];
-  const prompt = shim.active ? shim.prompt : latestUserPrompt(messages);
+  const prompt = shim.active ? shim.prompt : referencePrompt(messages);
   return { shim, messages, prompt };
-}
-
-function foldMessages(messages) {
-  return (messages || []).map((m) => ({ role: m && m.role || "user", content: textContent(m && m.content) }));
 }
 
 function countImages(messages) {
@@ -287,53 +269,54 @@ function estimatePromptTokens(messages, toolsChars) {
 // data only advertises buckets the account actually has; sending an
 // unsupported value can corrupt the response. Keep to high/max for now;
 // more granular levels require live capability discovery.
-function resolveThinking(modelId, payload) {
+function resolveThinking(modelId, payload, liveEntry = null) {
   const caps = getModelCapabilities(modelId);
-  if (!caps || !caps.thinking)
+  const supportsThinking = liveEntry ? liveEntry.reasoning !== false : !!(caps && caps.thinking);
+  if (!supportsThinking)
     return { enabled: false, effort: "high", effortSupported: false };
+
   const reasoning = payload && payload.reasoning;
+  const thinking = payload && payload.thinking;
+  if (reasoning === false || thinking && thinking.type === "disabled")
+    return { enabled: false, effort: "high", effortSupported: true };
+
   const raw = typeof payload?.reasoning_effort === "string"
     ? payload.reasoning_effort.trim().toLowerCase()
     : typeof reasoning?.effort === "string"
       ? reasoning.effort.trim().toLowerCase()
       : "";
-  let effort;
-  if (raw === "max" || raw === "xhigh")
-    effort = "max";
-  else
-    effort = "high";
+  const effort = raw === "max" || raw === "xhigh" ? "max" : "high";
   return { enabled: true, effort, effortSupported: true };
 }
 
 // Web search / tools switches shown in the site UI. Defaults off: the gateway
 // never silently upgrades a request into a search or agent turn.
-function resolveFeatures(payload) {
+function resolveFeatures(payload, agentMode = false) {
   const opt = (key) => payload && (payload[key] !== undefined ? payload[key] : payload.features?.[key]);
-  const webSearch = opt("web_search") ?? opt("auto_web_search");
-  return { toolsEnabled: opt("vlm_tools_enable") === true, webSearchEnabled: webSearch === true };
-}
-
-function buildHeaders(token, options) {
-  const headers = {
-    "Content-Type": "application/json",
-    Accept: options.accept,
-    "Accept-Language": "en-US",
-    "User-Agent": ZAI_USER_AGENT,
-    Origin: ZAI_BASE_URL,
-    Referer: ZAI_BASE_URL + "/",
-    Authorization: "Bearer " + token
+  const webSearch = opt("web_search") ?? opt("auto_web_search") ?? opt("webSearch") ?? opt("search");
+  const advancedSearch = opt("advancedSearch") ?? opt("advanced_search");
+  // Z.AI's own search/MCP tools and caller-provided agent tools share the
+  // model's action channel; the reference disables internal search in agent
+  // mode to prevent marker/tool conflicts.
+  if (agentMode)
+    return { toolsEnabled: false, webSearchEnabled: false, advancedSearchEnabled: false };
+  return {
+    toolsEnabled: opt("vlm_tools_enable") === true,
+    webSearchEnabled: webSearch === true || advancedSearch === true,
+    advancedSearchEnabled: advancedSearch === true
   };
-  if (options.frontendVersion)
-    headers["X-FE-Version"] = options.frontendVersion;
-  if (options.signature)
-    headers["X-Signature"] = options.signature;
-  return headers;
 }
 
-// The completion URL carries the client telemetry chat.z.ai expects. Static
-// screen/timezone values are intentional: they are part of the signed shape.
-function buildCompletionUrl(input) {
-  const now = new Date(input.timestamp);
+// Reference pure-HTTP wire shape from GLM-Free-API. Keep this separate from
+// the browser's opaque x-preview-l model selector and from the legacy chat
+// creation payload: the proven HTTP completion uses the public model id,
+// a client-generated chat UUID, and a deliberately minimal body.
+function referenceHttpModelId(modelId) {
+  const id = unprefixedModelId(modelId);
+  return id.toLowerCase() === "x-preview-l" ? "glm-5.3-flash" : id;
+}
+
+function buildReferenceCompletionUrl(input) {
   const params = new URLSearchParams({
     timestamp: String(input.timestamp),
     requestId: input.requestId,
@@ -341,107 +324,46 @@ function buildCompletionUrl(input) {
     version: CLIENT_PROTOCOL_VERSION,
     platform: "web",
     token: input.token,
-    user_agent: ZAI_USER_AGENT,
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
     language: "en-US",
-    languages: "en-US,en",
-    timezone: "UTC",
-    cookie_enabled: "true",
-    screen_width: "1280",
-    screen_height: "800",
-    screen_resolution: "1280x800",
-    viewport_height: "800",
-    viewport_width: "1280",
-    viewport_size: "1280x800",
-    color_depth: "24",
-    pixel_ratio: "1",
-    current_url: ZAI_BASE_URL + "/",
-    pathname: "/",
-    search: "",
-    hash: "",
-    host: "chat.z.ai",
-    hostname: "chat.z.ai",
-    protocol: "https:",
-    referrer: "",
-    title: "Z.ai - Advanced AI Chatbot & Agent powered by GLM-5.3",
-    timezone_offset: "0",
-    local_time: now.toISOString(),
-    utc_time: now.toUTCString(),
-    is_mobile: "false",
-    is_touch: "false",
-    max_touch_points: "0",
-    browser_name: "Chrome",
-    os_name: "Mac OS",
+    screen_resolution: "1920x1080",
+    viewport_size: "1920x1080",
+    timezone: "Europe/Paris",
+    timezone_offset: "-60",
     signature_timestamp: String(input.timestamp)
   });
   return ZAI_CHAT_URL + "?" + params.toString();
 }
 
-function buildNewChatBody(input) {
-  const { userMessageId } = input;
-  const model = upstreamModelId(input.modelId);
-  const body = {
-    chat: {
-      id: "",
-      title: "New Chat",
-      models: [model],
-      params: {},
-      history: { messages: { [userMessageId]: { id: userMessageId, parentId: null, childrenIds: [], role: "user", content: input.prompt, timestamp: Math.floor(Date.now() / 1000), models: [model] } }, currentId: userMessageId },
-      tags: [],
-      flags: [],
-      // chat.z.ai accepts features:[] for both guest and signed-in accounts; the
-      // tool-selector placeholder the web client sends is rejected on stricter
-      // accounts and surfaced as an upstream outage, so omit it.
-      features: [],
-      mcp_servers: [],
-      enable_thinking: input.enableThinking,
-      reasoning_effort: input.reasoningEffort,
-      auto_web_search: input.features.webSearchEnabled,
-      message_version: 1,
-      extra: { vlm_tools_enable: input.features.toolsEnabled, vlm_web_search_enable: false, vlm_website_mode: false },
-      timestamp: Date.now(),
-      type: "default"
-    }
+function buildReferenceFeatures({ thinking, features }) {
+  const out = {
+    enable_thinking: !!thinking.enabled,
+    flags: [],
+    image_generation: false,
+    web_search: false
   };
-  return { userMessageId, payload: { chat: body.chat } };
+  if (features.webSearchEnabled)
+    out.auto_web_search = true;
+  if (thinking.enabled && thinking.effortSupported)
+    out.reasoning_effort = thinking.effort;
+  return out;
 }
 
-function buildCompletionBody(input) {
-  const params = {};
-  for (const key of ["temperature", "top_p", "max_tokens", "stop"])
-    if (input.body && input.body[key] !== undefined)
-      params[key] = input.body[key];
-  const caps = getModelCapabilities(input.modelId);
-  if (params.max_tokens !== undefined && caps)
-    params.max_tokens = Math.min(Number(params.max_tokens) || 0, caps.output);
-  const features = {
-    image_generation: false,
-    web_search: false,
-    auto_web_search: input.features.webSearchEnabled,
-    preview_mode: true,
-    flags: [],
-    vlm_tools_enable: input.features.toolsEnabled,
-    vlm_web_search_enable: false,
-    vlm_website_mode: false,
-    enable_thinking: input.enableThinking
-  };
-  if (input.enableThinking && input.effortSupported)
-    features.reasoning_effort = input.reasoningEffort;
-  return {
-    stream: true,
-    model: upstreamModelId(input.modelId),
-    messages: foldMessages(input.messages),
-    signature_prompt: input.prompt,
-    params,
-    extra: { vlm_tools_enable: input.features.toolsEnabled, vlm_web_search_enable: false, vlm_website_mode: false },
-    features,
-    variables: {},
+function buildReferenceCompletionBody(input) {
+  const body = {
+    model: referenceHttpModelId(input.modelId),
     chat_id: input.chatId,
-    id: input.requestId,
-    current_user_message_id: input.userMessageId,
-    current_user_message_parent_id: null,
-    background_tasks: { title_generation: true, tags_generation: true },
-    captcha_verify_param: input.captchaVerifyParam
+    messages: input.messages,
+    signature_prompt: input.prompt,
+    stream: true,
+    captcha_verify_param: input.captchaVerifyParam,
+    features: buildReferenceFeatures({ thinking: input.thinking, features: input.features })
   };
+  if (input.files && input.files.length)
+    body.files = input.files;
+  if (input.features.advancedSearchEnabled)
+    body.mcp_servers = ["advanced-search"];
+  return body;
 }
 
 // chat.z.ai streams SSE in the same frames whether or not the client asked
@@ -735,35 +657,38 @@ export function wrapUtlsFetcher(fetcher) {
     });
   };
 }
-// JSON body, matching the { response, usage } contract of forwardToProvider.
-export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl) {
-  const fetcher = wrapUtlsFetcher(fetchImpl || c.upstreamFetch);
+// Pure-HTTP Z.AI engine, based on GLM-Free-API's proven serving flow.
+//
+// Crucial invariants:
+// - chat ids are client-generated UUIDs; no /api/v1/chats/new round-trip;
+// - CAPTCHA is minted immediately before the one completion POST;
+// - the HTTP wire uses the public model id (glm-5.3-flash), not the browser
+//   selector alias x-preview-l;
+// - request body stays minimal and matches the official web completion shape;
+// - every referenced chat is deleted after the response drains.
+async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options = {}) {
+  const baseFetcher = options.fetchImpl || (c && c.upstreamFetch) || globalThis.fetch;
+  const fetcher = wrapUtlsFetcher(baseFetcher);
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
-  const caps = getModelCapabilities(modelId);
-  if (!caps)
-    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  const images = countImages(payload.messages);
-  if (images)
-    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
+  const staticCaps = getModelCapabilities(modelId);
 
-  const { token: credentialToken, captcha } = parseCredential(rawKey, payload, c && c.req && typeof c.req.header === "function" ? {
-    get: (name) => c.req.header(name)
-  } : null);
-  if (!captcha)
-    throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion. Pass it as the x-zai-captcha request header (or providerSpecificData), or store one in the provider key. It is issued per completion, so the stored value only works once.", "zai_captcha");
+  const headerView = c && c.req && typeof c.req.header === "function"
+    ? { get: (name) => c.req.header(name) }
+    : null;
+  const parsed = parseCredential(rawKey, payload, headerView);
+  const credentialToken = parsed.token;
 
-  const prepared = prepareZaiTurn(payload);
-  const messages = prepared.messages;
-  const prompt = prepared.prompt;
-  if (!prompt && !images)
-    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
-
-  // Account token when the operator supplied one; guest session otherwise.
   const session = sessionFor({ fetcher, credential: credentialToken, key: route.zai_session_key });
   const registry = registryFor({ session, fetcher, fallback: (id) => modelCatalogEntry(id) });
   const entry = await registry.resolve(modelId);
+  if (!entry && !staticCaps)
+    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not available in the live model catalog.', "zai_model");
   if (entry && entry.available === false)
     throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
+
+  // Reference flow rejects early during an IP/WAF block, before image uploads
+  // and before burning a single-use device token.
+  assertWafAvailable();
 
   const active = await session.acquire();
   let token = active.token;
@@ -773,155 +698,249 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
   if (!session.feVersion)
     session.feVersion = await resolveFrontendVersion(fetcher);
 
-  const thinking = resolveThinking(modelId, payload);
-  const features = resolveFeatures(payload);
-  const userMessageId = crypto.randomUUID();
+  const imageCount = countImages(payload.messages);
+  const canVision = !!(entry && entry.attachment) || !!(staticCaps && staticCaps.vision);
+  if (imageCount && !canVision)
+    throw new ZaiWebError(400, 'Z.ai model "' + unprefixedModelId(modelId) + '" does not advertise image input.', "zai_vision_unsupported");
 
-  // 1. Create the remote chat the completion is attached to.
-  await awaitWafSlot();
-  let created;
-  try {
-    created = await fetcher(ZAI_NEW_CHAT_URL, {
-      method: "POST",
-      headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" }),
-      body: JSON.stringify(buildNewChatBody({
-        messages,
-        modelId,
-        prompt,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        features
-      }).payload)
-    });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  session.noteResponse(created.headers);
-  if (!created.ok) {
-    const text = String(await created.text().catch(() => "")).slice(0, 300);
-    const viaBrowser = await fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, created.status, text);
-    if (viaBrowser)
-      return viaBrowser;
-    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + text, "zai_chat_create");
-  }
-  const createdJson = await created.json().catch(() => null);
-  const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
-  if (!chatId)
-    throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
-
-  // 2. Signed completion. A 401 means the session aged out mid-flight: refresh
-  //    once and replay, rather than surfacing an auth error the operator
-  //    cannot act on.
-  const postCompletion = async (useToken, useUserId) => {
-    await awaitWafSlot();
-    const timestamp = Date.now();
-    const requestId = crypto.randomUUID();
-    const signature = await buildSignature({ prompt, requestId, timestamp, userId: useUserId });
-    const completionUrl = buildCompletionUrl({ requestId, timestamp, token: useToken, userId: useUserId });
-    return fetcher(completionUrl, {
-      method: "POST",
-      headers: session.headers({ Accept: "text/event-stream", "Content-Type": "application/json", "X-Signature": signature }),
-      body: JSON.stringify(buildCompletionBody({
-        body: payload,
-        captchaVerifyParam: captcha,
-        chatId,
-        messages,
-        modelId,
-        prompt,
-        requestId,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        effortSupported: thinking.effortSupported,
-        features
-      }))
-    });
+  // Pace Z.AI uploads through the same global lane, while arbitrary public
+  // image downloads only use the vision module's SSRF guard/timeouts.
+  const visionFetch = async (url, init) => {
+    let host = "";
+    try { host = new URL(String(url)).hostname; } catch {}
+    if (host === "chat.z.ai")
+      await awaitWafSlot();
+    return fetcher(url, init);
   };
 
-  let up;
+  let vision;
   try {
-    up = await postCompletion(token, userId);
-    if (up.status === 401) {
-      session.invalidate("completion 401");
-      const again = await session.refresh("completion 401");
-      if (again && again.token && again.token !== token) {
+    if (!imageCount) {
+      vision = { messages: structuredClone(payload.messages || []), files: [], imageParts: [] };
+    } else {
+      try {
+        vision = await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch });
+      } catch (first) {
+        // GLM-Free-API retries file upload once after re-initializing auth on
+        // 401. Do the same here, but keep session refresh in the gateway's
+        // session object instead of duplicating auth state inside vision.js.
+        if (String(first && first.code || "") !== "zai_vision_auth")
+          throw first;
+        session.invalidate("vision upload 401");
+        const again = await session.refresh("vision upload 401");
+        if (!again || !again.token)
+          throw first;
         token = again.token;
         userId = again.userId || userIdFromToken(token) || userId;
-        if (again.feVersion)
-          session.feVersion = session.feVersion || again.feVersion;
-        up = await postCompletion(token, userId);
+        vision = await processZaiVisionMessages(payload.messages || [], { token, fetchImpl: visionFetch });
       }
     }
   } catch (e) {
-    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
+    const status = Number(e && e.status) || 400;
+    const code = String(e && e.code || "zai_vision");
+    throw new ZaiWebError(status, "Z.ai image processing failed: " + String(e && e.message || e).slice(0, 240), code);
   }
-  session.noteResponse(up.headers);
-  if (!up.ok || !up.body) {
-    const text = String(await up.text().catch(() => "")).slice(0, 300);
-    const viaBrowser = await fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, up.status, text);
-    if (viaBrowser)
-      return viaBrowser;
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
+
+  const prepared = prepareZaiTurn({ ...payload, messages: vision.messages });
+  let messages = prepared.messages;
+  if (prepared.shim.active && vision.imageParts.length)
+    messages = attachZaiImageParts(messages, vision.imageParts);
+  const prompt = prepared.shim.active ? prepared.prompt : referencePrompt(messages);
+  if (!prompt && !vision.files.length)
+    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
+
+  const thinking = resolveThinking(modelId, payload, entry);
+  const features = resolveFeatures(payload, prepared.shim.active);
+  const poolKey = String(route.zai_session_key || route.route_id || route.id || ("uid:" + userId));
+  const { chatId } = acquireZaiChatId(poolKey, route.zai_session_pool_size);
+
+  // Match the reference's defer-style retirement: once a completion may have
+  // referenced this UUID, every terminal path retires it. WAF blocks skip the
+  // DELETE because poking a blocked edge only extends the problem.
+  const cleanup = async (idToDelete) => {
+    if (!idToDelete || zaiWaf.status().blocked)
+      return;
+    try {
+      await awaitWafSlot();
+      const res = await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
+        method: "DELETE",
+        headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
+      });
+      if (res.status === 401) {
+        session.invalidate("chat delete 401");
+        await session.refresh("chat delete 401").catch(() => {});
+        await awaitWafSlot();
+        await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
+          method: "DELETE",
+          headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
+        }).catch(() => {});
+      }
+    } catch {
+      // Stateless chat GC is best-effort and must never change the client result.
+    }
+  };
+
+  const retire = () => releaseZaiChatId(poolKey, chatId, cleanup);
+
+  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
+  const proofMode = options.proofMode || "caller";
+
+  const getProof = async () => {
+    if (proofMode === "caller") {
+      if (!parsed.captcha)
+        throw new ZaiWebError(503, "Z.ai needs a fresh captcha proof for this completion.", "zai_captcha");
+      return parsed.captcha;
+    }
+    const minted = await getZaiCaptchaProof({ storePath, fetchImpl: fetcher });
+    if (!minted || !minted.ok || !minted.param) {
+      const reason = String(minted && minted.reason || "");
+      const empty = reason !== "captcha-config" && minted && Number(minted.remaining) === 0;
+      const configMissing = reason === "captcha-config";
+      throw new ZaiWebError(503,
+        configMissing
+          ? "Z.ai captcha minting is not configured on this host."
+          : empty
+            ? "Z.ai device-token store is empty or exhausted."
+            : "Z.ai captcha proof generation failed.",
+        configMissing ? "zai_captcha_config" : empty ? "zai_tokens" : "zai_captcha");
+    }
+    return minted.param;
+  };
+
+  const postOnce = async (proof) => {
+    await awaitWafSlot();
+    const timestamp = Date.now();
+    const requestId = crypto.randomUUID();
+    const signature = await buildSignature({ prompt, requestId, timestamp, userId });
+    const url = buildReferenceCompletionUrl({ requestId, timestamp, token, userId });
+    const body = buildReferenceCompletionBody({
+      captchaVerifyParam: proof,
+      chatId,
+      messages,
+      modelId,
+      prompt,
+      thinking,
+      features,
+      files: vision.files
+    });
+    return fetcher(url, {
+      method: "POST",
+      headers: session.headers({
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+        "X-Signature": signature,
+        "X-Region": "overseas"
+      }),
+      body: JSON.stringify(body)
+    });
+  };
+
+  let up = null;
+  let lastProof = "";
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      lastProof = await getProof();
+      up = await postOnce(lastProof);
+      session.noteResponse(up.headers);
+      if (up.status !== 401)
+        break;
+
+      // Match the reference: refresh auth once, then perform a fresh attempt.
+      // Minted mode obtains a NEW CAPTCHA on the next loop iteration because
+      // proofs are single-use. Caller-proof mode can only retry the supplied
+      // proof, which is still useful when the 401 rejected before captcha use.
+      session.invalidate("completion 401");
+      const again = await session.refresh("completion 401");
+      if (!again || !again.token)
+        break;
+      token = again.token;
+      userId = again.userId || userIdFromToken(token) || userId;
+    }
+  } catch (e) {
+    retire();
+    if (e instanceof ZaiWebError)
+      throw e;
+    if (e instanceof ZaiWafBlockedError)
+      throw asWafError(e);
+    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 240), "zai_unreachable");
   }
-  // A healthy completion POST is the strongest evidence that the egress IP is
-  // no longer blocked. Reset any stale WAF backoff only here (not on GETs).
+
+  if (!up || !up.ok || !up.body) {
+    const status = Number(up && up.status) || 502;
+    const text = up ? String(await up.text().catch(() => "")).slice(0, 300) : "";
+    if (isZaiWafBlock(status, text)) {
+      const state = zaiWaf.recordBlock("reference-http");
+      retire();
+      const err = new ZaiWebError(503, "Z.ai temporarily blocked this gateway egress.", "zai_waf");
+      err.retryAfterSec = state.retryAfterSec;
+      throw err;
+    }
+    retire();
+    if (/captcha\s+verification\s+failed/i.test(text))
+      throw new ZaiWebError(502, "Z.ai rejected the freshly minted captcha proof.", "zai_captcha_rejected");
+    throw new ZaiWebError(status, "Z.ai completion error: " + text, "zai_completion");
+  }
+
   zaiWaf.recordSuccess();
 
+  // Adopt any token rotation captured by the session cookie jar. The provider
+  // key persistence layer above this adapter will reseal it after the call.
+  const recovered = session.token && session.token !== active.token ? session.token : null;
   const id = "chatcmpl-zai-" + Date.now().toString(36);
-  const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  // The session now owns the token chat.z.ai rotated during this request, so
-  // the stored provider key never keeps a credential the site already retired.
-  const recovered = session.token !== active.token ? session.token : rotatedToken(created.headers) || token;
-  // The remote chat is single-use; once the stream drains, delete it so the
-  // account doesn't accumulate dead conversations.
-  const cleanup = () => {
-    if (!chatId || zaiWaf.status().blocked) return Promise.resolve();
-    return fetcher(ZAI_DELETE_CHAT_URL(chatId), {
-      method: "DELETE",
-      headers: session.headers({ Accept: "application/json" })
-    }).catch(() => {});
-  };
-  if (isStream && up.body) {
-    // Tee the stream: client gets the shaped half; the discard half drives the
-    // stream to completion so cleanup fires even when the caller abandons it.
-    const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-    (async () => {
+  const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) +
+    imageCount * IMAGE_TOKEN_ALLOWANCE;
+
+  if (isStream) {
+    const [clientStream, drainStream] = up.body.tee();
+    const shaped = shapeFrameResponse({
+      id,
+      model: route.upstream_model || modelId,
+      source: clientStream,
+      promptTokens,
+      isStream,
+      recovered,
+      agent: prepared.shim.active,
+      tools: payload.tools || payload.functions || []
+    });
+    void (async () => {
       try {
-        const reader = discard.getReader();
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
+        const reader = drainStream.getReader();
+        while (!(await reader.read()).done) {}
       } catch {
       } finally {
-        await cleanup();
+        retire();
       }
-    })().catch(() => {});
+    })();
     return shaped;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-  await cleanup();
-  return shaped;
+
+  try {
+    return await shapeFrameResponse({
+      id,
+      model: route.upstream_model || modelId,
+      source: up.body,
+      promptTokens,
+      isStream,
+      recovered,
+      agent: prepared.shim.active,
+      tools: payload.tools || payload.functions || []
+    });
+  } finally {
+    retire();
+  }
 }
+
+// Caller-proof mode remains available for debugging/manual integrations, but
+// now uses the same proven HTTP wire as the automatic minted route.
+export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl) {
+  return runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
+    fetchImpl: fetchImpl || (c && c.upstreamFetch),
+    proofMode: "caller"
+  });
+}
+
 export function isWafChallenge(status, body) {
   return isZaiWafBlock(status, body);
-}
-async function fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session, status, text) {
-  if (!isWafChallenge(status, text))
-    return null;
-  const browserRaw = (session && session.token) ? JSON.stringify({ token: session.token }) : rawKey;
-  try {
-    const result = await callZaiBrowser(c, route, browserRaw, payload, isStream);
-    zaiWaf.recordSuccess();
-    return result;
-  } catch (e) {
-    const state = zaiWaf.recordBlock("signed+browser");
-    const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge after browser fallback.", "zai_waf");
-    err.retryAfterSec = state.retryAfterSec;
-    throw err;
-  }
 }
 
 // One converter for both transports: the signed HTTP path and the browser path
@@ -1001,164 +1020,41 @@ export function isZaiMintedFormat(value) {
   return String(value || "").toLowerCase() === "zaiminted";
 }
 
-/**
- * Minted transport: pure HTTP, no browser and no caller-supplied captcha.
+/** Automatic pure-HTTP mode: GLM-Free-API style CAPTCHA mint + completion.
  *
- * One flow per request, matching what the reference bridge does:
- *   1. create the chat (chat.z.ai materializes it on first completion)
- *   2. mint a captcha proof from a harvested device token
- *   3. POST the completion with that proof
- *
- * Device tokens are single-use, so each request consumes one from the store.
+ * Chromium is only a secondary escape hatch when the local proof infrastructure
+ * is unavailable/exhausted. Confirmed WAF blocks, model errors, request errors,
+ * and image requests never fall back to the browser.
  */
 export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchImpl) {
-  const fetcher = fetchImpl || ((url, init) => upstreamFetch(c, url, init));
-  const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
-  const caps = getModelCapabilities(modelId);
-  if (!caps)
-    throw new ZaiWebError(503, 'Z.ai consumer model "' + unprefixedModelId(modelId) + '" is not a known chat.z.ai model (glm-5.3, glm-5.3-flash, glm-5.2).', "zai_model");
-  const images = countImages(payload.messages);
-  if (images)
-    throw new ZaiWebError(400, "Z.ai web transports do not upload image bytes yet; the router was told vision=false, so this request should have rerouted.", "zai_vision_unsupported");
-
-  const { token } = parseCredential(rawKey, payload);
-  const userId = userIdFromToken(token);
-  if (!token || !userId)
-    throw credentialError();
-
-  const prepared = prepareZaiTurn(payload);
-  const messages = prepared.messages;
-  const prompt = prepared.prompt;
-  if (!prompt && !images)
-    throw new ZaiWebError(400, "Z.ai requires at least one user message.", "zai_no_prompt");
-
-  const { takeDeviceToken } = await import("./zai-tokens.js");
-  const { mintCaptcha } = await import("./zai-captcha.js");
-  // Fail before consuming a single-use device token when the egress breaker is open.
-  assertWafAvailable();
-  const storePath = (c && c.env && c.env.ZAI_TOKEN_STORE) || route.token_store_path || undefined;
-
-  const thinking = resolveThinking(modelId, payload);
-  const features = resolveFeatures(payload);
-  const frontendVersion = await resolveFrontendVersion(fetcher);
-  const userMessageId = crypto.randomUUID();
-
-  // 1. Create the chat.
-  await awaitWafSlot();
-  let created;
   try {
-    created = await fetcher(ZAI_NEW_CHAT_URL, {
-      method: "POST",
-      headers: buildHeaders(token, { accept: "application/json", frontendVersion }),
-      body: JSON.stringify(buildNewChatBody({
-        messages,
-        modelId,
-        prompt,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        features
-      }).payload)
+    return await runReferenceZaiHttp(c, route, rawKey, payload, isStream, {
+      fetchImpl: fetchImpl || ((url, init) => upstreamFetch(c, url, init)),
+      proofMode: "minted"
     });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai chat creation failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  if (!created.ok)
-    throw new ZaiWebError(created.status, "Z.ai chat creation error: " + String(await created.text().catch(() => "")).slice(0, 300), "zai_chat_create");
-  const createdJson = await created.json().catch(() => null);
-  const chatId = createdJson && typeof createdJson.id === "string" ? createdJson.id : "";
-  if (!chatId)
-    throw new ZaiWebError(502, "Z.ai chat creation returned no chat id.", "zai_chat_create");
+  } catch (primary) {
+    const browserFallbackValue = String(process.env.ZAI_BROWSER_FALLBACK || "").trim().toLowerCase();
+    const browserFallback = browserFallbackValue === "1" || browserFallbackValue === "true";
+    const code = String(primary && primary.code || "");
+    const proofFailure = code === "zai_tokens" || code === "zai_captcha" ||
+      code === "zai_captcha_config" || code === "zai_captcha_rejected";
+    if (!browserFallback || !proofFailure || countImages(payload && payload.messages))
+      throw primary;
 
-  // 2. Mint a proof, retrying with another token when Aliyun rejects one.
-  let proof = null;
-  let lastReason = "";
-  let remaining = 0;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const taken = await takeDeviceToken(storePath);
-    remaining = taken.remaining;
-    if (!taken.token)
-      break;
-    const minted = await mintCaptcha(taken.token, { fetchImpl: fetcher });
-    if (minted.ok) {
-      proof = minted.param;
-      break;
-    }
-    lastReason = minted.reason + (minted.detail ? ": " + String(minted.detail).slice(0, 160) : "");
-  }
-  if (!proof)
-    throw new ZaiWebError(503, remaining === 0
-      ? "Z.ai device-token store is empty (or exhausted). Harvest tokens and add them to the store; see docs/zai-minted.md."
-      : "Z.ai captcha minting failed for " + 5 + " device tokens (" + lastReason + ").",
-      "zai_tokens");
-
-  // 3. Completion with the minted proof.
-  const timestamp = Date.now();
-  const requestId = crypto.randomUUID();
-  const signature = await buildSignature({ prompt, requestId, timestamp, userId });
-  const completionUrl = buildCompletionUrl({ requestId, timestamp, token, userId });
-  let up;
-  try {
-    await awaitWafSlot();
-    up = await fetcher(completionUrl, {
-      method: "POST",
-      headers: buildHeaders(token, { accept: "text/event-stream", frontendVersion, signature }),
-      body: JSON.stringify(buildCompletionBody({
-        body: payload,
-        captchaVerifyParam: proof,
-        chatId,
-        messages,
-        modelId,
-        prompt,
-        requestId,
-        userMessageId,
-        enableThinking: thinking.enabled,
-        reasoningEffort: thinking.effort,
-        effortSupported: thinking.effortSupported,
-        features
-      }))
-    });
-  } catch (e) {
-    throw new ZaiWebError(502, "Z.ai completion request failed: " + String(e && e.message || e).slice(0, 300), "zai_unreachable");
-  }
-  if (!up.ok || !up.body) {
-    const text = String(await up.text().catch(() => "")).slice(0, 300);
-    if (isZaiWafBlock(up.status, text)) {
-      const state = zaiWaf.recordBlock("minted-completion");
-      const err = new ZaiWebError(503, "Z.ai rejected this gateway egress at the edge.", "zai_waf");
-      err.retryAfterSec = state.retryAfterSec;
+    try {
+      return await callZaiBrowser(c, route, rawKey, payload, isStream);
+    } catch (fallback) {
+      const err = new ZaiWebError(
+        Number(primary && primary.status) || 503,
+        "Z.ai pure-HTTP proof path failed (" + code + "); browser fallback also failed (" +
+          String(fallback && fallback.code || "zai_browser") + ").",
+        "zai_http_fallback_failed"
+      );
+      err.primaryCode = code;
+      err.fallbackCode = String(fallback && fallback.code || "zai_browser");
       throw err;
     }
-    throw new ZaiWebError(up.status || 502, "Z.ai completion error: " + text, "zai_completion");
   }
-  zaiWaf.recordSuccess();
-
-  const id = "chatcmpl-zaim-" + Date.now().toString(36);
-  const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
-  const cleanup = () => fetcher(ZAI_DELETE_CHAT_URL(chatId), {
-    method: "DELETE",
-    headers: buildHeaders(token, { accept: "application/json", frontendVersion })
-  }).catch(() => {});
-  if (isStream && up.body) {
-    const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-    (async () => {
-      try {
-        const reader = discard.getReader();
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      } catch {
-      } finally {
-        await cleanup();
-      }
-    })().catch(() => {});
-    return shaped;
-  }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
-  await cleanup();
-  return shaped;
 }
 
 export function isZaiBrowserFormat(value) {
@@ -1279,14 +1175,13 @@ export const __zaiTest = {
   captureVerifyParam,
   userIdFromToken,
   buildSignature,
-  buildCompletionUrl,
-  buildNewChatBody,
-  buildCompletionBody,
-  foldMessages,
-  latestUserPrompt,
+  buildReferenceCompletionUrl,
+  buildReferenceCompletionBody,
+  buildReferenceFeatures,
+  referenceHttpModelId,
+  referencePrompt,
   resolveThinking,
   resolveFeatures,
-  upstreamModelId,
   getModelCapabilities,
   modelCatalogEntry,
   isZaiModel,

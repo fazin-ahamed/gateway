@@ -6,7 +6,7 @@ This repository includes code and implementation details adapted from third-part
 
 Source project: `izaart95-jpg/GLM-Free-API`
 
-The gateway contains substantial implementation work adapted from GLM-Free-API, including Z.AI web-session / browser-transport techniques and token-harvesting behavior. GLM-Free-API is licensed under the MIT License:
+The gateway contains substantial implementation work adapted from GLM-Free-API, including the Z.AI pure-HTTP completion lifecycle, CAPTCHA proof generation/cache behavior, throwaway chat-session lifecycle, vision upload wire format, web-search/MCP feature mapping, agent compatibility techniques, browser fallback techniques, and token-harvesting behavior. Gateway-specific routing, security/error isolation, multi-provider/key state, schema/hashline Tool Repair Layer, and deployment integration are original adaptations around that reference flow. GLM-Free-API is licensed under the MIT License:
 
 > MIT License
 >

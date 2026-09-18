@@ -79,13 +79,15 @@ picks it up on the next start with no manual step.
 
 ## Provider formats
 
-`providers.fmt` accepts three values. The admin UI exposes all three.
+The admin UI exposes normal API providers plus three Z.AI consumer transports.
 
-| `fmt`       | Upstream                                   | Credential (sealed `provider_keys` row)                                                              |
-| ----------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `openai`    | `{base_url}/chat/completions`              | API key, sent as `Authorization: Bearer …`                                                            |
-| `anthropic` | `{base_url}/messages`                      | API key, sent as `x-api-key`                                                                          |
-| `zaiweb`    | Z.ai consumer web chat (`https://chat.z.ai`) | Optional: JSON `{"token":"<chat.z.ai token>","captcha_verify_param":"<proof>"}`. With no token the gateway bootstraps a guest session itself. |
+| `fmt` | Upstream | Credential |
+| --- | --- | --- |
+| `openai` | `{base_url}/chat/completions` | API key via `Authorization: Bearer …` |
+| `anthropic` | `{base_url}/messages` | API key via `x-api-key` |
+| `zaiminted` | chat.z.ai pure HTTP — **recommended** | Z.AI session token; gateway mints a fresh CAPTCHA proof from the local device-token store |
+| `zaiwebbrowser` | real chat.z.ai Chromium page — fallback/debug | Z.AI session token |
+| `zaiweb` | chat.z.ai pure HTTP with caller-supplied proof | Z.AI session token + fresh `captcha_verify_param` per completion |
 
 ### Z.ai web chat — session, models, and transport
 
@@ -95,7 +97,7 @@ hand-pasted JWT:
 - **Guest bootstrap** — `GET /` (warm cookies + discover the frontend build) →
   `POST /api/v1/auths/guest` → `GET /api/v1/auths/`. An account token in the
   provider key is validated first and preferred; guest is the fallback.
-- **Cookie jar** — every `Set-Cookie` from warm, auth, chat-create, completion,
+- **Cookie jar** — every `Set-Cookie` from warm, auth, completion, upload,
   and delete is retained and replayed, which is what the edge expects.
 - **Single-flight refresh** — concurrent requests share one refresh; a 401
   mid-flight invalidates, refreshes once, and replays the completion.
@@ -106,12 +108,14 @@ hand-pasted JWT:
   cookies decides which models the account can actually use. A model the
   account cannot see is reported `available: false` and the router skips it;
   the static table is fallback metadata only.
-- **Chat lifecycle** — each request uses a throwaway chat and deletes it once
-  the stream drains, so the account's history does not accumulate.
-- **Failure classification** — an edge/WAF/challenge block (`code: "zai_waf"`)
-  is reported separately from an auth failure or a model outage. A challenge
-  on the signed path is retried once via the browser transport using the live
-  session token, instead of surfacing a 5xx to the client.
+- **Chat lifecycle** — chat IDs are client-generated UUIDs, matching GLM-Free-API.
+  A pool of ready IDs is maintained locally; an ID only materializes upstream
+  when the completion references it. The used chat is deleted after the stream
+  drains, so history never accumulates or stacks on re-sent client context.
+- **Failure classification** — an edge/WAF block (`code: "zai_waf"`) is
+  process-wide and fails fast before image upload or CAPTCHA-token consumption.
+  Proof-infrastructure failures on `zaiminted` may use Chromium as a secondary
+  fallback; confirmed WAF/model/request failures do not.
 - **Persist** — the cookie jar, token, and frontend version are mirrored to
   `<db-dir>/zai-sessions.json` (override with `ZAI_SESSION_STORE`) so a
   restart does not re-bootstrap every guest.
@@ -122,89 +126,93 @@ hand-pasted JWT:
 `captcha_verify_param` is still required per completion on the signed path;
 it is issued once and cannot be reused.
 
-### Z.ai web chat — browser (`zaiwebbrowser`)
+### Z.ai web chat — pure HTTP (`zaiminted`, recommended)
 
-`zaiwebbrowser` removes the captcha step entirely: the gateway drives chat.z.ai
-in a local Chromium and lets the page mint its own proof. Each request gets a
-fresh page (no cross-conversation state), serialized by a per-credential mutex.
+The primary automatic Z.AI path follows the serving lifecycle proven by
+GLM-Free-API. Chromium is not in the normal request path.
 
-- Requires Chromium: `npm install playwright && npx playwright install chromium`.
-  On a host where you cannot install system packages, the `npx playwright install`
-  step may report missing shared libraries; two ways around it:
-  - point `BROWSER_EXECUTABLE` at a Chromium already present on the host
-    (or in `~/.cache/ms-playwright/*/chrome-linux64/chrome`) and skip the
-    download entirely, or
-  - run the browser on another machine and give this provider a `proxy_url`
-    pointing at the existing OCI relay — the guard that pins z.ai routes to
-    direct transport applies to `zaiminted`, not to this one.
+```text
+OpenAI request
+  -> live Z.AI model/capability check
+  -> optional image upload to /api/v1/files/
+  -> acquire local throwaway chat UUID
+  -> take/prefetch a harvested Aliyun device token
+  -> InitCaptchaV3 + VerifyCaptchaV3
+  -> fresh captcha_verify_param
+  -> one signed POST /api/v2/chat/completions
+  -> normalize SSE / tools / reasoning
+  -> DELETE /api/v1/chats/<uuid>
+```
 
-  ```sh
-  # in .env on the gateway host
-  BROWSER_EXECUTABLE=/home/<user>/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome
-  ```
-- Credential is the session token only: `{"token":"<chat.z.ai localStorage token>"}`.
-- Measured live: first turn ~8 s (includes cold Chromium launch), warm turns
-  ~2.4 s, no captcha input at any point.
-- One browser context is pooled per credential and reused, so consecutive
-  requests stay warm; idle contexts are closed after 5 minutes.
-  OpenAI `tools` are folded into a user-only agent prompt (GLM-Free-API
-  modern shim) and `<<<TOOL_CALL>>>` blocks come back as native `tool_calls`.
-  Images only on `glm-5.3-flash`. Model access is still per account tier.
-- Memory: a Chromium process runs alongside the gateway (roughly 300–500 MB).
-  On a small VM set `SESSION_POOL_SIZE`/limits accordingly, or use an API-key
-  provider where a browser is not needed at all.
+The key details are intentional:
 
-### Z.ai web chat — minted (`zaiminted`)
+- There is **no `POST /api/v1/chats/new` before a completion**. Z.AI chat IDs
+  are client-generated UUIDs and materialize when the completion first uses
+  them. This avoids changing session/WAF state between CAPTCHA minting and the
+  single-use completion.
+- HTTP uses the public model id such as `glm-5.3-flash`; `x-preview-l` is
+  treated only as the browser/UI alias.
+- The completion body is intentionally minimal: `model`, `chat_id`,
+  `messages`, `signature_prompt`, `stream`,
+  `captcha_verify_param`, `features`, plus optional `files` and
+  `mcp_servers`.
+- A tiny CAPTCHA cache keeps fresh proofs while the route is active and pauses
+  after inactivity. Device tokens are still single-use.
+- WAF state is checked **before** image upload or consuming a device token.
+- Every used chat is throwaway and best-effort deleted after the response
+  finishes. The local chat-id pool costs no upstream warmup.
+- `advancedSearch: true` maps to Z.AI's top-level
+  `mcp_servers:["advanced-search"]`. Normal `webSearch`/`search` maps to
+  `auto_web_search`. Both are disabled when caller-provided tools activate
+  the gateway agent shim, avoiding two competing action channels.
+- OpenAI tools still use our gateway-specific agent shim and **schema/hashline
+  Tool Repair Layer**; that work is not replaced by the reference transport.
+- Vision is real attachment upload now: image parts are uploaded to
+  `/api/v1/files/`, their `image_url` values are rewritten to the returned
+  file ids, and web-client-style `files[]` entries are attached. Remote image
+  downloads are protected by a public-IP/DNS SSRF guard.
 
-The `zaiweb` format needs a caller-supplied captcha proof per completion and the
-`zaiwebbrowser` format needs a browser. `zaiminted` needs neither: it mints the
-Aliyun proof itself in pure Node (no packages, no Chromium) from a file of
-harvested device tokens.
+Setup on the serving host:
 
-Setup:
-
-1. Harvest device tokens on a machine that has a browser (this is the only step
-   that needs one — the gateway stays browser-free):
-
+1. Put the Z.AI session token in the provider credential:
+   `{"token":"<chat.z.ai localStorage token>"}`.
+2. Harvest device tokens on any browser-capable machine:
    ```sh
-   node scripts/harvest-zai-tokens.mjs --token "<chat.z.ai localStorage token>" --count 300
+   node scripts/harvest-zai-tokens.mjs --token "<chat.z.ai token>" --count 300
    ```
+3. Copy the token file to the gateway host (default
+   `./data/zai-device-tokens.txt`).
+4. Set your own `ZAI_CAPTCHA_ACCESS_KEY`,
+   `ZAI_CAPTCHA_SECRET_KEY`, and `ZAI_CAPTCHA_SCENE_ID`; the repository
+   deliberately ships no shared CAPTCHA credentials.
+5. Add the **Z.AI web chat — recommended (pure HTTP)** preset.
 
-2. Copy the file to the gateway host: `scp data/zai-device-tokens.txt <host>:~/gateway/data/`.
-3. Supply the Aliyun captcha credential pair (`ZAI_CAPTCHA_ACCESS_KEY`,
-   `ZAI_CAPTCHA_SECRET_KEY`) — see `.env.example`. There is no shared default.
-4. Console → Providers → Add provider → preset **Z.AI web chat — automatic
-   (no browser)**, credential `{"token":"<chat.z.ai token>"}`.
+This serving path needs **no apt packages, Xvfb, Playwright, or Chromium**, so it
+fits restricted ecli/AIO eggs. Browser work is only needed for harvesting.
 
-Each completion consumes exactly one device token (Aliyun binds a token to a
-single verification), so the store needs topping up as it drains. An empty store
-returns a typed 503 (`zai_tokens`) naming the harvest script.
+### Z.ai web chat — browser fallback (`zaiwebbrowser`)
 
-**Status — minting works; the gateway's minted route does not yet.** Measured live:
+The Chromium implementation remains as a secondary transport and debugging
+reference. It is no longer the preferred automatic serving path.
 
-| Step | Result |
-| --- | --- |
-| Token harvest (`window.z_um.getToken()`) | works; 30 tokens in ~16 s |
-| `InitCaptchaV3` + payload construction | works; `data` blob byte-identical to the reference implementation |
-| `VerifyCaptchaV3` with a stealth-harvested token | works — `VerifyCode T001`, real `securityToken` |
-| A full direct flow (create chat → mint → completion) | **completed twice** on a signed-in account (`glm-5.3-flash`) |
-| The same flow through this gateway's provider | still answered `Captcha verification failed` / an outage sentinel |
+- It drives the real page so the page mints its own CAPTCHA proof.
+- Warm contexts are retained across Z.AI token rotation and cold-page
+  navigation is retried internally.
+- It needs a usable Chromium/Playwright runtime and consumes substantially more
+  memory than the pure-HTTP path.
+- `zaiminted` may try this fallback only for proof-infrastructure failures
+  such as an empty token store or unavailable CAPTCHA configuration. Set
+  `ZAI_BROWSER_FALLBACK=0` to disable that behavior.
+- Confirmed WAF blocks, model errors, request errors, and image requests do not
+  fall back to Chromium.
 
-Two things that are now settled:
+### Z.ai web chat — caller proof (`zaiweb`)
 
-- **The harvester must inject a stealth fingerprint.** Aliyun will not mint a
-  usable token from a plainly automated browser; `scripts/zai-harvest-stealth.js`
-  patches `navigator.webdriver`, plugins, `window.chrome`, WebGL and screen
-  geometry before any page JS runs. Without it every token fails with
-  `VerifyCode F001` — verified by running the harvested tokens through the
-  reference bridge, which failed the same way.
-- **The account tier matters.** A guest session only reaches `glm-5.3-flash`;
-  a signed-in account (`glm-5.3`, `glm-5.2`, vision models) is what makes the
-  route worth having.
-
-So the remaining gap is entirely in the gateway's completion request shape, not
-in token validity or minting. Until that is closed, use `zaiwebbrowser` (or an
-API-key provider) for anything you depend on.
+This is the manual/debug version of the same pure-HTTP engine. Instead of
+minting the CAPTCHA proof itself, it accepts a fresh `captcha_verify_param`
+from `x-zai-captcha` or the request body. The completion wire, throwaway-chat
+lifecycle, live model checks, SSE normalization, tools, search, and vision path
+are otherwise the same.
 
 ### Model-integrity probes
 
@@ -284,8 +292,9 @@ the usual model routes; every field stays editable before saving, and choosing
 
 | Preset         | Result                                                                                              |
 | -------------- | --------------------------------------------------------------------------------------------------- |
-| `zai-browser`  | `zaiwebbrowser` provider on `https://chat.z.ai` — automatic, no captcha; routes `z-ai/glm-5.3-flash` + `z-ai/glm-5.3` |
-| `zai-web`      | `zaiweb` provider on `https://chat.z.ai`, direct transport; routes `z-ai/glm-5.3-flash` + `z-ai/glm-5.3` |
+| `zai-minted`  | **recommended** `zaiminted` pure-HTTP provider on `https://chat.z.ai`; automatic fresh proofs, throwaway chats, tools/vision/search |
+| `zai-browser` | `zaiwebbrowser` Chromium fallback/debug transport |
+| `zai-web` | `zaiweb` manual caller-proof version of the same pure-HTTP engine |
 | `zai-api`      | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
 
 Route seeding never repoints a live slug: a preset only adds routes for slugs
@@ -308,9 +317,11 @@ Model routes to create (slug → `upstream_model`):
 
 | Public slug (suggested) | `upstream_model` | Thinking | Vision | Tools | Tier note                     |
 | ----------------------- | ---------------- | -------- | ------ | ----- | ----------------------------- |
-| `z-ai/glm-5.3-flash`    | `glm-5.3-flash`  | yes      | yes    | no    | reachable on guest sessions   |
-| `z-ai/glm-5.3`          | `glm-5.3`        | yes      | no     | no    | signed-in accounts only       |
-| `z-ai/glm-5.2`          | `glm-5.2`        | yes      | no     | no    | signed-in accounts only       |
+| `z-ai/glm-5.3-flash`    | `glm-5.3-flash`  | yes      | yes    | yes*  | reachable on guest sessions   |
+| `z-ai/glm-5.3`          | `glm-5.3`        | yes      | live catalog | yes* | signed-in accounts only       |
+| `z-ai/glm-5.2`          | `glm-5.2`        | yes      | live catalog | yes* | signed-in accounts only       |
+
+\* Caller tools are gateway-emulated through the Z.AI agent shim and Tool Repair Layer, not native OpenAI tool fields upstream.
 
 Getting the credential:
 
@@ -359,9 +370,10 @@ Behavior and limits:
 - OpenAI `tools` are not forwarded to chat.z.ai. They are folded into a
   user-only agent prompt; the model emits `<<<TOOL_CALL>>>` blocks, which
   the gateway converts to native OpenAI `tool_calls` (streamed incrementally).
-- Images are accepted only on `glm-5.3-flash`; anything else returns 400
-  (`zai_vision_unsupported`). Image parts are forwarded as `[image: <url>]`
-  markers — uploading attachments is not implemented.
+- Vision requests use the reference attachment pipeline: upload to
+  `/api/v1/files/`, rewrite the message image reference to the returned file
+  id, and attach `files[]`. Models that do not advertise image input are
+  rejected before completion.
 - `transport` must be `auto` or `direct`; the signed session cannot survive a
   relay hop, so `koyeb`/`oci` are rejected with a 400 (`zai_transport`).
 - Captcha proofs are short-lived. When one expires the route fails with a
