@@ -72,7 +72,7 @@ export function summarize(state) {
   return {
     mean: mean(state),
     lcb: lcb(state),
-    samples: samples(state),
+    samples: Math.round(samples(state)),
     alpha: Number(state && state.alpha) || 0,
     beta: Number(state && state.beta) || 0
   };

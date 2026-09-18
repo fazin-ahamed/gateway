@@ -37,6 +37,33 @@ test("GET /admin/prices falls back when extra price columns are missing", async 
   assert.equal(body.prices[0].prompt_per_1m, 1);
 });
 
+test("Bayesian reliability floor degrades 0/2 and 50%/10 routes, keeps cold starts", () => {
+  const floor = t.ROUTE_RELIABILITY_FLOOR;
+  const fresh = t.routeReliability(null);
+  assert.equal(fresh.band, "unproven");
+  assert.ok(fresh.lcb >= floor, "cold-start route stays above the floor on the prior");
+  const zeroTwo = t.routeReliability({ n: 2, ok_rate: 0 });
+  assert.equal(zeroTwo.band, "degraded");
+  assert.ok(zeroTwo.lcb < floor, "0/2 must fall below the floor");
+  const fiftyTen = t.routeReliability({ n: 10, ok_rate: 0.5 });
+  assert.equal(fiftyTen.band, "degraded");
+  assert.ok(fiftyTen.lcb < floor, "50% over 10 must fall below the floor");
+  const strong = t.routeReliability({ n: 50, ok_rate: 0.95 });
+  assert.equal(strong.band, "healthy");
+  const oneFail = t.routeReliability({ n: 1, ok_rate: 0 });
+  assert.equal(oneFail.n, 1, "a single attempt is thin evidence, floor needs >=2");
+});
+
+test("reflex pick prefers fast+reliable over cheap+slow, then cheapest among equals", () => {
+  const cheapSlow = { slug: "cheap-slow", cost: 0.2, avgMs: 124000, lcb: 0.51 };
+  const fastOk = { slug: "fast-ok", cost: 0.7, avgMs: 700, lcb: 0.7 };
+  const fastLux = { slug: "fast-lux", cost: 3.65, avgMs: 700, lcb: 0.7 };
+  assert.equal(t.reflexPick([cheapSlow, fastOk, fastLux]).slug, "fast-ok");
+  assert.equal(t.reflexPick([fastOk, fastLux]).slug, "fast-ok", "same reliability+latency → cheaper wins");
+  assert.equal(t.reflexPick([cheapSlow]).slug, "cheap-slow", "never returns null when the pool is non-empty");
+  assert.equal(t.reflexPick([]), null);
+});
+
 test("circuit window resets stale failure count instead of accumulating forever", () => {
   assert.equal(typeof t.__resetCircuitState, "function");
   assert.equal(typeof t.circuitRecord, "function");

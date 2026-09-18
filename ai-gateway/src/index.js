@@ -5,6 +5,7 @@ import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1 } from "./router/index.js";
+import { seedBeta, lcb as betaLcb } from "./router/posterior.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 var app = new Hono();
 app.use("/*", async (c, next) => {
@@ -2544,6 +2545,54 @@ async function autoSettings(c) {
   }
   return { enabled, preference: pref, excluded, overrides };
 }
+// Interactive/reflex latency budget. A route slower than this is dropped from
+// the easy-request pool unless nothing faster is eligible.
+var REFLEX_LATENCY_SLA_MS = 30000;
+// Bayesian reliability floor. A route with real evidence whose lower-confidence
+// bound sits below this is degraded and cannot be a primary.
+var ROUTE_RELIABILITY_FLOOR = 0.6;
+// Turn a slug-level health aggregate into a Bayesian reliability read. A fresh
+// route (no evidence) rides the optimistic Beta(8,2) prior so cold starts route;
+// once failures accumulate the lower-confidence bound drops it. This is why 0/2
+// reads DEGRADED instead of the old "no data therefore healthy".
+function routeReliability(h) {
+  const seed = seedBeta("route");
+  const n = Math.max(0, Number(h && h.n) || 0);
+  const ok = Number(h && h.ok_rate);
+  if (!n || !Number.isFinite(ok)) {
+    const bound2 = betaLcb(seed);
+    return { lcb: bound2, mean: seed.alpha / (seed.alpha + seed.beta), n: 0, band: "unproven" };
+  }
+  const success = Math.max(0, Math.min(n, n * ok));
+  const state = { alpha: seed.alpha + success, beta: seed.beta + (n - success) };
+  const bound = betaLcb(state);
+  const band = bound >= 0.8 ? "healthy" : bound >= ROUTE_RELIABILITY_FLOOR ? "probation" : "degraded";
+  return { lcb: bound, mean: state.alpha / (state.alpha + state.beta), n, band };
+}
+// Easy-request selection: maximize reliability, then subtract latency and cost.
+// A fast, reliable route beats a cheaper one that is slow or flaky. Routes over
+// the interactive SLA are excluded unless the whole pool is over it.
+function reflexPick(list) {
+  const pool0 = (list || []).filter(Boolean);
+  if (!pool0.length)
+    return null;
+  const underSla = pool0.filter((x) => (Number(x.avgMs) || 0) <= REFLEX_LATENCY_SLA_MS);
+  const pool = underSla.length ? underSla : pool0;
+  const maxCost = Math.max(...pool.map((x) => Number(x.cost) || 0), 1e-9);
+  let best = null, bestScore = -Infinity;
+  for (const cand of pool) {
+    const relTerm = (Number.isFinite(cand.lcb) ? cand.lcb : 0.8) * 5;
+    const latPenalty = Math.min(3, (Number(cand.avgMs) || 0) / 1000 / 10);
+    const costPenalty = Math.pow((Number(cand.cost) || 0) / maxCost, 2) * 1.5;
+    const wobbling = cand.wob || 0;
+    const s = relTerm - latPenalty - costPenalty - wobbling;
+    if (s > bestScore) {
+      bestScore = s;
+      best = cand;
+    }
+  }
+  return best;
+}
 async function pickAutoModel(c, payload, key) {
   const cfg = await autoSettings(c);
   if (!cfg.enabled)
@@ -2626,14 +2675,25 @@ async function pickAutoModel(c, payload, key) {
     const allOpen = routeIds.length > 0 && openCount >= routeIds.length;
     const h = healthBySlug.get(r.slug);
     const okRate = h ? Number(h.ok_rate) : 1;
-    // Eligible if capable and not a known-bad integrity slug. Quality floor
-    // is a soft skip (q + 0.8 >= need) so a 3.2 GLM-5 still takes need=3.6
-    // agent work instead of falling through to Astra.
-    const eligible = capable && !allOpen && q + 0.8 >= need && !(h && Number(h.n) >= 5 && okRate < 0.5);
+    const rel = routeReliability(h);
+    // Reliability floor: once a route has real evidence (>=2 attempts) and its
+    // lower-confidence bound sits below the floor it is degraded and cannot be a
+    // primary. Fresh routes ride the prior; the circuit breaker owns transient
+    // single failures. This drops a 50%/10 or 0/2 route that V1 used to accept.
+    const relOk = !(rel.n >= 2 && rel.lcb < ROUTE_RELIABILITY_FLOOR);
+    const qualityOk = q + 0.8 >= need;
+    const eligible = capable && !allOpen && qualityOk && relOk;
+    let reason = "";
+    if (!ctxOk) reason = "context";
+    else if (!visionOk) reason = "vision";
+    else if (!toolsOk) reason = "tools";
+    else if (allOpen) reason = "circuit open";
+    else if (!qualityOk) reason = "quality low";
+    else if (!relOk) reason = "degraded";
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, hardEligible: eligible, samples: h ? Number(h.n) : 0, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
+    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, hardEligible: eligible, samples: h ? Number(h.n) : 0, lcb: rel.lcb, relBand: relOk ? rel.band : "degraded", reason, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
   }
   const workhorseEligible = candidates.filter((x) => x.eligible && x.workhorse);
   const strongWork = workhorseEligible.filter((x) => !x.tiny);
@@ -2642,12 +2702,7 @@ async function pickAutoModel(c, payload, key) {
   if (!eligibleList.length) {
     picked = null;
   } else if (need <= 2.1) {
-    let best = null;
-    for (const cand of eligibleList) {
-      if (!best || cand.cost < best.cost || cand.cost === best.cost && cand.quality > best.quality)
-        best = cand;
-    }
-    picked = best;
+    picked = reflexPick(eligibleList);
   } else {
     const maxCost = Math.max(...eligibleList.map((x) => x.cost), 1e-9);
     const maxMs = Math.max(...eligibleList.map((x) => x.avgMs || 0), 1);
@@ -2739,6 +2794,29 @@ function numOrNull(value) {
     return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+async function ensurePriceColumns(db) {
+  if (!db || typeof db.exec !== "function")
+    return;
+  if (ensurePriceColumns.done)
+    return;
+  try {
+    const cols = await db.prepare("PRAGMA table_info(prices)").all();
+    const list = Array.isArray(cols) ? cols : (cols && cols.results) || [];
+    const names = new Set(list.map((c) => c.name));
+    const add = [
+      ["actual_prompt_per_1m", "ALTER TABLE prices ADD COLUMN actual_prompt_per_1m REAL"],
+      ["actual_completion_per_1m", "ALTER TABLE prices ADD COLUMN actual_completion_per_1m REAL"],
+      ["cache_read_per_1m", "ALTER TABLE prices ADD COLUMN cache_read_per_1m REAL"],
+      ["cache_write_per_1m", "ALTER TABLE prices ADD COLUMN cache_write_per_1m REAL"]
+    ];
+    for (const [name, sql] of add) {
+      if (!names.has(name))
+        db.exec(sql);
+    }
+    ensurePriceColumns.done = true;
+  } catch {
+  }
 }
 function priceFromRow(row) {
   const equivalentPrompt = Number(row && row.prompt_per_1m) || 0;
@@ -4474,6 +4552,7 @@ app.get("/admin/prices", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
+  await ensurePriceColumns(c.env.DB);
   const queries = [
     "SELECT slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at FROM prices ORDER BY slug",
     "SELECT slug, prompt_per_1m, completion_per_1m, currency, updated_at FROM prices ORDER BY slug"
@@ -4537,6 +4616,7 @@ app.post("/admin/prices", async (c) => {
   const ac = numOrNull(b.actual_completion_per_1m);
   const cr = numOrNull(b.cache_read_per_1m);
   const cw = numOrNull(b.cache_write_per_1m);
+  await ensurePriceColumns(c.env.DB);
   try {
     await c.env.DB.prepare("INSERT INTO prices (slug, prompt_per_1m, completion_per_1m, actual_prompt_per_1m, actual_completion_per_1m, cache_read_per_1m, cache_write_per_1m, currency, updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET prompt_per_1m=excluded.prompt_per_1m, completion_per_1m=excluded.completion_per_1m, actual_prompt_per_1m=excluded.actual_prompt_per_1m, actual_completion_per_1m=excluded.actual_completion_per_1m, cache_read_per_1m=excluded.cache_read_per_1m, cache_write_per_1m=excluded.cache_write_per_1m, currency=excluded.currency, updated_at=excluded.updated_at").bind(b.slug, p, ct, ap, ac, cr, cw, b.currency || "USD", nowIso()).run();
   } catch {
@@ -4603,7 +4683,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

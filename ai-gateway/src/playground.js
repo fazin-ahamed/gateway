@@ -45,6 +45,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   button.ghost{background:transparent;border:1px solid var(--line-hi);color:var(--muted);padding:7px 11px}button.ghost:hover{border-color:var(--accent);color:var(--accent)}
   button.danger{background:transparent;border:1px solid transparent;color:var(--bad);padding:6px 10px}button.danger:hover{background:rgba(228,91,91,.1);border-color:rgba(228,91,91,.4)}
   table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#t-list{overflow-x:auto;border-radius:var(--radius-sm)}#t-list table{min-width:880px}th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:middle}th{position:sticky;top:0;background:var(--surface-deep);color:var(--muted);font:9px/1.3 var(--mono);letter-spacing:.08em;text-transform:uppercase}tbody tr:hover{background:var(--surface-deep)}tbody tr:last-child td{border-bottom:0}
+  #pr-list{overflow-x:auto}#pr-list table{min-width:1100px}#pr-list input.rate{width:92px;min-width:72px;padding:5px 7px;font:11px/1.2 var(--mono)}#pr-list td.rate{padding:6px 8px}#pr-list tbody tr{cursor:pointer}
   .mono{font-family:var(--mono);font-size:11px;word-break:break-all}.pill{padding:2px 7px;border:1px solid transparent;border-radius:var(--r-pill);font:9px/1.2 var(--mono);letter-spacing:.04em;text-transform:uppercase;display:inline-block}.pill.ok{background:rgba(62,201,140,.12);border-color:rgba(62,201,140,.24);color:var(--good)}.pill.bad{background:rgba(228,91,91,.12);border-color:rgba(228,91,91,.24);color:var(--bad)}.pill.warn{background:rgba(220,174,79,.12);border-color:rgba(220,174,79,.24);color:var(--warn)}.pill.mut{background:rgba(95,109,130,.1);border-color:rgba(95,109,130,.2);color:var(--muted)}.pill.acc{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
   .stat{position:relative;min-height:88px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px 16px}.stat:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}.stat .k{color:var(--muted);font-size:10px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.stat .v{font:600 22px/1.1 var(--mono);margin-top:10px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}.stat .v.acc{color:var(--accent)}.stat .v.ok{color:var(--good)}.stat .v.bad{color:var(--bad)}
   .grid{display:grid;gap:12px}.grid.s4{grid-template-columns:repeat(4,minmax(0,1fr))}.grid.s3{grid-template-columns:repeat(3,minmax(0,1fr))}.grid.s2{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -1278,23 +1279,18 @@ async function loadCache(){
 document.getElementById('cache-refresh').onclick=loadCache;
 document.getElementById('cache-purge').onclick=function(){ confirmAction('Purge cache','Purge every protected response cache entry? This cannot be undone.','Purge all',async function(){ const {status,data}=await api('/admin/cache/purge',{method:'POST',body:JSON.stringify({confirm:'PURGE_ALL_CACHE'})}); if(status===200){toast('purged '+data.purged+' entries','ok');loadCache();}else toast('purge failed','err'); }); };
 
-// ---------- prices ----------
 document.getElementById('pr-save').onclick=async function(){
   const slug=document.getElementById('pr-slug').value.trim();
   if(!slug){ toast('slug required','err'); return; }
-  const opt=function(id){ const v=document.getElementById(id).value.trim(); return v===''?null:v; };
-  const body=JSON.stringify({
+  await savePriceRow({
     slug,
-    prompt_per_1m: document.getElementById('pr-prompt').value||0,
-    completion_per_1m: document.getElementById('pr-completion').value||0,
-    actual_prompt_per_1m: opt('pr-actual-prompt'),
-    actual_completion_per_1m: opt('pr-actual-completion'),
-    cache_read_per_1m: opt('pr-cache-read'),
-    cache_write_per_1m: opt('pr-cache-write')
+    prompt_per_1m: document.getElementById('pr-prompt').value,
+    completion_per_1m: document.getElementById('pr-completion').value,
+    actual_prompt_per_1m: document.getElementById('pr-actual-prompt').value,
+    actual_completion_per_1m: document.getElementById('pr-actual-completion').value,
+    cache_read_per_1m: document.getElementById('pr-cache-read').value,
+    cache_write_per_1m: document.getElementById('pr-cache-write').value
   });
-  const {status,data}=await api('/admin/prices',{method:'POST',body});
-  if(status===200){ toast('price saved','ok'); loadPrices(); }
-  else toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
 };
 document.getElementById('pr-sync').onclick=async function(){
   const btn=document.getElementById('pr-sync');
@@ -1306,19 +1302,80 @@ document.getElementById('pr-sync').onclick=async function(){
   }catch(e){ toast('sync failed: '+e.message,'err'); }
   finally{ btn.disabled=false; }
 };
-function dashRate(v){ return v==null||v===''?'—':Number(v); }
+function optRate(v){ const s=String(v==null?'':v).trim(); return s===''?null:s; }
+function rateInput(name, value, placeholder){
+  const v=value==null||value===''?'':value;
+  return '<input class="rate" data-f="'+name+'" type="number" step="0.0001" value="'+esc(String(v))+'" placeholder="'+esc(placeholder||'')+'">';
+}
+async function savePriceRow(p){
+  if(!p.slug){ toast('slug required','err'); return false; }
+  const body=JSON.stringify({
+    slug: p.slug,
+    prompt_per_1m: p.prompt_per_1m||0,
+    completion_per_1m: p.completion_per_1m||0,
+    actual_prompt_per_1m: optRate(p.actual_prompt_per_1m),
+    actual_completion_per_1m: optRate(p.actual_completion_per_1m),
+    cache_read_per_1m: optRate(p.cache_read_per_1m),
+    cache_write_per_1m: optRate(p.cache_write_per_1m)
+  });
+  const {status,data}=await api('/admin/prices',{method:'POST',body});
+  if(status===200){ toast('price saved','ok'); loadPrices(); return true; }
+  toast('save failed: '+(data&&data.error&&data.error.message||status),'err');
+  return false;
+}
+function fillPriceForm(p){
+  document.getElementById('pr-slug').value=p.slug||'';
+  document.getElementById('pr-prompt').value=p.prompt_per_1m==null?'':p.prompt_per_1m;
+  document.getElementById('pr-completion').value=p.completion_per_1m==null?'':p.completion_per_1m;
+  document.getElementById('pr-actual-prompt').value=p.actual_prompt_per_1m==null?'':p.actual_prompt_per_1m;
+  document.getElementById('pr-actual-completion').value=p.actual_completion_per_1m==null?'':p.actual_completion_per_1m;
+  document.getElementById('pr-cache-read').value=p.cache_read_per_1m==null?'':p.cache_read_per_1m;
+  document.getElementById('pr-cache-write').value=p.cache_write_per_1m==null?'':p.cache_write_per_1m;
+  document.getElementById('pr-slug').focus();
+}
 async function loadPrices(){
   const el=document.getElementById('pr-list');
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/prices'); data=res.data; }catch(e){ paintLoadError(el,'Could not load prices: '+e.message,loadPrices); return; }
   const rows=(data&&data.prices||[]).map(function(p){
-    return '<tr><td class="mono">'+esc(p.slug)+'</td><td>'+Number(p.prompt_per_1m||0)+'</td><td>'+Number(p.completion_per_1m||0)+'</td><td>'+dashRate(p.actual_prompt_per_1m)+'</td><td>'+dashRate(p.actual_completion_per_1m)+'</td><td>'+dashRate(p.cache_read_per_1m)+'</td><td>'+dashRate(p.cache_write_per_1m)+'</td><td>'+(p.currency||'USD')+'</td><td><button class="ghost" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="9"><div class="empty">No prices set. Costs will be 0 unless the upstream returns them.</div></td></tr>';
+    return '<tr data-slug="'+esc(p.slug)+'">'+
+      '<td class="mono">'+esc(p.slug)+'</td>'+
+      '<td class="rate">'+rateInput('prompt_per_1m', p.prompt_per_1m, '0')+'</td>'+
+      '<td class="rate">'+rateInput('completion_per_1m', p.completion_per_1m, '0')+'</td>'+
+      '<td class="rate">'+rateInput('actual_prompt_per_1m', p.actual_prompt_per_1m, 'eq')+'</td>'+
+      '<td class="rate">'+rateInput('actual_completion_per_1m', p.actual_completion_per_1m, 'eq')+'</td>'+
+      '<td class="rate">'+rateInput('cache_read_per_1m', p.cache_read_per_1m, 'prompt')+'</td>'+
+      '<td class="rate">'+rateInput('cache_write_per_1m', p.cache_write_per_1m, '0')+'</td>'+
+      '<td>'+(p.currency||'USD')+'</td>'+
+      '<td class="rowact"><button class="act" data-act="prsave" data-slug="'+esc(p.slug)+'">save</button> <button class="ghost" data-act="predit" data-slug="'+esc(p.slug)+'">edit</button> <button class="danger" data-act="prdel" data-slug="'+esc(p.slug)+'">delete</button></td></tr>';
+  }).join('') || '<tr><td colspan="9"><div class="empty">No prices set. Add a slug above, or sync equivalent rates from models.dev.</div></td></tr>';
   el.innerHTML='<table><tr><th>Slug</th><th>Eq prompt</th><th>Eq completion</th><th>Actual prompt</th><th>Actual completion</th><th>Cache read</th><th>Cache write</th><th>Cur</th><th></th></tr>'+rows+'</table>';
 }
+function priceFromRowEl(tr){
+  const out={ slug: tr.getAttribute('data-slug') };
+  tr.querySelectorAll('input[data-f]').forEach(function(inp){ out[inp.getAttribute('data-f')]=inp.value; });
+  return out;
+}
 document.getElementById('pr-list').addEventListener('click',function(e){
-  const b=e.target.closest('[data-act="prdel"]'); if(!b) return;
-  api('/admin/prices/'+encodeURIComponent(b.dataset.slug),{method:'DELETE'}).then(function(){ loadPrices(); });
+  const b=e.target.closest('[data-act]'); if(!b) return;
+  const act=b.getAttribute('data-act');
+  const tr=b.closest('tr');
+  if(act==='prsave'){ e.preventDefault(); savePriceRow(priceFromRowEl(tr)); return; }
+  if(act==='predit'){ e.preventDefault(); fillPriceForm(priceFromRowEl(tr)); return; }
+  if(act==='prdel'){
+    e.preventDefault();
+    confirmAction('Delete price','Remove the stored rates for '+b.dataset.slug+'?','Delete',async function(){
+      const {status,data}=await api('/admin/prices/'+encodeURIComponent(b.dataset.slug),{method:'DELETE'});
+      if(status===200){ toast('price deleted','ok'); loadPrices(); }
+      else toast('delete failed: '+(data&&data.error&&data.error.message||status),'err');
+    });
+  }
+});
+document.getElementById('pr-list').addEventListener('keydown',function(e){
+  if(e.key!=='Enter') return;
+  const inp=e.target.closest('input[data-f]'); if(!inp) return;
+  e.preventDefault();
+  savePriceRow(priceFromRowEl(inp.closest('tr')));
 });
 
 // ---------- LOGS ----------
@@ -1478,13 +1535,33 @@ document.getElementById('ar-run').onclick=async function(){
   out.innerHTML='<span class="small">Running preview…</span>';
   let d; try{ d=(await api('/admin/auto-preview',{method:'POST',body:JSON.stringify({prompt})})).data; }catch(e){ out.innerHTML='<div class="empty">Preview failed: '+esc(e.message)+'</div>'; return; }
   if(!d||!d.picked){ out.innerHTML='<div class="empty">'+esc((d&&d.error&&d.error.message)||'unavailable')+'</div>'; return; }
+  function statusPill(c){
+    if(c.eligible){
+      const band=c.relBand||'unproven';
+      const cls=band==='healthy'?'ok':(band==='degraded'?'bad':'warn');
+      return '<span class="pill '+cls+'">'+esc(band)+'</span>';
+    }
+    return '<span class="pill bad">'+esc(c.reason||'below floor')+'</span>';
+  }
   const rows=(d.candidates||[]).map(function(c){
-    const pill=c.eligible?'<span class="pill ok">eligible</span>':'<span class="pill mut">below floor</span>';
     const picked=c.slug===d.picked?' <span class="pill acc">PICKED</span>':'';
-    const h=c.samples>0?' · '+Math.round(c.okRate*100)+'% ok ('+c.samples+')':' · no data';
-    return '<tr><td class="mono">'+esc(c.slug)+picked+'</td><td>'+pill+'</td><td class="mono">'+c.quality.toFixed(2)+'</td><td class="mono">'+money(c.cost)+'/1M</td><td class="mono small">'+esc(String(Math.round(c.avgMs))+'ms'+h)+'</td></tr>';
+    const lcbTxt=Number.isFinite(c.lcb)?' · lcb '+c.lcb.toFixed(2):'';
+    const h=c.samples>0?' · '+Math.round(c.okRate*100)+'% ok ('+c.samples+')'+lcbTxt:' · no data';
+    return '<tr><td class="mono">'+esc(c.slug)+picked+'</td><td>'+statusPill(c)+'</td><td class="mono">'+c.quality.toFixed(2)+'</td><td class="mono">'+money(c.cost)+'/1M</td><td class="mono small">'+esc(String(Math.round(c.avgMs))+'ms'+h)+'</td></tr>';
   }).join('');
-  out.innerHTML='<div class="kvrow"><span class="pill '+(d.fallback?'warn':'acc')+'">'+(d.fallback?'fallback (nothing eligible)':'picked')+'</span><span class="grow"><b>'+esc(d.picked)+'</b> · complexity '+esc(String(d.complexity))+' → quality floor '+d.need.toFixed(2)+' · preference '+d.preference+'</span></div>'+
+  const v2=d.v2&&d.v2.explain?d.v2.explain:null;
+  const ir=(d.v2&&d.v2.taskIR)||null;
+  const secs=function(ms){ return ms==null?'—':(ms>=1000?(ms/1000).toFixed(1)+'s':Math.round(ms)+'ms'); };
+  const v2Html=v2?('<div class="kvrow" style="margin-top:10px"><span class="pill '+(d.v2.mode==='live'?'acc':'mut')+'">V2 '+esc(d.v2.mode||'shadow')+'</span>'+
+      '<span class="grow small">'+(ir?('task <b>'+esc(String(ir.task))+'</b> · confidence '+Math.round((ir.confidence||0)*100)+'% · '):'')+
+      'policy <b>'+esc(String(v2.mode))+'</b> → <b>'+esc(String(v2.primary||'—'))+'</b>'+
+      (v2.challenger?(' vs '+esc(String(v2.challenger))):'')+
+      ' · success '+Math.round((v2.expectedSuccess||0)*100)+'%'+
+      ' · '+secs(v2.expectedLatencyMs)+
+      ' · '+money(v2.expectedCost||0)+'/1M</span></div>'):
+    '<div class="small" style="margin-top:10px">V2 shadow: no policy (router off or no eligible routes)</div>';
+  out.innerHTML='<div class="kvrow"><span class="pill '+(d.fallback?'warn':'acc')+'">'+(d.fallback?'fallback (nothing eligible)':'V1 picked')+'</span><span class="grow"><b>'+esc(d.picked)+'</b> · complexity '+esc(String(d.complexity))+' → quality floor '+d.need.toFixed(2)+' · preference '+d.preference+'</span></div>'+
+    v2Html+
     '<table style="margin-top:10px"><tr><th>Model</th><th>Status</th><th>Quality</th><th>Cost</th><th>Health</th></tr>'+rows+'</table>';
 };
 document.getElementById('tj-refresh').onclick=function(){ loadTrajectories(); };
