@@ -4,8 +4,8 @@ import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
+import { shadowFromV1 } from "./router/index.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
-import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options", "nosniff");
@@ -2690,7 +2690,13 @@ async function pickAutoModel(c, payload, key) {
   });
   const slug = (horizon && horizon.slug) || picked.slug;
   const chosen = candidates.find((x) => x.slug === slug) || picked;
-  return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [] };
+  let v2 = null;
+  try {
+    v2 = shadowFromV1({ payload, candidates, preference: cfg.preference });
+  } catch (e) {
+    blog("AUTO v2 shadow failed: " + String(e && e.message || e).slice(0, 200));
+  }
+  return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [], v2 };
 }
 // Three in-place attempts on the same credential, then the next key/route.
 // Host/config 503s cannot recover on retry: Chromium missing a display,
@@ -4376,7 +4382,8 @@ app.post("/admin/auto-preview", async (c) => {
       phase: hz.phase,
       compact: !!hz.compact,
       taskIR: hz.taskIR || null
-    }
+    },
+    v2: decision.v2 || null
   });
 });
 app.get("/admin/cache", async (c) => {

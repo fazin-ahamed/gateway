@@ -236,5 +236,19 @@ CREATE TABLE IF NOT EXISTS zai_device_tokens (
   token TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
+
+-- Router V2 posteriors. Shadow path writes nothing yet; table exists so a
+-- later live cutover has somewhere to persist Beta(α,β) route health.
+CREATE TABLE IF NOT EXISTS router_stats (
+  scope TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  task_type TEXT NOT NULL DEFAULT '',
+  success_alpha REAL NOT NULL DEFAULT 8,
+  failure_beta REAL NOT NULL DEFAULT 2,
+  latency_ema REAL,
+  cost_ema REAL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (scope, scope_id, task_type)
+);
 CREATE INDEX IF NOT EXISTS idx_zai_device_tokens_fifo
   ON zai_device_tokens(id);
