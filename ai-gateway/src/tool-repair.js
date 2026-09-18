@@ -74,6 +74,15 @@ export function canonicalToolName(name, tools) {
   return matches.length === 1 ? matches[0].name : raw;
 }
 
+function looksLikeBareHashlinePatch(raw) {
+  const t = String(raw || "").trim();
+  return t.startsWith("[") && t.includes("#") && /\b(?:PUT|CUT|REM)\b/.test(t);
+}
+
+function normalizePatchText(raw) {
+  return String(raw || "").replace(/\\n/g, "\n").replace(/\r\n/g, "\n");
+}
+
 function parseArgs(raw) {
   if (raw == null || raw === "") return {};
   if (typeof raw === "object" && !Array.isArray(raw)) return { ...raw };
@@ -106,13 +115,32 @@ function moveAlias(args, props, aliases) {
 }
 
 function normalizeArgs(fn, raw) {
-  const args = parseArgs(raw);
-  if (!args) return null;
   const props = propsOf(fn);
+  let args = parseArgs(raw);
+
+  // Preserve the gateway's earlier hashline shorthand support: some coding
+  // models emit the patch language directly instead of wrapping it as JSON.
+  // Only wrap it when the advertised schema actually has an `input` field.
+  if (!args && typeof raw === "string" && looksLikeBareHashlinePatch(raw) &&
+      Object.prototype.hasOwnProperty.call(props, "input")) {
+    args = { input: normalizePatchText(raw.trim()) };
+  }
+  if (!args) return null;
   if (!Object.keys(props).length) return args;
   moveAlias(args, props, PATH_ALIASES);
   moveAlias(args, props, ANCHOR_ALIASES);
   moveAlias(args, props, CONTENT_ALIASES);
+  // Existing hashline/edit clients commonly call the patch body input/patch/
+  // content/text/diff. If the tool schema declares input, normalize to it.
+  if (Object.prototype.hasOwnProperty.call(props, "input") && args.input === undefined) {
+    for (const source of ["patch", "content", "text", "diff"]) {
+      if (args[source] === undefined) continue;
+      args.input = args[source];
+      if (!Object.prototype.hasOwnProperty.call(props, source)) delete args[source];
+      break;
+    }
+  }
+  if (typeof args.input === "string") args.input = normalizePatchText(args.input);
   moveAlias(args, props, AFTER_ALIASES);
   moveAlias(args, props, START_ALIASES);
   moveAlias(args, props, END_ALIASES);
@@ -120,6 +148,45 @@ function normalizeArgs(fn, raw) {
     for (const k of Object.keys(args)) if (!Object.prototype.hasOwnProperty.call(props, k)) delete args[k];
   }
   return args;
+}
+
+export function repairEditToolArguments(name, rawArgs, tools = []) {
+  if (!rawArgs || typeof rawArgs !== "string") return rawArgs;
+  const canonical = canonicalToolName(name, tools);
+  const defs = defsOf(tools);
+  let def = defs.find((fn) => fn.name === canonical) || null;
+
+  // Backwards compatibility with the pre-schema helper on main: when there
+  // is no schema, still understand bare hashline patches and common input
+  // aliases for tools whose names clearly identify them as edit/hashline.
+  if (!def) {
+    const editish = /edit|hashline/i.test(String(name || ""));
+    if (!editish) return rawArgs;
+    if (looksLikeBareHashlinePatch(rawArgs))
+      return JSON.stringify({ input: normalizePatchText(rawArgs.trim()) });
+    const parsed = parseArgs(rawArgs);
+    if (!parsed) {
+      const m = rawArgs.trim().match(/["']?input["']?\s*:\s*([\s\S]+)/i);
+      if (!m) return rawArgs;
+      let content = m[1].trim();
+      if (content.startsWith('"') && content.endsWith('"')) {
+        try { content = JSON.parse(content); } catch {}
+      }
+      return JSON.stringify({ input: normalizePatchText(content) });
+    }
+    if (parsed.input === undefined) {
+      for (const key of ["patch", "content", "text", "diff"]) {
+        if (parsed[key] === undefined) continue;
+        parsed.input = parsed[key];
+        break;
+      }
+    }
+    if (typeof parsed.input === "string") parsed.input = normalizePatchText(parsed.input);
+    return JSON.stringify(parsed);
+  }
+
+  const fixed = normalizeArgs(def, rawArgs);
+  return fixed == null ? rawArgs : JSON.stringify(fixed);
 }
 
 export function repairToolCall(call, tools) {
