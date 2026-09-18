@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 // Browser-backed chat.z.ai transport.
 //
 // Why this exists: chat.z.ai issues its CAPTCHA proof per completion, and the
@@ -22,6 +24,7 @@ const PAGE_IDLE_CLOSE_MS = 300000;
 // across OpenAI-compatible turns. A per-pool mutex serializes fill/click.
 const pools = new Map();
 let browserPromise = null;
+let xvfbProc = null;
 
 function sha256hexSync(str) {
   return createHash("sha256").update(String(str)).digest("hex");
@@ -56,14 +59,58 @@ export class ZaiBrowserUnavailable extends Error {
   }
 }
 
+function displaySocket(display) {
+  const n = String(display || "").replace(/^:/, "");
+  return "/tmp/.X11-unix/X" + n;
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Headed Chromium needs an X server. On a VM with no DISPLAY, start a private
+// Xvfb and point DISPLAY at it. Never flip to headless (chat.z.ai F001).
+async function ensureDisplay() {
+  if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY)
+    return process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
+  const display = process.env.ZAI_XVFB_DISPLAY || ":99";
+  if (existsSync(displaySocket(display))) {
+    process.env.DISPLAY = display;
+    return display;
+  }
+  let xvfb;
+  try {
+    xvfb = spawn("Xvfb", [display, "-screen", "0", "1280x800x24", "-nolisten", "tcp", "-ac"], {
+      stdio: "ignore",
+      detached: true
+    });
+  } catch (e) {
+    throw new ZaiBrowserUnavailable("headed Chromium needs Xvfb on this host (no DISPLAY). Install xvfb, or set DISPLAY. " + String(e && e.message || e).slice(0, 120));
+  }
+  xvfb.on("error", () => {});
+  xvfb.unref();
+  xvfbProc = xvfb;
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    if (existsSync(displaySocket(display))) {
+      process.env.DISPLAY = display;
+      return display;
+    }
+    if (xvfb.exitCode != null)
+      throw new ZaiBrowserUnavailable("Xvfb exited before the display socket appeared (install xvfb / xorg-x11-server-Xvfb).");
+    await sleep(50);
+  }
+  throw new ZaiBrowserUnavailable("Xvfb started but " + displaySocket(display) + " never appeared. Install xvfb or set DISPLAY.");
+}
+
 async function getBrowser() {
   if (!browserPromise) {
     browserPromise = (async () => {
+      await ensureDisplay();
       const { chromium } = await loadPlaywright();
       const executablePath = process.env.BROWSER_EXECUTABLE || undefined;
-      // Always headed. chat.z.ai F001-rejects true headless. On a VM with no
-      // physical display, auto-update.sh starts Node under xvfb-run so
-      // DISPLAY is set. Do not silently flip to headless here.
+      // Always headed. chat.z.ai F001-rejects true headless. DISPLAY is either
+      // the operator's X server or the Xvfb we just started.
       const launch = {
         headless: false,
         args: ["--window-position=4000,4000", "--mute-audio", "--no-sandbox", "--disable-dev-shm-usage"]
