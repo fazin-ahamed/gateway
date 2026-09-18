@@ -500,14 +500,14 @@ function chunk(id, created, model, delta, finish, usage) {
 // one finish chunk, and never a contentless frame (strict clients index
 // choices[0] and choke on `choices: []`). When agent=true, <<<TOOL_CALL>>>
 // blocks become incremental tool_calls deltas and finish_reason=tool_calls.
-function toOpenAiStream(source, model, id, agent = false) {
+function toOpenAiStream(source, model, id, agent = false, tools = []) {
   const created = Math.floor(Date.now() / 1000);
   const enc = new TextEncoder();
   let started = false;
   let finished = false;
   let chars = 0;
   let sawToolCalls = false;
-  const interceptor = agent ? new AgentStreamInterceptor() : null;
+  const interceptor = agent ? new AgentStreamInterceptor(tools) : null;
   return new ReadableStream({
     async start(controller) {
       const send = (obj) => controller.enqueue(enc.encode("data: " + JSON.stringify(obj) + "\n\n"));
@@ -881,7 +881,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
     // Tee the stream: client gets the shaped half; the discard half drives the
     // stream to completion so cleanup fires even when the caller abandons it.
     const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered, agent: prepared.shim.active });
+    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
     (async () => {
       try {
         const reader = discard.getReader();
@@ -896,7 +896,7 @@ export async function callZaiWeb(c, route, rawKey, payload, isStream, fetchImpl)
     })().catch(() => {});
     return shaped;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered, agent: prepared.shim.active });
+  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
   await cleanup();
   return shaped;
 }
@@ -923,10 +923,10 @@ async function fallbackBrowserOnWaf(c, route, rawKey, payload, isStream, session
 // hand over the same chat.z.ai frame stream, so the OpenAI mapping lives here
 // rather than twice.
 async function shapeFrameResponse(input) {
-  const { id, model, source, promptTokens, isStream, recovered, agent } = input;
+  const { id, model, source, promptTokens, isStream, recovered, agent, tools = [] } = input;
   if (isStream) {
     const headers = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };
-    return { response: new Response(toOpenAiStream(source, model, id, !!agent), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
+    return { response: new Response(toOpenAiStream(source, model, id, !!agent, tools), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
   }
 
   // Non-streaming: drain the same frame stream into a single completion body.
@@ -949,7 +949,7 @@ async function shapeFrameResponse(input) {
   let finishReason = "stop";
   const message = { role: "assistant", content };
   if (agent) {
-    const calls = parseAgentToolCalls(content);
+    const calls = parseAgentToolCalls(content, tools);
     content = stripAgentToolCalls(content);
     message.content = content;
     if (calls.length) {
@@ -1136,7 +1136,7 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
   }).catch(() => {});
   if (isStream && up.body) {
     const [clientStream, discard] = up.body.tee();
-    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null, agent: prepared.shim.active });
+    const shaped = shapeFrameResponse({ id, model: route.upstream_model || modelId, source: clientStream, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
     (async () => {
       try {
         const reader = discard.getReader();
@@ -1151,7 +1151,7 @@ export async function callZaiMinted(c, route, rawKey, payload, isStream, fetchIm
     })().catch(() => {});
     return shaped;
   }
-  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null, agent: prepared.shim.active });
+  const shaped = await shapeFrameResponse({ id, model: route.upstream_model || modelId, source: up.body, promptTokens, isStream, recovered: null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
   await cleanup();
   return shaped;
 }
@@ -1206,7 +1206,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
   // The frame converter reads a stream; wrap the captured response text.
   const source = new Response(turn.body).body || new Response("").body;
-  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: turn.recovered || null, agent: prepared.shim.active });
+  return shapeFrameResponse({ id, model: route.upstream_model || modelId, source, promptTokens, isStream, recovered: turn.recovered || null, agent: prepared.shim.active, tools: payload.tools || payload.functions || [] });
 }
 
 // Rebuild the caller's conversation into one prompt for the browser transport.
