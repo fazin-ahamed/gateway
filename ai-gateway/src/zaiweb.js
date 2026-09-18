@@ -23,9 +23,9 @@ const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
 const ZAI_SETTINGS_URL = ZAI_BASE_URL + "/api/v1/users/user/settings";
 const ZAI_DELETE_CHAT_URL = (chatId) => ZAI_BASE_URL + "/api/v1/chats/" + encodeURIComponent(chatId);
 const ZAI_DEFAULT_MODEL = "glm-5.3";
-const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.92";
+const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.93";
 const ZAI_FE_VERSION_CACHE_MS = 15 * 60 * 1000;
-const ZAI_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+const ZAI_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 const CLIENT_PROTOCOL_VERSION = "0.0.1";
 const SIGNATURE_KEY = "key-@@@@)))()((9))-xxxx&&&%%%%%";
 
@@ -234,9 +234,9 @@ function textContent(content) {
         parts.push(text);
       continue;
     }
-    // chat.z.ai's signed API takes no inline image parts; keep the URL so the
-    // model at least sees that an image was referenced instead of silently
-    // losing it.
+    // Before the vision upload pass this preserves image references for
+    // prompt accounting/fallback text. The pure-HTTP vision path later
+    // rewrites image_url values to real uploaded Z.AI file ids.
     if (part.type === "image_url" && part.image_url && typeof part.image_url.url === "string")
       parts.push("[image: " + part.image_url.url.slice(0, 2048) + "]");
   }
