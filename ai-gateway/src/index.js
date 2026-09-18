@@ -5,7 +5,7 @@ import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1 } from "./router/index.js";
-import { seedBeta, lcb as betaLcb } from "./router/posterior.js";
+import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 var app = new Hono();
 app.use("/*", async (c, next) => {
@@ -790,6 +790,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     let lastErrStatus = null;
     let lastRetryAfter = null;
     let attempts = 0;
+    const attemptTaskType = (autoDecision && autoDecision.horizon && autoDecision.horizon.taskIR && autoDecision.horizon.taskIR.task) || "";
     for (const route of routes.results) {
       const liveSlug = route.public_slug || slug;
       if (payload.model !== liveSlug)
@@ -831,6 +832,9 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         // Three in-place attempts for transport / 5xx / opaque relay errors;
         // then the next credential, then the next route.
         for (let transportAttempt = 0; transportAttempt < SAME_KEY_ATTEMPTS; transportAttempt++) {
+        const _attStart = Date.now();
+        const _attStartIso = nowIso();
+        const _att = { recorded: false, success: 0, status: null, why: null, errKind: null, ttft: null, prompt: 0, completion: 0, cost: null };
         try {
           // Stable Z.AI session/browser identity must be server-controlled and
           // credential-specific. Never derive pool identity from JWT claims.
@@ -839,6 +843,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             : route;
           const res = await forwardToProvider(c, attemptRoute, k.key, payload, isStream, requestId);
           const up = res.response;
+          _att.ttft = Date.now() - _attStart;
+          _att.status = up.status;
           // chat.z.ai retires its session cookie as it issues a new one; keep
           // the stored secret current so the route survives past the rotation.
           if (res.recovered && res.recovered !== k.key && k.keyId)
@@ -847,6 +853,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           if (!up.ok || !up.body) {
             const txt = await up.text();
             const why = classifyUpstreamFailure(txt);
+            _att.why = why;
             blog("FWD FAIL " + route.provider_name + " key=" + k.label + " -> HTTP " + up.status + " [" + why + "] " + String(txt).slice(0, 300));
             // Credential-scoped faults quarantine the key, never the provider.
             if (why === "auth") {
@@ -885,8 +892,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const txt = await up.text();
             const usage = res.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
             const costUsd = await computeCost(c, liveSlug, usage, route.provider_id);
+            _att.success = 1; _att.prompt = Number(usage.prompt_tokens) || 0; _att.completion = Number(usage.completion_tokens) || 0; _att.cost = costUsd;
             const clientTxt = sanitizeClientResponse(txt, liveSlug);
             if (isGenericUpstreamErrorResponse(clientTxt)) {
+              _att.why = "malformed";
               blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
               lastErr = "malformed upstream completion envelope";
               circuitRecordFail("route", route.id);
@@ -929,14 +938,18 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           circuitRecordOk("key", k.keyId);
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
+          _att.recorded = true;
+          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: attempts, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 1, http_status: up.status });
           const horizonHdrs = { "x-gateway-model": liveSlug };
           if (autoDecision && autoDecision.horizon)
             horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
-          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs });
+          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs, attemptId: _streamAttemptId, attemptStart: _attStart });
           return result;
         } catch (e) {
           // Adapter diagnostics stay internal; only gateway-owned errors cross
           // the public API boundary.
+          _att.status = (e && e.status) || 0;
+          _att.errKind = (e && e.code) || "transport";
           if (e instanceof ZaiWebError) {
             // Credential faults quarantine the key; provider faults hit the
             // keyed provider breaker. Route faults hit the route.
@@ -985,6 +998,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           if (shouldRetrySameKey(transportAttempt, e)) {
             blog("FWD RETRY " + route.provider_name + " key=" + k.label + " pre-header transport error");
             continue;
+          }
+        } finally {
+          if (!_att.recorded) {
+            const cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: attempts, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost });
           }
         }
         }
@@ -1809,6 +1827,13 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     const costUsd = await computeCost(c, slug, lastUsage, route.provider_id);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
+    if (extra && extra.attemptId) {
+      try {
+        await c.env.DB.prepare("UPDATE route_attempts SET latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(Date.now() - (extra.attemptStart || started), Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
+      } catch (e) {
+        blog("route_attempt stream patch failed: " + String(e.message || e));
+      }
+    }
     if (extra && extra.traj) {
       const msg = {
         role: "assistant",
@@ -2988,6 +3013,92 @@ async function recordTrajectory(c, t) {
     ).run();
   } catch (e) {
     blog("TRAJECTORY record failed: " + String(e.message || e));
+  }
+}
+// Canonical attempt outcome. health_impact=1 marks operational failures the
+// route posterior should learn from; capability/caller/policy/credential
+// failures are excluded so an unsupported-vision request or a dead key never
+// makes a route look unreliable.
+function classifyAttempt(status, why, errKind) {
+  const s = Number(status) || 0;
+  const w = String(why || errKind || "").toLowerCase();
+  const op = (cls) => ({ failure_class: cls, health_impact: 1 });
+  const noimp = (cls) => ({ failure_class: cls, health_impact: 0 });
+  if (w === "model" || /model_unavailable|unknown model|not found/.test(w))
+    return noimp("model_unavailable");
+  if (w === "tool_schema" || /\btool\b|vision|capability|unsupported/.test(w))
+    return noimp("capability");
+  if (w === "request_size" || /context|too.?large|request_size/.test(w))
+    return noimp("caller");
+  if (/captcha|credentials|browser_unavailable|config/.test(w))
+    return noimp("capability");
+  if (w === "auth" || s === 401 || s === 403)
+    return noimp("auth");
+  if (w === "rate_limit" || s === 429)
+    return noimp("rate_limit");
+  if (s === 400 || s === 404 || s === 422)
+    return noimp("caller");
+  if (/timeout|timed out/.test(w) || s === 408 || s === 504)
+    return op("timeout");
+  if (/reset|econnreset|socket|connect/.test(w))
+    return op("connect");
+  if (/waf/.test(w))
+    return op("waf");
+  if (w === "relay" || /relay|bad_upstream|malformed|stream_error/.test(w))
+    return op("bad_upstream_response");
+  if (s >= 500 || s === 0)
+    return op("upstream_5xx");
+  return op("upstream_5xx");
+}
+// Persisted Beta(alpha,beta) posterior per scope, updated only by operational
+// outcomes. Time-decayed via the same observe() the shadow router uses.
+async function updateRouterStat(c, scope, scopeId, taskType, success, latencyMs, costUsd) {
+  try {
+    const row = await c.env.DB.prepare("SELECT success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope=? AND scope_id=? AND task_type=?").bind(scope, scopeId, taskType || "").first();
+    const seed = seedBeta("route");
+    const prev = row
+      ? { alpha: Number(row.success_alpha) || seed.alpha, beta: Number(row.failure_beta) || seed.beta, updatedAt: Date.parse(row.updated_at) || Date.now(), kind: "route" }
+      : { ...seed, updatedAt: Date.now(), kind: "route" };
+    const next = betaObserve(prev, !!success);
+    const lat = Number(latencyMs);
+    const cost = Number(costUsd);
+    const emaL = row && row.latency_ema != null && Number.isFinite(lat) ? 0.8 * Number(row.latency_ema) + 0.2 * lat : (Number.isFinite(lat) ? lat : (row ? row.latency_ema : null));
+    const emaC = row && row.cost_ema != null && Number.isFinite(cost) ? 0.8 * Number(row.cost_ema) + 0.2 * cost : (Number.isFinite(cost) ? cost : (row ? row.cost_ema : null));
+    await c.env.DB.prepare("INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(scope, scope_id, task_type) DO UPDATE SET success_alpha=excluded.success_alpha, failure_beta=excluded.failure_beta, latency_ema=excluded.latency_ema, cost_ema=excluded.cost_ema, updated_at=excluded.updated_at").bind(scope, scopeId, taskType || "", next.alpha, next.beta, emaL == null ? null : emaL, emaC == null ? null : emaC, nowIso()).run();
+  } catch (e) {
+    blog("router_stats update failed: " + String(e.message || e));
+  }
+}
+// One row per real upstream attempt. Body-free. Returns the row id (for a
+// later streaming metric patch) or null. Updates the route posterior only for
+// operational outcomes (success, or failure with health_impact).
+async function recordRouteAttempt(c, a) {
+  try {
+    const r = await c.env.DB.prepare(
+      `INSERT INTO route_attempts
+       (request_id, parent_slug, route_id, provider_id, provider_key_id, public_slug, upstream_model, transport, task_type,
+        attempt_index, key_attempt_index, started_at, finished_at, success, health_impact, http_status, failure_class, failure_code,
+        ttft_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, fallback_from_route_id, rescue_used)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      a.request_id, a.parent_slug ?? null, a.route_id ?? null, a.provider_id ?? null, a.provider_key_id ?? null,
+      a.public_slug, a.upstream_model ?? null, a.transport ?? null, a.task_type ?? "",
+      a.attempt_index ?? 0, a.key_attempt_index ?? 0, a.started_at, a.finished_at ?? nowIso(),
+      a.success ? 1 : 0, a.health_impact ? 1 : 0, a.http_status ?? null, a.failure_class ?? null, a.failure_code ?? null,
+      a.ttft_ms ?? null, a.latency_ms ?? null, a.prompt_tokens ?? 0, a.completion_tokens ?? 0,
+      a.estimated_cost_usd ?? null, a.actual_cost_usd ?? null, a.fallback_from_route_id ?? null, a.rescue_used ? 1 : 0
+    ).run();
+    if (a.success || a.health_impact) {
+      const ok = !!a.success;
+      const scopeId = "route:" + (a.route_id ?? "?");
+      await updateRouterStat(c, "route", scopeId, "", ok, a.latency_ms, a.actual_cost_usd);
+      if (a.task_type)
+        await updateRouterStat(c, "route_task", scopeId, a.task_type, ok, a.latency_ms, a.actual_cost_usd);
+    }
+    return (r && r.meta && r.meta.last_row_id) || null;
+  } catch (e) {
+    blog("route_attempt record failed: " + String(e.message || e));
+    return null;
   }
 }
 function trajectorySeed(c, payload, key, slug, isStream, requestId) {
@@ -4747,7 +4858,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

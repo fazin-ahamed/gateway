@@ -241,6 +241,40 @@ test("migratePrices rebuilds a slug-only table with NULL actual_mode into (slug,
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM prices").all().results)[0].n, 3, "re-running the migration is a no-op");
 });
 
+test("classifyAttempt marks only operational failures for route health", () => {
+  const imp = (s, why, ek) => t.classifyAttempt(s, why, ek).health_impact;
+  assert.equal(imp(0, "model"), 0, "model-not-found is capability, not health");
+  assert.equal(imp(0, "tool_schema"), 0);
+  assert.equal(imp(0, "request_size"), 0);
+  assert.equal(imp(401, "auth"), 0, "a dead key is credential, not route health");
+  assert.equal(imp(429, "rate_limit"), 0);
+  assert.equal(imp(400, "unknown"), 0);
+  assert.equal(imp(404, ""), 0);
+  assert.equal(imp(500, "unknown"), 1);
+  assert.equal(imp(504, ""), 1);
+  assert.equal(imp(0, "relay"), 1);
+  assert.equal(imp(0, null, "ECONNRESET"), 1);
+  assert.equal(t.classifyAttempt(500, "unknown").failure_class, "upstream_5xx");
+  assert.equal(t.classifyAttempt(0, "relay").failure_class, "bad_upstream_response");
+});
+
+test("recordRouteAttempt writes one row per attempt and moves the posterior only on operational outcomes", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const c = { env: { DB: db } };
+  const base = { public_slug: "glm", route_id: 7, provider_id: 1, provider_key_id: 3, task_type: "chat:casual", started_at: "t", finished_at: "t", latency_ms: 800 };
+  await t.recordRouteAttempt(c, { ...base, request_id: "r1", success: 1, health_impact: 1, http_status: 200, failure_class: "success", actual_cost_usd: 0.001 });
+  await t.recordRouteAttempt(c, { ...base, request_id: "r2", success: 0, health_impact: 1, http_status: 500, failure_class: "upstream_5xx" });
+  await t.recordRouteAttempt(c, { ...base, request_id: "r3", success: 0, health_impact: 0, http_status: 400, failure_class: "caller" });
+  const n = db.prepare("SELECT COUNT(*) AS n FROM route_attempts").all().results[0].n;
+  assert.equal(n, 3, "one row per attempt, including the excluded caller error");
+  const stat = db.prepare("SELECT success_alpha, failure_beta FROM router_stats WHERE scope='route' AND scope_id='route:7' AND task_type=''").all().results[0];
+  assert.ok(stat.success_alpha > 8 && stat.success_alpha < 10, "one operational success raised alpha");
+  assert.ok(stat.failure_beta > 2 && stat.failure_beta < 4, "one operational failure raised beta; the caller error did not");
+});
+
 test("HORIZON reflex actions carry candidate cost before comparing cheapest", () => {
   const actions = generateActions([
     { slug: "model-a-mini", cost: 3, eligible: true, capable: true },

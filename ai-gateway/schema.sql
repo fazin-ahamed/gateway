@@ -258,5 +258,47 @@ CREATE TABLE IF NOT EXISTS router_stats (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (scope, scope_id, task_type)
 );
+
+-- One row per actual upstream attempt (per key, per retry, per fallback), not
+-- per request and not per final result. Body-free and safe to keep always-on;
+-- it is the authoritative telemetry the router learns route/provider health,
+-- latency, and cost from. `health_impact=1` marks operational failures the
+-- route posterior should learn from; capability/caller/policy failures do not.
+CREATE TABLE IF NOT EXISTS route_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL,
+  parent_slug TEXT,
+  route_id INTEGER,
+  provider_id INTEGER,
+  provider_key_id INTEGER,
+  public_slug TEXT NOT NULL,
+  upstream_model TEXT,
+  transport TEXT,
+  task_type TEXT,
+  attempt_index INTEGER NOT NULL DEFAULT 0,
+  key_attempt_index INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  success INTEGER NOT NULL DEFAULT 0,
+  health_impact INTEGER NOT NULL DEFAULT 1,
+  http_status INTEGER,
+  failure_class TEXT,
+  failure_code TEXT,
+  ttft_ms INTEGER,
+  latency_ms INTEGER,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd REAL,
+  actual_cost_usd REAL,
+  tool_valid INTEGER,
+  tool_success INTEGER,
+  verification_score REAL,
+  fallback_from_route_id INTEGER,
+  rescue_used INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_route_attempts_route_time ON route_attempts(route_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_route_attempts_provider_time ON route_attempts(provider_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_route_attempts_model_task_time ON route_attempts(public_slug, task_type, started_at);
+CREATE INDEX IF NOT EXISTS idx_route_attempts_request ON route_attempts(request_id);
 CREATE INDEX IF NOT EXISTS idx_zai_device_tokens_fifo
   ON zai_device_tokens(id);

@@ -31,7 +31,7 @@ export function createDb(path) {
         },
         run() {
           const info = stmt.run(...(api._params || []));
-          return { meta: { changes: Number(info.changes || 0) } };
+          return { meta: { changes: Number(info.changes || 0), last_row_id: Number(info.lastInsertRowid || 0) } };
         },
       };
       return api;
