@@ -268,10 +268,6 @@ function estimatePromptTokens(messages, toolsChars) {
   return Math.ceil(chars / PROMPT_CHARS_PER_TOKEN);
 }
 
-// The consumer settings UI exposes a bucketed effort selector. Live model
-// data only advertises buckets the account actually has; sending an
-// unsupported value can corrupt the response. Keep to high/max for now;
-// more granular levels require live capability discovery.
 function resolveThinking(modelId, payload, liveEntry = null) {
   const caps = getModelCapabilities(modelId);
   const supportsThinking = liveEntry ? liveEntry.reasoning !== false : !!(caps && caps.thinking);
@@ -281,7 +277,7 @@ function resolveThinking(modelId, payload, liveEntry = null) {
   const reasoning = payload && payload.reasoning;
   const thinking = payload && payload.thinking;
   if (reasoning === false || thinking && thinking.type === "disabled")
-    return { enabled: false, effort: "high", effortSupported: true };
+    return { enabled: false, effort: "high", effortSupported: false };
 
   const raw = typeof payload?.reasoning_effort === "string"
     ? payload.reasoning_effort.trim().toLowerCase()
@@ -289,7 +285,12 @@ function resolveThinking(modelId, payload, liveEntry = null) {
       ? reasoning.effort.trim().toLowerCase()
       : "";
   const effort = raw === "max" || raw === "xhigh" ? "max" : "high";
-  return { enabled: true, effort, effortSupported: true };
+  // GLM-Free-API only forwards reasoning_effort when the request asked for
+  // it AND the live catalog advertises the capability. Sending it otherwise
+  // is a Z.AI Internal Server Error.
+  const requested = raw === "high" || raw === "max" || raw === "xhigh";
+  const liveAllows = !!(liveEntry && liveEntry.effortSupported);
+  return { enabled: true, effort, effortSupported: requested && liveAllows };
 }
 
 // Web search / tools switches shown in the site UI. Defaults off: the gateway

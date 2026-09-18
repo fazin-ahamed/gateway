@@ -30,6 +30,9 @@ server/data/
 *.db
 *.db-shm
 *.db-wal
+# Harvested Z.AI device tokens (single-use secrets, never commit)
+data/zai-device-tokens.txt
+data/*.txt
 
 # Node dependencies (installed via npm in ai-gateway/)
 node_modules/

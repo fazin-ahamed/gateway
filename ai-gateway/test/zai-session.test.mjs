@@ -246,6 +246,7 @@ test("registry maps glm-5.3-flash to live x-preview-l instead of marking it unav
   assert.equal(flash.available, true);
   assert.equal(flash.source, "live");
   assert.equal(flash.wireId, "x-preview-l");
+  assert.equal(flash.effortSupported, false);
 });
 
 test("registry falls back when the live call fails", async () => {

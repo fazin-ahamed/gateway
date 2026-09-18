@@ -67,6 +67,7 @@ export function normalizeModels(payload) {
     const caps = (row.capabilities && typeof row.capabilities === "object") ? row.capabilities : row;
     const thinking = asBool(pick(caps, ["thinking", "reasoning", "enable_thinking", "deep_think", "supports_reasoning"]));
     const vision = asBool(pick(caps, ["vision", "image", "supports_vision", "multimodal", "vlm"]));
+    const effort = asBool(pick(caps, ["reasoning_effort"]));
     const available = asBool(pick(row, ["available", "enabled", "is_available", "usable", "access"])) ?? true;
     const context = asNumber(pick(caps, ["context_length", "context_window", "context", "max_context", "max_context_tokens"]));
     const output = asNumber(pick(caps, ["max_tokens", "max_output", "output", "max_output_tokens"]));
@@ -76,6 +77,8 @@ export function normalizeModels(payload) {
       available,
       reasoning: thinking === true,
       reasoningKnown: thinking !== undefined,
+      effortSupported: effort === true,
+      effortKnown: effort !== undefined,
       toolCall: asBool(pick(caps, ["tools", "tool_call", "function_calling"])) === true,
       attachment: vision === true,
       attachmentKnown: vision !== undefined,
@@ -195,7 +198,7 @@ export class ZaiModelRegistry {
       wireId: live.id,
       reasoning: live.reasoningKnown ? live.reasoning : (base ? base.reasoning : live.reasoning || false),
       // Tool support is a gateway capability: the agent shim can emulate it
-      // even when chat.z.ai itself reports no native function calling.
+      // even when chat.z.ai itself does not expose native OpenAI tools.
       toolCall: live.toolCall || (base ? base.toolCall : false) || false,
       // A live explicit vision=false is authoritative. Static fallback is
       // only used when the live catalog omitted the capability entirely.
@@ -207,6 +210,9 @@ export class ZaiModelRegistry {
         context: live.limit.context || (base ? base.limit.context : 0),
         output: live.limit.output || (base ? base.limit.output : 0)
       },
+      // GLM-Free-API: reasoning_effort is only a wire field when the live
+      // catalog explicitly sets capabilities.reasoning_effort = true.
+      effortSupported: live.effortKnown ? live.effortSupported : false,
       available: live.available,
       source: "live"
     };

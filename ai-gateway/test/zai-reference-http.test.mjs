@@ -47,9 +47,40 @@ test("reference completion body stays minimal and supports files + advanced sear
   assert.equal(body.features.auto_web_search, true);
   assert.equal(body.features.web_search, false);
   assert.equal(body.features.image_generation, false);
+  assert.equal(body.features.reasoning_effort, "high");
 
   for (const legacy of ["params", "extra", "variables", "id", "current_user_message_id", "background_tasks"])
     assert.equal(Object.prototype.hasOwnProperty.call(body, legacy), false, "legacy field leaked: " + legacy);
+});
+
+test("default Flash thinking omits reasoning_effort unless catalog allows and request asked", () => {
+  const thinking = __zaiTest.resolveThinking("glm-5.3-flash", { messages: [] });
+  assert.equal(thinking.enabled, true);
+  assert.equal(thinking.effortSupported, false);
+  const body = __zaiTest.buildReferenceCompletionBody({
+    captchaVerifyParam: "proof",
+    chatId: "chat-1",
+    messages: [{ role: "user", content: "hello" }],
+    modelId: "glm-5.3-flash",
+    prompt: "hello",
+    thinking,
+    features: {}
+  });
+  assert.equal(body.features.enable_thinking, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(body.features, "reasoning_effort"), false);
+
+  const allowed = __zaiTest.resolveThinking("glm-5.3-flash", { reasoning_effort: "high" }, { reasoning: true, effortSupported: true });
+  assert.equal(allowed.effortSupported, true);
+  const body2 = __zaiTest.buildReferenceCompletionBody({
+    captchaVerifyParam: "proof",
+    chatId: "chat-1",
+    messages: [{ role: "user", content: "hello" }],
+    modelId: "glm-5.3-flash",
+    prompt: "hello",
+    thinking: allowed,
+    features: {}
+  });
+  assert.equal(body2.features.reasoning_effort, "high");
 });
 
 test("reference signature prompt is all message text in order", () => {
