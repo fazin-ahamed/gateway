@@ -641,7 +641,7 @@ function parseCredential(rawKey, payload, headers) {
 // cannot imitate. When ZAI_UTLS_PROXY points at the local zaihttp helper, the
 // chat.z.ai calls are routed through it so they carry a Chrome ClientHello.
 // Everything else (and every test) keeps using the plain fetcher.
-export function wrapUtlsFetcher(fetcher) {
+export function wrapUtlsFetcher(fetcher, egressProxy) {
   const proxy = process.env.ZAI_UTLS_PROXY;
   if (!proxy || typeof fetcher !== "function")
     return fetcher;
@@ -665,14 +665,20 @@ export function wrapUtlsFetcher(fetcher) {
     }
     if (host !== "chat.z.ai")
       return fetcher(url, init);
+    const headers = {
+      ...asHeaderObject(init.headers),
+      "X-Target-Url": String(url),
+      "X-Target-Method": String(init.method || "GET").toUpperCase()
+    };
+    // Auto proxy-pool selection: the gateway pins one healthy egress for this
+    // session; the helper honors X-Egress-Proxy over its env default. Absent
+    // (manual mode) the helper uses ZAI_EGRESS_PROXY as before.
+    if (egressProxy)
+      headers["X-Egress-Proxy"] = String(egressProxy);
     return fetcher(base + "/proxy", {
       ...init,
       method: "POST",
-      headers: {
-        ...asHeaderObject(init.headers),
-        "X-Target-Url": String(url),
-        "X-Target-Method": String(init.method || "GET").toUpperCase()
-      }
+      headers
     });
   };
 }
@@ -686,7 +692,7 @@ export function wrapUtlsFetcher(fetcher) {
 // - every referenced chat is deleted after the response drains.
 async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options = {}) {
   const baseFetcher = options.fetchImpl || (c && c.upstreamFetch) || globalThis.fetch;
-  const fetcher = wrapUtlsFetcher(baseFetcher);
+  const fetcher = wrapUtlsFetcher(baseFetcher, options.egressProxy || (c && c.zaiEgress));
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
   const staticCaps = getModelCapabilities(modelId);
 

@@ -389,7 +389,8 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-h"><h2 class="sec">Recent requests</h2></div><div class="panel-b flush" id="tj-list"></div></div>
   </section>
   <section class="tab" id="tab-proxies">
-    <div class="pagehead"><div><h2 class="sec">Proxies</h2><p class="sub">Egress inventory for the Z.AI uTLS helper. Credentials are sealed in SQLite and never leave the server. Testing verifies a real HTTPS tunnel against a neutral destination \u2014 it never touches Z.AI.</p></div><div class="actions"><button class="ghost" id="px-test-all">Test all</button><button class="ghost" id="px-test-failed">Retest failed</button><button class="danger" id="px-remove-dead">Remove dead</button></div></div>
+    <div class="pagehead"><div><h2 class="sec">Proxies</h2><p class="sub">Egress inventory for the Z.AI uTLS helper. Credentials are sealed in SQLite and never leave the server. Testing verifies a real HTTPS tunnel against a neutral destination \u2014 it never touches Z.AI.</p></div><div class="actions"><label class="pg-check" style="margin:0" title="Auto: gateway picks the best healthy proxy and keeps it sticky. Manual: uses ZAI_EGRESS_PROXY."><input type="checkbox" id="px-auto"> Auto-select</label><button class="ghost" id="px-test-all">Test all</button><button class="ghost" id="px-test-failed">Retest failed</button><button class="danger" id="px-remove-dead">Remove dead</button></div></div>
+    <div id="px-active" class="hint" style="margin:0 0 10px"></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Import</h2></div><div class="panel-b">
       <textarea id="px-import" rows="4" placeholder="host:port&#10;http://user:pass@host:port&#10;socks5h://host:1080&#10;host:port:user:pass" style="width:100%;font-family:monospace;font-size:12px"></textarea>
       <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
@@ -1525,6 +1526,12 @@ async function loadProxies(){
     {k:'Untested',v:fmt((counts.untested||0)+(counts.disabled||0)),s:'no result yet'}
   ];
   statsEl.innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div><div class="sub2">'+esc(s.s||'')+'</div></div>';}).join('');
+  const autoEl=document.getElementById('px-auto'); if(autoEl) autoEl.checked=(data.mode==='auto');
+  const activeEl=document.getElementById('px-active');
+  if(activeEl){
+    if(data.mode==='auto') activeEl.innerHTML=data.active?('Active egress: <span class="mono">'+esc(data.active)+'</span> (sticky until it fails)'):'Auto-select on \u2014 no healthy proxy yet; test the pool.';
+    else activeEl.textContent='Manual: using ZAI_EGRESS_PROXY from the environment.';
+  }
   const rows=(data.proxies||[]);
   if(!rows.length){ listEl.innerHTML='<div class="empty" style="margin:20px">No proxies. Paste some above and Import.</div>'; return; }
   listEl.innerHTML='<table class="tbl"><thead><tr><th>Type</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Fails</th><th>Last test</th><th></th></tr></thead><tbody>'+
@@ -1559,6 +1566,13 @@ document.getElementById('px-import-btn').onclick=async function(){
   if(status!==200){ toast('import failed: '+(data&&data.error&&data.error.message||status),'err'); return; }
   toast('Imported '+data.imported+' \u2014 '+data.duplicates+' dup, '+data.invalid+' invalid','ok');
   document.getElementById('px-import').value='';
+  loadProxies();
+};
+document.getElementById('px-auto').onchange=async function(e){
+  const mode=e.target.checked?'auto':'manual';
+  const {status,data}=await api('/admin/proxies/mode',{method:'POST',body:JSON.stringify({mode})});
+  if(status!==200){ toast('mode change failed','err'); e.target.checked=!e.target.checked; return; }
+  toast(mode==='auto'?'Auto-select on \u2014 gateway picks the best healthy proxy':'Manual egress','ok');
   loadProxies();
 };
 document.getElementById('px-test-all').onclick=function(){ pxTest({},'all'); };

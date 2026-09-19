@@ -1041,6 +1041,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
 }
 async function forwardToProvider(c, route, apiKey, payload, isStream, requestId) {
   const fmt2 = (route.fmt || "openai").toLowerCase();
+  // Auto proxy-pool: resolve the sticky egress once per request for Z.AI
+  // routes (the only traffic that goes through the uTLS helper). Cached and
+  // sticky, so warmup/auth/captcha/completion/delete share one identity.
+  if (isZaiMintedFormat(fmt2) || isZaiBrowserFormat(fmt2) || isZaiWebFormat(fmt2)) {
+    try { c.zaiEgress = await resolveActiveEgress(c); } catch { c.zaiEgress = null; }
+  }
   if (isZaiMintedFormat(fmt2)) {
     if (route.transport && route.transport !== "auto" && route.transport !== "direct")
       throw new ZaiWebError(400, 'Z.AI minted routes must use direct transport (transport="' + route.transport + '").', "zai_transport");
@@ -4736,6 +4742,59 @@ app.get("/admin/router/reconcile", async (c) => {
 // keys and are NEVER returned to the browser. Batch testing runs server-side
 // through the loopback zaihttp /check-egress against a fixed neutral target.
 var PROXY_DEAD_THRESHOLD = 3;
+// Rank order for both the pool table and auto-selection: healthy first, then
+// lowest measured latency, then most proven successes. untested rides ahead of
+// flaky/dead so a fresh pool still yields a pick before its first test run.
+var PROXY_STATUS_RANK = { healthy: 0, untested: 1, flaky: 2, disabled: 3, dead: 4 };
+function compareProxyRank(a, b) {
+  const sa = PROXY_STATUS_RANK[a.status] ?? 5;
+  const sb = PROXY_STATUS_RANK[b.status] ?? 5;
+  if (sa !== sb) return sa - sb;
+  const la = a.last_latency_ms == null ? Infinity : Number(a.last_latency_ms);
+  const lb = b.last_latency_ms == null ? Infinity : Number(b.last_latency_ms);
+  if (la !== lb) return la - lb;
+  return (Number(b.success_count) || 0) - (Number(a.success_count) || 0);
+}
+// Sticky active egress: one process = one identity. The chosen proxy is cached
+// and only re-picked when it stops being a healthy candidate (dead/disabled/
+// gone), never per request — auto selection must not rotate identity mid
+// session. Manual mode (default) returns null so the helper uses its env.
+var activeEgress = { id: null, url: null, at: 0 };
+var ACTIVE_EGRESS_TTL_MS = 30000;
+async function resolveActiveEgress(c) {
+  const mode = await settingValue(c, "proxy_egress_mode", "manual");
+  if (mode !== "auto")
+    return null;
+  const now = Date.now();
+  // Re-validate the sticky choice cheaply; only re-pick if it is no longer a
+  // healthy/untested enabled row.
+  if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS)
+    return activeEgress.url;
+  const rows = await c.env.DB.prepare(
+    "SELECT id, scheme, host, port, username, password_enc, status, last_latency_ms, success_count FROM proxy_pool WHERE enabled=1 AND status IN ('healthy','untested')"
+  ).all();
+  const candidates = (rows.results || []).slice().sort(compareProxyRank);
+  // Keep the current sticky pick if it is still a candidate.
+  if (activeEgress.id != null) {
+    const keep = candidates.find((r) => r.id === activeEgress.id);
+    if (keep) {
+      activeEgress.at = now;
+      return activeEgress.url;
+    }
+  }
+  const pick = candidates[0];
+  if (!pick) {
+    activeEgress = { id: null, url: null, at: now };
+    return null;
+  }
+  let plainPassword = "";
+  if (pick.password_enc) {
+    try { plainPassword = await openProviderKey(c.env, pick.password_enc); } catch { plainPassword = ""; }
+  }
+  activeEgress = { id: pick.id, url: proxyEgressUrl(pick, plainPassword), at: now };
+  return activeEgress.url;
+}
+function __resetActiveEgress() { activeEgress = { id: null, url: null, at: 0 }; }
 function maskProxyRow(row) {
   const host = String(row.host).includes(":") ? "[" + row.host + "]" : row.host;
   const auth = row.username ? row.username + ":\u2022\u2022\u2022@" : "";
@@ -4771,11 +4830,35 @@ app.get("/admin/proxies", async (c) => {
   const rows = await c.env.DB.prepare(
     "SELECT id, scheme, host, port, username, password_enc, enabled, status, success_count, failure_count, consecutive_failures, last_latency_ms, last_failure_class, last_checked_at FROM proxy_pool ORDER BY id"
   ).all();
-  const list = rows.results || [];
+  const list = (rows.results || []).slice().sort(compareProxyRank);
   const counts = { untested: 0, healthy: 0, flaky: 0, dead: 0, disabled: 0 };
   for (const r of list)
     counts[r.status] = (counts[r.status] || 0) + 1;
-  return c.json({ proxies: list.map(maskProxyRow), total: list.length, counts });
+  const mode = await settingValue(c, "proxy_egress_mode", "manual");
+  let active = null;
+  if (mode === "auto") {
+    await resolveActiveEgress(c);
+    if (activeEgress.id != null) {
+      const row = list.find((r) => r.id === activeEgress.id);
+      if (row) active = maskProxyRow(row).endpoint;
+    }
+  }
+  return c.json({ proxies: list.map(maskProxyRow), total: list.length, counts, mode, active });
+});
+app.post("/admin/proxies/mode", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try {
+    b = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "invalid JSON body" } }, 400);
+  }
+  const mode = b.mode === "auto" ? "auto" : "manual";
+  await c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('proxy_egress_mode', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(mode, nowIso()).run();
+  __resetActiveEgress();
+  return c.json({ mode });
 });
 app.post("/admin/proxies/import", async (c) => {
   const denied = await requireAdmin(c);
@@ -5377,7 +5460,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

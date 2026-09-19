@@ -85,3 +85,10 @@ func TestCheckEgressRejectsNonLoopback(t *testing.T) {
 		t.Fatalf("non-loopback must be rejected, got %d", rec.Code)
 	}
 }
+
+
+func TestEgressProxyHeaderIsHopStripped(t *testing.T) {
+	if !hopHeaders["x-egress-proxy"] {
+		t.Fatal("x-egress-proxy must be a hop header so it never leaks upstream to chat.z.ai")
+	}
+}

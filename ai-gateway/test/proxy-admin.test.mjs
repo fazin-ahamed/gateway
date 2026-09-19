@@ -104,3 +104,68 @@ test("proxy endpoints require admin", async () => {
   const res = await app.fetch(new Request("http://gw/admin/proxies"));
   assert.equal(res.status, 401);
 });
+
+test("proxy rank: healthy before untested before flaky/dead; then latency, then successes", () => {
+  const rows = [
+    { status: "dead", last_latency_ms: 10, success_count: 0 },
+    { status: "healthy", last_latency_ms: 900, success_count: 5 },
+    { status: "healthy", last_latency_ms: 200, success_count: 1 },
+    { status: "untested", last_latency_ms: null, success_count: 0 },
+    { status: "flaky", last_latency_ms: 50, success_count: 3 }
+  ];
+  const sorted = rows.slice().sort(t.compareProxyRank);
+  assert.equal(sorted[0].status, "healthy");
+  assert.equal(sorted[0].last_latency_ms, 200, "faster healthy wins");
+  assert.equal(sorted[1].last_latency_ms, 900);
+  assert.equal(sorted[2].status, "untested");
+  assert.equal(sorted[3].status, "flaky");
+  assert.equal(sorted[4].status, "dead");
+});
+
+test("auto egress is sticky and only re-picks when the chosen proxy stops being healthy", async () => {
+  const { db, env } = appWithDb();
+  const c = { env };
+  const now = new Date().toISOString();
+  const ins = (host, status, lat) => db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, enabled, status, last_latency_ms, success_count, created_at, updated_at) VALUES ('socks5h',?,1080,'',1,?,?,1,?,?)").bind(host, status, lat, now, now).run();
+  ins("fast.example", "healthy", 100);
+  ins("slow.example", "healthy", 800);
+  // manual mode -> null (helper uses env)
+  const manual = await t.resolveActiveEgress(c);
+  assert.equal(manual, null);
+  // switch to auto
+  await db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('proxy_egress_mode','auto',?)").bind(now).run();
+  t.__resetActiveEgress();
+  const pick1 = await t.resolveActiveEgress(c);
+  assert.match(pick1, /fast\.example:1080/, "picks the fastest healthy proxy");
+  // A new, even-faster proxy appears — but the sticky pick must not change
+  // while the current one is still healthy (no per-session identity churn).
+  ins("faster.example", "healthy", 10);
+  const pick2 = await t.resolveActiveEgress(c);
+  assert.equal(pick2, pick1, "sticky: does not abandon a healthy egress mid-session");
+  // The chosen proxy goes dead -> re-pick.
+  db.prepare("UPDATE proxy_pool SET status='dead' WHERE host='fast.example'").run();
+  t.__resetActiveEgress(); // simulate TTL expiry / forced revalidation
+  const pick3 = await t.resolveActiveEgress(c);
+  assert.match(pick3, /faster\.example:1080/, "re-picks the best remaining healthy proxy");
+});
+
+test("mode endpoint flips manual/auto and never leaks a password in active egress", async () => {
+  const { app, db } = appWithDb();
+  const now = new Date().toISOString();
+  // seal a proxy with a password via import
+  await app.fetch(new Request("http://gw/admin/proxies/import", {
+    method: "POST",
+    headers: { ...AUTH, "content-type": "application/json" },
+    body: JSON.stringify({ text: "socks5h://bob:s3cret@9.9.9.9:1080" })
+  }));
+  db.prepare("UPDATE proxy_pool SET status='healthy', last_latency_ms=120 WHERE host='9.9.9.9'").run();
+  const flip = await app.fetch(new Request("http://gw/admin/proxies/mode", {
+    method: "POST", headers: { ...AUTH, "content-type": "application/json" }, body: JSON.stringify({ mode: "auto" })
+  }));
+  assert.equal((await flip.json()).mode, "auto");
+  const res = await app.fetch(new Request("http://gw/admin/proxies", { headers: AUTH }));
+  const body = await res.json();
+  assert.equal(body.mode, "auto");
+  assert.match(body.active, /bob:\u2022\u2022\u2022@9\.9\.9\.9:1080/, "active egress is shown masked");
+  assert.doesNotMatch(JSON.stringify(body), /s3cret/, "password never surfaces even as the active pick");
+});

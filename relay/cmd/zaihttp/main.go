@@ -69,6 +69,7 @@ var hopHeaders = map[string]bool{
 	"x-target-url":        true,
 	"x-target-method":     true,
 	"content-length":      true,
+	"x-egress-proxy":      true,
 	"proxy-authenticate":  true,
 	"proxy-authorization": true,
 	"te":                  true,
@@ -134,7 +135,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	cfg, _ := egress.Parse(os.Getenv("ZAI_EGRESS_PROXY"))
+	// The gateway may pin the egress per request via a loopback header (auto
+	// proxy-pool selection); otherwise fall back to the process env default.
+	egressSpec := r.Header.Get("X-Egress-Proxy")
+	if egressSpec == "" {
+		egressSpec = os.Getenv("ZAI_EGRESS_PROXY")
+	}
+	cfg, _ := egress.Parse(egressSpec)
 	conn, _, err := cfg.Dial(ctx, targetHost, 443)
 	if err != nil {
 		http.Error(w, "egress "+egress.Class(err), http.StatusBadGateway)
