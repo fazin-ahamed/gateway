@@ -18,6 +18,10 @@ const ZAI_AUTHS_URL = ZAI_BASE + "/api/v1/auths/";
 const ZAI_HOME_URL = ZAI_BASE + "/";
 const DEFAULT_FE_VERSION = "prod-fe-1.1.93";
 const FE_VERSION_TTL_MS = 15 * 60 * 1000;
+// Session bootstrap (warm/guest/auth) is a quick handshake, not a generation.
+// Bound it so a stonewalled edge fails in seconds instead of riding the
+// completion timeout for minutes. Matches the reference's per-call ~20s cap.
+const BOOTSTRAP_TIMEOUT_MS = 20000;
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
 export const looksLikeJwt = (value) => {
@@ -323,7 +327,8 @@ export class ZaiSession {
       await this._warm();
       const res = await this.fetcher(ZAI_AUTHS_URL, {
         method: "GET",
-        headers: this.headers({ Authorization: "Bearer " + token, Accept: "application/json" })
+        headers: this.headers({ Authorization: "Bearer " + token, Accept: "application/json" }),
+        timeoutMs: BOOTSTRAP_TIMEOUT_MS
       });
       this.jar.absorb(res.headers);
       return !!res.ok;
@@ -339,7 +344,8 @@ export class ZaiSession {
     try {
       const res = await this.fetcher(ZAI_HOME_URL, {
         method: "GET",
-        headers: { Accept: "text/html", "User-Agent": USER_AGENT }
+        headers: { Accept: "text/html", "User-Agent": USER_AGENT },
+        timeoutMs: BOOTSTRAP_TIMEOUT_MS
       });
       this.jar.absorb(res.headers);
       if (this.feVersion && Date.now() - this.lastValidated < FE_VERSION_TTL_MS)
@@ -362,7 +368,8 @@ export class ZaiSession {
       const res = await this.fetcher(ZAI_GUEST_URL, {
         method: "POST",
         headers: this.headers({ Accept: "application/json", "Content-Type": "application/json" }),
-        body: "{}"
+        body: "{}",
+        timeoutMs: BOOTSTRAP_TIMEOUT_MS
       });
       this.jar.absorb(res.headers);
       const body = await res.text().catch(() => "");
@@ -379,7 +386,8 @@ export class ZaiSession {
     try {
       const res = await this.fetcher(ZAI_AUTHS_URL, {
         method: "GET",
-        headers: this.headers({ Accept: "application/json" })
+        headers: this.headers({ Accept: "application/json" }),
+        timeoutMs: BOOTSTRAP_TIMEOUT_MS
       });
       this.jar.absorb(res.headers);
       const body = await res.text().catch(() => "");

@@ -1127,11 +1127,17 @@ async function ensureUpstreamDispatcher() {
 var UPSTREAM_TIMEOUT_MS = 600000;
 function upstreamFetch(c, url, init) {
   const ctrl = new AbortController();
-  const ms = Number(c && c.env && c.env.UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS;
+  // A per-call timeoutMs overrides the default generation ceiling. Session
+  // bootstrap (warm/guest/auth) is a quick handshake and must fail fast; only
+  // the completion stream deserves the long UPSTREAM_TIMEOUT_MS window.
+  const opts = { ...init };
+  const override = Number(opts.timeoutMs);
+  delete opts.timeoutMs;
+  const ms = Number.isFinite(override) && override > 0 ? override : (Number(c && c.env && c.env.UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS);
   let timer = null;
-  const clear = () => { if (timer) clearTimeout(timer); };
+  const clear = () => clearTimeout(timer);
   try {
-    const p = fetch(url, { ...init, signal: ctrl.signal });
+    const p = fetch(url, { ...opts, signal: ctrl.signal });
     // Arm the abort AFTER fetch() is issued; clear the moment headers land.
     timer = setTimeout(() => ctrl.abort(), ms);
     return p.then((r) => { clear(); return r; }).catch((e) => {

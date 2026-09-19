@@ -212,8 +212,29 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("copy: %v", err)
+	// Stream frame by frame: chat.z.ai sends SSE, and net/http buffers writes
+	// by default. Without flushing after each chunk the whole response is held
+	// until the buffer fills or upstream generation completes — which looks
+	// like a multi-minute hang to the client. Flush every read so tokens reach
+	// the gateway (and the caller) as they arrive.
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 16*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				log.Printf("copy: %v", rerr)
+			}
+			return
+		}
 	}
 }
 
