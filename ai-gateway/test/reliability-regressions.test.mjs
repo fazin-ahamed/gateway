@@ -565,3 +565,60 @@ test("/admin/router/reconcile gates route conclusions on health samples and expo
   const nope = await app.fetch(new Request("http://gw/admin/router/reconcile"));
   assert.equal(nope.status, 401, "reconcile requires admin");
 });
+
+test("fallback lineage: the winning attempt after a 5xx route records fallback_from_route_id", async () => {
+  // Two routes share slug "m". The first provider 5xxes every time; the
+  // gateway must fail over to the second route and the surviving
+  // route_attempts row must name the route it fell back FROM — otherwise the
+  // posterior learns the fallback's outcome against the wrong route.
+  const { createApp } = await import("../src/index.js");
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const env = { DB: db, PROVIDER_CRYPTO_KEY: "test-crypto-key-please-change", ADMIN_TOKEN: "admin" };
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").bind("sk-test", "t", 1, "usd", 1e9, now, now).run();
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (1,'Bad','http://bad.local/v1','direct','openai',1,1,'round_robin',?)").bind(now).run();
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (2,'Good','http://good.local/v1','direct','openai',1,1,'round_robin',?)").bind(now).run();
+  db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(1, await t.sealProviderKey(env, "bad-secret"), "k1", now).run();
+  db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(2, await t.sealProviderKey(env, "good-secret"), "k2", now).run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,0,1)").bind("m", 1, "up-m").run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,1,1)").bind("m", 2, "up-m").run();
+  const badRouteId = db.prepare("SELECT id FROM model_routes WHERE provider_id=1").all().results[0].id;
+  const goodRouteId = db.prepare("SELECT id FROM model_routes WHERE provider_id=2").all().results[0].id;
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("bad.local"))
+      return new Response(JSON.stringify({ error: { message: "upstream exploded" } }), { status: 500, headers: { "content-type": "application/json" } });
+    if (u.includes("good.local"))
+      return new Response(JSON.stringify({ id: "x", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "from-second" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }), { status: 200, headers: { "content-type": "application/json" } });
+    return new Response("unexpected " + u, { status: 500 });
+  };
+  try {
+    const app = createApp(env);
+    const res = await app.fetch(new Request("http://gw/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hello" }] })
+    }));
+    assert.equal(res.status, 200, "the request survives the dead first route");
+    const body = await res.json();
+    assert.equal(body.choices[0].message.content, "from-second");
+
+    const atts = db.prepare("SELECT route_id, success, fallback_from_route_id FROM route_attempts WHERE public_slug='m' ORDER BY id").all().results;
+    const badAtts = atts.filter((a) => a.route_id === badRouteId);
+    const goodAtts = atts.filter((a) => a.route_id === goodRouteId);
+    assert.ok(badAtts.length >= 1, "dead-route attempts are recorded");
+    assert.ok(badAtts.every((a) => a.success === 0), "dead-route attempts are failures");
+    assert.ok(badAtts.every((a) => a.fallback_from_route_id == null), "the first route did not fall back from anything");
+    assert.ok(goodAtts.length >= 1, "the winning route attempt is recorded");
+    const win = goodAtts[goodAtts.length - 1];
+    assert.equal(win.success, 1);
+    assert.equal(win.fallback_from_route_id, badRouteId, "the winning attempt names the route it fell back from");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

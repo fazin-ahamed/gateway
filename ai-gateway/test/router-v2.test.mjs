@@ -251,25 +251,33 @@ test("task-specific posterior overrides global once mature, else global prior", 
   const global = { success_alpha: 20, failure_beta: 4, updated_at: new Date().toISOString() };
   // 1 sample task row is immature -> global wins
   const immature = effectivePosterior(global, { success_alpha: 9, failure_beta: 1, updated_at: new Date().toISOString() });
-  assert.equal(immature.alpha, 20, "immature task posterior does not override global");
-  // 10 task samples is mature -> task wins
+  // Posteriors age at read time, so a row stamped "now" decays by the few ms
+  // of test-runner jitter before it is read. Compare with tolerance.
+  assert.ok(Math.abs(immature.alpha - 20) < 1e-4, "immature task posterior does not override global");
+  // 10 task samples is mature -> task wins (learned-worse alpha survives aging)
   const mature = effectivePosterior(global, { success_alpha: 2, failure_beta: 16, updated_at: new Date().toISOString() });
-  assert.equal(mature.alpha, 2, "mature task posterior overrides global");
+  assert.ok(Math.abs(mature.alpha - 2) < 1e-4, "mature task posterior overrides global");
   assert.ok(mature.beta > global.failure_beta, "route learned it is worse on this task");
 });
 
-test("cost uses per-request actual and cost_ema, not a raw per-1M sum", () => {
+test("cost uses per-request actual and cost_ema, not a raw per-1M sum; free routes stay $0", () => {
   const taskIR = compileTaskIR({ messages: [{ role: "user", content: "hi" }] });
   // per-request actual pricing wins over token rates
   const perReq = estimateCost({ price: { actual_mode: "per_request", actual_per_request: 0.003, prompt_per_1m: 5, completion_per_1m: 5 } }, taskIR);
-  assert.equal(perReq, 0.003);
+  assert.deepEqual(perReq, { cost: 0.003, known: true });
   // mature cost_ema wins over everything
   const ema = estimateCost({ stats: { cost_ema: 0.0012, success_alpha: 20, failure_beta: 5 }, price: { prompt_per_1m: 5, completion_per_1m: 5 } }, taskIR);
-  assert.equal(ema, 0.0012);
+  assert.deepEqual(ema, { cost: 0.0012, known: true });
   // token rates are evaluated against TaskIR tokens, not summed blindly
   const big = compileTaskIR({ messages: [{ role: "user", content: "x".repeat(400000) }] });
   const tokenCost = estimateCost({ price: { prompt_per_1m: 1, completion_per_1m: 3 } }, big);
-  assert.ok(tokenCost > 0 && tokenCost < 4, "token cost scales with estimated tokens, not 1+3");
+  assert.ok(tokenCost.cost > 0 && tokenCost.cost < 4 && tokenCost.known, "token cost scales with estimated tokens, not 1+3");
+  // A free route with a price row is known-$0, NOT coerced to the 0.5 unknown.
+  const free = estimateCost({ price: { actual_mode: "per_request", actual_per_request: 0 } }, taskIR);
+  assert.deepEqual(free, { cost: 0, known: true }, "free route stays exactly $0 and known");
+  // No price row at all is genuinely unknown -> placeholder, flagged not-known.
+  const unknown = estimateCost({}, taskIR);
+  assert.deepEqual(unknown, { cost: 0.5, known: false });
 });
 
 test("capability gates fail closed on unknown tools and cap missing context", () => {
@@ -305,5 +313,39 @@ test("luxury is a soft prior, not a hard exclusion", () => {
   assert.equal(routes[0].eligible, true, "luxury route is still hard-eligible; cost discourages it, capability does not exclude it");
   const policies = candidatePolicies(routes, compileTaskIR(payload));
   assert.ok(policies.some((p) => p.primary === "gpt-6-astra"), "a luxury route can be selected when it is the only capable option");
+});
+
+test("loadV2World reads route_task scope rows and keeps task evidence task-scoped (scope-split regression)", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, created_at) VALUES (1,'P','http://up.local/v1','direct','openai',1,1,?)").bind(now).run();
+  db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (1,'plain','k',1,?)").bind(now).run();
+  db.prepare("INSERT INTO model_routes (id, slug, provider_id, upstream_model, rank, enabled) VALUES (1,'m',1,'up-m',0,1)").run();
+  // Production writes the global prior under scope='route' with task_type='',
+  // and task evidence under scope='route_task' keyed "route:<id>". If
+  // loadV2World reads only scope='route' (the shipped bug) the task posterior
+  // is invisible; if it fails to split by scope, the global row would be
+  // mistaken for task evidence.
+  db.prepare("INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, updated_at) VALUES ('route','route:1','',20,4,?)").bind(now).run();
+  db.prepare("INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, updated_at) VALUES ('route_task','route:1','code:debug',2,16,?)").bind(now).run();
+  const { loadV2World } = await import("../src/router/candidates.js");
+  const c = { env: { DB: db } };
+
+  // A code:debug request must see the mature (18-sample) task posterior —
+  // learned-worse alpha=2 — instead of the healthy global prior.
+  const debugWorld = await loadV2World(c, { payload: { messages: [{ role: "user", content: "debug this TypeError stack trace in src/cache.ts" }] } });
+  const r1 = debugWorld.routes.find((r) => r.slug === "m");
+  assert.ok(r1, "route present in the V2 universe");
+  assert.ok(r1.eligible, "route is hard-eligible: unknown capability entry passes and one usable key exists");
+  assert.ok(r1.posterior.alpha < 3, "mature code:debug task posterior overrides the global prior on its own task");
+
+  // The same task row must not leak into a different task: chat:casual binds
+  // task_type='chat:casual' in the stats query, so only the global row joins.
+  const chatWorld = await loadV2World(c, { payload: { messages: [{ role: "user", content: "hi" }] } });
+  const r2 = chatWorld.routes.find((r) => r.slug === "m");
+  assert.ok(r2.posterior.alpha > 19.99, "a code:debug task row must not leak into a chat:casual request");
 });
 

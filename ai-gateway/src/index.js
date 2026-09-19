@@ -1032,7 +1032,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
             }
             c.__egressFailure = null;
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, deferPosterior: false });
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, deferPosterior: false });
           }
         }
         }
@@ -4788,13 +4788,19 @@ var activeEgress = { id: null, url: null, at: 0 };
 var ACTIVE_EGRESS_TTL_MS = 30000;
 async function resolveActiveEgress(c) {
   const mode = await settingValue(c, "proxy_egress_mode", "manual");
-  if (mode !== "auto")
+  if (mode !== "auto") {
+    if (c) c.zaiEgressId = null;
     return null;
+  }
+  // Bind the proxy identity onto THIS request. A concurrent request may
+  // re-select a different sticky egress before this one fails, so failure
+  // attribution must use the id this request actually dialed, not the global.
+  const bind = (url) => { if (c) c.zaiEgressId = activeEgress.id; return url; };
   const now = Date.now();
   // Re-validate the sticky choice cheaply; only re-pick if it is no longer a
   // healthy/untested enabled row.
   if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS)
-    return activeEgress.url;
+    return bind(activeEgress.url);
   const rows = await c.env.DB.prepare(
     "SELECT id, scheme, host, port, username, password_enc, status, last_latency_ms, success_count FROM proxy_pool WHERE enabled=1 AND status='healthy'"
   ).all();
@@ -4804,7 +4810,7 @@ async function resolveActiveEgress(c) {
     const keep = candidates.find((r) => r.id === activeEgress.id);
     if (keep) {
       activeEgress.at = now;
-      return activeEgress.url;
+      return bind(activeEgress.url);
     }
   }
   // Try candidates in rank order; skip any whose credential cannot be
@@ -4820,13 +4826,13 @@ async function resolveActiveEgress(c) {
         continue;
       }
       activeEgress = { id: pick.id, url: proxyEgressUrl(pick, plainPassword), at: now };
-      return activeEgress.url;
+      return bind(activeEgress.url);
     }
     activeEgress = { id: pick.id, url: proxyEgressUrl(pick, ""), at: now };
-    return activeEgress.url;
+    return bind(activeEgress.url);
   }
   activeEgress = { id: null, url: null, at: now };
-  return null;
+  return bind(null);
 }
 function __resetActiveEgress() { activeEgress = { id: null, url: null, at: 0 }; }
 // A production Z.AI request just failed because the active egress proxy could
@@ -4834,7 +4840,9 @@ function __resetActiveEgress() { activeEgress = { id: null, url: null, at: 0 }; 
 // a check failure so the proxy trends toward flaky/dead, and invalidate the
 // sticky pick so the next request re-selects a healthy egress.
 async function noteEgressFailure(c, failureClass) {
-  const id = activeEgress.id;
+  // Prefer the proxy this request actually bound; fall back to the global
+  // sticky id only if the request was not stamped (older call paths).
+  const id = (c && c.zaiEgressId != null) ? c.zaiEgressId : activeEgress.id;
   if (id == null)
     return;
   try {
@@ -4842,7 +4850,10 @@ async function noteEgressFailure(c, failureClass) {
   } catch (e) {
     blog("noteEgressFailure failed: " + String(e.message || e));
   }
-  __resetActiveEgress();
+  // Only invalidate the sticky pick if it is still the proxy that failed; a
+  // concurrent request may already have re-selected a different egress.
+  if (activeEgress.id === id)
+    __resetActiveEgress();
 }
 // The uTLS helper lives at ZAI_UTLS_PROXY when auto-update injected it, else at
 // the conventional ZAI_HTTP_ADDR. Discover it by health rather than assuming

@@ -88,9 +88,20 @@ export function extractFeatures(payload) {
   const urls = (ask.match(/https?:\/\/[^\s)]+/gi) || []).length;
   const semanticTokens = Math.ceil(ask.length / 4) + imageCount * 500;
   const contextTokens = Math.ceil((textChars + systemChars + toolSchemaChars) / 4) + imageCount * 500;
+  // The caller's explicit output ceiling (OpenAI max_tokens /
+  // max_completion_tokens). Used for hard output-capability gating, distinct
+  // from the heuristic expectedOutputTokens used for cost.
+  const requestedOutputTokens = Math.max(0, Number(payload && (payload.max_completion_tokens ?? payload.max_tokens)) || 0);
   const hasImplement = /\b(implement|build a|create a|code a|develop a)\b/i.test(ask);
-  const asksTools = /\b(use (the )?tools?|call \w+|search the web|browse|run (the )?tests?|patch|edit the file|look this up)\b/i.test(askLower)
-    || hasImplement && toolCount > 0 && files > 0;
+  // tool_choice is authoritative when the caller sets it. "required" or a
+  // named {type:"function"} choice forces tools required regardless of prose;
+  // "none" forces not-required. Otherwise fall back to lexical detection.
+  const tc = payload && payload.tool_choice;
+  const forcedTools = tc === "required" || (tc && typeof tc === "object" && (tc.type === "function" || tc.type === "tool" || tc.function));
+  const forbidTools = tc === "none";
+  const asksTools = forbidTools ? false : (forcedTools && toolCount > 0) || (
+    /\b(use (the )?tools?|call \w+|search the web|browse|run (the )?tests?|patch|edit the file|look this up)\b/i.test(askLower)
+    || hasImplement && toolCount > 0 && files > 0);
   return {
     words,
     turns,
@@ -99,6 +110,7 @@ export function extractFeatures(payload) {
     contextTokens,
     toolCount,
     toolsAvailable: toolCount,
+    requestedOutputTokens,
     toolsRequired: asksTools,
     imageCount,
     files,
@@ -226,6 +238,10 @@ export function compileTaskIR(payload) {
     contextTokens: f.contextTokens,
     semanticTokens: f.semanticTokens,
     expectedOutputTokens,
+    // Hard output-capability floor: the larger of the caller's explicit
+    // request and our heuristic estimate. A route whose advertised output
+    // ceiling is below this must fail the capability gate.
+    requiredOutputTokens: Math.max(expectedOutputTokens, f.requestedOutputTokens || 0),
     tools: {
       available: f.toolsAvailable,
       required: !!f.toolsRequired,

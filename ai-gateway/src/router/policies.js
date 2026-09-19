@@ -8,13 +8,28 @@ import { lcb, mean, summarize } from "./posterior.js";
 export const MODES = ["reflex", "blend", "verified", "conductor", "rescue"];
 
 function costOf(route) {
+  // A route with a known cost keeps it verbatim — including exactly 0 for a
+  // free model. Only a genuinely unknown cost falls back to the 0.5 placeholder.
+  if (route && route.costKnown) {
+    const n = Number(route.cost);
+    return Number.isFinite(n) && n >= 0 ? n : 0.5;
+  }
   const n = Number(route && route.cost);
   return Number.isFinite(n) && n > 0 ? n : 0.5;
 }
 
+function costKnownOf(route) {
+  return !!(route && route.costKnown);
+}
+
 function latencyOf(route) {
-  const n = Number(route && (route.p50Ms || route.avgMs));
+  const n = Number(route && (route.latencyEma || route.p50Ms || route.avgMs));
   return Number.isFinite(n) && n > 0 ? n : 800;
+}
+
+function latencyKnownOf(route) {
+  const n = Number(route && (route.latencyEma || route.p50Ms || route.avgMs));
+  return Number.isFinite(n) && n > 0;
 }
 
 function successOf(route, taskIR) {
@@ -206,9 +221,16 @@ export function explainPolicy(policy, taskIR, routes) {
     challengerRoute: policy.challengerRef,
     verifier: policy.verifier,
     verifierRoute: policy.verifierRef,
+    // "expectedSuccess" is an operational-reliability estimate (will the route
+    // return a usable completion), NOT answer-quality. The UI must not label it
+    // "success"/quality. costKnown/latencyKnown flag placeholder values so the
+    // UI can mark an unmeasured default instead of showing it as observed.
     expectedSuccess: policy.success,
+    reliabilityKind: "operational",
     expectedCost: policy.cost,
+    costKnown: costKnownOf(primary),
     expectedLatencyMs: policy.latency,
+    latencyKnown: latencyKnownOf(primary),
     primaryHealth: primary && primary.posterior ? summarize(primary.posterior) : null
   };
 }

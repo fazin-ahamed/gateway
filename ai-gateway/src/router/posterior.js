@@ -26,10 +26,19 @@ export function age(state, at = Date.now(), halfLifeMs = 3 * 86400000, kind = "r
   const prior = seedBeta(useKind);
   const last = Number.isFinite(Number(prev.updatedAt)) ? Number(prev.updatedAt) : at;
   const elapsed = Math.max(0, at - last);
+  // Sign-preserving decay: the excess over the prior fades toward the prior in
+  // BOTH directions. Clamping a negative excess to zero snapped a route that
+  // had learned "worse than prior" (alpha below the prior) back up to the
+  // prior while beta kept its mass — erasing the learned signal at read time.
+  // Decay the magnitude, keep the sign, so stale evidence reverts symmetrically.
+  const toward = (p, v) => {
+    const excess = Number(v ?? p) - p;
+    return p + Math.sign(excess) * decayMass(Math.abs(excess), elapsed, halfLifeMs);
+  };
   return {
     kind: useKind,
-    alpha: prior.alpha + Math.max(0, decayMass((prev.alpha ?? prior.alpha) - prior.alpha, elapsed, halfLifeMs)),
-    beta: prior.beta + Math.max(0, decayMass((prev.beta ?? prior.beta) - prior.beta, elapsed, halfLifeMs)),
+    alpha: toward(prior.alpha, prev.alpha),
+    beta: toward(prior.beta, prev.beta),
     updatedAt: at
   };
 }

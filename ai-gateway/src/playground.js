@@ -1859,12 +1859,12 @@ document.getElementById('ar-run').onclick=async function(){
   const ir=(d.v2&&d.v2.taskIR)||null;
   const secs=function(ms){ return ms==null?'—':(ms>=1000?(ms/1000).toFixed(1)+'s':Math.round(ms)+'ms'); };
   const v2Html=v2?('<div class="kvrow" style="margin-top:10px"><span class="pill '+(d.v2.mode==='live'?'acc':'mut')+'">V2 '+esc(d.v2.mode||'shadow')+'</span>'+
-      '<span class="grow small">'+(ir?('task <b>'+esc(String(ir.task))+'</b> · confidence '+Math.round((ir.confidence||0)*100)+'% · '):'')+
+      '<span class="grow small">'+(ir?('task <b>'+esc(String(ir.task))+'</b> · classifier margin '+(ir.confidence||0).toFixed(2)+' · '):'')+
       'policy <b>'+esc(String(v2.mode))+'</b> → <b>'+esc(String(v2.primary||'—'))+'</b>'+
       (v2.challenger?(' vs '+esc(String(v2.challenger))):'')+
-      ' · success '+Math.round((v2.expectedSuccess||0)*100)+'%'+
-      ' · '+secs(v2.expectedLatencyMs)+
-      ' · '+money(v2.expectedCost||0)+'/1M</span></div>'):
+      ' · operational reliability '+Math.round((v2.expectedSuccess||0)*100)+'%'+
+      ' · '+secs(v2.expectedLatencyMs)+(v2.latencyKnown===false?' <span class="hint">(default)</span>':'')+
+      ' · '+money(v2.expectedCost||0)+'/req'+(v2.costKnown===false?' <span class="hint">(default)</span>':'')+'</span></div>'):
     '<div class="small" style="margin-top:10px">V2 shadow: no policy (router off or no eligible routes)</div>';
   out.innerHTML='<div class="kvrow"><span class="pill '+(d.fallback?'warn':'acc')+'">'+(d.fallback?'fallback (nothing eligible)':'V1 picked')+'</span><span class="grow"><b>'+esc(d.picked)+'</b> · complexity '+esc(String(d.complexity))+' → quality floor '+d.need.toFixed(2)+' · preference '+d.preference+'</span></div>'+
     v2Html+

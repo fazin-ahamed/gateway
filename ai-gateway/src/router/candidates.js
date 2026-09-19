@@ -9,7 +9,7 @@
 // choose from, so a V1 bug cannot silently empty V2's pool.
 
 import { isTinyModel, normalizeModelId, routeKey } from "./identity.js";
-import { seedBeta, samples as posteriorSamples } from "./posterior.js";
+import { age, seedBeta, samples as posteriorSamples } from "./posterior.js";
 import { compileTaskIR } from "./task-ir.js";
 import { shadowDecide } from "./policies.js";
 
@@ -40,13 +40,16 @@ export function posteriorFromStats(row) {
 // once it has independent evidence. This is the whole point of the per-task
 // router_stats rows — route 12 may be excellent on code:debug and mediocre on
 // vision:reasoning, and the router should learn that.
-export function effectivePosterior(globalStats, taskStats) {
-  const global = posteriorFromStats(globalStats);
+export function effectivePosterior(globalStats, taskStats, at = Date.now()) {
+  // Age at read time: an untouched route decays toward its prior instead of
+  // staying frozen at its last observation. posterior.observe() already ages
+  // on write, but a route that stops receiving traffic is only re-aged here.
+  const global = age(posteriorFromStats(globalStats), at);
   if (!taskStats)
     return global;
-  const task = posteriorFromStats(taskStats);
-  if (posteriorSamples(task) >= TASK_POSTERIOR_MATURE)
-    return task;
+  const taskRaw = posteriorFromStats(taskStats);
+  if (posteriorSamples(taskRaw) >= TASK_POSTERIOR_MATURE)
+    return age(taskRaw, at);
   return global;
 }
 
@@ -55,26 +58,22 @@ export function effectivePosterior(globalStats, taskStats) {
 // rates evaluated against the TaskIR token estimate.
 export function estimateCost(row, taskIR) {
   const ema = Number(row && row.stats && row.stats.cost_ema);
-  if (Number.isFinite(ema) && ema > 0 && posteriorSamples(posteriorFromStats(row.stats)) >= COST_EMA_MATURE)
-    return ema;
+  if (Number.isFinite(ema) && ema >= 0 && posteriorSamples(posteriorFromStats(row.stats)) >= COST_EMA_MATURE)
+    return { cost: ema, known: true };
   const price = row && row.price;
   if (price) {
-    if (String(price.actual_mode) === "per_request" && Number(price.actual_per_request) > 0)
-      return Number(price.actual_per_request);
+    if (String(price.actual_mode) === "per_request" && Number.isFinite(Number(price.actual_per_request)) && Number(price.actual_per_request) >= 0)
+      return { cost: Number(price.actual_per_request), known: true };
     const promptRate = Number(price.actual_prompt_per_1m) || Number(price.prompt_per_1m) || 0;
     const complRate = Number(price.actual_completion_per_1m) || Number(price.completion_per_1m) || 0;
+    // A price row exists, so rates of 0 are a real "this route is free", not
+    // "unknown". Only the total absence of a price row is unknown.
     const inTok = Number(taskIR && taskIR.contextTokens) || 0;
     const outTok = Number(taskIR && taskIR.expectedOutputTokens) || 0;
     const est = (inTok / 1e6) * promptRate + (outTok / 1e6) * complRate;
-    if (est > 0)
-      return est;
-    // A route with a price row but a zero-token estimate still has known
-    // rates; fall back to the per-1M sum so it is not mistaken for unpriced.
-    const sum = promptRate + complRate;
-    if (sum > 0)
-      return sum / 1e6 * 1000; // ~1k-token-equivalent floor, keeps ordering
+    return { cost: est, known: true };
   }
-  return 0.5;
+  return { cost: 0.5, known: false };
 }
 
 function capabilitiesOf(entry) {
@@ -106,11 +105,11 @@ export function v2Capable(caps, taskIR) {
   const tokens = Number(taskIR && taskIR.contextTokens) || 0;
   const wantsVision = !!(taskIR && taskIR.modalities && taskIR.modalities.includes("image"));
   const wantsTools = !!(taskIR && taskIR.tools && taskIR.tools.required);
-  const wantOut = Number(taskIR && taskIR.expectedOutputTokens) || 0;
   const ctxLimit = caps.unknown ? UNKNOWN_CONTEXT_FALLBACK : (caps.context > 0 ? caps.context : UNKNOWN_CONTEXT_FALLBACK);
   const ctxOk = tokens <= Math.floor(ctxLimit * 0.9);
-  // Unknown capability fails closed on a hard requirement.
   const visionOk = !wantsVision || (!caps.unknown && caps.vision);
+  // Unknown capability fails closed on a hard requirement.
+  const wantOut = Number(taskIR && (taskIR.requiredOutputTokens ?? taskIR.expectedOutputTokens)) || 0;
   const toolsOk = !wantsTools || (!caps.unknown && caps.tools);
   // Output limit only gates when the route actually advertises one.
   const outOk = !(caps.output > 0) || wantOut === 0 || wantOut <= caps.output;
@@ -141,7 +140,8 @@ export function shapeV2Route(row, taskIR) {
   if (!reason && !hasCredential) reason = enabledKeyCount > 0 ? "keys circuit-open" : "no key";
   if (!reason && circuit) reason = "circuit open";
   const posterior = effectivePosterior(row.stats, row.taskStats);
-  const cost = estimateCost(row, taskIR);
+  const costEst = estimateCost(row, taskIR);
+  const latencyEma = Number(row.stats && row.stats.latency_ema) || 0;
   const rk = routeKey({
     slug,
     upstream_model: row.upstream_model || slug,
@@ -154,9 +154,11 @@ export function shapeV2Route(row, taskIR) {
     routeId: row.route_id ?? row.id ?? null,
     providerId: row.provider_id ?? null,
     transport: String(row.transport || row.fmt || "direct"),
-    cost,
-    avgMs: Number(row.stats && row.stats.latency_ema) || 0,
-    p50Ms: Number(row.stats && row.stats.latency_ema) || 0,
+    cost: costEst.cost,
+    costKnown: costEst.known,
+    avgMs: latencyEma,
+    latencyEma,
+    latencyKnown: latencyEma > 0,
     capable: gate.capable,
     workhorse: isWorkhorseSlug(slug),
     luxury,
@@ -246,16 +248,20 @@ export async function loadV2World(c, {
     if (!dead)
       usableKeysByProvider.set(pid, (usableKeysByProvider.get(pid) || 0) + 1);
   }
+  // Task-specific rows are written under scope='route_task'; the global prior
+  // under scope='route'. Both must be read here or effectivePosterior never
+  // sees task evidence. Split by scope, not task_type: a global row has an
+  // empty task_type, a task row carries this request's task.
   const statsRows = await c.env.DB.prepare(
-    "SELECT scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope='route' AND (task_type='' OR task_type=?)"
+    "SELECT scope, scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE (scope='route' AND task_type='') OR (scope='route_task' AND task_type=?)"
   ).bind(taskIR.task || "").all();
   const globalStats = new Map();
   const taskStats = new Map();
   for (const s of statsRows.results || []) {
-    if (s.task_type === "" || s.task_type == null)
-      globalStats.set(String(s.scope_id), s);
-    else
+    if (s.scope === "route_task")
       taskStats.set(String(s.scope_id), s);
+    else
+      globalStats.set(String(s.scope_id), s);
   }
 
   const allow = allowed ? new Set(allowed) : null;
