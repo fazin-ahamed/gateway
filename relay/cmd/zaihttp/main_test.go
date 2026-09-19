@@ -106,6 +106,27 @@ func TestParseEgressModes(t *testing.T) {
 	}
 }
 
+func TestParseEgressIPv6AndValidation(t *testing.T) {
+	v6, err := parseEgress("socks5h://[::1]:9050")
+	if err != nil || v6.addr != "[::1]:9050" || !v6.remoteDNS {
+		t.Fatalf("ipv6: %+v %v", v6, err)
+	}
+	v6d, err := parseEgress("http://[2001:db8::1]")
+	if err != nil || v6d.addr != "[2001:db8::1]:80" {
+		t.Fatalf("ipv6 default port: %+v %v", v6d, err)
+	}
+	if _, err := parseEgress("http://1.2.3.4:8080/path"); err == nil {
+		t.Fatal("path must be rejected")
+	}
+	if _, err := parseEgress("http://1.2.3.4:8080?x=1"); err == nil {
+		t.Fatal("query must be rejected")
+	}
+	longUser := "http://" + strings.Repeat("u", 256) + ":p@1.2.3.4:8080"
+	if _, err := parseEgress(longUser); err == nil {
+		t.Fatal("over-long username must be rejected")
+	}
+}
+
 func TestSanitizeDialErrHidesEgress(t *testing.T) {
 	msg := sanitizeDialErr(fmtErr("socks5h://user:hunter2@127.0.0.1:9050 socks status 5"))
 	if strings.Contains(msg, "9050") || strings.Contains(msg, "hunter2") || strings.Contains(msg, "socks5h") {

@@ -109,35 +109,61 @@ func parseEgress(raw string) (egressConfig, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return egressConfig{}, fmt.Errorf("invalid")
 	}
+	// A proxy URL is host:port only. Reject anything carrying a path, query,
+	// or fragment — that is almost always a malformed paste, not an egress.
+	if u.Path != "" && u.Path != "/" {
+		return egressConfig{}, fmt.Errorf("unexpected path")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return egressConfig{}, fmt.Errorf("unexpected query/fragment")
+	}
 	user, pass := "", ""
 	if u.User != nil {
 		user = u.User.Username()
 		pass, _ = u.User.Password()
 	}
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		switch u.Scheme {
+	// SOCKS5 username/password auth is length-prefixed with a single byte.
+	if len(user) > 255 || len(pass) > 255 {
+		return egressConfig{}, fmt.Errorf("credential too long")
+	}
+	// IPv6 literals ([::1]) must go through Hostname()/Port(), never a bare
+	// Contains(":") check.
+	host := u.Hostname()
+	port := u.Port()
+	if host == "" {
+		return egressConfig{}, fmt.Errorf("no host")
+	}
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
 		case "http":
-			host += ":80"
+			port = "80"
 		case "https":
-			host += ":443"
+			port = "443"
 		case "socks5", "socks5h":
-			host += ":1080"
+			port = "1080"
 		}
 	}
+	addr := net.JoinHostPort(host, port)
 	switch strings.ToLower(u.Scheme) {
 	case "http":
-		return egressConfig{kind: "http", addr: host, user: user, pass: pass}, nil
+		return egressConfig{kind: "http", addr: addr, user: user, pass: pass}, nil
 	case "https":
-		return egressConfig{kind: "https", addr: host, user: user, pass: pass}, nil
+		return egressConfig{kind: "https", addr: addr, user: user, pass: pass}, nil
 	case "socks5":
-		return egressConfig{kind: "socks5", addr: host, user: user, pass: pass, remoteDNS: false}, nil
+		return egressConfig{kind: "socks5", addr: addr, user: user, pass: pass, remoteDNS: false}, nil
 	case "socks5h":
-		return egressConfig{kind: "socks5", addr: host, user: user, pass: pass, remoteDNS: true}, nil
+		return egressConfig{kind: "socks5", addr: addr, user: user, pass: pass, remoteDNS: true}, nil
 	default:
 		return egressConfig{}, fmt.Errorf("unsupported scheme")
 	}
 }
+
+// Proxy connect + tunnel + optional proxy-TLS must finish inside a short
+// window even though the overall request context is 10 minutes: a proxy that
+// accepts TCP then stalls during CONNECT/SOCKS/TLS would otherwise hold an
+// attempt open for the whole deadline. The negotiation deadline is cleared by
+// the caller before response streaming begins.
+const egressNegotiationTimeout = 15 * time.Second
 
 func dialUpstream(ctx context.Context, egress egressConfig) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 15 * time.Second}
@@ -145,32 +171,45 @@ func dialUpstream(ctx context.Context, egress egressConfig) (net.Conn, error) {
 	if egress.kind == "direct" {
 		return d.DialContext(ctx, "tcp", target)
 	}
-	proxyConn, err := d.DialContext(ctx, "tcp", egress.addr)
+	negCtx, negCancel := context.WithTimeout(ctx, egressNegotiationTimeout)
+	defer negCancel()
+	proxyConn, err := d.DialContext(negCtx, "tcp", egress.addr)
 	if err != nil {
 		return nil, err
 	}
+	// Bound every negotiation stage; clear the deadline before returning so the
+	// long-lived streaming body is not affected.
+	if dl, ok := negCtx.Deadline(); ok {
+		_ = proxyConn.SetDeadline(dl)
+	}
 	var ready net.Conn = proxyConn
 	if egress.kind == "https" {
-		host, _, _ := net.SplitHostPort(egress.addr)
+		host := egress.addr
+		if h, _, splitErr := net.SplitHostPort(egress.addr); splitErr == nil {
+			host = h
+		}
 		tlsConn := tls.Client(proxyConn, &tls.Config{ServerName: host, NextProtos: []string{"http/1.1"}})
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		if err := tlsConn.HandshakeContext(negCtx); err != nil {
 			proxyConn.Close()
 			return nil, err
 		}
 		ready = tlsConn
 	}
+	clearDeadline := func() { _ = proxyConn.SetDeadline(time.Time{}) }
 	switch egress.kind {
 	case "http", "https":
-		if err := httpConnect(ctx, ready, target, egress); err != nil {
+		if err := httpConnect(negCtx, ready, target, egress); err != nil {
 			ready.Close()
 			return nil, err
 		}
+		clearDeadline()
 		return ready, nil
 	case "socks5":
-		if err := socks5Connect(ctx, ready, targetHost, 443, egress); err != nil {
+		if err := socks5Connect(negCtx, ready, targetHost, 443, egress); err != nil {
 			ready.Close()
 			return nil, err
 		}
+		clearDeadline()
 		return ready, nil
 	default:
 		ready.Close()
@@ -268,13 +307,24 @@ func socks5Connect(ctx context.Context, conn net.Conn, host string, port uint16,
 		if err != nil || len(ips) == 0 {
 			return fmt.Errorf("socks resolve")
 		}
-		ip := ips[0].IP
-		if v4 := ip.To4(); v4 != nil {
+		// Prefer a usable IPv4, then IPv6 — never blindly take ips[0], which
+		// may be an AAAA the egress cannot route while an A works fine.
+		var chosen net.IP
+		for _, a := range ips {
+			if a.IP.To4() != nil {
+				chosen = a.IP
+				break
+			}
+		}
+		if chosen == nil {
+			chosen = ips[0].IP
+		}
+		if v4 := chosen.To4(); v4 != nil {
 			req = append(req, 0x01)
 			req = append(req, v4...)
 		} else {
 			req = append(req, 0x04)
-			req = append(req, ip.To16()...)
+			req = append(req, chosen.To16()...)
 		}
 	}
 	portBytes := make([]byte, 2)
