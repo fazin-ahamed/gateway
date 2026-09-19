@@ -170,6 +170,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="limits">Limits</button>
   <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="auto">Auto</button>
+  <button type="button" data-tab="proxies">Proxies</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -387,6 +388,23 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-h"><h2 class="sec">Latency by model</h2></div><div class="panel-b" id="tj-chart"></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Recent requests</h2></div><div class="panel-b flush" id="tj-list"></div></div>
   </section>
+  <section class="tab" id="tab-proxies">
+    <div class="pagehead"><div><h2 class="sec">Proxies</h2><p class="sub">Egress inventory for the Z.AI uTLS helper. Credentials are sealed in SQLite and never leave the server. Testing verifies a real HTTPS tunnel against a neutral destination \u2014 it never touches Z.AI.</p></div><div class="actions"><button class="ghost" id="px-test-all">Test all</button><button class="ghost" id="px-test-failed">Retest failed</button><button class="danger" id="px-remove-dead">Remove dead</button></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Import</h2></div><div class="panel-b">
+      <textarea id="px-import" rows="4" placeholder="host:port&#10;http://user:pass@host:port&#10;socks5h://host:1080&#10;host:port:user:pass" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <label class="hint" style="margin:0">Default type for bare host:port
+          <select id="px-default-scheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H</option></select>
+        </label>
+        <button class="act" id="px-import-btn">Import</button>
+        <label class="hint" style="margin:0">Concurrency <input id="px-conc" type="number" value="20" min="1" max="50" style="width:60px"></label>
+        <label class="hint" style="margin:0">Timeout ms <input id="px-timeout" type="number" value="10000" min="1000" max="20000" step="1000" style="width:80px"></label>
+      </div>
+    </div></div>
+    <div class="hero-stats" id="px-stats"></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Pool</h2></div><div class="panel-b flush" id="px-list"></div></div>
+  </section>
+
 
   <section class="tab" id="tab-logs">
     <div class="pagehead"><div><h2 class="sec">Logs</h2><p class="sub">Live request and provider events from this process. In memory only; the ring holds the last 500 lines and resets on restart.</p></div><div class="actions"><label class="pg-check" style="margin:0"><input type="checkbox" id="lg-auto"> Auto</label><button class="ghost" id="lg-refresh">Refresh</button><button class="ghost" id="lg-copy">Copy</button></div></div>
@@ -445,6 +463,7 @@ async function selectTab(t){
     if(t==='limits') await loadLimits();
     if(t==='auto') await loadAutoSettings();
     if(t==='trajectories') await loadTrajectories();
+    if(t==='proxies') await loadProxies();
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
@@ -1486,6 +1505,74 @@ document.getElementById('lg-copy').onclick=function(){
 document.getElementById('lg-auto').addEventListener('change',function(e){
   clearInterval(logsAutoTimer); logsAutoTimer=null;
   if(e.target.checked){ logsAutoTimer=setInterval(loadLogs,3000); loadLogs(); }
+});
+
+
+// ---------- PROXIES ----------
+function proxyStatusPill(s){
+  const map={healthy:'ok',flaky:'warn',dead:'bad',disabled:'',untested:''};
+  return '<span class="pill '+(map[s]||'')+'">'+esc(s)+'</span>';
+}
+async function loadProxies(){
+  const statsEl=document.getElementById('px-stats'); const listEl=document.getElementById('px-list');
+  paintSkeleton(statsEl,'stats');
+  let data; try{ data=(await api('/admin/proxies')).data; }catch(e){ paintLoadError(listEl,'Could not load proxies: '+e.message,loadProxies); return; }
+  const counts=data.counts||{};
+  const stats=[
+    {k:'Total',v:fmt(data.total||0),s:'in pool'},
+    {k:'Healthy',v:fmt(counts.healthy||0),c:'ok',s:'usable'},
+    {k:'Flaky/Dead',v:fmt((counts.flaky||0)+(counts.dead||0)),c:'warn',s:'failing'},
+    {k:'Untested',v:fmt((counts.untested||0)+(counts.disabled||0)),s:'no result yet'}
+  ];
+  statsEl.innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div><div class="sub2">'+esc(s.s||'')+'</div></div>';}).join('');
+  const rows=(data.proxies||[]);
+  if(!rows.length){ listEl.innerHTML='<div class="empty" style="margin:20px">No proxies. Paste some above and Import.</div>'; return; }
+  listEl.innerHTML='<table class="tbl"><thead><tr><th>Type</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Fails</th><th>Last test</th><th></th></tr></thead><tbody>'+
+    rows.map(function(p){
+      const lat=p.last_latency_ms!=null?fmt(p.last_latency_ms)+'ms':'\u2014';
+      const fails=p.consecutive_failures?(p.consecutive_failures+' streak'):(p.failure_count||0);
+      const last=p.last_checked_at?esc(p.last_checked_at.replace('T',' ').slice(0,19)):'\u2014';
+      const fc=p.last_failure_class?' <span class="hint">('+esc(p.last_failure_class)+')</span>':'';
+      return '<tr><td class="mono">'+esc(p.scheme)+'</td><td class="mono">'+esc(p.endpoint)+'</td><td>'+proxyStatusPill(p.status)+'</td><td>'+lat+'</td><td>'+fails+fc+'</td><td class="mono">'+last+'</td>'+
+        '<td style="text-align:right;white-space:nowrap"><button class="ghost sm" data-px-test="'+p.id+'">Test</button> <button class="ghost sm" data-px-toggle="'+p.id+'">'+(p.enabled?'Disable':'Enable')+'</button> <button class="danger sm" data-px-del="'+p.id+'">Del</button></td></tr>';
+    }).join('')+'</tbody></table>';
+}
+function pxTestOpts(extra){
+  const conc=Math.min(50,Math.max(1,Number(document.getElementById('px-conc').value)||20));
+  const timeout=Math.min(20000,Math.max(1000,Number(document.getElementById('px-timeout').value)||10000));
+  return Object.assign({concurrency:conc,timeout_ms:timeout},extra||{});
+}
+async function pxTest(body,label){
+  toast('Testing '+label+'\u2026');
+  try{
+    const {status,data}=await api('/admin/proxies/test',{method:'POST',body:JSON.stringify(pxTestOpts(body))});
+    if(status!==200){ toast('test failed: '+(data&&data.error&&data.error.message||status),'err'); return; }
+    toast('Tested '+data.tested+' \u2014 '+data.healthy+' healthy, '+data.dead+' dead','ok');
+    loadProxies();
+  }catch(e){ toast('test failed: '+e.message,'err'); }
+}
+document.getElementById('px-import-btn').onclick=async function(){
+  const text=document.getElementById('px-import').value;
+  if(!text.trim()){ toast('Paste proxies first','err'); return; }
+  const scheme=document.getElementById('px-default-scheme').value;
+  const {status,data}=await api('/admin/proxies/import',{method:'POST',body:JSON.stringify({text,default_scheme:scheme})});
+  if(status!==200){ toast('import failed: '+(data&&data.error&&data.error.message||status),'err'); return; }
+  toast('Imported '+data.imported+' \u2014 '+data.duplicates+' dup, '+data.invalid+' invalid','ok');
+  document.getElementById('px-import').value='';
+  loadProxies();
+};
+document.getElementById('px-test-all').onclick=function(){ pxTest({},'all'); };
+document.getElementById('px-test-failed').onclick=function(){ pxTest({failed_only:true},'failed'); };
+document.getElementById('px-remove-dead').onclick=function(){
+  confirmAction('Remove dead proxies','Delete every proxy classified dead (3+ consecutive failures)? This cannot be undone.','Remove',async function(){
+    const {data}=await api('/admin/proxies/delete',{method:'POST',body:JSON.stringify({dead:true})});
+    toast('Removed '+((data&&data.deleted)||0)+' dead','ok'); loadProxies();
+  });
+};
+document.getElementById('px-list').addEventListener('click',function(e){
+  const t=e.target.closest('button[data-px-test]'); if(t){ pxTest({ids:[Number(t.dataset.pxTest)]},'proxy'); return; }
+  const g=e.target.closest('button[data-px-toggle]'); if(g){ api('/admin/proxies/'+Number(g.dataset.pxToggle)+'/toggle',{method:'POST'}).then(loadProxies); return; }
+  const d=e.target.closest('button[data-px-del]'); if(d){ confirmAction('Delete proxy','Remove this proxy from the pool?','Delete',async function(){ await api('/admin/proxies/delete',{method:'POST',body:JSON.stringify({ids:[Number(d.dataset.pxDel)]})}); loadProxies(); }); return; }
 });
 
 // ---------- TRAJECTORIES ----------
