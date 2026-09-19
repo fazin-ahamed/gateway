@@ -1549,14 +1549,15 @@ async function loadProxies(){
   }
   const rows=(data.proxies||[]);
   if(!rows.length){ listEl.innerHTML='<div class="empty" style="margin:20px">No proxies. Paste some above and Import.</div>'; return; }
-  listEl.innerHTML='<div style="padding:8px 12px"><button class="danger sm" id="px-del-selected" disabled>Delete selected</button> <span class="hint" id="px-sel-count"></span></div>'+
+  listEl.innerHTML='<div style="padding:8px 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><button class="danger sm" id="px-del-selected" disabled>Delete selected</button> <span class="hint" id="px-sel-count"></span>'+
+    '<span id="px-progress" class="hint" style="display:none;flex:1;min-width:160px"><span id="px-progress-label"></span><span class="px-bar" style="display:block;height:4px;border-radius:3px;background:var(--line,#333);margin-top:4px;overflow:hidden"><span id="px-progress-fill" style="display:block;height:100%;width:0;background:var(--accent,#4ea1ff);transition:width .2s"></span></span></span></div>'+
     '<table class="tbl"><thead><tr><th style="width:28px"><input type="checkbox" id="px-select-all" title="Select all"></th><th>Type</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Fails</th><th>Last test</th><th></th></tr></thead><tbody>'+
     rows.map(function(p){
       const lat=p.last_latency_ms!=null?fmt(p.last_latency_ms)+'ms':'\u2014';
       const fails=p.consecutive_failures?(p.consecutive_failures+' streak'):(p.failure_count||0);
       const last=p.last_checked_at?esc(p.last_checked_at.replace('T',' ').slice(0,19)):'\u2014';
       const fc=p.last_failure_class?' <span class="hint">('+esc(p.last_failure_class)+')</span>':'';
-      return '<tr><td><input type="checkbox" class="px-row-sel" data-px-id="'+p.id+'"></td><td class="mono">'+esc(p.scheme)+'</td><td class="mono">'+esc(p.endpoint)+'</td><td>'+proxyStatusPill(p.status)+'</td><td>'+lat+'</td><td>'+fails+fc+'</td><td class="mono">'+last+'</td>'+
+      return '<tr data-px-row="'+p.id+'"><td><input type="checkbox" class="px-row-sel" data-px-id="'+p.id+'"></td><td class="mono">'+esc(p.scheme)+'</td><td class="mono">'+esc(p.endpoint)+'</td><td class="px-c-status">'+proxyStatusPill(p.status)+'</td><td class="px-c-lat">'+lat+'</td><td class="px-c-fails">'+fails+fc+'</td><td class="mono px-c-last">'+last+'</td>'+
         '<td style="text-align:right;white-space:nowrap"><button class="ghost sm" data-px-reach="'+p.id+'">Reach test</button> <button class="ghost sm" data-px-test="'+p.id+'">Test</button> <button class="ghost sm" data-px-toggle="'+p.id+'">'+(p.enabled?'Disable':'Enable')+'</button> <button class="danger sm" data-px-del="'+p.id+'">Del</button></td></tr>';
     }).join('')+'</tbody></table>';
   pxWireSelection();
@@ -1590,14 +1591,64 @@ function pxTestOpts(extra){
   const timeout=Math.min(20000,Math.max(1000,Number(document.getElementById('px-timeout').value)||10000));
   return Object.assign({concurrency:conc,timeout_ms:timeout},extra||{});
 }
+function pxPatchRow(ev){
+  const tr=document.querySelector('tr[data-px-row="'+ev.id+'"]');
+  if(!tr) return;
+  if(ev.error){
+    const st=tr.querySelector('.px-c-status'); if(st) st.innerHTML='<span class="pill bad">'+esc(ev.error)+'</span>';
+    tr.style.background=''; return;
+  }
+  const st=tr.querySelector('.px-c-status'); if(st) st.innerHTML=proxyStatusPill(ev.status);
+  const lat=tr.querySelector('.px-c-lat'); if(lat) lat.textContent=ev.last_latency_ms!=null?fmt(ev.last_latency_ms)+'ms':'\u2014';
+  const fails=tr.querySelector('.px-c-fails');
+  if(fails){ const fc=ev.last_failure_class?' <span class="hint">('+esc(ev.last_failure_class)+')</span>':''; fails.innerHTML=(ev.consecutive_failures?(ev.consecutive_failures+' streak'):'0')+fc; }
+  const last=tr.querySelector('.px-c-last'); if(last&&ev.last_checked_at) last.textContent=ev.last_checked_at.replace('T',' ').slice(0,19);
+  // brief flash so the eye catches which row just updated
+  tr.style.transition='background .15s'; tr.style.background=ev.success?'rgba(78,161,255,.12)':'rgba(255,90,90,.10)';
+  setTimeout(function(){ tr.style.background=''; },600);
+}
+function pxProgress(done,total,healthy,dead){
+  const box=document.getElementById('px-progress');
+  const fill=document.getElementById('px-progress-fill');
+  const label=document.getElementById('px-progress-label');
+  if(!box) return;
+  box.style.display=done<total?'':'none';
+  if(fill) fill.style.width=total?Math.round(done/total*100)+'%':'0';
+  if(label) label.textContent='Testing '+done+'/'+total+' \u2014 '+healthy+' healthy, '+dead+' dead';
+}
 async function pxTest(body,label){
+  // Live path: stream one event per proxy and repaint that row as it lands, no
+  // reload. Falls back to a single toast if the stream can't be read.
   toast('Testing '+label+'\u2026');
+  let r;
   try{
-    const {status,data}=await api('/admin/proxies/test',{method:'POST',body:JSON.stringify(pxTestOpts(body))});
-    if(status!==200){ toast('test failed: '+(data&&data.error&&data.error.message||status),'err'); return; }
-    toast('Tested '+data.tested+' \u2014 '+data.healthy+' healthy, '+data.dead+' dead','ok');
-    loadProxies();
-  }catch(e){ toast('test failed: '+e.message,'err'); }
+    r=await fetch(API+'/admin/proxies/test',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(pxTestOpts(Object.assign({stream:true},body)))});
+  }catch(e){ toast('test failed: '+e.message,'err'); return; }
+  if(r.status===401){ setTimeout(function(){location.href=API+'/_gw';},400); return; }
+  if(!r.ok||!r.body){ let d=null; try{d=await r.json();}catch(e){} toast('test failed: '+((d&&d.error&&d.error.message)||r.status),'err'); return; }
+  const reader=r.body.getReader(); const dec=new TextDecoder(); let buf=''; let total=0; let last={tested:0,healthy:0,dead:0};
+  const sel=pxSelectedIds();
+  try{
+    for(;;){
+      const {value,done}=await reader.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let nl; while((nl=buf.indexOf(NL+NL))>=0){
+        const frame=buf.slice(0,nl); buf=buf.slice(nl+2);
+        const line=frame.split(NL).find(function(l){return l.indexOf('data:')===0;}); if(!line) continue;
+        let ev; try{ ev=JSON.parse(line.slice(5).trim()); }catch(e){ continue; }
+        if(ev.type==='start'){ total=ev.total; pxProgress(0,total,0,0); }
+        else if(ev.type==='result'){ pxPatchRow(ev); last={tested:ev.tested,healthy:ev.healthy,dead:ev.dead}; pxProgress(ev.tested,total,ev.healthy||0,ev.dead||0); }
+        else if(ev.type==='done'){ last={tested:ev.tested,healthy:ev.healthy,dead:ev.dead}; if(ev.error) toast('stream error: '+ev.error,'err'); }
+      }
+    }
+  }catch(e){ toast('stream interrupted: '+e.message,'err'); }
+  pxProgress(last.tested,last.tested,last.healthy,last.dead);
+  // restore the caller's selection (rows weren't rebuilt, but be safe) and
+  // refresh the pool's active-egress/counts banner without nuking the table
+  document.querySelectorAll('.px-row-sel').forEach(function(el){ el.checked=sel.indexOf(Number(el.dataset.pxId))>=0; });
+  const delBtn=document.getElementById('px-del-selected'); const cnt=document.getElementById('px-sel-count'); const n=pxSelectedIds().length;
+  if(delBtn) delBtn.disabled=n===0; if(cnt) cnt.textContent=n?(n+' selected'):'';
+  toast('Tested '+last.tested+' \u2014 '+last.healthy+' healthy, '+last.dead+' dead','ok');
 }
 document.getElementById('px-import-btn').onclick=async function(){
   const text=document.getElementById('px-import').value;

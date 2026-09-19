@@ -5088,10 +5088,14 @@ app.post("/admin/proxies/test", async (c) => {
     "SELECT id, scheme, host, port, username, password_enc FROM proxy_pool WHERE " + where + " ORDER BY id"
   ).bind(...(typeof idBinds !== "undefined" ? idBinds : [])).all();
   const pool = rows.results || [];
+  const wantsStream = b.stream === true;
   let tested = 0;
   let healthy = 0;
   let dead = 0;
-  const runOne = async (row) => {
+  // emit is a sink: SSE writer when streaming, else a no-op. runOne tests one
+  // proxy, patches its health, and reports the post-update row snapshot so the
+  // UI can repaint that single row live instead of reloading the whole pool.
+  const makeRunOne = (emit) => async (row) => {
     let plainPassword = "";
     if (row.password_enc) {
       try {
@@ -5101,6 +5105,7 @@ app.post("/admin/proxies/test", async (c) => {
         // proxy health, surface it as an internal error for this row.
         blog("proxy test decrypt failed id=" + row.id + ": " + String(e.message || e));
         tested++;
+        emit({ type: "result", id: row.id, error: "decrypt_failed", tested });
         return;
       }
     }
@@ -5116,18 +5121,48 @@ app.post("/admin/proxies/test", async (c) => {
     } catch (e) {
       result = { success: false, failure_class: "request_failed" };
     }
-    await applyProxyResult(c, row.id, result);
+    const snap = await applyProxyResult(c, row.id, result);
     tested++;
     if (result.success) healthy++;
-    else {
-      const after = await c.env.DB.prepare("SELECT status FROM proxy_pool WHERE id=?").bind(row.id).first();
-      if (after && after.status === "dead") dead++;
-    }
+    else if (snap && snap.status === "dead") dead++;
+    emit({
+      type: "result",
+      id: row.id,
+      success: !!result.success,
+      status: snap ? snap.status : null,
+      last_latency_ms: snap ? snap.last_latency_ms : null,
+      consecutive_failures: snap ? snap.consecutive_failures : null,
+      last_failure_class: snap ? snap.last_failure_class : null,
+      last_checked_at: snap ? snap.last_checked_at : null,
+      tested, healthy, dead
+    });
   };
-  // Bounded concurrency.
-  for (let i = 0; i < pool.length; i += concurrency)
-    await Promise.all(pool.slice(i, i + concurrency).map(runOne));
-  return c.json({ tested, healthy, dead });
+  if (!wantsStream) {
+    const runOne = makeRunOne(() => {});
+    for (let i = 0; i < pool.length; i += concurrency)
+      await Promise.all(pool.slice(i, i + concurrency).map(runOne));
+    return c.json({ tested, healthy, dead });
+  }
+  // Live mode: stream one SSE event per proxy as its result lands, so the UI
+  // updates rows and progress without a reload. Bounded concurrency preserved.
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (obj) => { try { controller.enqueue(enc.encode("data: " + JSON.stringify(obj) + "\n\n")); } catch {} };
+      send({ type: "start", total: pool.length });
+      const runOne = makeRunOne(send);
+      try {
+        for (let i = 0; i < pool.length; i += concurrency)
+          await Promise.all(pool.slice(i, i + concurrency).map(runOne));
+        send({ type: "done", tested, healthy, dead });
+      } catch (e) {
+        send({ type: "done", tested, healthy, dead, error: String(e && e.message || e) });
+      }
+      send({ type: "eof" });
+      try { controller.close(); } catch {}
+    }
+  });
+  return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-accel-buffering": "no" } });
 });
 async function applyProxyResult(c, id, result) {
   const now = nowIso();
@@ -5142,7 +5177,7 @@ async function applyProxyResult(c, id, result) {
     await c.env.DB.prepare(
       "UPDATE proxy_pool SET success_count=success_count+1, consecutive_failures=0, status='healthy', last_latency_ms=?, last_failure_class=NULL, last_checked_at=?, updated_at=? WHERE id=?"
     ).bind(result.total_ms ?? null, now, now, id).run();
-    return;
+    return { status: "healthy", last_latency_ms: result.total_ms ?? null, consecutive_failures: 0, last_failure_class: null, last_checked_at: now };
   }
   const consec = (Number(row.consecutive_failures) || 0) + 1;
   // 3 consecutive failures => dead. Below that, a failing proxy is 'flaky'
@@ -5152,6 +5187,7 @@ async function applyProxyResult(c, id, result) {
   await c.env.DB.prepare(
     "UPDATE proxy_pool SET failure_count=failure_count+1, consecutive_failures=?, status=?, last_failure_class=?, last_checked_at=?, updated_at=? WHERE id=?"
   ).bind(consec, status, result.failure_class || "request_failed", now, now, id).run();
+  return { status, last_latency_ms: null, consecutive_failures: consec, last_failure_class: result.failure_class || "request_failed", last_checked_at: now };
 }
 // Live Z.AI diagnostic. Runs the real warm + session-acquire phases through
 // the same uTLS helper + egress the request path uses, and reports each step's
