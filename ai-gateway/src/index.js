@@ -4506,6 +4506,185 @@ app.get("/admin/trajectories/:id", async (c) => {
     return c.json({ error: { message: "trajectory not found" } }, 404);
   return c.json({ trajectory: row });
 });
+// Reconciliation between the authoritative per-attempt telemetry (route_attempts)
+// and the legacy per-request trajectories. route_attempts is the source of
+// truth; trajectories still feeds live V1 health until the cutover, so drift
+// between them must be visible rather than buried in aggregates.
+app.get("/admin/router/reconcile", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const hours = Math.min(168, Math.max(1, Number(c.req.query("hours")) || 24));
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
+
+  // health_impact samples are the only observations that train a posterior;
+  // auth/caller/cancel/capability exclusions are deliberately excluded, so a
+  // route must clear 20 of THEM (not raw attempts) before its numbers mean
+  // anything. 3/5 health samples must never read as "60% reliable".
+  const MIN_HEALTH_SAMPLES = 20;
+  const readiness = (healthSamples) =>
+    healthSamples >= 50 ? "normal" : healthSamples >= 20 ? "low_confidence" : "insufficient_sample";
+
+  const atts = await c.env.DB.prepare(
+    `SELECT id, request_id, public_slug, route_id, transport, task_type, success, health_impact,
+            failure_class, failure_code, ttft_ms, latency_ms, started_at, finished_at, fallback_from_route_id
+     FROM route_attempts WHERE started_at >= ?`
+  ).bind(cutoff).all();
+  const attemptRows = atts.results || [];
+
+  const byRoute = new Map();
+  const unmatchedAttempts = [];
+  for (const a of attemptRows) {
+    const key = String(a.public_slug || "?");
+    if (!byRoute.has(key)) {
+      byRoute.set(key, {
+        slug: key,
+        attempts: 0, health_samples: 0, health_success: 0, health_failure: 0,
+        excluded: 0, cancelled: 0, incomplete: 0,
+        latencies: [], ttfts: [], task_types: new Map(), failure_classes: new Map(),
+        fallback_in: 0, fallback_out: 0
+      });
+    }
+    const r = byRoute.get(key);
+    r.attempts++;
+    if (a.task_type) r.task_types.set(String(a.task_type), (r.task_types.get(String(a.task_type)) || 0) + 1);
+    if (a.fallback_from_route_id != null) r.fallback_in++;
+    if (a.latency_ms != null) r.latencies.push(Number(a.latency_ms));
+    if (a.ttft_ms != null) r.ttfts.push(Number(a.ttft_ms));
+
+    if (!a.health_impact) {
+      // Cancelled streams carry health_impact=0 and their own class; excluded
+      // operational noise should not inflate a route's apparent maturity.
+      if (a.failure_class === "cancelled") r.cancelled++;
+      r.excluded++;
+      continue;
+    }
+    r.health_samples++;
+    if (a.success) r.health_success++;
+    else {
+      r.health_failure++;
+      if (a.failure_class === "stream_incomplete") r.incomplete++;
+      const fc = String(a.failure_class || "unknown");
+      r.failure_classes.set(fc, (r.failure_classes.get(fc) || 0) + 1);
+    }
+  }
+
+  const traj = await c.env.DB.prepare(
+    `SELECT id, slug, status, http_status, provider, created_at FROM trajectories WHERE created_at >= ?`
+  ).bind(cutoff).all();
+  const trajRows = traj.results || [];
+
+  // Terminal-outcome semantics: route_attempts success=1 is the same verdict as
+  // a trajectory "ok"; both cancelled and incomplete map to their own classes on
+  // the attempt side, so compare the normalized bucket, not raw HTTP status.
+  const attemptVerdict = new Map();
+  for (const a of attemptRows)
+    attemptVerdict.set(String(a.request_id), { verdict: a.success ? "success" : (a.failure_class || "failure"), row: a });
+
+  let matched = 0, statusMismatches = 0, routeMismatches = 0;
+  const mismatchExamples = [];
+  const trajIds = new Set(trajRows.map((t) => String(t.id)));
+  for (const [reqId, v] of attemptVerdict) {
+    if (!trajIds.has(reqId)) {
+      unmatchedAttempts.push({ request_id: reqId, slug: v.row.public_slug, failure_class: v.row.failure_class || null });
+      continue;
+    }
+    matched++;
+    const t = trajRows.find((x) => String(x.id) === reqId);
+    const trajVerdict = t.status === "ok" ? "success" : t.status === "cancelled" ? "cancelled" : "failure";
+    const attVerdict = v.verdict === "stream_incomplete" ? "failure" : v.verdict;
+    if (trajVerdict !== attVerdict) {
+      statusMismatches++;
+      if (mismatchExamples.length < 25)
+        mismatchExamples.push({ request_id: reqId, slug: v.row.public_slug, route_attempt_verdict: attVerdict, trajectory_status: t.status });
+    }
+    // The final route a request used is the one the trajectory recorded as its
+    // provider/rank; a successful attempt on a route the trajectory never names
+    // means the two systems disagreed about who served the request.
+    if (t.provider && v.row.route_id != null && String(t.slug) !== String(v.row.public_slug))
+      routeMismatches++;
+  }
+  // Multi-attempt requests can write several attempt rows but one trajectory;
+  // count trajectory rows that never produced an attempt (e.g. cache hits and
+  // pre-forward rejections) so the hole is visible instead of netting to zero.
+  const trajNoAttempt = trajRows.filter((t) => !attemptVerdict.has(String(t.id)));
+  const unmatchedTrajectories = trajNoAttempt
+    .slice(0, 25)
+    .map((t) => ({ id: t.id, slug: t.slug, status: t.status }));
+
+  const pct = (arr, p) => {
+    if (!arr.length) return null;
+    const s = arr.slice().sort((x, y) => x - y);
+    const i = Math.min(s.length - 1, Math.max(0, Math.ceil(p * s.length) - 1));
+    return s[i];
+  };
+
+  const routes = [...byRoute.values()].map((r) => {
+    const healthRate = r.health_samples ? r.health_success / r.health_samples : null;
+    return {
+      slug: r.slug,
+      attempts: r.attempts,
+      health_samples: r.health_samples,
+      health_success: r.health_success,
+      health_failure: r.health_failure,
+      health_success_rate: healthRate == null ? null : Number(healthRate.toFixed(4)),
+      excluded_attempts: r.excluded,
+      cancelled: r.cancelled,
+      stream_incomplete: r.incomplete,
+      failure_classes: Object.fromEntries([...r.failure_classes.entries()].sort((a, b) => b[1] - a[1])),
+      task_types: Object.fromEntries([...r.task_types.entries()].sort((a, b) => b[1] - a[1])),
+      latency_ms: { p50: pct(r.latencies, 0.5), p95: pct(r.latencies, 0.95) },
+      ttft_ms: { p50: pct(r.ttfts, 0.5), p95: pct(r.ttfts, 0.95) },
+      fallback_in: r.fallback_in,
+      fallback_out: r.fallback_out,
+      fallback_rate: r.attempts ? Number((r.fallback_in / r.attempts).toFixed(4)) : 0,
+      decision_readiness: {
+        status: readiness(r.health_samples),
+        health_samples: r.health_samples,
+        minimum_health_samples: MIN_HEALTH_SAMPLES
+      }
+    };
+  }).sort((a, b) => b.attempts - a.attempts);
+
+  const totalHealth = routes.reduce((s, r) => s + r.health_samples, 0);
+  const totalHealthSuccess = routes.reduce((s, r) => s + r.health_success, 0);
+  const okTraj = trajRows.filter((t) => t.status === "ok").length;
+  // Aggregate failure classes across every route, so a single systemic class
+  // (e.g. stream_incomplete) is visible without summing the per-route tables.
+  const failureClassAgg = new Map();
+  for (const a of attemptRows) {
+    if (!a.health_impact || a.success) continue;
+    const fc = String(a.failure_class || "unknown");
+    failureClassAgg.set(fc, (failureClassAgg.get(fc) || 0) + 1);
+  }
+
+  return c.json({
+    window_hours: hours,
+    attempts: {
+      rows: attemptRows.length,
+      health_samples: totalHealth,
+      operational: totalHealth,
+      success_rate: totalHealth ? Number((totalHealthSuccess / totalHealth).toFixed(4)) : null
+    },
+    trajectories: {
+      requests: trajRows.length,
+      success_rate: trajRows.length ? Number((okTraj / trajRows.length).toFixed(4)) : null
+    },
+    agreement: {
+      matched_requests: matched,
+      status_mismatches: statusMismatches,
+      route_mismatches: routeMismatches,
+      mismatch_examples: mismatchExamples,
+      unmatched_attempts: unmatchedAttempts.slice(0, 25),
+      unmatched_attempt_count: unmatchedAttempts.length,
+      unmatched_trajectories: unmatchedTrajectories,
+      unmatched_trajectory_count: trajNoAttempt.length
+    },
+    by_route: routes,
+    by_failure_class: Object.fromEntries([...failureClassAgg.entries()].sort((a, b) => b[1] - a[1])),
+    warnings: []
+  });
+});
 // ---- Trajectory exporters ----
 // Each ok request/response pair becomes a training example. The request
 // already carries the full multi-turn conversation (agents resend history

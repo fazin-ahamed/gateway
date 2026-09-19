@@ -481,3 +481,87 @@ test("POST /v1/chat/completions reaches the provider (regression: tool-repair im
     globalThis.fetch = realFetch;
   }
 });
+
+test("/admin/router/reconcile gates route conclusions on health samples and exposes dual-write drift", async () => {
+  const { createApp } = await import("../src/index.js");
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const env = { DB: db, ADMIN_TOKEN: "admin" };
+  const now = new Date().toISOString();
+
+  const attSeq = { n: 0 };
+  const att = (slug, success, healthImpact, cls, opts = {}) => {
+    attSeq.n++;
+    const reqId = opts.req_id || ("r" + attSeq.n);
+    db.prepare(
+      "INSERT INTO route_attempts (request_id, public_slug, route_id, task_type, success, health_impact, failure_class, latency_ms, ttft_ms, started_at, finished_at, fallback_from_route_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+    ).bind(reqId, slug, opts.route_id ?? 7, opts.task_type ?? "chat:casual", success, healthImpact, cls ?? null, opts.latency ?? 100, opts.ttft ?? 50, now, now, opts.fallback_from ?? null).run();
+    return reqId;
+  };
+
+  // noisy route: 7 health samples — below the 20-sample floor, so 4/7 must
+  // never read as a meaningful 57% reliability.
+  for (let i = 0; i < 4; i++) att("noisy", 1, 1, "success", { latency: 100 + i });
+  for (let i = 4; i < 7; i++) att("noisy", 0, 1, "upstream_5xx", { latency: 300 });
+  // mature route: 50 health samples, 45 ok / 5 fail — normal confidence.
+  for (let i = 0; i < 45; i++) att("mature", 1, 1, "success", { latency: 80, ttft: 40, req_id: "m" + i });
+  for (let i = 45; i < 50; i++) att("mature", 0, 1, "stream_incomplete", { latency: 1200, req_id: "m" + i });
+  // excluded classes must not count toward maturity
+  att("mature", 0, 0, "cancelled", {});
+  att("mature", 0, 0, "auth", {});
+  // one fallback into mature from another route
+  att("mature", 1, 1, "success", { fallback_from: 6 });
+
+  // trajectories: match most mature requests, but flip one verdict so the
+  // agreement layer must surface a mismatch by ID (not body).
+  for (let i = 0; i < 45; i++)
+    db.prepare("INSERT INTO trajectories (id, created_at, slug, status, provider) VALUES (?,?,?,?,?)").bind("m" + i, now, "mature", "ok", "P").run();
+  db.prepare("INSERT INTO trajectories (id, created_at, slug, status, provider) VALUES (?,?,?,?,?)").bind("m45", now, "mature", "ok", "P").run();
+  // a trajectory with no matching attempt row (cache hit / pre-forward reject)
+  db.prepare("INSERT INTO trajectories (id, created_at, slug, status, provider) VALUES (?,?,?,?,?)").bind("lonely", now, "mature", "ok", "P").run();
+
+  const app = createApp(env);
+  const res = await app.fetch(new Request("http://gw/admin/router/reconcile", { headers: { authorization: "Bearer admin" } }));
+  assert.equal(res.status, 200, "read-only reconcile behind requireAdmin");
+  const body = await res.json();
+
+  const noisy = body.by_route.find((r) => r.slug === "noisy");
+  assert.ok(noisy, "noisy route present");
+  assert.equal(noisy.health_samples, 7);
+  assert.equal(noisy.decision_readiness.status, "insufficient_sample", "7 samples is below the 20 floor");
+  assert.equal(noisy.decision_readiness.minimum_health_samples, 20);
+  assert.equal(noisy.excluded_attempts, 0, "no exclusions on noisy");
+
+  const mature = body.by_route.find((r) => r.slug === "mature");
+  assert.ok(mature, "mature route present");
+  assert.equal(mature.health_samples, 51, "45 ok + 5 incomplete + 1 fallback; cancelled/auth excluded");
+  assert.equal(mature.decision_readiness.status, "normal", "50+ samples is full confidence");
+  assert.equal(mature.cancelled, 1, "the cancelled attempt is reported but excluded from health");
+  assert.equal(mature.excluded_attempts, 2, "cancelled + auth are both excluded");
+  assert.equal(mature.stream_incomplete, 5);
+  assert.equal(mature.fallback_in, 1);
+  assert.ok(mature.fallback_rate > 0, "fallback rate is populated");
+  assert.equal(Object.keys(mature.task_types).length, 1, "task-type breakdown is populated");
+  assert.notEqual(mature.latency_ms.p50, null, "latency percentiles populated");
+
+  // The agreement layer: m45 is attempt-fail but trajectory-ok, so exactly
+  // one status mismatch must surface by ID, and 'lonely' is an unmatched
+  // trajectory.
+  assert.equal(body.agreement.status_mismatches, 1, "attempt-fail vs trajectory-ok is a mismatch");
+  assert.equal(body.agreement.mismatch_examples[0].request_id, "m45");
+  assert.ok(!JSON.stringify(body.agreement.mismatch_examples[0]).includes("response_json"), "mismatch examples carry IDs only, no bodies");
+  assert.equal(body.agreement.unmatched_trajectory_count, 1, "'lonely' has no attempt row");
+  assert.equal(body.agreement.unmatched_trajectories[0].id, "lonely");
+  assert.ok(body.agreement.matched_requests >= 45, "the 45 matching mature requests join");
+
+  // Excluded classes must not be in the health failure-class table.
+  assert.equal(body.by_failure_class["cancelled"], undefined, "cancelled is not a health failure class");
+  assert.equal(body.by_failure_class["auth"], undefined, "auth is not a health failure class");
+  assert.equal(body.by_failure_class["stream_incomplete"], 5, "stream_incomplete is a health failure");
+
+  // An unauthenticated request must not see any of this.
+  const nope = await app.fetch(new Request("http://gw/admin/router/reconcile"));
+  assert.equal(nope.status, 401, "reconcile requires admin");
+});
