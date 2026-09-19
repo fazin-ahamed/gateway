@@ -4,7 +4,7 @@ import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
-import { shadowFromV1 } from "./router/index.js";
+import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
@@ -2819,7 +2819,17 @@ async function pickAutoModel(c, payload, key) {
   const chosen = candidates.find((x) => x.slug === slug && x.eligible) || picked;
   let v2 = null;
   try {
-    v2 = shadowFromV1({ payload, candidates, preference: cfg.preference });
+    const allowed = key ? await allowedSlugs(c, key) : null;
+    const world = await loadV2World(c, {
+      payload,
+      allowed,
+      excluded: cfg.excluded,
+      catalogById: byId,
+      overlay,
+      circuitOpen,
+      lookupPrice: (slug, providerId) => lookupPriceRow(c, slug, providerId)
+    });
+    v2 = shadowV2({ payload, routes: world.routes, preference: cfg.preference });
   } catch (e) {
     blog("AUTO v2 shadow failed: " + String(e && e.message || e).slice(0, 200));
   }

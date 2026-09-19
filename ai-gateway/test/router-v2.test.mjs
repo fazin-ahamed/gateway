@@ -5,7 +5,7 @@ import { compileTaskIR, classifyTask } from "../src/router/task-ir.js";
 import { normalizeModelId, routeKey } from "../src/router/identity.js";
 import { age, observe, lcb, mean, seedBeta, summarize } from "../src/router/posterior.js";
 import { candidatePolicies, pareto, pickPolicy, shadowDecide } from "../src/router/policies.js";
-import { ROUTER_V2_MODE, shadowFromV1 } from "../src/router/index.js";
+import { ROUTER_V2_MODE, shadowFromV1, shadowV2, buildV2Universe } from "../src/router/index.js";
 import { generateActions } from "../src/horizon.js";
 
 test("casual hi is chat:casual, debug stack is code:debug", () => {
@@ -153,3 +153,78 @@ test("ineligible route never enters V2 policies", () => {
   assert.ok(policies.every((p) => p.primary !== "z-ai/glm-5.3-flash"));
   assert.ok(policies.some((p) => p.primary === "qwen-flash"));
 });
+
+test("V2 universe does not inherit V1 eligibility: a V1-degraded route with a key still competes", () => {
+  const payload = { messages: [{ role: "user", content: "hi" }] };
+  const { routes } = buildV2Universe([
+    {
+      slug: "glm-5.3-flash",
+      upstream_model: "glm-5.3-flash",
+      provider_id: 1,
+      route_id: 7,
+      key_count: 1,
+      circuitOpen: false,
+      price: { prompt_per_1m: 0.1, completion_per_1m: 0.4 },
+      stats: { success_alpha: 8, failure_beta: 12, latency_ema: 900, updated_at: new Date().toISOString() }
+    }
+  ], payload);
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0].eligible, true, "V2 must not inherit V1's degraded-ok_rate filter");
+  assert.equal(routes[0].hardEligible, true);
+  assert.ok(routes[0].posterior.beta > 2, "router_stats posterior is used, not trajectory ok_rate");
+});
+
+test("V2 universe drops routes with no credential even if V1 would have scored them", () => {
+  const payload = { messages: [{ role: "user", content: "hi" }] };
+  const { routes } = buildV2Universe([
+    { slug: "glm-5.3-flash", key_count: 0, circuitOpen: false, price: { prompt_per_1m: 0.1, completion_per_1m: 0.1 } }
+  ], payload);
+  assert.equal(routes[0].eligible, false);
+  assert.equal(routes[0].reason, "no key");
+});
+
+test("shadowV2 source is v2-universe, not v1-compat", () => {
+  const prev = process.env.ROUTER_V2;
+  process.env.ROUTER_V2 = "shadow";
+  try {
+    const decision = shadowV2({
+      payload: { messages: [{ role: "user", content: "hi" }] },
+      rows: [
+        { slug: "glm-5.3-flash", key_count: 1, circuitOpen: false, price: { prompt_per_1m: 0.01, completion_per_1m: 0.02 } }
+      ],
+      preference: 70
+    });
+    assert.equal(decision.source, "v2-universe");
+    assert.equal(decision.mode, "shadow");
+    assert.ok(decision.picked);
+    assert.equal(decision.picked.primary, "glm-5.3-flash");
+  } finally {
+    if (prev === undefined) delete process.env.ROUTER_V2;
+    else process.env.ROUTER_V2 = prev;
+  }
+});
+
+test("V2 vision gate uses TaskIR modalities, not V1 quality/need", () => {
+  const payload = {
+    messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x/a.png" } }, { type: "text", text: "what is this" }] }]
+  };
+  const { taskIR, routes } = buildV2Universe([
+    {
+      slug: "text-only",
+      key_count: 1,
+      entry: { limit: { context: 128000 }, modalities: { input: ["text"] }, toolCall: true }
+    },
+    {
+      slug: "vision-ok",
+      key_count: 1,
+      entry: { limit: { context: 128000 }, modalities: { input: ["text", "image"] }, toolCall: true }
+    }
+  ], payload);
+  assert.ok(taskIR.modalities.includes("image"));
+  const text = routes.find((r) => r.slug === "text-only");
+  const vis = routes.find((r) => r.slug === "vision-ok");
+  assert.equal(text.eligible, false);
+  assert.equal(text.reason, "vision");
+  assert.equal(vis.eligible, true);
+});
+

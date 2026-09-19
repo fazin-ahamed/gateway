@@ -1,10 +1,15 @@
 // Router V2 shadow path. Never selects live traffic unless ROUTER_V2=live.
 // Default is shadow: compute the policy, attach it, leave V1 in control.
+//
+// The candidate universe is independent of V1. shadowFromV1 still exists as
+// a compatibility wrapper for tests that pass a V1-shaped list, but live
+// Auto traffic uses loadV2World + shadowFromUniverse.
 
 import { compileTaskIR } from "./task-ir.js";
 import { normalizeModelId, routeKey } from "./identity.js";
 import { observe, seedBeta, summarize } from "./posterior.js";
 import { shadowDecide } from "./policies.js";
+import { buildV2Universe, loadV2World, shadowFromUniverse, shapeV2Route } from "./candidates.js";
 
 export const ROUTER_V2_MODE = () => {
   const raw = String(process.env.ROUTER_V2 || "shadow").toLowerCase();
@@ -24,6 +29,8 @@ function posteriorFromCandidate(cand) {
   return { alpha: seed.alpha + success, beta: seed.beta + fail, updatedAt: Date.now() };
 }
 
+// Compatibility adapter for unit tests that still pass a V1-shaped list.
+// Production Auto traffic must not call this — use loadV2World instead.
 export function routesFromV1Candidates(candidates) {
   return (candidates || []).map((c) => ({
     slug: c.slug,
@@ -53,7 +60,18 @@ export function shadowFromV1({ payload, candidates, preference }) {
   });
   return {
     ...decision,
-    mode: ROUTER_V2_MODE()
+    mode: ROUTER_V2_MODE(),
+    source: "v1-compat"
+  };
+}
+
+export function shadowV2({ payload, rows, routes, preference }) {
+  if (ROUTER_V2_MODE() === "off") return null;
+  const decision = shadowFromUniverse({ payload, rows, routes, preference });
+  return {
+    ...decision,
+    mode: ROUTER_V2_MODE(),
+    source: "v2-universe"
   };
 }
 
@@ -63,5 +81,9 @@ export {
   routeKey,
   observe,
   summarize,
-  seedBeta
+  seedBeta,
+  buildV2Universe,
+  loadV2World,
+  shadowFromUniverse,
+  shapeV2Route
 };
