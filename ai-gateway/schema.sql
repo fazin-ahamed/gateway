@@ -302,3 +302,48 @@ CREATE INDEX IF NOT EXISTS idx_route_attempts_model_task_time ON route_attempts(
 CREATE INDEX IF NOT EXISTS idx_route_attempts_request ON route_attempts(request_id);
 CREATE INDEX IF NOT EXISTS idx_zai_device_tokens_fifo
   ON zai_device_tokens(id);
+
+-- Egress proxy inventory for the Z.AI uTLS helper. Credentials are AES-GCM
+-- envelopes written by the worker (same providerCryptoKey machinery as
+-- provider api_key), never plaintext. status is the explicit lifecycle:
+--   untested | healthy | flaky | dead | disabled
+-- Raw counters are kept alongside status so the UI never has to infer it.
+-- One helper process still owns one sticky egress at runtime; this table is
+-- inventory + connectivity health, not a per-request rotation pool.
+CREATE TABLE IF NOT EXISTS proxy_pool (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scheme TEXT NOT NULL,              -- http | https | socks5 | socks5h
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  password_enc TEXT,                 -- AES-GCM envelope, never plaintext
+  enabled INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'untested',
+  success_count INTEGER NOT NULL DEFAULT 0,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_latency_ms INTEGER,
+  last_failure_class TEXT,
+  last_checked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- Identity is scheme+host+port+username: the same host on two schemes or
+  -- two accounts are distinct proxies.
+  UNIQUE(scheme, host, port, username)
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_pool_status ON proxy_pool(status);
+
+-- Per-check outcome metadata (no bodies): lets a route tell "failed once" from
+-- "98.7% reliable over 400 checks".
+CREATE TABLE IF NOT EXISTS proxy_test_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proxy_id INTEGER NOT NULL REFERENCES proxy_pool(id) ON DELETE CASCADE,
+  success INTEGER NOT NULL DEFAULT 0,
+  failure_class TEXT,
+  connect_ms INTEGER,
+  tunnel_ms INTEGER,
+  tls_ms INTEGER,
+  total_ms INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_test_runs_proxy ON proxy_test_runs(proxy_id, created_at);

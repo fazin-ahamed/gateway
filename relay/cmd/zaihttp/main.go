@@ -7,14 +7,14 @@
 // chat.z.ai with uTLS (Chrome hello, HTTP/1.1) and streams the response back,
 // letting the gateway keep its normal HTTP shape.
 //
-// Egress is process-sticky via ZAI_EGRESS_PROXY: empty (direct TCP),
-// http(s):// (HTTP CONNECT), or socks5/socks5h:// (real SOCKS5, socks5h
-// does remote DNS). uTLS always happens AFTER the tunnel is up, so
-// chat.z.ai still sees a Chrome ClientHello. One helper process = one
-// egress identity; do not rotate the proxy mid-session.
+// Egress is process-sticky via ZAI_EGRESS_PROXY (see internal/egress): empty
+// (direct TCP), http(s):// (HTTP CONNECT), or socks5/socks5h:// (real SOCKS5).
+// uTLS always happens AFTER the tunnel is up. One helper process = one egress
+// identity; do not rotate the proxy mid-session.
 //
-// It is intentionally narrow: only https://chat.z.ai is dialable, only POST
-// /proxy is served, and it listens on loopback unless told otherwise.
+// Two loopback-only POST routes: /proxy (production sticky egress) and
+// /check-egress (proxy-pool connectivity check against a fixed neutral
+// destination — never chat.z.ai, never a caller-supplied URL).
 //
 //	go run ./cmd/zaihttp                    # 127.0.0.1:8477
 //	ZAI_UTLS_PROXY=http://127.0.0.1:8477    # gateway side
@@ -25,10 +25,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
-	"encoding/base64"
-	"encoding/binary"
-	"fmt"
+	"encoding/json"
 	"io"
 	"log"
 	"net"
@@ -39,9 +36,21 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+
+	"gateway-relay/zaihttp/internal/egress"
 )
 
 const targetHost = "chat.z.ai"
+
+// Fixed, neutral destination for proxy-pool connectivity checks. Never
+// chat.z.ai (bulk checks must not hammer the real upstream) and never
+// caller-supplied (that would make /check-egress an SSRF proxy).
+const (
+	checkHost = "www.gstatic.com"
+	checkPort = 443
+	checkPath = "/generate_204"
+)
+
 func chromeTLSConfig() *utls.Config {
 	return &utls.Config{
 		ServerName: targetHost,
@@ -71,307 +80,35 @@ func main() {
 	if addr == "" {
 		addr = "127.0.0.1:8477"
 	}
-	egress, err := parseEgress(os.Getenv("ZAI_EGRESS_PROXY"))
+	cfg, err := egress.Parse(os.Getenv("ZAI_EGRESS_PROXY"))
 	if err != nil {
 		log.Fatalf("ZAI_EGRESS_PROXY: %v", err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
-		_, _ = io.WriteString(w, `{"ok":true,"egress":"`+egress.kind+`"}`)
+		_, _ = io.WriteString(w, `{"ok":true,"egress":"`+cfg.Kind+`"}`)
 	})
 	mux.HandleFunc("/proxy", handleProxy)
+	mux.HandleFunc("/check-egress", handleCheckEgress)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("zaihttp listening addr=%s target=%s egress=%s", addr, targetHost, egress.kind)
+	log.Printf("zaihttp listening addr=%s target=%s egress=%s", addr, targetHost, cfg.Kind)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}
 }
 
-type egressConfig struct {
-	kind     string // direct | http | https | socks5
-	addr     string // host:port of the proxy, empty for direct
-	user     string
-	pass     string
-	remoteDNS bool // socks5h: send hostname to the proxy
-}
-
-func parseEgress(raw string) (egressConfig, error) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return egressConfig{kind: "direct"}, nil
-	}
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return egressConfig{}, fmt.Errorf("invalid")
-	}
-	// A proxy URL is host:port only. Reject anything carrying a path, query,
-	// or fragment — that is almost always a malformed paste, not an egress.
-	if u.Path != "" && u.Path != "/" {
-		return egressConfig{}, fmt.Errorf("unexpected path")
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return egressConfig{}, fmt.Errorf("unexpected query/fragment")
-	}
-	user, pass := "", ""
-	if u.User != nil {
-		user = u.User.Username()
-		pass, _ = u.User.Password()
-	}
-	// SOCKS5 username/password auth is length-prefixed with a single byte.
-	if len(user) > 255 || len(pass) > 255 {
-		return egressConfig{}, fmt.Errorf("credential too long")
-	}
-	// IPv6 literals ([::1]) must go through Hostname()/Port(), never a bare
-	// Contains(":") check.
-	host := u.Hostname()
-	port := u.Port()
-	if host == "" {
-		return egressConfig{}, fmt.Errorf("no host")
-	}
-	if port == "" {
-		switch strings.ToLower(u.Scheme) {
-		case "http":
-			port = "80"
-		case "https":
-			port = "443"
-		case "socks5", "socks5h":
-			port = "1080"
-		}
-	}
-	addr := net.JoinHostPort(host, port)
-	switch strings.ToLower(u.Scheme) {
-	case "http":
-		return egressConfig{kind: "http", addr: addr, user: user, pass: pass}, nil
-	case "https":
-		return egressConfig{kind: "https", addr: addr, user: user, pass: pass}, nil
-	case "socks5":
-		return egressConfig{kind: "socks5", addr: addr, user: user, pass: pass, remoteDNS: false}, nil
-	case "socks5h":
-		return egressConfig{kind: "socks5", addr: addr, user: user, pass: pass, remoteDNS: true}, nil
-	default:
-		return egressConfig{}, fmt.Errorf("unsupported scheme")
-	}
-}
-
-// Proxy connect + tunnel + optional proxy-TLS must finish inside a short
-// window even though the overall request context is 10 minutes: a proxy that
-// accepts TCP then stalls during CONNECT/SOCKS/TLS would otherwise hold an
-// attempt open for the whole deadline. The negotiation deadline is cleared by
-// the caller before response streaming begins.
-const egressNegotiationTimeout = 15 * time.Second
-
-func dialUpstream(ctx context.Context, egress egressConfig) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 15 * time.Second}
-	target := targetHost + ":443"
-	if egress.kind == "direct" {
-		return d.DialContext(ctx, "tcp", target)
-	}
-	negCtx, negCancel := context.WithTimeout(ctx, egressNegotiationTimeout)
-	defer negCancel()
-	proxyConn, err := d.DialContext(negCtx, "tcp", egress.addr)
+func isLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return nil, err
+		host = r.RemoteAddr
 	}
-	// Bound every negotiation stage; clear the deadline before returning so the
-	// long-lived streaming body is not affected.
-	if dl, ok := negCtx.Deadline(); ok {
-		_ = proxyConn.SetDeadline(dl)
-	}
-	var ready net.Conn = proxyConn
-	if egress.kind == "https" {
-		host := egress.addr
-		if h, _, splitErr := net.SplitHostPort(egress.addr); splitErr == nil {
-			host = h
-		}
-		tlsConn := tls.Client(proxyConn, &tls.Config{ServerName: host, NextProtos: []string{"http/1.1"}})
-		if err := tlsConn.HandshakeContext(negCtx); err != nil {
-			proxyConn.Close()
-			return nil, err
-		}
-		ready = tlsConn
-	}
-	clearDeadline := func() { _ = proxyConn.SetDeadline(time.Time{}) }
-	switch egress.kind {
-	case "http", "https":
-		if err := httpConnect(negCtx, ready, target, egress); err != nil {
-			ready.Close()
-			return nil, err
-		}
-		clearDeadline()
-		return ready, nil
-	case "socks5":
-		if err := socks5Connect(negCtx, ready, targetHost, 443, egress); err != nil {
-			ready.Close()
-			return nil, err
-		}
-		clearDeadline()
-		return ready, nil
-	default:
-		ready.Close()
-		return nil, fmt.Errorf("unsupported egress")
-	}
-}
-
-func httpConnect(ctx context.Context, conn net.Conn, target string, egress egressConfig) error {
-	var b strings.Builder
-	b.WriteString("CONNECT " + target + " HTTP/1.1\r\n")
-	b.WriteString("Host: " + target + "\r\n")
-	if egress.user != "" {
-		token := base64.StdEncoding.EncodeToString([]byte(egress.user + ":" + egress.pass))
-		b.WriteString("Proxy-Authorization: Basic " + token + "\r\n")
-	}
-	b.WriteString("\r\n")
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-		defer conn.SetDeadline(time.Time{})
-	}
-	if _, err := io.WriteString(conn, b.String()); err != nil {
-		return err
-	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("connect status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func socks5Connect(ctx context.Context, conn net.Conn, host string, port uint16, egress egressConfig) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-		defer conn.SetDeadline(time.Time{})
-	}
-	methods := []byte{0x00}
-	if egress.user != "" {
-		methods = []byte{0x02, 0x00}
-	}
-	greet := append([]byte{0x05, byte(len(methods))}, methods...)
-	if _, err := conn.Write(greet); err != nil {
-		return err
-	}
-	reply := make([]byte, 2)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		return err
-	}
-	if reply[0] != 0x05 {
-		return fmt.Errorf("socks version")
-	}
-	switch reply[1] {
-	case 0x00:
-		// no auth
-	case 0x02:
-		u := []byte(egress.user)
-		p := []byte(egress.pass)
-		auth := make([]byte, 0, 3+len(u)+len(p))
-		auth = append(auth, 0x01, byte(len(u)))
-		auth = append(auth, u...)
-		auth = append(auth, byte(len(p)))
-		auth = append(auth, p...)
-		if _, err := conn.Write(auth); err != nil {
-			return err
-		}
-		ar := make([]byte, 2)
-		if _, err := io.ReadFull(conn, ar); err != nil {
-			return err
-		}
-		if ar[1] != 0x00 {
-			return fmt.Errorf("socks auth")
-		}
-	default:
-		return fmt.Errorf("socks method")
-	}
-
-	req := []byte{0x05, 0x01, 0x00}
-	if egress.remoteDNS {
-		req = append(req, 0x03, byte(len(host)))
-		req = append(req, []byte(host)...)
-	} else if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			req = append(req, 0x01)
-			req = append(req, v4...)
-		} else {
-			req = append(req, 0x04)
-			req = append(req, ip.To16()...)
-		}
-	} else {
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil || len(ips) == 0 {
-			return fmt.Errorf("socks resolve")
-		}
-		// Prefer a usable IPv4, then IPv6 — never blindly take ips[0], which
-		// may be an AAAA the egress cannot route while an A works fine.
-		var chosen net.IP
-		for _, a := range ips {
-			if a.IP.To4() != nil {
-				chosen = a.IP
-				break
-			}
-		}
-		if chosen == nil {
-			chosen = ips[0].IP
-		}
-		if v4 := chosen.To4(); v4 != nil {
-			req = append(req, 0x01)
-			req = append(req, v4...)
-		} else {
-			req = append(req, 0x04)
-			req = append(req, chosen.To16()...)
-		}
-	}
-	portBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBytes, port)
-	req = append(req, portBytes...)
-	if _, err := conn.Write(req); err != nil {
-		return err
-	}
-	hdr := make([]byte, 4)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return err
-	}
-	if hdr[1] != 0x00 {
-		return fmt.Errorf("socks status %d", hdr[1])
-	}
-	switch hdr[3] {
-	case 0x01:
-		_, err := io.CopyN(io.Discard, conn, 4+2)
-		return err
-	case 0x03:
-		l := make([]byte, 1)
-		if _, err := io.ReadFull(conn, l); err != nil {
-			return err
-		}
-		_, err := io.CopyN(io.Discard, conn, int64(l[0])+2)
-		return err
-	case 0x04:
-		_, err := io.CopyN(io.Discard, conn, 16+2)
-		return err
-	default:
-		return fmt.Errorf("socks atyp")
-	}
-}
-
-func sanitizeDialErr(err error) string {
-	if err == nil {
-		return "dial failed"
-	}
-	s := err.Error()
-	// Never leak proxy URLs, credentials, or host:port of the egress.
-	if strings.Contains(s, "socks") {
-		return "egress tunnel failed"
-	}
-	if strings.Contains(s, "connect status") {
-		return "egress tunnel failed"
-	}
-	return "dial failed"
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -397,17 +134,17 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	egress, _ := parseEgress(os.Getenv("ZAI_EGRESS_PROXY"))
-	conn, err := dialUpstream(ctx, egress)
+	cfg, _ := egress.Parse(os.Getenv("ZAI_EGRESS_PROXY"))
+	conn, _, err := cfg.Dial(ctx, targetHost, 443)
 	if err != nil {
-		http.Error(w, sanitizeDialErr(err), http.StatusBadGateway)
+		http.Error(w, "egress "+egress.Class(err), http.StatusBadGateway)
 		return
 	}
 	defer conn.Close()
 
 	tlsConn := utls.UClient(conn, chromeTLSConfig(), utls.HelloChrome_Auto)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		http.Error(w, "tls: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "tls handshake failed", http.StatusBadGateway)
 		return
 	}
 
@@ -462,4 +199,41 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("copy: %v", err)
 	}
+}
+
+// handleCheckEgress tests one caller-supplied proxy against the fixed neutral
+// destination. Loopback-only; the destination is compiled in, never taken from
+// the request, so this cannot be used as a general-purpose proxy.
+func handleCheckEgress(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(r) {
+		http.Error(w, "loopback only", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Proxy     string `json:"proxy"`
+		TimeoutMs int    `json:"timeout_ms"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	cfg, err := egress.Parse(body.Proxy)
+	if err != nil {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(egress.CheckResult{FailureClass: egress.ClassBadConfig})
+		return
+	}
+	timeout := time.Duration(body.TimeoutMs) * time.Millisecond
+	if timeout <= 0 || timeout > 20*time.Second {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	res := egress.Check(ctx, cfg, checkHost, checkPort, checkPath)
+	w.Header().Set("content-type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
