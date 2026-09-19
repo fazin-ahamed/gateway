@@ -8,6 +8,7 @@ import { shadowFromV1 } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
+import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options", "nosniff");

@@ -373,3 +373,49 @@ test("typed provider errors are converted to gateway-owned provider-neutral publ
   assert.equal(t.publicProviderError(cases[0]).status, 503);
   assert.equal(t.publicProviderError(cases[1]).status, 503);
 });
+
+test("POST /v1/chat/completions reaches the provider (regression: tool-repair import missing → ReferenceError 500)", async () => {
+  // This is the layer 42ecf8d shipped broken: runChatCompletion calls
+  // applyToolRepairPolicyToPayload on every request. With no import it threw a
+  // ReferenceError before routing, which Hono surfaced as a plaintext
+  // "Internal Server Error" 500 for every model. Unit tests over __test exports
+  // never touch this path, so only a real request through createApp catches it.
+  const { createApp } = await import("../src/index.js");
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const env = { DB: db, PROVIDER_CRYPTO_KEY: "test-crypto-key-please-change", ADMIN_TOKEN: "admin" };
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").bind("sk-test", "t", 1, "usd", 1e9, now, now).run();
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(1, "P", "http://up.local/v1", "direct", "openai", 1, 1, "round_robin", now).run();
+  const sealed = await t.sealProviderKey(env, "up-secret");
+  db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(1, sealed, "primary", now).run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,0,1)").bind("m", 1, "up-m").run();
+
+  const realFetch = globalThis.fetch;
+  let sawUpstream = false;
+  globalThis.fetch = async (url) => {
+    sawUpstream = true;
+    return new Response(
+      JSON.stringify({ id: "x", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+  try {
+    const app = createApp(env);
+    const res = await app.fetch(new Request("http://gw/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hello" }] })
+    }));
+    const text = await res.text();
+    assert.notEqual(text, "Internal Server Error", "handler must not throw uncaught before routing");
+    assert.equal(res.status, 200, "the request reaches the provider and returns its completion");
+    assert.ok(sawUpstream, "the request actually got past payload prep to the upstream forward");
+    const body = JSON.parse(text);
+    assert.equal(body.choices[0].message.content, "hi");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
