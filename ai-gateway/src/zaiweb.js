@@ -1234,6 +1234,68 @@ export async function validateZaiWebKey(rawKey, fetchImpl) {
   }
 }
 
+// Admin live diagnostic: runs the real Z.AI phases (through the same uTLS
+// helper + egress the request path uses) and reports each step's outcome,
+// timing, and HTTP status. Credentials are never echoed — only presence,
+// source, and a redacted userId. Safe to expose behind requireAdmin: it makes
+// at most a warm GET + one auth/guest probe, never a completion.
+export async function diagnoseZai(c, route, rawKey, options = {}) {
+  const steps = [];
+  const step = async (name, fn) => {
+    const t0 = Date.now();
+    try {
+      const detail = await fn();
+      steps.push({ step: name, ok: true, ms: Date.now() - t0, ...detail });
+      return detail;
+    } catch (e) {
+      steps.push({ step: name, ok: false, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 240), code: e && e.code });
+      throw e;
+    }
+  };
+  const baseFetcher = options.fetchImpl || (c && c.upstreamFetch) || globalThis.fetch;
+  const egress = options.egressProxy || (c && c.zaiEgress) || null;
+  const fetcher = wrapUtlsFetcher(baseFetcher, egress);
+  const usingHelper = !!process.env.ZAI_UTLS_PROXY;
+  const parsed = parseCredential(rawKey, null, null);
+  const hasAccountToken = !!parsed.token;
+  const result = {
+    provider: route && route.provider_name,
+    fmt: route && route.fmt,
+    upstream_model: route && route.upstream_model,
+    utls_helper_env: usingHelper ? process.env.ZAI_UTLS_PROXY : null,
+    egress_pinned: egress ? "auto-pool" : "env/direct",
+    account_token_supplied: hasAccountToken,
+    steps
+  };
+  const session = sessionFor({ fetcher, credential: parsed.token, key: (route && route.zai_session_key) || "diag" });
+  try {
+    // Phase 1: warm homepage (cookies + frontend version) — the first
+    // chat.z.ai call, and the usual place a WAF stonewall shows up.
+    await step("warm", async () => {
+      await session._warm();
+      return { fe_version: session.feVersion, cookies: session.jar.cookies.size, last_error: session.lastError || null };
+    });
+    // Phase 2: acquire a usable session (account token adopt, or guest
+    // bootstrap). Reports which path won and a redacted identity.
+    await step("acquire", async () => {
+      const snap = await session.acquire();
+      return { source: snap.source, user_id: snap.userId ? String(snap.userId).slice(0, 8) + "\u2026" : null, has_token: !!snap.token };
+    });
+    result.ok = true;
+  } catch (e) {
+    result.ok = false;
+    result.failure = { message: String(e && e.message || e).slice(0, 240), code: e && e.code, status: e && e.status };
+    result.session_status = session.status();
+    // Redact any token that leaked into status.
+    if (result.session_status) {
+      delete result.session_status.token;
+      if (result.session_status.userId)
+        result.session_status.userId = String(result.session_status.userId).slice(0, 8) + "\u2026";
+    }
+  }
+  return result;
+}
+
 export const __zaiTest = {
   extractToken,
   captureVerifyParam,

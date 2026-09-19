@@ -2,7 +2,7 @@ import { LOGIN_HTML } from "./login.js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
-import { callZaiBrowser, callZaiMinted, callZaiWeb, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
+import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
@@ -1007,7 +1007,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             break;
           }
           circuitRecordFailure(routeCircuit, { status: (e && e.status) || 0, kind: "unknown" });
-          blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e));
+          blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e) + (e && e.code ? " [" + e.code + "]" : "") + (c.__egressFailure ? " egress=" + c.__egressFailure : ""));
           lastErr = "upstream transport error";
           if (e && e.status)
             lastErrStatus = e.status;
@@ -5099,6 +5099,43 @@ async function applyProxyResult(c, id, result) {
     "UPDATE proxy_pool SET failure_count=failure_count+1, consecutive_failures=?, status=?, last_failure_class=?, last_checked_at=?, updated_at=? WHERE id=?"
   ).bind(consec, status, result.failure_class || "request_failed", now, now, id).run();
 }
+// Live Z.AI diagnostic. Runs the real warm + session-acquire phases through
+// the same uTLS helper + egress the request path uses, and reports each step's
+// status/timing so a failing route can be diagnosed without shell access.
+// Credentials are never returned — only presence, source, redacted userId.
+app.get("/admin/zai/diagnose", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  await ensureUpstreamDispatcher();
+  const slug = String(c.req.query("slug") || "").trim();
+  // Find a Z.AI route: the requested slug, else the first enabled zai* route.
+  const rows = await c.env.DB.prepare(
+    `SELECT mr.slug, mr.upstream_model, mr.provider_id, p.name AS provider_name, p.fmt, p.transport
+     FROM model_routes mr JOIN providers p ON p.id=mr.provider_id
+     WHERE mr.enabled=1 AND p.enabled=1 AND p.fmt IN ('zaiminted','zaiweb','zaiwebbrowser')` +
+     (slug ? " AND mr.slug=?" : "") + " ORDER BY mr.rank LIMIT 1"
+  ).bind(...(slug ? [slug] : [])).all();
+  const route = (rows.results || [])[0];
+  if (!route)
+    return c.json({ error: { message: slug ? ("no enabled Z.AI route for slug " + slug) : "no enabled Z.AI route found" } }, 404);
+  route.zai_session_key = "provider:" + route.provider_id + ":diag";
+  // Resolve the sealed credential for this provider, same as the live path.
+  let rawKey = "";
+  try {
+    const keys = await providerKeys(c, route.provider_id);
+    rawKey = (keys[0] && keys[0].key) || "";
+  } catch (e) {
+    return c.json({ error: { message: "could not load provider credential: " + String(e.message || e) } }, 500);
+  }
+  // Pin the same egress the live path would use (auto-pool or env), so the
+  // probe reflects reality.
+  try { c.zaiEgress = await resolveActiveEgress(c); } catch { c.zaiEgress = null; }
+  c.upstreamFetch = (url, init) => upstreamFetch(c, url, init);
+  const report = await diagnoseZai(c, route, rawKey, {});
+  report.helper_online = !!(await zaiHelperBase());
+  return c.json(report);
+});
 // ---- Trajectory exporters ----
 // Each ok request/response pair becomes a training example. The request
 // already carries the full multi-turn conversation (agents resend history
