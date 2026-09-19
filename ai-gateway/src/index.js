@@ -682,6 +682,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   } catch {
     return c.json({ error: { message: "Invalid JSON body" } }, 400);
   }
+  // Snapshot the caller's request before any gateway mutation (auto-harness,
+  // tool-repair). Telemetry and task classification must describe what the
+  // user asked for, not what the gateway injected.
+  const originalPayload = structuredClone(payload);
   let slug = payload.model;
   let autoDecision = null;
   if (String(slug).toLowerCase() === AUTO_SLUG) {
@@ -794,8 +798,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     let attempts = 0;
     // Label every request from the canonical Router V2 TaskIR (not just auto
     // traffic), so explicit-model calls also train route-task statistics.
+    // Compile from the ORIGINAL request: auto-harness and tool-repair inject
+    // gateway-authored text into `payload`, and classifying that instead of
+    // the caller's request would poison route-task statistics.
     let attemptTaskType = "";
-    try { attemptTaskType = (compileTaskIR(payload) || {}).task || ""; } catch {}
+    try { attemptTaskType = (compileTaskIR(originalPayload) || {}).task || ""; } catch {}
     let realAttemptSeq = 0;
     let previousRealRouteId = null;
     for (const route of routes.results) {
@@ -1838,22 +1845,12 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     const costUsd = await computeCost(c, slug, lastUsage, route.provider_id);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
+    // Terminal outcome, computed once and shared by the route_attempts patch
+    // and the trajectory dual-write so both telemetry systems agree.
+    const outcome = streamTerminalOutcome({ clientCancelled, streamError, finishSeen });
     if (extra && extra.attemptId) {
       const attLatency = Date.now() - (extra.attemptStart || started);
-      const gotOutput = !!(contentBuf || reasoningBuf || toolCallsBuf.length);
-      // Terminal outcome is three/four-way, not just !streamError. A client
-      // cancel is not a route failure and must not train the posterior; an
-      // upstream that closed without a finish_reason is flagged incomplete.
-      let outcome;
-      if (clientCancelled)
-        outcome = { success: 0, failure_class: "cancelled", observe: false };
-      else if (streamError)
-        outcome = { success: 0, failure_class: "stream_error", observe: true };
-      else if (!finishSeen)
-        outcome = { success: gotOutput ? 1 : 0, failure_class: "stream_incomplete", observe: true };
-      else
-        outcome = { success: 1, failure_class: "success", observe: true };
-      const hi = outcome.observe ? 1 : 0;
+      const hi = outcome.health_impact;
       const ttft = firstTokenAt ? (firstTokenAt - (extra.attemptStart || started)) : null;
       try {
         await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, health_impact=?, ttft_ms=COALESCE(?, ttft_ms), latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(outcome.success, outcome.failure_class, hi, ttft, attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
@@ -1882,8 +1879,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       };
       await recordTrajectory(c, {
         ...extra.traj,
-        status: streamError ? "fail" : "ok",
-        httpStatus: streamError ? 500 : 200,
+        status: outcome.trajectory_status,
+        httpStatus: outcome.http_status,
         provider: route.provider_name,
         rank: route.rank,
         attempts: extra.attempts || 1,
@@ -1892,10 +1889,10 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
         totalTokens: lastUsage.total_tokens,
         costUsd,
         latencyMs: Date.now() - started,
-        error: streamError || null,
+        error: streamError || (outcome.success ? null : outcome.failure_class),
         responseJson: (contentBuf || reasoningBuf || toolCallsBuf.length) ? JSON.stringify({ choices: [{ message: msg }], usage: lastUsage }) : null
       });
-      if (!streamError && extra.cacheKey && (contentBuf || toolCallsBuf.length)) {
+      if (outcome.failure_class === "success" && extra.cacheKey && (contentBuf || toolCallsBuf.length)) {
         const replayFr = normalizeTerminalFinishReason("stop", hasAccumulatedToolCalls(toolCallsBuf), !!(contentBuf || reasoningBuf));
         const replayBody = JSON.stringify({ id: "cached-" + requestId, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: extra.traj.slug, choices: [{ index: 0, message: msg, finish_reason: replayFr !== null ? replayFr : undefined }], usage: lastUsage });
         await storeResponseCache(c, {
@@ -1958,11 +1955,14 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             }
             const dc = choices && choices[0] && choices[0].delta;
             if (dc) {
-              if (firstTokenAt === null && (typeof dc.content === "string" || typeof (dc.reasoning_content ?? dc.reasoning ?? dc.thinking) === "string" || Array.isArray(dc.tool_calls)))
+              const rc = dc.reasoning_content ?? dc.reasoning ?? dc.thinking;
+              const hasContent = typeof dc.content === "string" && dc.content.length > 0;
+              const hasReasoning = typeof rc === "string" && rc.length > 0;
+              const hasToolDelta = Array.isArray(dc.tool_calls) && dc.tool_calls.length > 0;
+              if (firstTokenAt === null && (hasContent || hasReasoning || hasToolDelta))
                 firstTokenAt = Date.now();
               if (typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
                 contentBuf += dc.content;
-              const rc = dc.reasoning_content ?? dc.reasoning ?? dc.thinking;
               if (typeof rc === "string" && reasoningBuf.length < TRAJ_BODY_CAP)
                 reasoningBuf += rc;
               if (Array.isArray(dc.tool_calls)) {
@@ -2042,7 +2042,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       clientCancelled = true;
       // Stop the upstream generation so we do not keep paying for tokens the
       // client abandoned.
-      try { reader.cancel(reason); } catch {}
+      try { reader.cancel(reason).catch(() => {}); } catch {}
       blog("Stream client cancelled id=" + requestId + " reason=" + String(reason || "unknown").slice(0, 160));
     }
   });
@@ -2270,6 +2270,7 @@ function circuitRecord(kindOrKey, ok) {
 }
 var AUTO_SLUG = "auto";
 var routerHealthCache = { at: 0, rows: [] };
+function __resetRouterHealthCache() { routerHealthCache = { at: 0, rows: [] }; }
 async function routerHealth(c) {
   const now = Date.now();
   if (now - routerHealthCache.at < 30000)
@@ -2280,7 +2281,7 @@ async function routerHealth(c) {
               COUNT(*) AS n,
               AVG(CASE WHEN status='ok' THEN 1.0 ELSE 0.0 END) AS ok_rate,
               AVG(latency_ms) AS avg_ms
-       FROM (SELECT slug, status, latency_ms, created_at FROM trajectories WHERE created_at >= ?)
+       FROM (SELECT slug, status, latency_ms, created_at FROM trajectories WHERE created_at >= ? AND status IN ('ok', 'fail'))
        GROUP BY slug`
     ).bind(new Date(now - 24 * 3600000).toISOString()).all();
     // Fold in the latest integrity verdict: a slug whose only route failed
@@ -3104,11 +3105,35 @@ function classifyAttempt(status, why, errKind) {
     return op("upstream_5xx");
   return op("upstream_5xx");
 }
+// Single source of truth for a stream's terminal outcome, consumed by BOTH
+// telemetry systems (route_attempts + router_stats posterior, and the legacy
+// trajectories dual-write) so they can never disagree about the same stream.
+// Precedence: a client cancel wins over everything (the user abandoned the
+// stream — not a route failure, never trains the posterior, and must not move
+// V1 health); then a hard stream error; then a stream that closed without a
+// finish_reason (operationally incomplete — a partial body is not a win); else
+// success. `observe` gates the Beta posterior; `health_impact` mirrors it.
+function streamTerminalOutcome({ clientCancelled, streamError, finishSeen }) {
+  if (clientCancelled)
+    return { success: 0, failure_class: "cancelled", observe: false, health_impact: 0, trajectory_status: "cancelled", http_status: 499 };
+  if (streamError)
+    return { success: 0, failure_class: "stream_error", observe: true, health_impact: 1, trajectory_status: "fail", http_status: 500 };
+  if (!finishSeen)
+    return { success: 0, failure_class: "stream_incomplete", observe: true, health_impact: 1, trajectory_status: "fail", http_status: 500 };
+  return { success: 1, failure_class: "success", observe: true, health_impact: 1, trajectory_status: "ok", http_status: 200 };
+}
 var routerStatLocks = new Map();
 function withRouterStatLock(lockKey, fn) {
   const prev = routerStatLocks.get(lockKey) || Promise.resolve();
   const next = prev.then(fn, fn);
-  routerStatLocks.set(lockKey, next.then(() => {}, () => {}));
+  const settled = next.then(() => {}, () => {});
+  routerStatLocks.set(lockKey, settled);
+  // Drop the settled tail so the map does not retain a resolved promise per
+  // key forever; only clear it if no newer observation has queued behind us.
+  settled.finally(() => {
+    if (routerStatLocks.get(lockKey) === settled)
+      routerStatLocks.delete(lockKey);
+  });
   return next;
 }
 // Persisted Beta(alpha,beta) posterior per scope, updated only by operational
@@ -4925,7 +4950,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

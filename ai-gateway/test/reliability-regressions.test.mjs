@@ -373,7 +373,69 @@ test("typed provider errors are converted to gateway-owned provider-neutral publ
   assert.equal(t.publicProviderError(cases[0]).status, 503);
   assert.equal(t.publicProviderError(cases[1]).status, 503);
 });
+test("stream terminal outcome: incomplete is an operational failure, cancel never trains, dual-write agrees", () => {
+  const cancelled = t.streamTerminalOutcome({ clientCancelled: true, streamError: null, finishSeen: false });
+  assert.equal(cancelled.success, 0);
+  assert.equal(cancelled.failure_class, "cancelled");
+  assert.equal(cancelled.observe, false, "a client cancel must never move the posterior");
+  assert.equal(cancelled.health_impact, 0, "a cancel is not a route failure");
+  assert.equal(cancelled.trajectory_status, "cancelled", "dual-write must not log a cancel as ok");
 
+  const err = t.streamTerminalOutcome({ clientCancelled: false, streamError: "boom", finishSeen: false });
+  assert.equal(err.success, 0);
+  assert.equal(err.failure_class, "stream_error");
+  assert.equal(err.observe, true);
+  assert.equal(err.health_impact, 1);
+  assert.equal(err.trajectory_status, "fail");
+
+  // The core fix: a stream that produced some bytes but closed without a
+  // finish_reason is NOT a Bayesian win — success must be 0.
+  const incomplete = t.streamTerminalOutcome({ clientCancelled: false, streamError: null, finishSeen: false });
+  assert.equal(incomplete.success, 0, "no valid terminal completion is an operational failure, not a partial win");
+  assert.equal(incomplete.failure_class, "stream_incomplete");
+  assert.equal(incomplete.observe, true, "an incomplete stream still trains the posterior — as a failure");
+  assert.equal(incomplete.trajectory_status, "fail");
+
+  const ok = t.streamTerminalOutcome({ clientCancelled: false, streamError: null, finishSeen: true });
+  assert.equal(ok.success, 1);
+  assert.equal(ok.failure_class, "success");
+  assert.equal(ok.trajectory_status, "ok");
+
+  // Cancel wins over a late error flag; the user abandoned the stream first.
+  const cancelWins = t.streamTerminalOutcome({ clientCancelled: true, streamError: "late", finishSeen: false });
+  assert.equal(cancelWins.failure_class, "cancelled");
+
+  // Dual-write invariant both systems depend on: a success posterior observation
+  // (success===1) exists iff the trajectory logs "ok"; every other outcome that
+  // is observed logs "fail", and the one unobserved outcome logs "cancelled".
+  for (const o of [cancelled, err, incomplete, ok]) {
+    assert.equal(o.success === 1, o.trajectory_status === "ok");
+    assert.equal(o.health_impact === 1, o.observe === true);
+    if (!o.observe) assert.equal(o.trajectory_status, "cancelled");
+  }
+});
+
+test("routerHealth excludes cancelled streams from the V1 ok-rate", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const c = { env: { DB: db } };
+  const now = new Date().toISOString();
+  const ins = (id, status) => db.prepare(
+    "INSERT INTO trajectories (id, created_at, slug, status, latency_ms) VALUES (?,?,?,?,?)"
+  ).bind(id, now, "glm", status, 100).run();
+  ins("a", "ok");
+  ins("b", "fail");
+  ins("c", "cancelled");
+  t.__resetRouterHealthCache();
+  const rows = await t.routerHealth(c);
+  const glm = rows.find((r) => r.slug === "glm");
+  assert.ok(glm, "glm has health rows");
+  assert.equal(Number(glm.n), 2, "cancelled is excluded from the sample entirely (ok + fail only)");
+  assert.equal(Number(glm.ok_rate), 0.5, "1 ok of 2 real completions; the cancel neither helps nor hurts");
+  t.__resetRouterHealthCache();
+});
 test("POST /v1/chat/completions reaches the provider (regression: tool-repair import missing → ReferenceError 500)", async () => {
   // This is the layer 42ecf8d shipped broken: runChatCompletion calls
   // applyToolRepairPolicyToPayload on every request. With no import it threw a
