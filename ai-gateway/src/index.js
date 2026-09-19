@@ -1019,8 +1019,20 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           }
         } finally {
           if (!_att.recorded) {
-            const cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (_att.why || _att.errKind || null), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom });
+            // A proxy-egress failure (the helper's X-Egress-Proxy dial failed,
+            // NOT chat.z.ai) must not train route/model health. Attribute it to
+            // the proxy pool, invalidate the sticky pick, and record the attempt
+            // with health_impact=0.
+            const egressCls = c.__egressFailure;
+            let cls;
+            if (egressCls && !_att.success) {
+              cls = { failure_class: "egress_failure", health_impact: 0 };
+              await noteEgressFailure(c, egressCls);
+            } else {
+              cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
+            }
+            c.__egressFailure = null;
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, deferPosterior: false });
           }
         }
         }
@@ -4771,10 +4783,10 @@ async function resolveActiveEgress(c) {
   if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS)
     return activeEgress.url;
   const rows = await c.env.DB.prepare(
-    "SELECT id, scheme, host, port, username, password_enc, status, last_latency_ms, success_count FROM proxy_pool WHERE enabled=1 AND status IN ('healthy','untested')"
+    "SELECT id, scheme, host, port, username, password_enc, status, last_latency_ms, success_count FROM proxy_pool WHERE enabled=1 AND status='healthy'"
   ).all();
   const candidates = (rows.results || []).slice().sort(compareProxyRank);
-  // Keep the current sticky pick if it is still a candidate.
+  // Keep the current sticky pick if it is still a healthy candidate.
   if (activeEgress.id != null) {
     const keep = candidates.find((r) => r.id === activeEgress.id);
     if (keep) {
@@ -4782,19 +4794,68 @@ async function resolveActiveEgress(c) {
       return activeEgress.url;
     }
   }
-  const pick = candidates[0];
-  if (!pick) {
-    activeEgress = { id: null, url: null, at: now };
-    return null;
+  // Try candidates in rank order; skip any whose credential cannot be
+  // decrypted (config error, NOT a proxy fault) rather than dialing with an
+  // empty password and mislabeling the proxy as auth-failed.
+  for (const pick of candidates) {
+    if (pick.password_enc) {
+      let plainPassword;
+      try {
+        plainPassword = await openProviderKey(c.env, pick.password_enc);
+      } catch (e) {
+        blog("proxy egress decrypt failed id=" + pick.id + " (config error, not proxy fault): " + String(e.message || e));
+        continue;
+      }
+      activeEgress = { id: pick.id, url: proxyEgressUrl(pick, plainPassword), at: now };
+      return activeEgress.url;
+    }
+    activeEgress = { id: pick.id, url: proxyEgressUrl(pick, ""), at: now };
+    return activeEgress.url;
   }
-  let plainPassword = "";
-  if (pick.password_enc) {
-    try { plainPassword = await openProviderKey(c.env, pick.password_enc); } catch { plainPassword = ""; }
-  }
-  activeEgress = { id: pick.id, url: proxyEgressUrl(pick, plainPassword), at: now };
-  return activeEgress.url;
+  activeEgress = { id: null, url: null, at: now };
+  return null;
 }
 function __resetActiveEgress() { activeEgress = { id: null, url: null, at: 0 }; }
+// A production Z.AI request just failed because the active egress proxy could
+// not be dialed (not chat.z.ai). Record it against the proxy pool exactly like
+// a check failure so the proxy trends toward flaky/dead, and invalidate the
+// sticky pick so the next request re-selects a healthy egress.
+async function noteEgressFailure(c, failureClass) {
+  const id = activeEgress.id;
+  if (id == null)
+    return;
+  try {
+    await applyProxyResult(c, id, { success: false, failure_class: "egress:" + String(failureClass || "egress") });
+  } catch (e) {
+    blog("noteEgressFailure failed: " + String(e.message || e));
+  }
+  __resetActiveEgress();
+}
+// The uTLS helper lives at ZAI_UTLS_PROXY when auto-update injected it, else at
+// the conventional ZAI_HTTP_ADDR. Discover it by health rather than assuming
+// its absence from a missing env var — a missing var must not read as "helper
+// offline" when the process is in fact up on the default port.
+async function helperHealthCheck(base) {
+  if (!base) return false;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 2000);
+    const r = await fetch(base.replace(/\/+$/, "") + "/healthz", { signal: ctrl.signal });
+    clearTimeout(t);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+async function zaiHelperBase() {
+  const configured = String(process.env.ZAI_UTLS_PROXY || "").trim();
+  const fallback = process.env.ZAI_HTTP_ADDR ? "http://" + String(process.env.ZAI_HTTP_ADDR).trim() : "http://127.0.0.1:8477";
+  for (const base of [configured, fallback]) {
+    if (base && await helperHealthCheck(base))
+      return base.replace(/\/+$/, "");
+  }
+  return null;
+}
 function maskProxyRow(row) {
   const host = String(row.host).includes(":") ? "[" + row.host + "]" : row.host;
   const auth = row.username ? row.username + ":\u2022\u2022\u2022@" : "";
@@ -4843,7 +4904,8 @@ app.get("/admin/proxies", async (c) => {
       if (row) active = maskProxyRow(row).endpoint;
     }
   }
-  return c.json({ proxies: list.map(maskProxyRow), total: list.length, counts, mode, active });
+  const helper = await zaiHelperBase();
+  return c.json({ proxies: list.map(maskProxyRow), total: list.length, counts, mode, active, helper: { online: !!helper, base: helper } });
 });
 app.post("/admin/proxies/mode", async (c) => {
   const denied = await requireAdmin(c);
@@ -4942,9 +5004,9 @@ app.post("/admin/proxies/test", async (c) => {
   } catch {
     b = {};
   }
-  const base = String(process.env.ZAI_UTLS_PROXY || "").replace(/\/+$/, "");
+  const base = await zaiHelperBase();
   if (!base)
-    return c.json({ error: { message: "uTLS helper (ZAI_UTLS_PROXY) not configured; cannot test egress" } }, 503);
+    return c.json({ error: { message: "uTLS helper offline; start zaihttp (ZAI_HTTP_ADDR / ZAI_UTLS_PROXY) to test egress" } }, 503);
   const concurrency = Math.min(50, Math.max(1, Number(b.concurrency) || 20));
   const timeoutMs = Math.min(20000, Math.max(1000, Number(b.timeout_ms) || 10000));
   let where = "enabled=1";
@@ -4965,7 +5027,15 @@ app.post("/admin/proxies/test", async (c) => {
   const runOne = async (row) => {
     let plainPassword = "";
     if (row.password_enc) {
-      try { plainPassword = await openProviderKey(c.env, row.password_enc); } catch { plainPassword = ""; }
+      try {
+        plainPassword = await openProviderKey(c.env, row.password_enc);
+      } catch (e) {
+        // Config/crypto error, not a proxy fault: do not dial, do not touch
+        // proxy health, surface it as an internal error for this row.
+        blog("proxy test decrypt failed id=" + row.id + ": " + String(e.message || e));
+        tested++;
+        return;
+      }
     }
     const proxyUrl = proxyEgressUrl(row, plainPassword);
     let result = { success: false, failure_class: "request_failed" };
@@ -5460,7 +5530,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

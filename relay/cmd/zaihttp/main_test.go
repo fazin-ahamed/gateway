@@ -17,6 +17,7 @@ func TestTemplatesUseHTTP11(t *testing.T) {
 
 func TestRejectsNonZaiHost(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/proxy", strings.NewReader("{}"))
+	req.RemoteAddr = "127.0.0.1:5555"
 	req.Header.Set("X-Target-Url", "https://evil.example/api")
 	rec := httptest.NewRecorder()
 	handleProxy(rec, req)
@@ -27,11 +28,23 @@ func TestRejectsNonZaiHost(t *testing.T) {
 
 func TestRejectsNonPost(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+	req.RemoteAddr = "127.0.0.1:5555"
 	req.Header.Set("X-Target-Url", "https://chat.z.ai/api/models")
 	rec := httptest.NewRecorder()
 	handleProxy(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status=%d", rec.Code)
+	}
+}
+
+func TestProxyRejectsNonLoopback(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/proxy", strings.NewReader("{}"))
+	req.RemoteAddr = "203.0.113.9:4444"
+	req.Header.Set("X-Target-Url", "https://chat.z.ai/api/models")
+	rec := httptest.NewRecorder()
+	handleProxy(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback /proxy must be forbidden, got %d", rec.Code)
 	}
 }
 

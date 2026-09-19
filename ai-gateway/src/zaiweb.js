@@ -641,7 +641,7 @@ function parseCredential(rawKey, payload, headers) {
 // cannot imitate. When ZAI_UTLS_PROXY points at the local zaihttp helper, the
 // chat.z.ai calls are routed through it so they carry a Chrome ClientHello.
 // Everything else (and every test) keeps using the plain fetcher.
-export function wrapUtlsFetcher(fetcher, egressProxy) {
+export function wrapUtlsFetcher(fetcher, egressProxy, onEgressFailure) {
   const proxy = process.env.ZAI_UTLS_PROXY;
   if (!proxy || typeof fetcher !== "function")
     return fetcher;
@@ -675,16 +675,23 @@ export function wrapUtlsFetcher(fetcher, egressProxy) {
     // (manual mode) the helper uses ZAI_EGRESS_PROXY as before.
     if (egressProxy)
       headers["X-Egress-Proxy"] = String(egressProxy);
-    return fetcher(base + "/proxy", {
+    const res = await fetcher(base + "/proxy", {
       ...init,
       method: "POST",
       headers
     });
+    // The helper flags a failed proxy dial (never chat.z.ai) with this header.
+    // Surface it so the gateway attributes it to the proxy, not route health.
+    try {
+      const ef = res && res.headers && typeof res.headers.get === "function" ? res.headers.get("X-Egress-Failure") : null;
+      if (ef && typeof onEgressFailure === "function")
+        onEgressFailure(String(ef));
+    } catch {}
+    return res;
   };
 }
 // Pure-HTTP Z.AI engine, based on GLM-Free-API's proven serving flow.
 //
-// Crucial invariants:
 // - chat ids are client-generated UUIDs; no /api/v1/chats/new round-trip;
 // - CAPTCHA is minted immediately before the one completion POST;
 // - the HTTP wire uses the live catalog id (x-preview-l for Flash);
@@ -692,7 +699,7 @@ export function wrapUtlsFetcher(fetcher, egressProxy) {
 // - every referenced chat is deleted after the response drains.
 async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options = {}) {
   const baseFetcher = options.fetchImpl || (c && c.upstreamFetch) || globalThis.fetch;
-  const fetcher = wrapUtlsFetcher(baseFetcher, options.egressProxy || (c && c.zaiEgress));
+  const fetcher = wrapUtlsFetcher(baseFetcher, options.egressProxy || (c && c.zaiEgress), (cls) => { if (c) c.__egressFailure = cls || "egress"; });
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
   const staticCaps = getModelCapabilities(modelId);
 

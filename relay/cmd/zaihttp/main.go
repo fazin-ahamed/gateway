@@ -113,6 +113,12 @@ func isLoopback(r *http.Request) bool {
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
+	// Defense in depth: the helper binds loopback, but this endpoint tunnels an
+	// arbitrary X-Egress-Proxy — no outside client should ever reach it.
+	if !isLoopback(r) {
+		http.Error(w, "loopback only", http.StatusForbidden)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -144,6 +150,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	cfg, _ := egress.Parse(egressSpec)
 	conn, _, err := cfg.Dial(ctx, targetHost, 443)
 	if err != nil {
+		// Distinguish "the egress proxy failed" from "chat.z.ai failed": the
+		// gateway must not attribute a dead proxy to route/model health.
+		w.Header().Set("X-Egress-Failure", egress.Class(err))
 		http.Error(w, "egress "+egress.Class(err), http.StatusBadGateway)
 		return
 	}

@@ -169,3 +169,56 @@ test("mode endpoint flips manual/auto and never leaks a password in active egres
   assert.match(body.active, /bob:\u2022\u2022\u2022@9\.9\.9\.9:1080/, "active egress is shown masked");
   assert.doesNotMatch(JSON.stringify(body), /s3cret/, "password never surfaces even as the active pick");
 });
+
+test("auto-select never picks an untested proxy (must prove health first)", async () => {
+  const { db, env } = appWithDb();
+  const c = { env };
+  const now = new Date().toISOString();
+  await db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('proxy_egress_mode','auto',?)").bind(now).run();
+  db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, enabled, status, created_at, updated_at) VALUES ('socks5h','1.2.3.4',1080,'',1,'untested',?,?)").bind(now, now).run();
+  t.__resetActiveEgress();
+  const pick = await t.resolveActiveEgress(c);
+  assert.equal(pick, null, "an untested proxy must not receive live traffic; fall back to manual/direct");
+  // Once proven healthy it becomes eligible.
+  db.prepare("UPDATE proxy_pool SET status='healthy', last_latency_ms=100 WHERE host='1.2.3.4'").run();
+  t.__resetActiveEgress();
+  assert.match(await t.resolveActiveEgress(c), /1\.2\.3\.4:1080/);
+});
+
+test("auto-select fails closed on credential decrypt error (config error != proxy fault)", async () => {
+  const { db, env } = appWithDb();
+  const c = { env };
+  const now = new Date().toISOString();
+  await db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('proxy_egress_mode','auto',?)").bind(now).run();
+  // A healthy proxy whose password envelope is corrupt/undecryptable.
+  db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, password_enc, enabled, status, last_latency_ms, created_at, updated_at) VALUES ('socks5h','bad.example',1080,'bob','enc:v1:garbage.garbage',1,'healthy',50,?,?)").bind(now, now).run();
+  db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, enabled, status, last_latency_ms, created_at, updated_at) VALUES ('socks5h','good.example',1080,'',1,'healthy',80,?,?)").bind(now, now).run();
+  t.__resetActiveEgress();
+  const pick = await t.resolveActiveEgress(c);
+  // Skips the undecryptable one (does NOT dial it with an empty password) and
+  // picks the next healthy proxy instead.
+  assert.match(pick, /good\.example:1080/, "skips the config-broken proxy, uses the next healthy one");
+  // Its health must be untouched — a crypto error is not a proxy failure.
+  const bad = db.prepare("SELECT failure_count, status FROM proxy_pool WHERE host='bad.example'").all().results[0];
+  assert.equal(bad.failure_count, 0, "decrypt failure must not decrement proxy health");
+  assert.equal(bad.status, "healthy");
+});
+
+test("noteEgressFailure attributes to the proxy pool and invalidates the sticky pick", async () => {
+  const { db, env } = appWithDb();
+  const c = { env };
+  const now = new Date().toISOString();
+  await db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('proxy_egress_mode','auto',?)").bind(now).run();
+  db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, enabled, status, last_latency_ms, created_at, updated_at) VALUES ('socks5h','p1.example',1080,'',1,'healthy',60,?,?)").bind(now, now).run();
+  t.__resetActiveEgress();
+  const pick = await t.resolveActiveEgress(c);
+  assert.match(pick, /p1\.example/);
+  // A production request just failed on this egress.
+  await t.noteEgressFailure(c, "connect_timeout");
+  const row = db.prepare("SELECT failure_count, consecutive_failures, status, last_failure_class FROM proxy_pool WHERE host='p1.example'").all().results[0];
+  assert.equal(row.failure_count, 1, "the proxy, not the route, absorbs the failure");
+  assert.equal(row.consecutive_failures, 1);
+  assert.match(row.last_failure_class, /egress:connect_timeout/);
+  const runs = db.prepare("SELECT COUNT(*) AS n FROM proxy_test_runs WHERE proxy_id=(SELECT id FROM proxy_pool WHERE host='p1.example')").all().results[0].n;
+  assert.equal(runs, 1, "recorded as a proxy_test_runs row");
+});
