@@ -2820,6 +2820,7 @@ async function pickAutoModel(c, payload, key) {
   let v2 = null;
   try {
     const allowed = key ? await allowedSlugs(c, key) : null;
+    const priceResolver = await buildPriceResolver(c);
     const world = await loadV2World(c, {
       payload,
       allowed,
@@ -2827,7 +2828,8 @@ async function pickAutoModel(c, payload, key) {
       catalogById: byId,
       overlay,
       circuitOpen,
-      lookupPrice: (slug, providerId) => lookupPriceRow(c, slug, providerId)
+      keyCircuitOpen: (keyId) => circuitOpen("key", keyId),
+      priceResolver
     });
     v2 = shadowV2({ payload, routes: world.routes, preference: cfg.preference });
   } catch (e) {
@@ -2978,6 +2980,39 @@ async function lookupPriceRow(c, slug, providerId) {
     }
   }
   return null;
+}
+// One query for every price row, then an in-memory (slug,providerId) resolver
+// with the same provider-specific-then-default fallback as lookupPriceRow.
+// V2's shadow world would otherwise do one price query per route on every
+// Auto request while pickAutoModel blocks on it.
+async function buildPriceResolver(c) {
+  const hasProvider = await pricesHasProvider(c);
+  const cols = hasProvider ? PRICE_COLS + ", provider_id, slug" : PRICE_COLS + ", slug";
+  let rows = [];
+  try {
+    const r = await c.env.DB.prepare("SELECT " + cols + " FROM prices").all();
+    rows = r.results || [];
+  } catch {
+    try {
+      const r = await c.env.DB.prepare("SELECT prompt_per_1m, completion_per_1m, slug FROM prices").all();
+      rows = r.results || [];
+    } catch {
+      rows = [];
+    }
+  }
+  const byKey = new Map();
+  for (const row of rows) {
+    const pid = hasProvider ? (Number(row.provider_id) || 0) : 0;
+    byKey.set(row.slug + "|" + pid, row);
+  }
+  return (slug, providerId) => {
+    if (!slug)
+      return null;
+    const pid = Number(providerId) || 0;
+    if (hasProvider && pid && byKey.has(slug + "|" + pid))
+      return byKey.get(slug + "|" + pid);
+    return byKey.get(slug + "|0") || null;
+  };
 }
 async function computeCost(c, slug, usage, providerId) {
   const pt = Number(usage && usage.cost_usd) || 0;

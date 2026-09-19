@@ -9,9 +9,20 @@
 // choose from, so a V1 bug cannot silently empty V2's pool.
 
 import { isTinyModel, normalizeModelId, routeKey } from "./identity.js";
-import { seedBeta } from "./posterior.js";
+import { seedBeta, samples as posteriorSamples } from "./posterior.js";
 import { compileTaskIR } from "./task-ir.js";
 import { shadowDecide } from "./policies.js";
+
+// A task-specific route posterior only overrides the global one once it has
+// its own evidence; below this it is noise and the global posterior is the
+// better prior.
+const TASK_POSTERIOR_MATURE = 5;
+// cost_ema is trusted as the real per-request cost once the route has enough
+// observations; below this fall back to the priced estimate.
+const COST_EMA_MATURE = 5;
+// A known catalog entry with no advertised context window is treated as this
+// conservative ceiling rather than unlimited.
+const UNKNOWN_CONTEXT_FALLBACK = 32000;
 
 export function posteriorFromStats(row) {
   const seed = seedBeta("route");
@@ -25,13 +36,45 @@ export function posteriorFromStats(row) {
   };
 }
 
-function costFromPrice(row) {
-  if (!row)
-    return 0.5;
-  const prompt = Number(row.prompt_per_1m) || 0;
-  const completion = Number(row.completion_per_1m) || 0;
-  const n = prompt + completion;
-  return Number.isFinite(n) && n > 0 ? n : 0.5;
+// Global route posterior is the prior; the task-specific posterior takes over
+// once it has independent evidence. This is the whole point of the per-task
+// router_stats rows — route 12 may be excellent on code:debug and mediocre on
+// vision:reasoning, and the router should learn that.
+export function effectivePosterior(globalStats, taskStats) {
+  const global = posteriorFromStats(globalStats);
+  if (!taskStats)
+    return global;
+  const task = posteriorFromStats(taskStats);
+  if (posteriorSamples(task) >= TASK_POSTERIOR_MATURE)
+    return task;
+  return global;
+}
+
+// Real expected per-request cost, not the sum of two $/1M rates. Prefers a
+// mature cost_ema, then a per-request actual price, then actual/list token
+// rates evaluated against the TaskIR token estimate.
+export function estimateCost(row, taskIR) {
+  const ema = Number(row && row.stats && row.stats.cost_ema);
+  if (Number.isFinite(ema) && ema > 0 && posteriorSamples(posteriorFromStats(row.stats)) >= COST_EMA_MATURE)
+    return ema;
+  const price = row && row.price;
+  if (price) {
+    if (String(price.actual_mode) === "per_request" && Number(price.actual_per_request) > 0)
+      return Number(price.actual_per_request);
+    const promptRate = Number(price.actual_prompt_per_1m) || Number(price.prompt_per_1m) || 0;
+    const complRate = Number(price.actual_completion_per_1m) || Number(price.completion_per_1m) || 0;
+    const inTok = Number(taskIR && taskIR.contextTokens) || 0;
+    const outTok = Number(taskIR && taskIR.expectedOutputTokens) || 0;
+    const est = (inTok / 1e6) * promptRate + (outTok / 1e6) * complRate;
+    if (est > 0)
+      return est;
+    // A route with a price row but a zero-token estimate still has known
+    // rates; fall back to the per-1M sum so it is not mistaken for unpriced.
+    const sum = promptRate + complRate;
+    if (sum > 0)
+      return sum / 1e6 * 1000; // ~1k-token-equivalent floor, keeps ordering
+  }
+  return 0.5;
 }
 
 function capabilitiesOf(entry) {
@@ -55,42 +98,63 @@ export function isWorkhorseSlug(id) {
   return WORKHORSE.test(String(id || "").toLowerCase());
 }
 
-// TaskIR-native capability gate. Does not consult V1 quality/need or
-// trajectory ok_rate — those are V1's worldview.
+// TaskIR-native capability gate. Fail-closed: a hard requirement (tools,
+// context, output, vision) with no catalog/overlay evidence is NOT assumed
+// satisfied. A missing context window uses a conservative ceiling, never
+// infinity, and the output limit is checked against the expected output.
 export function v2Capable(caps, taskIR) {
   const tokens = Number(taskIR && taskIR.contextTokens) || 0;
   const wantsVision = !!(taskIR && taskIR.modalities && taskIR.modalities.includes("image"));
   const wantsTools = !!(taskIR && taskIR.tools && taskIR.tools.required);
-  const ctxOk = caps.unknown ? tokens < 32000 : (!caps.context || tokens <= Math.floor(caps.context * 0.9));
+  const wantOut = Number(taskIR && taskIR.expectedOutputTokens) || 0;
+  const ctxLimit = caps.unknown ? UNKNOWN_CONTEXT_FALLBACK : (caps.context > 0 ? caps.context : UNKNOWN_CONTEXT_FALLBACK);
+  const ctxOk = tokens <= Math.floor(ctxLimit * 0.9);
+  // Unknown capability fails closed on a hard requirement.
   const visionOk = !wantsVision || (!caps.unknown && caps.vision);
-  const toolsOk = !wantsTools || caps.tools || caps.unknown;
+  const toolsOk = !wantsTools || (!caps.unknown && caps.tools);
+  // Output limit only gates when the route actually advertises one.
+  const outOk = !(caps.output > 0) || wantOut === 0 || wantOut <= caps.output;
   let reason = "";
   if (!ctxOk) reason = "context";
   else if (!visionOk) reason = "vision";
   else if (!toolsOk) reason = "tools";
-  return { capable: ctxOk && visionOk && toolsOk, reason, ctxOk, visionOk, toolsOk };
+  else if (!outOk) reason = "output";
+  return { capable: ctxOk && visionOk && toolsOk && outOk, reason, ctxOk, visionOk, toolsOk, outOk };
 }
 
 export function shapeV2Route(row, taskIR) {
   const slug = String(row.slug || "");
   const caps = capabilitiesOf(row.entry);
   const gate = v2Capable(caps, taskIR);
-  const hasCredential = Number(row.key_count) > 0;
+  const enabledKeyCount = Number(row.key_count) || 0;
+  // Live execution has per-key circuit breakers; usable keys, not merely
+  // enabled ones, decide whether a credential is actually available.
+  const usableKeyCount = row.usable_key_count == null ? enabledKeyCount : Number(row.usable_key_count) || 0;
+  const hasCredential = usableKeyCount > 0;
   const circuit = !!row.circuitOpen;
   const luxury = isLuxurySlug(slug);
-  const eligible = gate.capable && hasCredential && !circuit && !luxury;
+  // Luxury is an economic prior, NOT a capability failure. An expensive
+  // flagship can be exactly what a hard, high-verification task needs, so it
+  // stays hard-eligible and is discouraged by cost/budget in scoring instead.
+  const eligible = gate.capable && hasCredential && !circuit;
   let reason = gate.reason;
-  if (!reason && !hasCredential) reason = "no key";
+  if (!reason && !hasCredential) reason = enabledKeyCount > 0 ? "keys circuit-open" : "no key";
   if (!reason && circuit) reason = "circuit open";
-  if (!reason && luxury) reason = "luxury";
-  const posterior = posteriorFromStats(row.stats);
+  const posterior = effectivePosterior(row.stats, row.taskStats);
+  const cost = estimateCost(row, taskIR);
+  const rk = routeKey({
+    slug,
+    upstream_model: row.upstream_model || slug,
+    provider_id: row.provider_id,
+    transport: row.transport || row.fmt
+  });
   return {
     slug,
     model: normalizeModelId(row.upstream_model || slug),
     routeId: row.route_id ?? row.id ?? null,
     providerId: row.provider_id ?? null,
     transport: String(row.transport || row.fmt || "direct"),
-    cost: costFromPrice(row.price),
+    cost,
     avgMs: Number(row.stats && row.stats.latency_ema) || 0,
     p50Ms: Number(row.stats && row.stats.latency_ema) || 0,
     capable: gate.capable,
@@ -99,16 +163,15 @@ export function shapeV2Route(row, taskIR) {
     tiny: isTinyModel(slug),
     eligible,
     hardEligible: eligible,
+    enabledKeyCount,
+    usableKeyCount,
     hasCredential,
     circuitOpen: circuit,
+    outputLimit: caps.output || 0,
+    contextLimit: caps.unknown ? 0 : caps.context,
     reason,
     posterior,
-    key: routeKey({
-      slug,
-      upstream_model: row.upstream_model || slug,
-      provider_id: row.provider_id,
-      transport: row.transport || row.fmt
-    })
+    key: rk
   };
 }
 
@@ -130,27 +193,70 @@ export function shadowFromUniverse({ payload, rows, routes, preference }) {
     universe: built.routes.map((r) => ({
       slug: r.slug,
       routeId: r.routeId,
+      routeKey: r.key,
       eligible: r.eligible,
       reason: r.reason,
-      key: r.key
+      luxury: r.luxury
     }))
   };
 }
 
-export async function loadV2World(c, { payload, allowed = null, excluded = [], catalogById = null, overlay = new Map(), circuitOpen = () => false, lookupPrice = async () => null } = {}) {
+// Resolve capability entry preferring the actual upstream model, so a public
+// slug that differs from upstream_model does not silently become an
+// unknown-capability route.
+function resolveEntry(row, overlay, catalogById) {
+  const upstream = row.upstream_model || "";
+  const slug = row.slug || "";
+  return (
+    overlay.get(slug) ||
+    overlay.get(upstream) ||
+    matchEntry(catalogById, upstream) ||
+    matchEntry(catalogById, slug) ||
+    null
+  );
+}
+
+export async function loadV2World(c, {
+  payload,
+  allowed = null,
+  excluded = [],
+  catalogById = null,
+  overlay = new Map(),
+  circuitOpen = () => false,
+  keyCircuitOpen = null,
+  priceResolver = () => null
+} = {}) {
+  const taskIR = compileTaskIR(payload || {});
   const rows = await c.env.DB.prepare(
-    `SELECT mr.id, mr.slug, mr.upstream_model, mr.rank, mr.provider_id, p.fmt, p.transport,
-            (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id=p.id AND pk.enabled=1) AS key_count
+    `SELECT mr.id, mr.slug, mr.upstream_model, mr.rank, mr.provider_id, p.fmt, p.transport
      FROM model_routes mr
      JOIN providers p ON p.id=mr.provider_id
      WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1`
   ).all();
-  const statsRows = await c.env.DB.prepare(
-    "SELECT scope_id, success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope='route' AND task_type=''"
+  // One query for keys, one for stats — no per-route round-trips.
+  const keyRows = await c.env.DB.prepare(
+    "SELECT id, provider_id FROM provider_keys WHERE enabled=1"
   ).all();
-  const statsByScope = new Map();
-  for (const s of statsRows.results || [])
-    statsByScope.set(String(s.scope_id), s);
+  const enabledKeysByProvider = new Map();
+  const usableKeysByProvider = new Map();
+  for (const k of keyRows.results || []) {
+    const pid = k.provider_id;
+    enabledKeysByProvider.set(pid, (enabledKeysByProvider.get(pid) || 0) + 1);
+    const dead = keyCircuitOpen ? keyCircuitOpen(k.id) : false;
+    if (!dead)
+      usableKeysByProvider.set(pid, (usableKeysByProvider.get(pid) || 0) + 1);
+  }
+  const statsRows = await c.env.DB.prepare(
+    "SELECT scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope='route' AND (task_type='' OR task_type=?)"
+  ).bind(taskIR.task || "").all();
+  const globalStats = new Map();
+  const taskStats = new Map();
+  for (const s of statsRows.results || []) {
+    if (s.task_type === "" || s.task_type == null)
+      globalStats.set(String(s.scope_id), s);
+    else
+      taskStats.set(String(s.scope_id), s);
+  }
 
   const allow = allowed ? new Set(allowed) : null;
   const skip = new Set((excluded || []).map((s) => String(s)));
@@ -161,9 +267,8 @@ export async function loadV2World(c, { payload, allowed = null, excluded = [], c
       continue;
     if (allow && !allow.has(r.slug))
       continue;
-    const entry = overlay.get(r.slug) || matchEntry(catalogById, r.slug);
-    const price = await lookupPrice(r.slug, r.provider_id);
-    const circuit = !!(circuitOpen("route", r.id) || circuitOpen("provider", r.provider_id));
+    const entry = resolveEntry(r, overlay, catalogById);
+    const scope = "route:" + r.id;
     world.push({
       id: r.id,
       route_id: r.id,
@@ -172,19 +277,24 @@ export async function loadV2World(c, { payload, allowed = null, excluded = [], c
       provider_id: r.provider_id,
       fmt: r.fmt,
       transport: r.transport,
-      key_count: r.key_count,
+      key_count: enabledKeysByProvider.get(r.provider_id) || 0,
+      usable_key_count: usableKeysByProvider.get(r.provider_id) || 0,
       entry,
-      price,
-      stats: statsByScope.get("route:" + r.id) || null,
-      circuitOpen: circuit
+      price: priceResolver(r.slug, r.provider_id),
+      stats: globalStats.get(scope) || null,
+      taskStats: taskStats.get(scope) || null,
+      circuitOpen: !!(circuitOpen("route", r.id) || circuitOpen("provider", r.provider_id))
     });
   }
   return buildV2Universe(world, payload);
 }
+
 function matchEntry(byId, slug) {
   if (!byId || typeof byId.get !== "function")
     return null;
   const want = String(slug || "");
+  if (!want)
+    return null;
   if (byId.has(want))
     return byId.get(want);
   const lower = want.toLowerCase();

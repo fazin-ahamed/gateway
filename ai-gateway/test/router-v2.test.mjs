@@ -6,6 +6,7 @@ import { normalizeModelId, routeKey } from "../src/router/identity.js";
 import { age, observe, lcb, mean, seedBeta, summarize } from "../src/router/posterior.js";
 import { candidatePolicies, pareto, pickPolicy, shadowDecide } from "../src/router/policies.js";
 import { ROUTER_V2_MODE, shadowFromV1, shadowV2, buildV2Universe } from "../src/router/index.js";
+import { effectivePosterior, estimateCost, v2Capable, shapeV2Route, isLuxurySlug } from "../src/router/candidates.js";
 import { generateActions } from "../src/horizon.js";
 
 test("casual hi is chat:casual, debug stack is code:debug", () => {
@@ -226,5 +227,83 @@ test("V2 vision gate uses TaskIR modalities, not V1 quality/need", () => {
   assert.equal(text.eligible, false);
   assert.equal(text.reason, "vision");
   assert.equal(vis.eligible, true);
+});
+
+
+test("policies carry route identity (routeId + routeKey), not just slug", () => {
+  const payload = { messages: [{ role: "user", content: "hi" }] };
+  // Same public slug, two different provider routes.
+  const { routes } = buildV2Universe([
+    { slug: "glm-5.3", upstream_model: "glm-5.3", provider_id: 1, route_id: 12, key_count: 1, price: { prompt_per_1m: 0.01, completion_per_1m: 0.02 } },
+    { slug: "glm-5.3", upstream_model: "glm-5.3", provider_id: 2, route_id: 29, key_count: 1, price: { prompt_per_1m: 0.08, completion_per_1m: 0.16 } }
+  ], payload);
+  const policies = candidatePolicies(routes, compileTaskIR(payload));
+  const reflex = policies.find((p) => p.mode === "reflex");
+  assert.ok(reflex.primaryRef, "policy carries a route ref");
+  assert.ok(reflex.primaryRef.routeKey, "route key present");
+  assert.ok([12, 29].includes(reflex.primaryRef.routeId), "route id present");
+  // The cheaper route (12) must be the chosen primary — proving route-level,
+  // not slug-level, selection.
+  assert.equal(reflex.primaryRef.routeId, 12);
+});
+
+test("task-specific posterior overrides global once mature, else global prior", () => {
+  const global = { success_alpha: 20, failure_beta: 4, updated_at: new Date().toISOString() };
+  // 1 sample task row is immature -> global wins
+  const immature = effectivePosterior(global, { success_alpha: 9, failure_beta: 1, updated_at: new Date().toISOString() });
+  assert.equal(immature.alpha, 20, "immature task posterior does not override global");
+  // 10 task samples is mature -> task wins
+  const mature = effectivePosterior(global, { success_alpha: 2, failure_beta: 16, updated_at: new Date().toISOString() });
+  assert.equal(mature.alpha, 2, "mature task posterior overrides global");
+  assert.ok(mature.beta > global.failure_beta, "route learned it is worse on this task");
+});
+
+test("cost uses per-request actual and cost_ema, not a raw per-1M sum", () => {
+  const taskIR = compileTaskIR({ messages: [{ role: "user", content: "hi" }] });
+  // per-request actual pricing wins over token rates
+  const perReq = estimateCost({ price: { actual_mode: "per_request", actual_per_request: 0.003, prompt_per_1m: 5, completion_per_1m: 5 } }, taskIR);
+  assert.equal(perReq, 0.003);
+  // mature cost_ema wins over everything
+  const ema = estimateCost({ stats: { cost_ema: 0.0012, success_alpha: 20, failure_beta: 5 }, price: { prompt_per_1m: 5, completion_per_1m: 5 } }, taskIR);
+  assert.equal(ema, 0.0012);
+  // token rates are evaluated against TaskIR tokens, not summed blindly
+  const big = compileTaskIR({ messages: [{ role: "user", content: "x".repeat(400000) }] });
+  const tokenCost = estimateCost({ price: { prompt_per_1m: 1, completion_per_1m: 3 } }, big);
+  assert.ok(tokenCost > 0 && tokenCost < 4, "token cost scales with estimated tokens, not 1+3");
+});
+
+test("capability gates fail closed on unknown tools and cap missing context", () => {
+  const toolTask = compileTaskIR({ messages: [{ role: "user", content: "use the tool" }], tools: [{ type: "function", function: { name: "f" } }], tool_choice: "required" });
+  // Unknown capability must NOT satisfy a hard tool requirement.
+  const unknown = v2Capable({ unknown: true }, { ...toolTask, tools: { required: true } });
+  assert.equal(unknown.toolsOk, false, "unknown tool capability fails closed");
+  // Known route with context=0 uses conservative fallback, not infinity.
+  const huge = compileTaskIR({ messages: [{ role: "user", content: "y".repeat(200000) }] });
+  const noCtx = v2Capable({ unknown: false, context: 0, tools: true }, huge);
+  assert.equal(noCtx.ctxOk, false, "missing context window is not treated as unlimited");
+  // Output limit is checked against expected output.
+  const smallOut = v2Capable({ unknown: false, context: 1000000, output: 10, tools: true }, { contextTokens: 10, expectedOutputTokens: 5000, modalities: ["text"], tools: {} });
+  assert.equal(smallOut.outOk, false, "tiny output limit fails a large expected output");
+});
+
+test("usable key count excludes circuit-open keys", () => {
+  const payload = { messages: [{ role: "user", content: "hi" }] };
+  const { routes } = buildV2Universe([
+    { slug: "glm-5.3", key_count: 3, usable_key_count: 0, price: { prompt_per_1m: 0.01, completion_per_1m: 0.01 } }
+  ], payload);
+  assert.equal(routes[0].eligible, false, "3 enabled but 0 usable keys is not eligible");
+  assert.equal(routes[0].reason, "keys circuit-open");
+});
+
+test("luxury is a soft prior, not a hard exclusion", () => {
+  const payload = { messages: [{ role: "user", content: "prove this theorem rigorously with full derivation" }] };
+  const { routes } = buildV2Universe([
+    { slug: "gpt-6-astra", upstream_model: "gpt-6-astra", provider_id: 1, route_id: 1, key_count: 1, entry: { limit: { context: 400000 }, modalities: { input: ["text"] }, toolCall: true }, price: { prompt_per_1m: 5, completion_per_1m: 15 } }
+  ], payload);
+  assert.equal(isLuxurySlug("gpt-6-astra"), true);
+  assert.equal(routes[0].luxury, true);
+  assert.equal(routes[0].eligible, true, "luxury route is still hard-eligible; cost discourages it, capability does not exclude it");
+  const policies = candidatePolicies(routes, compileTaskIR(payload));
+  assert.ok(policies.some((p) => p.primary === "gpt-6-astra"), "a luxury route can be selected when it is the only capable option");
 });
 
