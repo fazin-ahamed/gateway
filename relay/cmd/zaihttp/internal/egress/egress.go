@@ -360,10 +360,13 @@ func wrapDiscard(err error) error {
 	return &classErr{ClassTunnelRejected, err}
 }
 
-// CheckResult is the outcome of a single proxy connectivity test.
+// CheckResult is the outcome of a single proxy connectivity test. It is
+// metadata only — never the response body — so this can never be used to
+// exfiltrate content through the loopback checker.
 type CheckResult struct {
 	Success      bool   `json:"success"`
 	FailureClass string `json:"failure_class,omitempty"`
+	HttpStatus   int    `json:"http_status,omitempty"`
 	ConnectMs    int64  `json:"connect_ms"`
 	TunnelMs     int64  `json:"tunnel_ms"`
 	TLSMs        int64  `json:"tls_ms"`
@@ -414,7 +417,10 @@ func Check(ctx context.Context, cfg Config, testHost string, testPort uint16, re
 		return res
 	}
 	resp.Body.Close()
-	// Any well-formed HTTP response proves the tunnel + TLS + request worked.
+	// Any well-formed HTTP response proves the tunnel + TLS + request worked;
+	// the status itself (even 403/404) is useful signal for a URL reachability
+	// test. Only the status line is kept — never the body.
+	res.HttpStatus = resp.StatusCode
 	res.Success = true
 	res.TotalMs = time.Since(overall).Milliseconds()
 	return res

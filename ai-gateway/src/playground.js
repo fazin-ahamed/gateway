@@ -403,6 +403,15 @@ var PLAYGROUND_HTML = `<!doctype html>
         <label class="hint" style="margin:0">Timeout ms <input id="px-timeout" type="number" value="10000" min="1000" max="20000" step="1000" style="width:80px"></label>
       </div>
     </div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Egress reachability test</h2></div><div class="panel-b">
+      <p class="hint" style="margin-top:0">Can this box reach a URL \u2014 directly, or through a proxy \u2014 before you trust it? Metadata only (status + stage timings), never the body.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="px-reach-url" type="text" value="https://chat.z.ai/" placeholder="https://chat.z.ai/" style="flex:1;min-width:260px;font-family:monospace;font-size:12px">
+        <input id="px-reach-proxy" type="text" placeholder="optional proxy: socks5h://host:1080" style="flex:1;min-width:220px;font-family:monospace;font-size:12px">
+        <button class="act" id="px-reach-btn">Test URL</button>
+      </div>
+      <div id="px-reach-out" class="hint" style="margin-top:8px"></div>
+    </div></div>
     <div class="hero-stats" id="px-stats"></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Pool</h2></div><div class="panel-b flush" id="px-list"></div></div>
   </section>
@@ -1540,15 +1549,41 @@ async function loadProxies(){
   }
   const rows=(data.proxies||[]);
   if(!rows.length){ listEl.innerHTML='<div class="empty" style="margin:20px">No proxies. Paste some above and Import.</div>'; return; }
-  listEl.innerHTML='<table class="tbl"><thead><tr><th>Type</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Fails</th><th>Last test</th><th></th></tr></thead><tbody>'+
+  listEl.innerHTML='<div style="padding:8px 12px"><button class="danger sm" id="px-del-selected" disabled>Delete selected</button> <span class="hint" id="px-sel-count"></span></div>'+
+    '<table class="tbl"><thead><tr><th style="width:28px"><input type="checkbox" id="px-select-all" title="Select all"></th><th>Type</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Fails</th><th>Last test</th><th></th></tr></thead><tbody>'+
     rows.map(function(p){
       const lat=p.last_latency_ms!=null?fmt(p.last_latency_ms)+'ms':'\u2014';
       const fails=p.consecutive_failures?(p.consecutive_failures+' streak'):(p.failure_count||0);
       const last=p.last_checked_at?esc(p.last_checked_at.replace('T',' ').slice(0,19)):'\u2014';
       const fc=p.last_failure_class?' <span class="hint">('+esc(p.last_failure_class)+')</span>':'';
-      return '<tr><td class="mono">'+esc(p.scheme)+'</td><td class="mono">'+esc(p.endpoint)+'</td><td>'+proxyStatusPill(p.status)+'</td><td>'+lat+'</td><td>'+fails+fc+'</td><td class="mono">'+last+'</td>'+
-        '<td style="text-align:right;white-space:nowrap"><button class="ghost sm" data-px-test="'+p.id+'">Test</button> <button class="ghost sm" data-px-toggle="'+p.id+'">'+(p.enabled?'Disable':'Enable')+'</button> <button class="danger sm" data-px-del="'+p.id+'">Del</button></td></tr>';
+      return '<tr><td><input type="checkbox" class="px-row-sel" data-px-id="'+p.id+'"></td><td class="mono">'+esc(p.scheme)+'</td><td class="mono">'+esc(p.endpoint)+'</td><td>'+proxyStatusPill(p.status)+'</td><td>'+lat+'</td><td>'+fails+fc+'</td><td class="mono">'+last+'</td>'+
+        '<td style="text-align:right;white-space:nowrap"><button class="ghost sm" data-px-reach="'+p.id+'">Reach test</button> <button class="ghost sm" data-px-test="'+p.id+'">Test</button> <button class="ghost sm" data-px-toggle="'+p.id+'">'+(p.enabled?'Disable':'Enable')+'</button> <button class="danger sm" data-px-del="'+p.id+'">Del</button></td></tr>';
     }).join('')+'</tbody></table>';
+  pxWireSelection();
+}
+function pxSelectedIds(){
+  return Array.from(document.querySelectorAll('.px-row-sel:checked')).map(function(el){return Number(el.dataset.pxId);});
+}
+function pxWireSelection(){
+  const all=document.getElementById('px-select-all');
+  const delBtn=document.getElementById('px-del-selected');
+  const count=document.getElementById('px-sel-count');
+  const refresh=function(){
+    const n=pxSelectedIds().length;
+    if(delBtn) delBtn.disabled=n===0;
+    if(count) count.textContent=n?(n+' selected'):'';
+  };
+  if(all) all.onchange=function(){ document.querySelectorAll('.px-row-sel').forEach(function(el){el.checked=all.checked;}); refresh(); };
+  document.querySelectorAll('.px-row-sel').forEach(function(el){ el.onchange=refresh; });
+  if(delBtn) delBtn.onclick=function(){
+    const ids=pxSelectedIds();
+    if(!ids.length) return;
+    confirmAction('Delete selected proxies','Delete '+ids.length+' selected prox'+(ids.length===1?'y':'ies')+'? This cannot be undone.','Delete',async function(){
+      const {data}=await api('/admin/proxies/delete',{method:'POST',body:JSON.stringify({ids})});
+      toast('Deleted '+((data&&data.deleted)||0),'ok'); loadProxies();
+    });
+  };
+  refresh();
 }
 function pxTestOpts(extra){
   const conc=Math.min(50,Math.max(1,Number(document.getElementById('px-conc').value)||20));
@@ -1581,6 +1616,28 @@ document.getElementById('px-auto').onchange=async function(e){
   toast(mode==='auto'?'Auto-select on \u2014 gateway picks the best healthy proxy':'Manual egress','ok');
   loadProxies();
 };
+async function pxReachTest(body, label){
+  const url=(body && body.url) || document.getElementById('px-reach-url').value.trim();
+  if(!/^https:\/\//i.test(url)){ toast('Enter an https:// URL','err'); return; }
+  const out=document.getElementById('px-reach-out');
+  if(out) out.textContent='Testing '+(label||url)+'\u2026';
+  toast('Testing '+(label||'URL')+'\u2026');
+  const payload=Object.assign({ url }, body||{});
+  try{
+    const {status,data}=await api('/admin/egress/test',{method:'POST',body:JSON.stringify(payload)});
+    if(status!==200){ const m=(data&&data.error&&data.error.message)||status; if(out) out.innerHTML='<span class="pill bad">error</span> '+esc(String(m)); toast('test failed: '+m,'err'); return; }
+    const r=data.result||{};
+    const okPill=r.success?'<span class="pill ok">reachable</span>':'<span class="pill bad">'+esc(r.failure_class||'failed')+'</span>';
+    const timings='connect '+fmt(r.connect_ms||0)+'ms · tunnel '+fmt(r.tunnel_ms||0)+'ms · tls '+fmt(r.tls_ms||0)+'ms · total '+fmt(r.total_ms||0)+'ms';
+    const httpline=r.http_status?(' · HTTP '+r.http_status):'';
+    if(out) out.innerHTML=okPill+' via '+esc(data.via||'direct')+httpline+' <span class="hint">('+timings+')</span>';
+    toast(r.success?'reachable':'unreachable: '+(r.failure_class||'failed'),r.success?'ok':'err');
+  }catch(e){ if(out) out.textContent='test failed: '+e.message; toast('test failed: '+e.message,'err'); }
+}
+document.getElementById('px-reach-btn').onclick=function(){
+  const proxy=document.getElementById('px-reach-proxy').value.trim();
+  pxReachTest(proxy?{ proxy }:{}, null);
+};
 document.getElementById('px-test-all').onclick=function(){ pxTest({},'all'); };
 document.getElementById('px-test-failed').onclick=function(){ pxTest({failed_only:true},'failed'); };
 document.getElementById('px-remove-dead').onclick=function(){
@@ -1590,6 +1647,7 @@ document.getElementById('px-remove-dead').onclick=function(){
   });
 };
 document.getElementById('px-list').addEventListener('click',function(e){
+  const rt=e.target.closest('button[data-px-reach]'); if(rt){ pxReachTest({ proxy_id: Number(rt.dataset.pxReach) }, 'proxy #'+rt.dataset.pxReach); return; }
   const t=e.target.closest('button[data-px-test]'); if(t){ pxTest({ids:[Number(t.dataset.pxTest)]},'proxy'); return; }
   const g=e.target.closest('button[data-px-toggle]'); if(g){ api('/admin/proxies/'+Number(g.dataset.pxToggle)+'/toggle',{method:'POST'}).then(loadProxies); return; }
   const d=e.target.closest('button[data-px-del]'); if(d){ confirmAction('Delete proxy','Remove this proxy from the pool?','Delete',async function(){ await api('/admin/proxies/delete',{method:'POST',body:JSON.stringify({ids:[Number(d.dataset.pxDel)]})}); loadProxies(); }); return; }

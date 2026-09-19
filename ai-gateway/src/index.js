@@ -4935,6 +4935,60 @@ app.post("/admin/proxies/mode", async (c) => {
   __resetActiveEgress();
   return c.json({ mode });
 });
+// Reachability tester: probe any https URL, directly or through a pool proxy
+// (by id) or an inline proxy URL. Returns metadata only (status + stage
+// timings + failure class), never the body, and runs through the loopback
+// helper. Answers "can THIS box reach X, and does proxy Y help?" — the exact
+// question when an egress IP is blocked.
+app.post("/admin/egress/test", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try {
+    b = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "invalid JSON body" } }, 400);
+  }
+  const url = String(b.url || "").trim();
+  if (!/^https:\/\//i.test(url))
+    return c.json({ error: { message: "url must be an https:// URL" } }, 400);
+  const base = await zaiHelperBase();
+  if (!base)
+    return c.json({ error: { message: "uTLS helper offline; cannot run egress test" } }, 503);
+  // Resolve the proxy: a pool id, an inline proxy URL, or none (direct).
+  let proxy = "";
+  if (b.proxy_id != null) {
+    const row = await c.env.DB.prepare("SELECT scheme, host, port, username, password_enc FROM proxy_pool WHERE id=?").bind(Number(b.proxy_id)).first();
+    if (!row)
+      return c.json({ error: { message: "proxy id not found" } }, 404);
+    let plainPassword = "";
+    if (row.password_enc) {
+      try {
+        plainPassword = await openProviderKey(c.env, row.password_enc);
+      } catch {
+        return c.json({ error: { message: "proxy credential could not be decrypted (config error)" } }, 500);
+      }
+    }
+    proxy = proxyEgressUrl(row, plainPassword);
+  } else if (b.proxy) {
+    proxy = String(b.proxy).trim();
+  }
+  const timeoutMs = Math.min(20000, Math.max(1000, Number(b.timeout_ms) || 15000));
+  try {
+    const resp = await fetch(base + "/reach-egress", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url, proxy, timeout_ms: timeoutMs })
+    });
+    const result = await resp.json();
+    // Echo back which egress was used (masked) so the operator sees context;
+    // never echo the decrypted proxy URL.
+    return c.json({ url, via: b.proxy_id != null ? ("proxy #" + Number(b.proxy_id)) : (proxy ? "inline proxy" : "direct"), result });
+  } catch (e) {
+    return c.json({ error: { message: "egress test failed: " + String(e.message || e) } }, 502);
+  }
+});
 app.post("/admin/proxies/import", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)

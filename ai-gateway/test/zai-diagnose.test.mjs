@@ -84,3 +84,50 @@ test("diagnose requires admin", async () => {
   const res = await app.fetch(new Request("http://gw/admin/zai/diagnose"));
   assert.equal(res.status, 401);
 });
+
+test("POST /admin/egress/test probes a URL through the helper, metadata only", async () => {
+  const { app, env } = await seededApp();
+  // Seed a pool proxy with a sealed password so we can test proxy_id resolution.
+  const now = new Date().toISOString();
+  const sealed = await t.sealProviderKey(env, "s3cret");
+  env.DB.prepare("INSERT INTO proxy_pool (scheme, host, port, username, password_enc, enabled, status, created_at, updated_at) VALUES ('socks5h','p.example',1080,'bob',?,1,'healthy',?,?)").bind(sealed, now, now).run();
+  const pid = env.DB.prepare("SELECT id FROM proxy_pool WHERE host='p.example'").all().results[0].id;
+  const realFetch = globalThis.fetch;
+  const prevProxy = process.env.ZAI_UTLS_PROXY;
+  process.env.ZAI_UTLS_PROXY = "http://127.0.0.1:8477";
+  let reachBody = null;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.endsWith("/healthz")) return new Response('{"ok":true}', { status: 200 });
+    if (u.endsWith("/reach-egress")) {
+      reachBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ success: true, http_status: 403, connect_ms: 40, tunnel_ms: 60, tls_ms: 55, total_ms: 200 }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("{}", { status: 404 });
+  };
+  try {
+    const res = await app.fetch(new Request("http://gw/admin/egress/test", {
+      method: "POST", headers: { authorization: "Bearer admin", "content-type": "application/json" },
+      body: JSON.stringify({ url: "https://chat.z.ai/", proxy_id: pid })
+    }));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.result.success, true);
+    assert.equal(body.result.http_status, 403);
+    assert.match(body.via, /proxy #/);
+    // The helper received the decrypted proxy URL, but the admin response must not.
+    assert.match(reachBody.proxy, /bob:s3cret@p\.example:1080/, "helper gets the real proxy");
+    assert.doesNotMatch(JSON.stringify(body), /s3cret/, "admin response never carries the password");
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prevProxy === undefined) delete process.env.ZAI_UTLS_PROXY; else process.env.ZAI_UTLS_PROXY = prevProxy;
+  }
+});
+
+test("POST /admin/egress/test rejects non-https and requires admin", async () => {
+  const { app } = await seededApp();
+  const noauth = await app.fetch(new Request("http://gw/admin/egress/test", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://x/" }) }));
+  assert.equal(noauth.status, 401);
+  const bad = await app.fetch(new Request("http://gw/admin/egress/test", { method: "POST", headers: { authorization: "Bearer admin", "content-type": "application/json" }, body: JSON.stringify({ url: "ftp://x/" }) }));
+  assert.equal(bad.status, 400);
+});

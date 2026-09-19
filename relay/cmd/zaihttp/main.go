@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,6 +93,7 @@ func main() {
 	})
 	mux.HandleFunc("/proxy", handleProxy)
 	mux.HandleFunc("/check-egress", handleCheckEgress)
+	mux.HandleFunc("/reach-egress", handleReachEgress)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -271,6 +273,70 @@ func handleCheckEgress(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	res := egress.Check(ctx, cfg, checkHost, checkPort, checkPath)
+	w.Header().Set("content-type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+// handleReachEgress is an admin connectivity probe for ANY https URL, direct
+// or through a supplied proxy. Loopback-only, and metadata-only (status +
+// stage timings + failure class, never the body) so it is a reachability
+// tester, not an SSRF/exfiltration proxy. The gateway gates it behind
+// requireAdmin; this layer just enforces loopback + https.
+func handleReachEgress(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(r) {
+		http.Error(w, "loopback only", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		URL       string `json:"url"`
+		Proxy     string `json:"proxy"`
+		TimeoutMs int    `json:"timeout_ms"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	u, err := url.Parse(strings.TrimSpace(body.URL))
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(egress.CheckResult{FailureClass: "bad_url"})
+		return
+	}
+	host := u.Hostname()
+	var port uint16 = 443
+	if p := u.Port(); p != "" {
+		n, perr := strconv.Atoi(p)
+		if perr != nil || n < 1 || n > 65535 {
+			w.Header().Set("content-type", "application/json")
+			_ = json.NewEncoder(w).Encode(egress.CheckResult{FailureClass: "bad_url"})
+			return
+		}
+		port = uint16(n)
+	}
+	reqPath := u.EscapedPath()
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	if u.RawQuery != "" {
+		reqPath += "?" + u.RawQuery
+	}
+	cfg, perr := egress.Parse(body.Proxy)
+	if perr != nil {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(egress.CheckResult{FailureClass: egress.ClassBadConfig})
+		return
+	}
+	timeout := time.Duration(body.TimeoutMs) * time.Millisecond
+	if timeout <= 0 || timeout > 20*time.Second {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	res := egress.Check(ctx, cfg, host, port, reqPath)
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
 }
