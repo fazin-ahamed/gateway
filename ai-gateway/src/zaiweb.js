@@ -348,8 +348,13 @@ function buildReferenceFeatures({ thinking, features }) {
   };
   if (features.webSearchEnabled)
     out.auto_web_search = true;
-  if (thinking.enabled && thinking.effortSupported)
+  if (thinking.enabled && thinking.effortSupported) {
     out.reasoning_effort = thinking.effort;
+    // When reasoning_effort is active the upstream ignores the client's
+    // enable_thinking choice and thinks anyway (reference zai.go:358); send
+    // the value the site actually uses rather than the one we resolved.
+    out.enable_thinking = true;
+  }
   return out;
 }
 
@@ -1228,7 +1233,6 @@ export const __zaiTest = {
   referencePrompt,
   resolveThinking,
   resolveFeatures,
-  getModelCapabilities,
   modelCatalogEntry,
   isZaiModel,
   toOpenAiStream,

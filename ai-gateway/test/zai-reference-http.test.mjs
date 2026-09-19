@@ -94,6 +94,19 @@ test("default Flash thinking omits reasoning_effort unless catalog allows and re
   assert.equal(body2.features.reasoning_effort, "high");
 });
 
+test("reasoning_effort forces enable_thinking true (reference zai.go:358)", () => {
+  // GLM-Free-API ignores the client's enable_thinking choice whenever
+  // reasoning_effort is active. Sending enable_thinking:false with
+  // reasoning_effort is a protocol mismatch that the site does not honour.
+  const features = __zaiTest.buildReferenceFeatures({
+    thinking: { enabled: true, effort: "max", effortSupported: true },
+    features: {}
+  });
+  assert.equal(features.reasoning_effort, "max");
+  assert.equal(features.enable_thinking, true);
+});
+
+
 test("user-level stream errors are model-unavailable, not retryable stream failures", () => {
   const classified = __zaiTest.classifyZaiStreamFailure("Model not available for current user level");
   assert.equal(classified.code, "zai_model_unavailable");

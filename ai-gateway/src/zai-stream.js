@@ -121,8 +121,12 @@ class AppendOnlyEmitter {
   }
 }
 
+// chat.z.ai sometimes answers HTTP 200 with the failure embedded in the SSE
+// JSON (reference extractZAIError). The observed shapes are data.error and a
+// nested data.data.error; both must surface as a terminal stream error or the
+// client receives a truncated-but-successful-looking completion.
 function frameError(frame, data) {
-  const raw = frame?.error ?? data?.error;
+  const raw = frame?.error ?? data?.error ?? data?.data?.error;
   if (!raw) return "";
   if (typeof raw === "string") return raw;
   return String(raw.message || raw.detail || raw.msg || "upstream stream error");

@@ -73,3 +73,28 @@ test("OpenAI-shaped ZAI SSE starts with role only and never leaks provider ident
   assert.ok(payloads.some((p) => p.error?.code === "upstream_stream_error"));
   assert.equal(payloads.some((p) => p.choices?.[0]?.finish_reason === "stop" && payloads.some((x) => x.error)), false, "an errored stream must not also claim a successful stop");
 });
+
+test("inline SSE errors at data.data.error terminate the stream (reference extractZAIError)", () => {
+  // GLM-Free-API extractZAIError inspects data.error and a nested
+  // data.data.error. A 200-with-embedded-error that we fail to catch
+  // surfaces as a successful truncated completion.
+  const n = createZaiFrameNormalizer({ holdback: 0 });
+  const events = collect(n, [
+    { data: { delta_content: "hello" } },
+    { data: { data: { error: { detail: "quota exceeded" } } } }
+  ]);
+  const err = events.find((e) => e.error);
+  assert.ok(err, "nested data.data.error must surface as a terminal error");
+  assert.match(String(err.error), /quota exceeded/);
+  assert.equal(err.done, true);
+});
+
+test("inline SSE errors at data.error also terminate the stream", () => {
+  const n = createZaiFrameNormalizer({ holdback: 0 });
+  const events = collect(n, [
+    { data: { error: { message: "model overloaded" } } }
+  ]);
+  const err = events.find((e) => e.error);
+  assert.ok(err);
+  assert.match(String(err.error), /model overloaded/);
+});
