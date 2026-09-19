@@ -1618,7 +1618,7 @@ document.getElementById('px-auto').onchange=async function(e){
 };
 async function pxReachTest(body, label){
   const url=(body && body.url) || document.getElementById('px-reach-url').value.trim();
-  if(!/^https:\/\//i.test(url)){ toast('Enter an https:// URL','err'); return; }
+  if(url.slice(0,8).toLowerCase()!=='https://'){ toast('Enter an https:// URL','err'); return; }
   const out=document.getElementById('px-reach-out');
   if(out) out.textContent='Testing '+(label||url)+'\u2026';
   toast('Testing '+(label||'URL')+'\u2026');
