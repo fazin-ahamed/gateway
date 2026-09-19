@@ -34,3 +34,16 @@ jobs:
           go-version-file: relay/go.mod
           cache-dependency-path: relay/go.sum
       - run: go test ./...
+
+  zaihttp:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay/cmd/zaihttp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: relay/cmd/zaihttp/go.mod
+          cache-dependency-path: relay/cmd/zaihttp/go.sum
+      - run: go test ./...

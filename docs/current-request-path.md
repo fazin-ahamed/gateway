@@ -15,10 +15,10 @@ stable across deploys.
    - OpenAI-compatible: upstream `/chat/completions`
    - Anthropic: upstream `/messages`, translated to OpenAI-compatible output
    - Z.ai web chat (`zaiminted`, recommended): signed pure-HTTP calls to
-     chat.z.ai, translated to OpenAI-compatible output. The `zaiweb` and
-     `zaiwebbrowser` labels select the same engine but change how the CAPTCHA
-     proof is acquired (caller-supplied proof, or a Chromium fallback for
-     proof-infrastructure failures). All three are direct transport only.
+     chat.z.ai, translated to OpenAI-compatible output. `zaiweb` uses the same
+     engine with a caller-supplied CAPTCHA proof. `zaiwebbrowser` is a separate
+     Chromium path (`callZaiBrowser`) used as fallback/debug, not the same
+     engine. All three are direct transport only.
 5. Transport selection:
    - Provider without `proxy_url`: direct server-to-provider HTTPS fetch.
    - Provider with `proxy_url`: server sends the provider request through an
@@ -29,9 +29,9 @@ stable across deploys.
      helper (`ZAI_UTLS_PROXY`) when a Chrome ClientHello is required, and
      otherwise plain HTTPS.
 6. Server tries routes in rank order until one returns a usable response.
-   Provider-specific client errors (for example a Z.ai route missing a
-   session credential) return their own status and `error.code` instead of
-   being flattened into a generic 503, so operators can act on them.
+   Client-facing errors are gateway-owned and provider-neutral: they never
+   include upstream hostnames, adapter codes (`zai_*`), or relay names.
+   Operators still see the classified failure internally via `route_attempts`.
 7. Non-streaming responses are parsed for usage, priced, sanitized, cached when eligible, and returned with gateway headers.
 8. Streaming responses are normalized to OpenAI-style SSE, priced, and returned to the client.
 9. Provider credentials remain in the gateway database or process env; the relay only receives the already-authorized provider request.

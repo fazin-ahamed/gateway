@@ -66,7 +66,13 @@ start_zaihttp() {
     log "zaihttp helper missing (no go, no $ZAIHTTP_BIN); Node TLS will be used"
     return 0
   fi
-  ZAI_HTTP_ADDR="$ZAIHTTP_ADDR" nohup "$RUN_BIN" >>"$ZAIHTTP_LOG" 2>&1 &
+  # Sticky egress is process-level: one helper = one identity. Pull from .env
+  # without sourcing the whole file (secrets). Never log the URL (credentials).
+  EGRESS=$(grep -E '^ZAI_EGRESS_PROXY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r' || true)
+  if [ -n "$EGRESS" ]; then
+    log "zaihttp egress configured (scheme-sticky; value not logged)"
+  fi
+  ZAI_HTTP_ADDR="$ZAIHTTP_ADDR" ZAI_EGRESS_PROXY="$EGRESS" nohup "$RUN_BIN" >>"$ZAIHTTP_LOG" 2>&1 &
   echo $! > /tmp/zaihttp.pid
   log "started zaihttp pid=$! addr=$ZAIHTTP_ADDR log=$ZAIHTTP_LOG"
   i=0
