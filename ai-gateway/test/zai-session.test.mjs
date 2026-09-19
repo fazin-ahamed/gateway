@@ -137,22 +137,31 @@ test("an account token is validated and preferred over guest", async () => {
   assert.ok(!calls.some((u) => u.includes("/auths/guest")), "guest bootstrap not needed");
 });
 
-test("a rejected account token falls back to guest", async () => {
-  const guest = jwt({ id: "guest-3" });
+test("a supplied account token is trusted directly, not gated on a probe", async () => {
+  // The reference never pre-validates the account token; it uses it and lets
+  // the completion call be the judge (a 401 there triggers refresh). Pre-
+  // validating threw away valid account JWTs whenever the /auths/ probe was
+  // WAF-challenged or non-200, then fell to guest ("no account token").
+  const account = jwt({ id: "acct-1" });
+  let guestPosted = false;
   const fetcher = async (url) => {
     const path = new URL(String(url)).pathname;
     if (path === "/")
       return new Response("<html></html>", { status: 200 });
-    if (path === "/api/v1/auths/guest")
-      return new Response(JSON.stringify({ token: guest }), { status: 200 });
+    if (path === "/api/v1/auths/guest") {
+      guestPosted = true;
+      return new Response(JSON.stringify({ token: jwt({ id: "guest-x" }) }), { status: 200 });
+    }
     if (path === "/api/v1/auths/")
-      return new Response("{}", { status: 401 });
+      return new Response("{}", { status: 401 }); // probe is hostile
     return new Response("{}", { status: 200 });
   };
-  const session = new ZaiSession({ fetcher, credential: jwt({ id: "stale" }), key: "t-fallback" });
+  const session = new ZaiSession({ fetcher, credential: account, key: "t-trust" });
   const acquired = await session.acquire();
-  assert.equal(acquired.source, "guest");
-  assert.equal(acquired.userId, "guest-3");
+  assert.equal(acquired.source, "account", "account token adopted despite a hostile probe");
+  assert.equal(acquired.userId, "acct-1");
+  assert.equal(acquired.token, account);
+  assert.equal(guestPosted, false, "must not fall through to guest bootstrap when an account token is supplied");
 });
 
 test("a rotated cookie token is adopted and exported", async () => {

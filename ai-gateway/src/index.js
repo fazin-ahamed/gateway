@@ -1134,10 +1134,17 @@ function upstreamFetch(c, url, init) {
   const override = Number(opts.timeoutMs);
   delete opts.timeoutMs;
   const ms = Number.isFinite(override) && override > 0 ? override : (Number(c && c.env && c.env.UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS);
+  // Compose, do not replace, a caller-supplied signal: the session layer arms
+  // its own deadline that must cover response-BODY consumption (this timer
+  // only guards time-to-headers). Both can abort the underlying fetch.
+  const signal = opts.signal
+    ? (typeof AbortSignal.any === "function" ? AbortSignal.any([opts.signal, ctrl.signal]) : ctrl.signal)
+    : ctrl.signal;
+  delete opts.signal;
   let timer = null;
   const clear = () => clearTimeout(timer);
   try {
-    const p = fetch(url, { ...opts, signal: ctrl.signal });
+    const p = fetch(url, { ...opts, signal });
     // Arm the abort AFTER fetch() is issued; clear the moment headers land.
     timer = setTimeout(() => ctrl.abort(), ms);
     return p.then((r) => { clear(); return r; }).catch((e) => {

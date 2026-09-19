@@ -237,11 +237,15 @@ export class ZaiSession {
     this.state = "REFRESHING";
     const account = credentialToken(this.credential);
     if (account) {
-      if (await this._validate(account)) {
-        this._adopt(account, "account");
-        return this.snapshot();
-      }
-      this.lastError = "account token rejected";
+      // Trust a supplied account token: warm best-effort for cookies and the
+      // frontend version, then adopt it directly. The completion call is the
+      // real validator — a 401 there already triggers a refresh. Gating
+      // adoption on a separate /auths/ probe returning 200 threw away valid
+      // account JWTs whenever that probe was WAF-challenged or non-200, then
+      // fell through to guest bootstrap ("no account token" — misleading).
+      await this._warm().catch(() => {});
+      this._adopt(account, "account");
+      return this.snapshot();
     }
     const guest = await this._bootstrapGuest();
     if (guest) {
@@ -322,19 +326,20 @@ export class ZaiSession {
     };
   }
 
-  async _validate(token) {
+  // Fetch + full body read under ONE deadline. upstreamFetch's own timer only
+  // guards time-to-headers; a fast-headers/slow-body stall would otherwise ride
+  // the 600s generation ceiling. The session owns an AbortController armed
+  // until res.text() resolves, composed into the fetch via init.signal.
+  async _boundedText(url, init) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), BOOTSTRAP_TIMEOUT_MS);
     try {
-      await this._warm();
-      const res = await this.fetcher(ZAI_AUTHS_URL, {
-        method: "GET",
-        headers: this.headers({ Authorization: "Bearer " + token, Accept: "application/json" }),
-        timeoutMs: BOOTSTRAP_TIMEOUT_MS
-      });
+      const res = await this.fetcher(url, { ...init, signal: ctrl.signal, timeoutMs: BOOTSTRAP_TIMEOUT_MS });
       this.jar.absorb(res.headers);
-      return !!res.ok;
-    } catch (e) {
-      this.lastError = "session validation failed: " + String(e && e.message || e).slice(0, 160);
-      return false;
+      const body = await res.text().catch(() => "");
+      return { res, body };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -342,64 +347,70 @@ export class ZaiSession {
   // and the same response reveals the current frontend build.
   async _warm() {
     try {
-      const res = await this.fetcher(ZAI_HOME_URL, {
+      const { body } = await this._boundedText(ZAI_HOME_URL, {
         method: "GET",
-        headers: { Accept: "text/html", "User-Agent": USER_AGENT },
-        timeoutMs: BOOTSTRAP_TIMEOUT_MS
+        headers: { Accept: "text/html", "User-Agent": USER_AGENT }
       });
-      this.jar.absorb(res.headers);
       if (this.feVersion && Date.now() - this.lastValidated < FE_VERSION_TTL_MS)
-        return res;
-      const body = await res.text().catch(() => "");
+        return;
       const match = body.match(/\/frontend\/(prod-fe-\d+(?:\.\d+)*)\/assets\//);
       this.feVersion = match ? match[1] : this.feVersion || DEFAULT_FE_VERSION;
-      return res;
     } catch (e) {
       this.feVersion = this.feVersion || DEFAULT_FE_VERSION;
       this.lastError = "warm request failed: " + String(e && e.message || e).slice(0, 160);
-      return null;
     }
   }
 
-  async _bootstrapGuest() {
-    await this._warm();
-    // 1. Ask the site for a guest session.
+  async _guestPost() {
     try {
-      const res = await this.fetcher(ZAI_GUEST_URL, {
+      const { body } = await this._boundedText(ZAI_GUEST_URL, {
         method: "POST",
         headers: this.headers({ Accept: "application/json", "Content-Type": "application/json" }),
-        body: "{}",
-        timeoutMs: BOOTSTRAP_TIMEOUT_MS
+        body: "{}"
       });
-      this.jar.absorb(res.headers);
-      const body = await res.text().catch(() => "");
       const fromBody = findJwt(body);
       if (fromBody)
         return fromBody;
       const fromCookie = this.jar.get("token");
-      if (looksLikeJwt(fromCookie))
-        return fromCookie;
+      return looksLikeJwt(fromCookie) ? fromCookie : "";
     } catch (e) {
       this.lastError = "guest request failed: " + String(e && e.message || e).slice(0, 160);
+      return "";
     }
-    // 2. Fall back to the auth status endpoint, which also reports the token.
+  }
+
+  async _authStatus() {
     try {
-      const res = await this.fetcher(ZAI_AUTHS_URL, {
+      const { body } = await this._boundedText(ZAI_AUTHS_URL, {
         method: "GET",
-        headers: this.headers({ Accept: "application/json" }),
-        timeoutMs: BOOTSTRAP_TIMEOUT_MS
+        headers: this.headers({ Accept: "application/json" })
       });
-      this.jar.absorb(res.headers);
-      const body = await res.text().catch(() => "");
       const fromBody = findJwt(body);
       if (fromBody)
         return fromBody;
       const fromCookie = this.jar.get("token");
-      if (looksLikeJwt(fromCookie))
-        return fromCookie;
+      return looksLikeJwt(fromCookie) ? fromCookie : "";
     } catch (e) {
       this.lastError = "auth status failed: " + String(e && e.message || e).slice(0, 160);
+      return "";
     }
+  }
+
+  // Mirror the reference bootstrap exactly: warm, guest POST, auth GET, then a
+  // SECOND guest POST fallback (the reference retries the POST when the token
+  // is still empty). Guest mode is a first-class path — no account token
+  // required.
+  async _bootstrapGuest() {
+    await this._warm();
+    const first = await this._guestPost();
+    if (first)
+      return first;
+    const auth = await this._authStatus();
+    if (auth)
+      return auth;
+    const second = await this._guestPost();
+    if (second)
+      return second;
     return "";
   }
 }
