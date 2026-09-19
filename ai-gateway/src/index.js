@@ -9,6 +9,7 @@ import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
+import { parseProxyImport } from "./proxy-parse.js";
 var app = new Hono();
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options", "nosniff");
@@ -4730,6 +4731,208 @@ app.get("/admin/router/reconcile", async (c) => {
     warnings: []
   });
 });
+// ---- Proxy pool: egress inventory + connectivity testing ----
+// Credentials are sealed with the same providerCryptoKey machinery as provider
+// keys and are NEVER returned to the browser. Batch testing runs server-side
+// through the loopback zaihttp /check-egress against a fixed neutral target.
+var PROXY_DEAD_THRESHOLD = 3;
+function maskProxyRow(row) {
+  const host = String(row.host).includes(":") ? "[" + row.host + "]" : row.host;
+  const auth = row.username ? row.username + ":\u2022\u2022\u2022@" : "";
+  return {
+    id: row.id,
+    scheme: row.scheme,
+    endpoint: auth + host + ":" + row.port,
+    host: row.host,
+    port: row.port,
+    username: row.username || "",
+    has_password: !!row.password_enc,
+    enabled: !!row.enabled,
+    status: row.status,
+    success_count: row.success_count,
+    failure_count: row.failure_count,
+    consecutive_failures: row.consecutive_failures,
+    last_latency_ms: row.last_latency_ms,
+    last_failure_class: row.last_failure_class,
+    last_checked_at: row.last_checked_at
+  };
+}
+function proxyEgressUrl(row, plainPassword) {
+  const host = String(row.host).includes(":") ? "[" + row.host + "]" : row.host;
+  const cred = row.username
+    ? encodeURIComponent(row.username) + (plainPassword ? ":" + encodeURIComponent(plainPassword) : "") + "@"
+    : "";
+  return row.scheme + "://" + cred + host + ":" + row.port;
+}
+app.get("/admin/proxies", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const rows = await c.env.DB.prepare(
+    "SELECT id, scheme, host, port, username, password_enc, enabled, status, success_count, failure_count, consecutive_failures, last_latency_ms, last_failure_class, last_checked_at FROM proxy_pool ORDER BY id"
+  ).all();
+  const list = rows.results || [];
+  const counts = { untested: 0, healthy: 0, flaky: 0, dead: 0, disabled: 0 };
+  for (const r of list)
+    counts[r.status] = (counts[r.status] || 0) + 1;
+  return c.json({ proxies: list.map(maskProxyRow), total: list.length, counts });
+});
+app.post("/admin/proxies/import", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try {
+    b = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "invalid JSON body" } }, 400);
+  }
+  const defaultScheme = ["http", "https", "socks5", "socks5h"].includes(b.default_scheme) ? b.default_scheme : "http";
+  const parsed = parseProxyImport(String(b.text || ""), defaultScheme);
+  let imported = 0;
+  let duplicatesInDb = 0;
+  const now = nowIso();
+  for (const p of parsed.accepted) {
+    const passwordEnc = p.password ? await sealProviderKey(c.env, p.password) : null;
+    try {
+      const r = await c.env.DB.prepare(
+        "INSERT INTO proxy_pool (scheme, host, port, username, password_enc, enabled, status, created_at, updated_at) VALUES (?,?,?,?,?,1,'untested',?,?) ON CONFLICT(scheme, host, port, username) DO NOTHING"
+      ).bind(p.scheme, p.host, p.port, p.username || "", passwordEnc, now, now).run();
+      if (r && r.meta && r.meta.changes > 0)
+        imported++;
+      else
+        duplicatesInDb++;
+    } catch (e) {
+      blog("proxy import row failed: " + String(e.message || e));
+    }
+  }
+  return c.json({
+    imported,
+    duplicates: parsed.duplicates + duplicatesInDb,
+    invalid: parsed.invalid.length,
+    invalid_samples: parsed.invalid.slice(0, 10)
+  });
+});
+app.post("/admin/proxies/:id/toggle", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const id = Number(c.req.param("id"));
+  const row = await c.env.DB.prepare("SELECT enabled, status FROM proxy_pool WHERE id=?").bind(id).first();
+  if (!row)
+    return c.json({ error: { message: "proxy not found" } }, 404);
+  const enabled = row.enabled ? 0 : 1;
+  // Disabling parks the row in the explicit 'disabled' state; enabling returns
+  // it to 'untested' so it must re-earn health.
+  const status = enabled ? "untested" : "disabled";
+  await c.env.DB.prepare("UPDATE proxy_pool SET enabled=?, status=?, updated_at=? WHERE id=?").bind(enabled, status, nowIso(), id).run();
+  return c.json({ id, enabled: !!enabled, status });
+});
+app.post("/admin/proxies/delete", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try {
+    b = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "invalid JSON body" } }, 400);
+  }
+  if (b.dead === true) {
+    const r = await c.env.DB.prepare("DELETE FROM proxy_pool WHERE status='dead'").run();
+    return c.json({ deleted: (r && r.meta && r.meta.changes) || 0 });
+  }
+  const ids = Array.isArray(b.ids) ? b.ids.map((x) => Number(x)).filter(Number.isInteger) : [];
+  if (!ids.length)
+    return c.json({ error: { message: "provide ids[] or dead:true" } }, 400);
+  const placeholders = ids.map(() => "?").join(",");
+  const r = await c.env.DB.prepare("DELETE FROM proxy_pool WHERE id IN (" + placeholders + ")").bind(...ids).run();
+  return c.json({ deleted: (r && r.meta && r.meta.changes) || 0 });
+});
+app.post("/admin/proxies/test", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let b;
+  try {
+    b = await c.req.json();
+  } catch {
+    b = {};
+  }
+  const base = String(process.env.ZAI_UTLS_PROXY || "").replace(/\/+$/, "");
+  if (!base)
+    return c.json({ error: { message: "uTLS helper (ZAI_UTLS_PROXY) not configured; cannot test egress" } }, 503);
+  const concurrency = Math.min(50, Math.max(1, Number(b.concurrency) || 20));
+  const timeoutMs = Math.min(20000, Math.max(1000, Number(b.timeout_ms) || 10000));
+  let where = "enabled=1";
+  if (Array.isArray(b.ids) && b.ids.length) {
+    const ids = b.ids.map((x) => Number(x)).filter(Number.isInteger);
+    where = "id IN (" + ids.map(() => "?").join(",") + ")";
+    var idBinds = ids;
+  } else if (b.failed_only === true) {
+    where = "enabled=1 AND status IN ('dead','flaky')";
+  }
+  const rows = await c.env.DB.prepare(
+    "SELECT id, scheme, host, port, username, password_enc FROM proxy_pool WHERE " + where + " ORDER BY id"
+  ).bind(...(typeof idBinds !== "undefined" ? idBinds : [])).all();
+  const pool = rows.results || [];
+  let tested = 0;
+  let healthy = 0;
+  let dead = 0;
+  const runOne = async (row) => {
+    let plainPassword = "";
+    if (row.password_enc) {
+      try { plainPassword = await openProviderKey(c.env, row.password_enc); } catch { plainPassword = ""; }
+    }
+    const proxyUrl = proxyEgressUrl(row, plainPassword);
+    let result = { success: false, failure_class: "request_failed" };
+    try {
+      const resp = await fetch(base + "/check-egress", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proxy: proxyUrl, timeout_ms: timeoutMs })
+      });
+      result = await resp.json();
+    } catch (e) {
+      result = { success: false, failure_class: "request_failed" };
+    }
+    await applyProxyResult(c, row.id, result);
+    tested++;
+    if (result.success) healthy++;
+    else {
+      const after = await c.env.DB.prepare("SELECT status FROM proxy_pool WHERE id=?").bind(row.id).first();
+      if (after && after.status === "dead") dead++;
+    }
+  };
+  // Bounded concurrency.
+  for (let i = 0; i < pool.length; i += concurrency)
+    await Promise.all(pool.slice(i, i + concurrency).map(runOne));
+  return c.json({ tested, healthy, dead });
+});
+async function applyProxyResult(c, id, result) {
+  const now = nowIso();
+  const row = await c.env.DB.prepare("SELECT success_count, failure_count, consecutive_failures FROM proxy_pool WHERE id=?").bind(id).first();
+  if (!row)
+    return;
+  await c.env.DB.prepare(
+    "INSERT INTO proxy_test_runs (proxy_id, success, failure_class, connect_ms, tunnel_ms, tls_ms, total_ms, created_at) VALUES (?,?,?,?,?,?,?,?)"
+  ).bind(id, result.success ? 1 : 0, result.failure_class || null, result.connect_ms ?? null, result.tunnel_ms ?? null, result.tls_ms ?? null, result.total_ms ?? null, now).run();
+  if (result.success) {
+    // A single success clears the consecutive-failure streak and marks healthy.
+    await c.env.DB.prepare(
+      "UPDATE proxy_pool SET success_count=success_count+1, consecutive_failures=0, status='healthy', last_latency_ms=?, last_failure_class=NULL, last_checked_at=?, updated_at=? WHERE id=?"
+    ).bind(result.total_ms ?? null, now, now, id).run();
+    return;
+  }
+  const consec = (Number(row.consecutive_failures) || 0) + 1;
+  // 3 consecutive failures => dead. Below that, a failing proxy is 'flaky'
+  // rather than deleted: public proxies are noisy and a single failure should
+  // not evict one. Remove Dead only removes the dead.
+  const status = consec >= PROXY_DEAD_THRESHOLD ? "dead" : "flaky";
+  await c.env.DB.prepare(
+    "UPDATE proxy_pool SET failure_count=failure_count+1, consecutive_failures=?, status=?, last_failure_class=?, last_checked_at=?, updated_at=? WHERE id=?"
+  ).bind(consec, status, result.failure_class || "request_failed", now, now, id).run();
+}
 // ---- Trajectory exporters ----
 // Each ok request/response pair becomes a training example. The request
 // already carries the full multi-turn conversation (agents resend history
@@ -5174,7 +5377,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome };
+export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
