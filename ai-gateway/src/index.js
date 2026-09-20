@@ -5014,6 +5014,8 @@ app.get("/admin/router/shadow-experiment", async (c) => {
       // 1000+ overall disagreements is the strong-evaluation threshold.
       evaluation_strength: changed >= 1000 ? "strong" : changed >= 100 ? "weak" : "insufficient"
     },
+    by_task: tasks,
+    by_quality_state: Object.fromEntries([...byState.entries()].sort((a, b) => b[1] - a[1])),
     served_objective_evidence: changed ? {
       valid: servedObjectiveValid,
       invalid: servedObjectiveInvalid,
