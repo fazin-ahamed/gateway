@@ -290,8 +290,10 @@ export function qualityGate(route, taskIR, floors) {
   return { pass, cold: false, quality: Number(q.mean), floor: f.quality, reason: pass ? "quality ok" : "below quality floor" };
 }
 
-// Among routes clearing every constraint, cheapest then fastest. Deliberately
-// not a blended score.
+// Among routes clearing every constraint: MATURE (known_good) routes form the
+// primary pool; COLD routes are the fallback pool, used only when no mature
+// route passes. Sorting all eligible by cost alone would let a cheap unproven
+// model beat a proven good one. Within a pool, cheapest then fastest.
 export function constraintFirstPick(routes, taskIR, floors) {
   const f = floors || floorsFor(taskIR);
   const rows = (routes || []).filter((r) => r && r.slug && r.hardEligible === true).map((route) => {
@@ -301,8 +303,11 @@ export function constraintFirstPick(routes, taskIR, floors) {
   });
   const eligible = rows.filter((x) => x.eligible);
   const rejected = rows.filter((x) => !x.eligible);
-  eligible.sort((a, b) => (economicCost(a.route) - economicCost(b.route)) || (latencyOf(a.route) - latencyOf(b.route)));
-  const best = eligible[0] || null;
+  const byCostLatency = (a, b) => (economicCost(a.route) - economicCost(b.route)) || (latencyOf(a.route) - latencyOf(b.route));
+  const mature = eligible.filter((x) => qualityStateOf(x.route).state === "known_good").sort(byCostLatency);
+  const cold = eligible.filter((x) => qualityStateOf(x.route).state !== "known_good").sort(byCostLatency);
+  const pool = mature.length ? mature : cold;
+  const best = pool[0] || null;
   return {
     floors: f,
     pick: best ? best.route : null,

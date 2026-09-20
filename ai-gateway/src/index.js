@@ -1080,7 +1080,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
             }
             c.__egressFailure = null;
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false, ...shadowAttemptFields(autoDecision) });
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false, ...(_att.success ? shadowAttemptFields(autoDecision) : {}) });
           }
         }
         }
@@ -4943,14 +4943,16 @@ app.get("/admin/router/shadow-experiment", async (c) => {
   const hours = Math.min(168, Math.max(1, Number(c.req.query("hours")) || 24));
   const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
 
-  // Only rows that actually carry the experiment columns; every other attempt
-  // (explicit-model traffic, non-final retries) stays null and is excluded.
+  // Exactly one decision per request: only the SUCCESSFUL serving attempt
+  // carries the columns, so requiring success=1 and deduping by request_id
+  // keeps a request that failed twice and succeeded once at one decision.
   const rows = await c.env.DB.prepare(
     `SELECT request_id, task_type, public_slug, route_id, success, health_impact, latency_ms, actual_cost_usd,
             v2_operational_route_id, v2_quality_route_id, v2_quality_changed, v2_quality_state, v2_quality_reason,
             v2_reliability_floor, v2_quality_floor
      FROM route_attempts
-     WHERE started_at >= ? AND v2_quality_changed IS NOT NULL`
+     WHERE started_at >= ? AND v2_quality_changed IS NOT NULL AND success=1
+     GROUP BY request_id`
   ).bind(cutoff).all();
   const decs = rows.results || [];
 
@@ -4969,12 +4971,13 @@ app.get("/admin/router/shadow-experiment", async (c) => {
     byState.set(st, (byState.get(st) || 0) + 1);
   }
 
-  // The headline metric: when quality changed the choice, did the
-  // quality-aware alternate subsequently carry stronger objective evidence
-  // (tool validity) than the route that actually served? A high disagreement
-  // rate alone means nothing if the alternate never proves better.
+  // Objective evidence attached to the requests where quality changed the
+  // choice. TRUTHFUL LABELING: the quality-aware alternate was shadow-only and
+  // was never executed, so its answer quality is unknowable from this request.
+  // These observations describe the route that ACTUALLY SERVED. Proving the
+  // alternate is better requires a live canary/A-B; this is the baseline.
   const changedReqIds = decs.filter((d) => d.v2_quality_changed).map((d) => String(d.request_id));
-  let alternateBetter = 0, alternateWorse = 0, alternateNoEvidence = 0;
+  let servedObjectiveValid = 0, servedObjectiveInvalid = 0, servedNoEvidence = 0;
   if (changedReqIds.length) {
     const placeholders = changedReqIds.map(() => "?").join(",");
     const obs = await c.env.DB.prepare(
@@ -4989,9 +4992,9 @@ app.get("/admin/router/shadow-experiment", async (c) => {
     }
     for (const d of decs.filter((x) => x.v2_quality_changed)) {
       const v = evidence.get(String(d.request_id));
-      if (v == null) alternateNoEvidence++;
-      else if (v >= 1) alternateBetter++;
-      else alternateWorse++;
+      if (v == null) servedNoEvidence++;
+      else if (v >= 1) servedObjectiveValid++;
+      else servedObjectiveInvalid++;
     }
   }
 
@@ -5011,13 +5014,10 @@ app.get("/admin/router/shadow-experiment", async (c) => {
       // 1000+ overall disagreements is the strong-evaluation threshold.
       evaluation_strength: changed >= 1000 ? "strong" : changed >= 100 ? "weak" : "insufficient"
     },
-    by_task: tasks,
-    by_quality_state: Object.fromEntries([...byState.entries()].sort((a, b) => b[1] - a[1])),
-    alternate_evidence: changed ? {
-      better: alternateBetter,
-      worse: alternateWorse,
-      no_objective_evidence: alternateNoEvidence,
-      better_rate: (alternateBetter + alternateWorse) ? Number((alternateBetter / (alternateBetter + alternateWorse)).toFixed(4)) : null
+    served_objective_evidence: changed ? {
+      valid: servedObjectiveValid,
+      invalid: servedObjectiveInvalid,
+      no_objective_evidence: servedNoEvidence
     } : null,
     notes: [
       "Only auto-routed requests carry shadow columns; explicit-model traffic is excluded.",
@@ -6175,7 +6175,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

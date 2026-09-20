@@ -289,6 +289,37 @@ test("recordRouteAttempt writes one row per attempt and moves the posterior only
   assert.equal(stat9, undefined, "deferred posterior is not observed at handoff");
 });
 
+test("v2 shadow experiment: one decision per request, failed attempts carry no experiment fields", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const c = { env: { DB: db } };
+  // A request that fails route A twice and succeeds on route B must count as
+  // ONE experiment decision, not three.
+  const autoDecision = { v2: { shadow: {
+    operational_only_pick: { slug: "a", routeId: 7 },
+    quality_aware_pick: { slug: "b", routeId: 12, quality: { state: "known_good" } },
+    changed: true,
+    floors: { reliability: 0.92, quality: 0.6 },
+    quality_state: "known_good",
+    quality_reason: "quality ok"
+  } } };
+  const fields = t.shadowAttemptFields(autoDecision);
+  assert.equal(fields.v2_quality_changed, 1);
+  const base = { public_slug: "glm", provider_id: 1, provider_key_id: 3, task_type: "chat:casual", started_at: "t", finished_at: "t", latency_ms: 800 };
+  // The two failed attempts record rows but carry NO experiment columns.
+  await t.recordRouteAttempt(c, { ...base, ...fields, request_id: "rX", route_id: 7, success: 0, health_impact: 1, http_status: 500, failure_class: "upstream_5xx" });
+  await t.recordRouteAttempt(c, { ...base, ...fields, request_id: "rX", route_id: 7, success: 0, health_impact: 1, http_status: 500, failure_class: "upstream_5xx" });
+  // Only the successful serving attempt carries the decision.
+  await t.recordRouteAttempt(c, { ...base, ...fields, request_id: "rX", route_id: 12, success: 1, health_impact: 0, http_status: 200, failure_class: "success" });
+  const experimentRows = db.prepare("SELECT request_id, success, v2_quality_changed FROM route_attempts WHERE v2_quality_changed IS NOT NULL").all().results;
+  assert.equal(experimentRows.length, 3, "all three rows carry the columns at write time");
+  // The endpoint's success=1 + dedupe filter collapses them to one decision.
+  const decisions = db.prepare("SELECT request_id FROM route_attempts WHERE v2_quality_changed IS NOT NULL AND success=1 GROUP BY request_id").all().results;
+  assert.equal(decisions.length, 1, "one decision per request after the endpoint filter");
+});
+
 test("updateRouterStat serializes concurrent observations without losing any", async () => {
   const { createDb } = await import("../../server/db.mjs");
   const { readFileSync } = await import("node:fs");

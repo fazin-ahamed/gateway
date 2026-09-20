@@ -134,3 +134,27 @@ test("the comparison reports every rejected route with its own reason", () => {
   assert.equal(qa.consideredCount, 3);
   assert.equal(qa.eligibleCount, 1);
 });
+
+test("known_good pool beats the cold fallback pool: a cheap unproven model does not win", () => {
+  const taskIR = compileTaskIR(CHAT);
+  // A cheap COLD route would win a pure cost sort; the mature known_good
+  // route must be preferred even though it costs more.
+  const qa = constraintFirstPick([
+    route("cheap-cold", { quality: COLD, cost: 0.001 }),
+    route("pricey-good", { quality: GOOD, cost: 0.05 })
+  ], taskIR);
+  assert.equal(qa.pick.slug, "pricey-good", "mature known_good wins over a cheap cold route");
+  assert.equal(qa.eligibleCount, 2, "both are eligible; the pool ordering is what differs");
+});
+
+test("a cold route wins only when no mature known_good route passes", () => {
+  const taskIR = compileTaskIR(CHAT);
+  const qa = constraintFirstPick([
+    route("bad-good", { quality: BAD, cost: 0.002 }),
+    route("cold-fallback", { quality: COLD, cost: 0.04 })
+  ], taskIR);
+  assert.equal(qa.pick.slug, "cold-fallback", "cold is the fallback pool, used only without a mature pass");
+  const rejected = qa.rejected.find((r) => r.slug === "bad-good");
+  assert.equal(rejected.reason, "below quality floor");
+});
+
