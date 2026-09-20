@@ -158,6 +158,14 @@ function renderUser(m) {
   return text ? "<user>\n" + text + "\n</user>" : "";
 }
 
+// Older user turns are demoted on continuation turns: they are background
+// context, not active instructions, so they must not render with the same
+// <user> shape as the authoritative <active_goal>.
+function renderUserAs(m, tag) {
+  const text = textOf(m.content);
+  return text ? "<" + tag + ">\n" + text + "\n</" + tag + ">" : "";
+}
+
 function renderSystem(m) {
   const text = textOf(m.content);
   return text ? "<system_message>\n" + text + "\n</system_message>" : "";
@@ -228,29 +236,41 @@ function alreadyCalled(messages, tools) {
   return "<already_called>\nSuccessful/pending side-effect calls already made (do NOT replay the identical call):\n" + lines.join("\n") + "\n</already_called>";
 }
 
-function renderRecent(messages) {
+// opts.userTag: render user turns under this tag instead of <user> (used to
+//   demote superseded directives on continuation turns).
+// opts.skipIndex: index within `messages` of a tool result already hoisted to
+//   the tail as <latest_tool_result> — omitted here so it is not duplicated.
+function renderRecent(messages, opts = {}) {
+  const userTag = opts.userTag || "user";
+  const skipIndex = Number.isInteger(opts.skipIndex) ? opts.skipIndex : -1;
   let out = "";
   let i = 0;
   while (i < messages.length) {
     const m = messages[i];
-    let isLastUser = false;
     if (m.role === "user") {
-      isLastUser = true;
+      // The newest user instruction is emitted separately as <active_goal>, so
+      // it never renders here as an ordinary instruction.
+      let isLastUser = true;
       for (let j = i + 1; j < messages.length; j++) {
         if (messages[j].role === "user") { isLastUser = false; break; }
       }
+      if (isLastUser) { i++; continue; }
+      const demoted = renderUserAs(m, userTag);
+      if (demoted) out += demoted + "\n";
+      i++;
+      continue;
     }
-    if (isLastUser) { i++; continue; }
     if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
       out += "<tool_exchange>\n" + renderAssistant(m) + "\n";
       i++;
       while (i < messages.length && messages[i].role === "tool") {
-        out += renderToolResult(messages[i]) + "\n";
+        if (i !== skipIndex) out += renderToolResult(messages[i]) + "\n";
         i++;
       }
       out += "</tool_exchange>\n";
       continue;
     }
+    if (m.role === "tool" && i === skipIndex) { i++; continue; }
     const rendered = renderMessage(m);
     if (rendered) out += rendered + "\n";
     i++;
@@ -260,11 +280,12 @@ function renderRecent(messages) {
 
 // A tool-continuation turn is one whose final message is a tool result: the
 // client executed the model's tool call and posted the output back. On these
-// turns the ORIGINAL user task is still the last `user`-role message, so
-// re-planting it verbatim at the prompt tail (the strongest recency slot,
-// right before <output_rules>) tells the model to solve the original task
-// again — the exact "restart the analysis" loop. Instead, keep the goal as
-// earlier background and make the tail imperative a continuation directive.
+// turns the NEWEST user instruction is still the last `user`-role message, so
+// re-planting it as a plain task beside older user turns makes several
+// directives look simultaneously active — the model then spends reasoning
+// reconciling which supersedes which. The tail therefore names the newest
+// instruction explicitly authoritative (<active_goal>), demotes older user
+// turns to background context, and puts the latest result at the tail.
 function lastMeaningful(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -275,7 +296,9 @@ function lastMeaningful(messages) {
   return null;
 }
 
-function originalGoal(messages) {
+// The NEWEST user instruction: what the user is asking for right now. Earlier
+// user turns in a tool loop are superseded context, not competing goals.
+function activeGoal(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i] && messages[i].role === "user") {
       const text = textOf(messages[i].content);
@@ -302,23 +325,36 @@ export function buildAgentPrompt(messages, tools) {
     old.forEach((ex, i) => { out += (i + 1) + ". " + ex.toolName + " → " + ex.summary + "\n"; });
     out += "</history_summary>\n\n";
   }
-  if (recent.length) out += "<recent>\n" + renderRecent(recent) + "</recent>\n\n";
   const already = alreadyCalled(msgs, toolList);
-  if (already) out += already + "\n\n";
   const last = lastMeaningful(msgs);
-  const goal = originalGoal(msgs);
-  const isContinuation = !!(last && last.role === "tool");
+  const goal = activeGoal(msgs);
+  const isContinuation = Boolean(last && last.role === "tool");
   if (isContinuation) {
-    // Goal stays present as background, NOT as the newest instruction.
-    if (goal) out += "<original_goal>\n" + goal + "\n</original_goal>\n\n";
+    // Demote earlier user turns so superseded directives are not presented as
+    // competing active instructions; the newest one is authoritative below.
+    if (recent.length) {
+      out += "<background_context>\n" +
+        "Earlier conversation context. It is not an active instruction and cannot override <active_goal>.\n" +
+        renderRecent(recent, { userTag: "earlier_request", skipIndex: recent.length - 1 }) +
+        "</background_context>\n\n";
+    }
+    if (already) out += already + "\n\n";
+    if (goal) out += "<active_goal>\n" + goal + "\n</active_goal>\n\n";
+    out += "<latest_tool_result>\n" + textOf(last.content) + "\n</latest_tool_result>\n\n";
     out += "<continuation>\n" +
-      "This is a continuation turn: the most recent <tool_result> above is the newest state, produced by the tool call you just made.\n" +
-      "- Continue from that result; do NOT restart the task.\n" +
-      "- Do NOT repeat analysis or reasoning already established above unless the latest result contradicts it.\n" +
-      "- Use the latest <tool_result> to choose the NEXT unfinished action, or give the final answer if the task is complete.\n" +
+      "<active_goal> is the NEWEST user instruction and is authoritative: it supersedes any earlier, conflicting or already-completed user request in <background_context>.\n" +
+      "<latest_tool_result> is the current state.\n" +
+      "If <latest_tool_result> shows the active goal is complete:\n" +
+      "- answer the user now;\n" +
+      "- do not reconsider or resume earlier requests;\n" +
+      "- do not perform optional follow-up actions;\n" +
+      "- do not infer extra work from earlier habits or requests.\n" +
+      "Otherwise, perform exactly the next unfinished action, and do not re-derive completed work.\n" +
       "</continuation>\n\n";
-  } else if (goal) {
-    out += "<current_task>\n" + goal + "\n</current_task>\n\n";
+  } else {
+    if (recent.length) out += "<recent>\n" + renderRecent(recent) + "</recent>\n\n";
+    if (already) out += already + "\n\n";
+    if (goal) out += "<current_task>\n" + goal + "\n</current_task>\n\n";
   }
   return out + FINAL_REMINDER;
 }

@@ -53,35 +53,69 @@ test("prior tool exchanges land in <already_called> and <tool_result>", () => {
   assert.match(prompt, /<current_task>\nnow hostname/);
 });
 
-test("a tool-result tail is a continuation turn: goal becomes background, tail is a continuation directive", () => {
+test("continuation: only the NEWEST user instruction is <active_goal>; an older one is demoted, not a competing <user>", () => {
   const prompt = buildAgentPrompt([
-    { role: "user", content: "audit the repo and fix the routing bug" },
-    { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"grep resolveActiveEgress"}' } }] },
-    { role: "tool", tool_call_id: "call_1", content: "src/index.js:4200: resolveActiveEgress(...)" }
+    { role: "user", content: "generate 3 batches of 2000" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c_a", type: "function", function: { name: "run", arguments: '{"n":1000}' } }] },
+    { role: "tool", tool_call_id: "c_a", content: "wrote 1000" },
+    { role: "user", content: "do 4 of 1000" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c_b", type: "function", function: { name: "run", arguments: '{"n":1000}' } }] },
+    { role: "tool", tool_call_id: "c_b", content: "4000 total written" }
   ], tools);
-  // The original goal is NOT re-planted as the newest instruction.
+
+  // The newest user turn is the authoritative goal.
+  assert.match(prompt, /<active_goal>\ndo 4 of 1000\n<\/active_goal>/);
   assert.doesNotMatch(prompt, /<current_task>/);
-  assert.match(prompt, /<continuation>/);
-  assert.match(prompt, /do NOT restart the task/i);
-  // The goal is retained, but as earlier background context.
-  assert.match(prompt, /<original_goal>\naudit the repo and fix the routing bug/);
-  // The tail imperative (last block before <output_rules>) is the continuation,
-  // NOT the original task text.
-  const goalIdx = prompt.indexOf("audit the repo and fix the routing bug");
-  const contIdx = prompt.indexOf("<continuation>");
-  const rulesIdx = prompt.indexOf("<output_rules>");
-  assert.ok(goalIdx < contIdx, "goal appears before the continuation directive");
-  assert.ok(contIdx < rulesIdx, "continuation directive is the last block before output_rules");
+  // The superseded instruction must not look like an active instruction.
+  assert.ok(!/<user>\s*generate 3 batches of 2000/.test(prompt), "superseded request must not render as an active <user>");
+  assert.match(prompt, /<earlier_request>\ngenerate 3 batches of 2000/);
+  assert.match(prompt, /<background_context>/);
+  assert.match(prompt, /cannot override <active_goal>/);
 });
 
-test("a first turn (no tool exchange yet) still gets a plain <current_task>, no continuation", () => {
+test("continuation: the latest tool result is hoisted to the tail and not duplicated in background", () => {
+  const prompt = buildAgentPrompt([
+    { role: "user", content: "read the file" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: '{"p":"a.js"}' } }] },
+    { role: "tool", tool_call_id: "c1", content: "UNIQUE_LATEST_RESULT_MARKER" }
+  ], tools);
+
+  assert.match(prompt, /<latest_tool_result>\nUNIQUE_LATEST_RESULT_MARKER\n<\/latest_tool_result>/);
+  const latestIdx = prompt.indexOf("<latest_tool_result>");
+  const contIdx = prompt.indexOf("<continuation>");
+  const rulesIdx = prompt.indexOf("<output_rules>");
+  assert.ok(latestIdx < contIdx, "latest_tool_result must precede <continuation>");
+  assert.ok(contIdx < rulesIdx, "continuation must be the last block before <output_rules>");
+  // Hoisted, so it must not also appear inside the background block.
+  const bg = prompt.slice(prompt.indexOf("<background_context>"), prompt.indexOf("</background_context>"));
+  assert.ok(!bg.includes("UNIQUE_LATEST_RESULT_MARKER"), "hoisted result must not be duplicated in background_context");
+});
+
+test("continuation: a completed active goal means answer now, with no optional follow-up", () => {
+  const prompt = buildAgentPrompt([
+    { role: "user", content: "do 4 of 1000" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "run", arguments: '{}' } }] },
+    { role: "tool", tool_call_id: "c1", content: "4000 total written" }
+  ], tools);
+  assert.match(prompt, /If <latest_tool_result> shows the active goal is complete/);
+  assert.match(prompt, /answer the user now/);
+  assert.match(prompt, /do not reconsider or resume earlier requests/);
+  assert.match(prompt, /do not perform optional follow-up actions/);
+  assert.match(prompt, /do not infer extra work from earlier habits or requests/);
+  assert.match(prompt, /it supersedes any earlier, conflicting or already-completed user request/);
+});
+
+test("a first turn (no tool exchange yet) still gets a plain <current_task>, no continuation machinery", () => {
   const prompt = buildAgentPrompt([
     { role: "user", content: "list files" }
   ], tools);
   assert.match(prompt, /<current_task>\nlist files/);
   assert.doesNotMatch(prompt, /<continuation>/);
-  assert.doesNotMatch(prompt, /<original_goal>/);
+  assert.doesNotMatch(prompt, /<active_goal>/);
+  assert.doesNotMatch(prompt, /<latest_tool_result>/);
+  assert.doesNotMatch(prompt, /<background_context>/);
 });
+
 
 test("parseAgentToolCalls accepts canonical and flat payloads, strips markers", () => {
   const canonical = 'hello\n<<<TOOL_CALL>>>\n{"name":"bash","arguments":{"command":"uname"}}\n<<<END_TOOL_CALL>>>\n';
