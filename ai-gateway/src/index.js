@@ -4907,6 +4907,66 @@ app.get("/admin/router/registry", async (c) => {
     unresolved_count: unresolved.length
   });
 });
+// Agent-loop repetition telemetry (Z.AI agent shim). Body-free aggregate that
+// quantifies whether the continuation-aware prompt reduced re-derivation:
+// repeat-rate (tool_calls_repeated / emitted) and mean reasoning_prefix_overlap,
+// sliced by continuation_mode and agent_round. Reasoning is never stored or
+// returned as text — only hash-derived overlap.
+app.get("/admin/router/agent-loop", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const hours = Math.min(720, Math.max(1, Number(c.req.query("hours")) || 24));
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
+  const rowsQ = await c.env.DB.prepare(
+    `SELECT continuation_mode, agent_round, tool_calls_emitted, tool_calls_repeated,
+            reasoning_chars, reasoning_prefix_overlap
+     FROM agent_loop_events WHERE created_at >= ?`
+  ).bind(cutoff).all();
+  const rows = rowsQ.results || [];
+
+  const bucket = () => ({ events: 0, emitted: 0, repeated: 0, overlap_sum: 0, overlap_n: 0 });
+  const fold = (b, r) => {
+    b.events++;
+    b.emitted += Number(r.tool_calls_emitted) || 0;
+    b.repeated += Number(r.tool_calls_repeated) || 0;
+    if (r.reasoning_prefix_overlap != null) {
+      b.overlap_sum += Number(r.reasoning_prefix_overlap);
+      b.overlap_n++;
+    }
+  };
+  const summarize = (b) => ({
+    events: b.events,
+    tool_calls_emitted: b.emitted,
+    tool_calls_repeated: b.repeated,
+    repeat_rate: b.emitted ? Number((b.repeated / b.emitted).toFixed(4)) : null,
+    mean_reasoning_overlap: b.overlap_n ? Number((b.overlap_sum / b.overlap_n).toFixed(4)) : null,
+    overlap_samples: b.overlap_n
+  });
+
+  const overall = bucket();
+  const byMode = new Map();
+  const byRound = new Map();
+  for (const r of rows) {
+    fold(overall, r);
+    const mode = String(r.continuation_mode || "unknown");
+    if (!byMode.has(mode)) byMode.set(mode, bucket());
+    fold(byMode.get(mode), r);
+    // Round buckets past 6 collapse into "6+" so a long loop does not explode
+    // the response with one row per round.
+    const rn = Number(r.agent_round) || 1;
+    const rk = rn >= 6 ? "6+" : String(rn);
+    if (!byRound.has(rk)) byRound.set(rk, bucket());
+    fold(byRound.get(rk), r);
+  }
+
+  return c.json({
+    window_hours: hours,
+    overall: summarize(overall),
+    by_continuation_mode: Object.fromEntries([...byMode.entries()].map(([k, v]) => [k, summarize(v)])),
+    by_agent_round: Object.fromEntries([...byRound.entries()].sort((a, b) => (a[0] === "6+" ? 99 : Number(a[0])) - (b[0] === "6+" ? 99 : Number(b[0]))).map(([k, v]) => [k, summarize(v)]))
+  });
+});
 // ---- Proxy pool: egress inventory + connectivity testing ----
 // Credentials are sealed with the same providerCryptoKey machinery as provider
 // keys and are NEVER returned to the browser. Batch testing runs server-side

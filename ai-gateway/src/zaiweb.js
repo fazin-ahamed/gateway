@@ -15,6 +15,7 @@ import { applyAgentShim, parseAgentToolCalls, stripAgentToolCalls, AgentStreamIn
 import { acquireZaiChatId, releaseZaiChatId } from "./zai-session-pool.js";
 import { getZaiCaptchaProof } from "./zai-captcha-cache.js";
 import { attachZaiImageParts, processZaiVisionMessages } from "./zai-vision.js";
+import { recordAgentLoopEvent } from "./router/agent-telemetry.js";
 
 import { seedWireToCanonical } from "./router/model-registry.js";
 const ZAI_BASE_URL = "https://chat.z.ai";
@@ -437,13 +438,15 @@ function chunk(id, created, model, delta, finish, usage) {
 // one finish chunk, and never a contentless frame (strict clients index
 // choices[0] and choke on `choices: []`). When agent=true, <<<TOOL_CALL>>>
 // blocks become incremental tool_calls deltas and finish_reason=tool_calls.
-function toOpenAiStream(source, model, id, agent = false, tools = []) {
+function toOpenAiStream(source, model, id, agent = false, tools = [], onComplete = null) {
   const created = Math.floor(Date.now() / 1000);
   const enc = new TextEncoder();
   let started = false;
   let finished = false;
   let chars = 0;
   let sawToolCalls = false;
+  let accReasoning = "";
+  const accToolCalls = [];
   const interceptor = agent ? new AgentStreamInterceptor(tools) : null;
   return new ReadableStream({
     async start(controller) {
@@ -455,6 +458,7 @@ function toOpenAiStream(source, model, id, agent = false, tools = []) {
           send(chunk(id, created, model, { role: "assistant" }));
         }
         sawToolCalls = true;
+        for (const tc of toolCalls) accToolCalls.push(tc);
         send(chunk(id, created, model, { tool_calls: toolCalls }));
       };
       const finish = (reason) => {
@@ -476,6 +480,9 @@ function toOpenAiStream(source, model, id, agent = false, tools = []) {
         const usage = { prompt_tokens: 0, completion_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), total_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), cost_usd: 0 };
         send(chunk(id, created, model, {}, reason || (sawToolCalls ? "tool_calls" : "stop"), usage));
         controller.enqueue(enc.encode("data: [DONE]\n\n"));
+        if (onComplete) {
+          try { onComplete({ reasoning: accReasoning, toolCalls: accToolCalls }); } catch {}
+        }
       };
       try {
         await readDeltas(source, (delta) => {
@@ -490,6 +497,7 @@ function toOpenAiStream(source, model, id, agent = false, tools = []) {
               started = true;
               send(chunk(id, created, model, { role: "assistant" }));
             }
+            accReasoning += delta.reasoning;
             send(chunk(id, created, model, { reasoning_content: delta.reasoning }));
           }
           if (delta.content) {
@@ -945,6 +953,24 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const promptTokens = estimatePromptTokens(messages, payload.tools ? JSON.stringify(payload.tools).length : 0) +
     imageCount * IMAGE_TOKEN_ALLOWANCE;
 
+  // Agent-loop repetition telemetry: only for tool-shim turns, keyed by the
+  // ORIGINAL client history (not the folded prompt). Best-effort and body-free
+  // — recordAgentLoopEvent stores only hashes and never blocks the response.
+  const turnSalt = String(route.zai_session_key || route.route_id || route.id || route.public_slug || "");
+  const onComplete = prepared.shim.active
+    ? ({ reasoning, toolCalls }) => {
+        void recordAgentLoopEvent(c, {
+          requestId: id,
+          messages: payload.messages || [],
+          emittedToolCalls: toolCalls || [],
+          reasoning: reasoning || "",
+          publicSlug: route.public_slug || null,
+          upstreamModel: route.upstream_model || modelId,
+          turnSalt
+        });
+      }
+    : null;
+
   if (isStream) {
     const [clientStream, drainStream] = up.body.tee();
     const shaped = shapeFrameResponse({
@@ -955,7 +981,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       isStream,
       recovered,
       agent: prepared.shim.active,
-      tools: payload.tools || payload.functions || []
+      tools: payload.tools || payload.functions || [],
+      onComplete
     });
     void (async () => {
       try {
@@ -978,7 +1005,8 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       isStream,
       recovered,
       agent: prepared.shim.active,
-      tools: payload.tools || payload.functions || []
+      tools: payload.tools || payload.functions || [],
+      onComplete
     });
   } finally {
     retire();
@@ -1009,10 +1037,10 @@ function classifyZaiStreamFailure(text) {
 // hand over the same chat.z.ai frame stream, so the OpenAI mapping lives here
 // rather than twice.
 async function shapeFrameResponse(input) {
-  const { id, model, source, promptTokens, isStream, recovered, agent, tools = [] } = input;
+  const { id, model, source, promptTokens, isStream, recovered, agent, tools = [], onComplete = null } = input;
   if (isStream) {
     const headers = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };
-    return { response: new Response(toOpenAiStream(source, model, id, !!agent, tools), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
+    return { response: new Response(toOpenAiStream(source, model, id, !!agent, tools, onComplete), { status: 200, headers }), usage: { prompt_tokens: promptTokens, completion_tokens: 0, total_tokens: promptTokens, cost_usd: 0 }, recovered };
   }
 
   // Non-streaming: drain the same frame stream into a single completion body.
@@ -1048,6 +1076,9 @@ async function shapeFrameResponse(input) {
   }
   if (reasoning)
     message.reasoning_content = reasoning;
+  if (onComplete) {
+    try { onComplete({ reasoning, toolCalls: message.tool_calls || [] }); } catch {}
+  }
   const completionTokens = Math.ceil(content.length / OUTPUT_CHARS_PER_TOKEN);
   const usage = { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, cost_usd: 0 };
   const body = {

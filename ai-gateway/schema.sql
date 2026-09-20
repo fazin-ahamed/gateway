@@ -437,3 +437,32 @@ CREATE TABLE IF NOT EXISTS proxy_test_runs (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_test_runs_proxy ON proxy_test_runs(proxy_id, created_at);
+
+-- Agent-loop repetition telemetry for the Z.AI agent shim. One row per agent
+-- completion (a single tool round). Body-free: reasoning is stored ONLY as a
+-- hash-set fingerprint (reasoning_fp), never as text. reasoning_prefix_overlap
+-- is the Jaccard similarity of this round's opening reasoning against the
+-- PREVIOUS round of the same logical_turn_id — it quantifies whether the model
+-- is re-deriving the same reasoning instead of continuing. tool_calls_repeated
+-- is the stateless companion signal: a call re-issued after it was already made
+-- and answered. Used to measure the continuation-prompt fix before/after.
+CREATE TABLE IF NOT EXISTS agent_loop_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT,
+  logical_turn_id TEXT NOT NULL,
+  public_slug TEXT,
+  upstream_model TEXT,
+  task_type TEXT NOT NULL DEFAULT '',
+  agent_round INTEGER NOT NULL DEFAULT 1,
+  continuation_mode TEXT NOT NULL DEFAULT 'first_turn',
+  tool_exchanges_in_history INTEGER NOT NULL DEFAULT 0,
+  tool_results_in_history INTEGER NOT NULL DEFAULT 0,
+  tool_calls_emitted INTEGER NOT NULL DEFAULT 0,
+  tool_calls_repeated INTEGER NOT NULL DEFAULT 0,
+  reasoning_chars INTEGER NOT NULL DEFAULT 0,
+  reasoning_prefix_overlap REAL,
+  reasoning_fp TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_loop_turn ON agent_loop_events(logical_turn_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_loop_time ON agent_loop_events(created_at);
