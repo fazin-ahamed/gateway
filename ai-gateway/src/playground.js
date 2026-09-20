@@ -1923,8 +1923,17 @@ document.getElementById('ar-run').onclick=async function(){
         ?' · predicted quality '+Math.round(v2.quality.stats.mean*100)+'% <span class="hint">('+Number(v2.quality.stats.evidence).toFixed(1)+' weighted evidence)</span>'
         :' · quality <span class="hint">insufficient evidence (prior only)</span>')+'</span></div>'):
     '<div class="small" style="margin-top:10px">V2 shadow: no policy (router off or no eligible routes)</div>';
+  const sh=d.v2&&d.v2.shadow?d.v2.shadow:null;
+  const shHtml=sh?('<div class="kvrow" style="margin-top:6px"><span class="pill '+(sh.changed?'warn':'mut')+'">constraint-first '+(sh.changed?'DIFFERS':'agrees')+'</span>'+
+    '<span class="grow small">quality-constrained pick <b>'+esc(String((sh.quality_aware_pick&&sh.quality_aware_pick.slug)||'— nothing cleared the floors'))+'</b>'+
+    ' vs operational <b>'+esc(String((sh.operational_only_pick&&sh.operational_only_pick.slug)||'—'))+'</b>'+
+    (sh.floors?' · floors rel '+Number(sh.floors.reliability).toFixed(2)+' / quality '+Number(sh.floors.quality).toFixed(2):'')+
+    ' · considered '+fmt(sh.considered||0)+' → eligible '+fmt(sh.eligible||0)+
+    ((sh.rejected_by_constraint&&sh.rejected_by_constraint.length)?' · below floor: '+sh.rejected_by_constraint.map(function(r){return esc(String(r.slug))+' ('+esc(String(r.reason||'floor'))+')';}).join(', '):'')+
+    (sh.changed?' <span class="hint">shadow only — serving unchanged</span>':'')+
+    '</span></div>'):'';
   out.innerHTML='<div class="kvrow"><span class="pill '+(d.fallback?'warn':'acc')+'">'+(d.fallback?'fallback (nothing eligible)':'V1 picked')+'</span><span class="grow"><b>'+esc(d.picked)+'</b> · complexity '+esc(String(d.complexity))+' → quality floor '+d.need.toFixed(2)+' · preference '+d.preference+'</span></div>'+
-    v2Html+
+    v2Html+shHtml+
     '<table style="margin-top:10px"><tr><th>Model</th><th>Status</th><th>Quality</th><th>Cost</th><th>Health</th></tr>'+rows+'</table>';
 };
 document.getElementById('tj-refresh').onclick=function(){ loadTrajectories(); };
