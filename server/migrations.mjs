@@ -73,3 +73,33 @@ export function migrateQualityIdentity(db) {
     return false;
   }
 }
+
+// Same CREATE TABLE IF NOT EXISTS gap as the quality column above: a DB created
+// before the V2 shadow experiment columns existed never receives them, and the
+// route_attempts INSERT would then fail on every auto-routed request.
+export function migrateRouteAttemptsV2(db) {
+  const added = [];
+  try {
+    const r = db.prepare("PRAGMA table_info(route_attempts)").all();
+    const names = new Set(((r && r.results) || []).map((c) => c && c.name));
+    const cols = [
+      ["v2_operational_route_id", "INTEGER"],
+      ["v2_quality_route_id", "INTEGER"],
+      ["v2_quality_changed", "INTEGER"],
+      ["v2_quality_state", "TEXT"],
+      ["v2_quality_reason", "TEXT"],
+      ["v2_reliability_floor", "REAL"],
+      ["v2_quality_floor", "REAL"]
+    ];
+    for (const [name, type] of cols) {
+      if (names.has(name)) continue;
+      db.exec("ALTER TABLE route_attempts ADD COLUMN " + name + " " + type);
+      added.push(name);
+    }
+    if (added.length)
+      console.warn("[gateway] migration: added route_attempts V2 shadow columns:", added.join(", "));
+  } catch (e) {
+    console.warn("[gateway] route_attempts V2 migration skipped:", e.message);
+  }
+  return added;
+}

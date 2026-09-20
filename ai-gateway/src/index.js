@@ -1005,7 +1005,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
           _att.recorded = true;
-          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 0, http_status: up.status, fallback_from_route_id: _fallbackFrom, deferPosterior: true });
+          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 0, http_status: up.status, fallback_from_route_id: _fallbackFrom, deferPosterior: true, ...shadowAttemptFields(autoDecision) });
           const horizonHdrs = { "x-gateway-model": liveSlug };
           if (autoDecision && autoDecision.horizon)
             horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
@@ -1080,7 +1080,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
             }
             c.__egressFailure = null;
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false });
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false, ...shadowAttemptFields(autoDecision) });
           }
         }
         }
@@ -3371,6 +3371,26 @@ async function updateRouterStat(c, scope, scopeId, taskType, success, latencyMs,
     }
   });
 }
+// Flatten the Router V2 shadow decision into the nullable route_attempts
+// columns. Only the final serving attempt of an auto-routed request carries
+// these, so the experiment ("how often would quality change the choice?") is
+// recorded exactly once per request. Nulls everywhere else.
+function shadowAttemptFields(autoDecision) {
+  const sh = autoDecision && autoDecision.v2 && autoDecision.v2.shadow;
+  if (!sh) return {};
+  const opRoute = sh.operational_only_pick || {};
+  const qaPick = sh.quality_aware_pick || null;
+  const floors = sh.floors || {};
+  return {
+    v2_operational_route_id: opRoute.routeId ?? null,
+    v2_quality_route_id: qaPick ? (qaPick.routeId ?? null) : null,
+    v2_quality_changed: sh.changed ? 1 : 0,
+    v2_quality_state: String(sh.quality_state || (qaPick ? "cold" : "none")),
+    v2_quality_reason: String(sh.quality_reason || "no shadow decision"),
+    v2_reliability_floor: floors.reliability != null ? Number(floors.reliability) : null,
+    v2_quality_floor: floors.quality != null ? Number(floors.quality) : null
+  };
+}
 // One row per real upstream attempt. Body-free. Returns the row id (for a
 // later streaming metric patch) or null. Updates the route posterior only for
 // operational outcomes (success, or failure with health_impact).
@@ -3381,8 +3401,10 @@ async function recordRouteAttempt(c, a) {
        (request_id, parent_slug, route_id, provider_id, provider_key_id, public_slug, upstream_model, transport, task_type,
         attempt_index, key_attempt_index, started_at, finished_at, success, health_impact, http_status, failure_class, failure_code,
         ttft_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, fallback_from_route_id, rescue_used,
-        tool_valid, tool_success, verification_score)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        tool_valid, tool_success, verification_score,
+        v2_operational_route_id, v2_quality_route_id, v2_quality_changed, v2_quality_state, v2_quality_reason,
+        v2_reliability_floor, v2_quality_floor)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       a.request_id, a.parent_slug ?? null, a.route_id ?? null, a.provider_id ?? null, a.provider_key_id ?? null,
       a.public_slug, a.upstream_model ?? null, a.transport ?? null, a.task_type ?? "",
@@ -3390,7 +3412,10 @@ async function recordRouteAttempt(c, a) {
       a.success ? 1 : 0, a.health_impact ? 1 : 0, a.http_status ?? null, a.failure_class ?? null, a.failure_code ?? null,
       a.ttft_ms ?? null, a.latency_ms ?? null, a.prompt_tokens ?? 0, a.completion_tokens ?? 0,
       a.estimated_cost_usd ?? null, a.actual_cost_usd ?? null, a.fallback_from_route_id ?? null, a.rescue_used ? 1 : 0,
-      a.tool_valid ?? null, a.tool_success ?? null, a.verification_score ?? null
+      a.tool_valid ?? null, a.tool_success ?? null, a.verification_score ?? null,
+      a.v2_operational_route_id ?? null, a.v2_quality_route_id ?? null, a.v2_quality_changed ?? null,
+      a.v2_quality_state ?? null, a.v2_quality_reason ?? null,
+      a.v2_reliability_floor ?? null, a.v2_quality_floor ?? null
     ).run();
     if ((a.success || a.health_impact) && !a.deferPosterior) {
       const ok = !!a.success;
@@ -4901,6 +4926,104 @@ app.get("/admin/router/reconcile", async (c) => {
     by_route: routes,
     by_failure_class: Object.fromEntries([...failureClassAgg.entries()].sort((a, b) => b[1] - a[1])),
     warnings: []
+  });
+});
+
+// Router V2 shadow experiment evaluation. The dual decision (operational pick
+// vs constraint-first quality-aware pick) is recorded on the final serving
+// attempt of each auto-routed request; this answers "how often would quality
+// change the choice, and does the alternate look better?" from real traffic.
+// Read-only. Sample-threshold guidance mirrors the experiment plan: below 100
+// decisions per task family the numbers are noise; 100-499 is early signal;
+// 500+ is where floor calibration becomes meaningful.
+app.get("/admin/router/shadow-experiment", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const hours = Math.min(168, Math.max(1, Number(c.req.query("hours")) || 24));
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
+
+  // Only rows that actually carry the experiment columns; every other attempt
+  // (explicit-model traffic, non-final retries) stays null and is excluded.
+  const rows = await c.env.DB.prepare(
+    `SELECT request_id, task_type, public_slug, route_id, success, health_impact, latency_ms, actual_cost_usd,
+            v2_operational_route_id, v2_quality_route_id, v2_quality_changed, v2_quality_state, v2_quality_reason,
+            v2_reliability_floor, v2_quality_floor
+     FROM route_attempts
+     WHERE started_at >= ? AND v2_quality_changed IS NOT NULL`
+  ).bind(cutoff).all();
+  const decs = rows.results || [];
+
+  const byTask = new Map();
+  const byState = new Map();
+  let changed = 0;
+  for (const d of decs) {
+    const task = String(d.task_type || "(none)");
+    const t = byTask.get(task) || { task, decisions: 0, changed: 0, cold: 0, no_candidate: 0 };
+    t.decisions++;
+    if (d.v2_quality_changed) { t.changed++; changed++; }
+    if (d.v2_quality_state === "cold") t.cold++;
+    if (d.v2_quality_state === "none") t.no_candidate++;
+    byTask.set(task, t);
+    const st = String(d.v2_quality_state || "unknown");
+    byState.set(st, (byState.get(st) || 0) + 1);
+  }
+
+  // The headline metric: when quality changed the choice, did the
+  // quality-aware alternate subsequently carry stronger objective evidence
+  // (tool validity) than the route that actually served? A high disagreement
+  // rate alone means nothing if the alternate never proves better.
+  const changedReqIds = decs.filter((d) => d.v2_quality_changed).map((d) => String(d.request_id));
+  let alternateBetter = 0, alternateWorse = 0, alternateNoEvidence = 0;
+  if (changedReqIds.length) {
+    const placeholders = changedReqIds.map(() => "?").join(",");
+    const obs = await c.env.DB.prepare(
+      `SELECT o.request_id, o.canonical_model_id, o.signal_type, o.value
+       FROM quality_observations o
+       WHERE o.request_id IN (${placeholders}) AND o.signal_type='tool_valid'`
+    ).bind(...changedReqIds).all();
+    const evidence = new Map();
+    for (const o of (obs.results || [])) {
+      const k = String(o.request_id);
+      evidence.set(k, Number(o.value));
+    }
+    for (const d of decs.filter((x) => x.v2_quality_changed)) {
+      const v = evidence.get(String(d.request_id));
+      if (v == null) alternateNoEvidence++;
+      else if (v >= 1) alternateBetter++;
+      else alternateWorse++;
+    }
+  }
+
+  const tasks = [...byTask.values()].map((t) => ({
+    ...t,
+    disagreement_rate: t.decisions ? Number((t.changed / t.decisions).toFixed(4)) : null,
+    // Noise/inspect only below 100; early signal 100-499; calibrate at 500+.
+    maturity: t.decisions >= 500 ? "calibrate" : t.decisions >= 100 ? "early_signal" : "noise"
+  })).sort((a, b) => b.decisions - a.decisions);
+
+  return c.json({
+    window_hours: hours,
+    decisions: decs.length,
+    disagreement: {
+      changed_choice: changed,
+      rate: decs.length ? Number((changed / decs.length).toFixed(4)) : null,
+      // 1000+ overall disagreements is the strong-evaluation threshold.
+      evaluation_strength: changed >= 1000 ? "strong" : changed >= 100 ? "weak" : "insufficient"
+    },
+    by_task: tasks,
+    by_quality_state: Object.fromEntries([...byState.entries()].sort((a, b) => b[1] - a[1])),
+    alternate_evidence: changed ? {
+      better: alternateBetter,
+      worse: alternateWorse,
+      no_objective_evidence: alternateNoEvidence,
+      better_rate: (alternateBetter + alternateWorse) ? Number((alternateBetter / (alternateBetter + alternateWorse)).toFixed(4)) : null
+    } : null,
+    notes: [
+      "Only auto-routed requests carry shadow columns; explicit-model traffic is excluded.",
+      "Sample thresholds: <100/task = noise, 100-499 = early signal, 500+/task = calibrate floors, 1000+ disagreements = evaluate.",
+      "Traffic recorded before the v2 columns existed is not counted (rows are null)."
+    ]
   });
 });
 

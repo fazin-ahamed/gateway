@@ -294,7 +294,19 @@ CREATE TABLE IF NOT EXISTS route_attempts (
   tool_success INTEGER,
   verification_score REAL,
   fallback_from_route_id INTEGER,
-  rescue_used INTEGER NOT NULL DEFAULT 0
+  rescue_used INTEGER NOT NULL DEFAULT 0,
+  -- Router V2 shadow experiment (nullable; only the FINAL serving attempt of
+  -- an auto-routed request carries these). The dual decision is recorded once
+  -- per request so "how often would quality change the choice?" is answerable
+  -- from real traffic. Route IDs, not slugs: operational stats/cost/latency are
+  -- route-specific while quality is canonical-model-specific. Body-free.
+  v2_operational_route_id INTEGER,
+  v2_quality_route_id INTEGER,
+  v2_quality_changed INTEGER,
+  v2_quality_state TEXT,
+  v2_quality_reason TEXT,
+  v2_reliability_floor REAL,
+  v2_quality_floor REAL
 );
 CREATE INDEX IF NOT EXISTS idx_route_attempts_route_time ON route_attempts(route_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_route_attempts_provider_time ON route_attempts(provider_id, started_at);

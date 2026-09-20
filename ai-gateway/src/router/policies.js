@@ -329,12 +329,24 @@ export function shadowDecide({ routes, taskIR, preference }) {
   const qa = constraintFirstPick(routes, taskIR);
   const qualityAware = qa.pick && {
     slug: qa.pick.slug,
+    routeId: qa.pick.routeId ?? null,
     canonicalModelId: qa.pick.canonicalModelId || null,
     quality: qualityStateOf(qa.pick),
     cost: economicCost(qa.pick),
     latency: latencyOf(qa.pick)
   };
-  const operationalOnly = { slug: picked && picked.primary, id: picked && picked.id };
+  const operationalOnly = { slug: picked && picked.primary, id: picked && picked.id, routeId: (picked && picked.primaryRef && picked.primaryRef.routeId) || null };
+  // The reason the quality-aware pick differs (or does not): cold-start
+  // allowance, below-floor rejection, or no eligible route at all. Recorded so
+  // "how often did constraints produce no candidate" is answerable later.
+  const qaState = qualityAware ? (qualityAware.quality && qualityAware.quality.state) || "cold" : "none";
+  const qaReason = !qualityAware
+    ? "no constraint-eligible route"
+    : qa.eligibleCount === 0
+      ? "constraints produced no candidate"
+      : qualityAware.quality && qualityAware.quality.state === "cold"
+        ? "cold-start allowance"
+        : "quality ok";
   return {
     version: 2,
     shadow: {
@@ -344,7 +356,9 @@ export function shadowDecide({ routes, taskIR, preference }) {
       floors: qa.floors,
       considered: qa.consideredCount,
       eligible: qa.eligibleCount,
-      rejected_by_constraint: qa.rejected
+      rejected_by_constraint: qa.rejected,
+      quality_state: qaState,
+      quality_reason: qaReason
     },
     taskIR: taskIR && {
       task: taskIR.task,
