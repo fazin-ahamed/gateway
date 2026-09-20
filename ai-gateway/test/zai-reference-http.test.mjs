@@ -152,17 +152,18 @@ test("live explicit vision=false overrides static flash vision fallback", async 
   assert.deepEqual(resolved.modalities.input, ["text"]);
 });
 
-test("throwaway chat-id pool is local, replenished, and cleanup is async", async () => {
+test("throwaway chat-id pool hands out local distinct ids; cleanup is async at the reuse limit", async () => {
   resetZaiSessionPools();
   const a = acquireZaiChatId("acct", 2);
   const b = acquireZaiChatId("acct", 2);
-  assert.notEqual(a.chatId, b.chatId);
-  assert.equal(zaiSessionPoolStatus("acct").ready, 2);
+  assert.notEqual(a.chatId, b.chatId, "each acquire gets its own local id");
 
+  // With reuse=1 (legacy behavior), the first release deletes immediately.
   let cleaned = "";
-  releaseZaiChatId("acct", a.chatId, async (id) => { cleaned = id; });
+  const c = acquireZaiChatId("legacy-acct", 2, 1);
+  releaseZaiChatId("legacy-acct", c.chatId, async (id) => { cleaned = id; });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(cleaned, a.chatId);
+  assert.equal(cleaned, c.chatId, "reuse=1 deletes on first release, asynchronously");
 });
 
 test("vision pipeline uploads data URLs and rewrites image_url to the ZAI file id", async () => {

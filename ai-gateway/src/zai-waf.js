@@ -46,43 +46,93 @@ export function createZaiWafController(options = {}) {
   const maxPaceMs = Math.max(minPaceMs, Number(options.maxPaceMs) || DEFAULT_MAX_PACE_MS);
 
   let blockCount = 0;
-  let openUntil = 0;
+  let blocked = false;
+  let nextProbeAt = 0;
   let cooldownMs = 0;
   let lastReason = "";
   let nextAllowedAt = 0;
   let lane = Promise.resolve();
+  let probing = false;
+  let probeFn = typeof options.probe === "function" ? options.probe : null;
 
-  const retryAfterSec = () => openUntil > now() ? Math.max(1, Math.ceil((openUntil - now()) / 1000)) : 0;
+  // Time until the breaker will next ATTEMPT a recovery probe. Not a promise
+  // that traffic resumes then — only a passing probe (or a real success)
+  // clears the block.
+  const retryAfterSec = () => (blocked && nextProbeAt > now()) ? Math.max(1, Math.ceil((nextProbeAt - now()) / 1000)) : (blocked ? 1 : 0);
 
   const status = () => ({
-    blocked: openUntil > now(),
+    blocked,
     blockCount,
-    cooldownMs: openUntil > now() ? cooldownMs : (blockCount ? cooldownMs : 0),
+    consecutiveBlocks: blockCount,
+    cooldownMs: blocked ? cooldownMs : 0,
     retryAfterSec: retryAfterSec(),
+    probing,
     lastReason
   });
 
+  const escalate = () => {
+    // 60s -> 120s -> 240s -> ... -> maxCooldownMs (default 30 min).
+    cooldownMs = Math.min(maxCooldownMs, baseCooldownMs * (2 ** Math.max(0, blockCount - 1)));
+    nextProbeAt = now() + cooldownMs;
+  };
+
+  // Kick a recovery probe if the breaker is open, a probe is due, none is in
+  // flight, and a probe function is registered. Fire-and-forget: a USER request
+  // must never become the recovery test, and it must not wait on the probe.
+  const maybeProbe = () => {
+    if (!blocked || probing || !probeFn || nextProbeAt > now())
+      return;
+    probing = true;
+    Promise.resolve()
+      .then(() => probeFn())
+      .then((recovered) => {
+        if (recovered) {
+          blocked = false;
+          blockCount = 0;
+          cooldownMs = 0;
+          nextProbeAt = 0;
+          lastReason = "";
+        } else {
+          // Still blocked: back off further before the next probe.
+          blockCount++;
+          escalate();
+        }
+      })
+      .catch(() => {
+        // Probe error is inconclusive: keep the breaker open, back off, retry.
+        blockCount++;
+        escalate();
+      })
+      .finally(() => { probing = false; });
+  };
+
   const assertAvailable = () => {
-    const retry = retryAfterSec();
-    if (retry > 0)
-      throw new ZaiWafBlockedError(retry);
+    if (blocked) {
+      // Opportunistically schedule recovery, then fail this caller fast.
+      maybeProbe();
+      throw new ZaiWafBlockedError(retryAfterSec());
+    }
   };
 
   const recordBlock = (reason = "edge-block") => {
     blockCount++;
-    cooldownMs = Math.min(maxCooldownMs, baseCooldownMs * (2 ** Math.max(0, blockCount - 1)));
-    openUntil = now() + cooldownMs;
+    blocked = true;
+    escalate();
     lastReason = String(reason || "edge-block").slice(0, 80);
     return status();
   };
 
   const recordSuccess = () => {
+    // A real completion is a stronger recovery signal than any probe.
     blockCount = 0;
-    openUntil = 0;
+    blocked = false;
     cooldownMs = 0;
+    nextProbeAt = 0;
     lastReason = "";
     return status();
   };
+
+  const setProbe = (fn) => { probeFn = typeof fn === "function" ? fn : null; };
 
   const pace = () => {
     const task = lane.catch(() => {}).then(async () => {
@@ -107,7 +157,7 @@ export function createZaiWafController(options = {}) {
     assertAvailable();
   };
 
-  return { status, assertAvailable, recordBlock, recordSuccess, pace, beforeRequest };
+  return { status, assertAvailable, recordBlock, recordSuccess, pace, beforeRequest, setProbe, maybeProbe };
 }
 
 export const zaiWaf = createZaiWafController();

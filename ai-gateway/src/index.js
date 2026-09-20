@@ -3,6 +3,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
+import { zaiWaf } from "./zai-waf.js";
+import { zaiSessionPoolStatus } from "./zai-session-pool.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
@@ -5441,6 +5443,26 @@ app.get("/admin/zai/diagnose", async (c) => {
   const report = await diagnoseZai(c, route, rawKey, {});
   report.helper_online = !!(await zaiHelperBase());
   return c.json(report);
+});
+// Z.AI egress health: WAF breaker state (blocked/probing/backoff) plus the
+// bounded-reuse session pool status. Admin-only; leaks no credentials, only
+// operational counters. Cheap — no upstream calls.
+app.get("/admin/zai/status", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const waf = zaiWaf.status();
+  return c.json({
+    waf: {
+      blocked: waf.blocked,
+      probing: waf.probing,
+      consecutiveBlocks: waf.consecutiveBlocks,
+      retryInSec: waf.retryAfterSec,
+      cooldownMs: waf.cooldownMs,
+      lastReason: waf.lastReason || null
+    },
+    sessions: zaiSessionPoolStatus()
+  });
 });
 // ---- Trajectory exporters ----
 // Each ok request/response pair becomes a training example. The request

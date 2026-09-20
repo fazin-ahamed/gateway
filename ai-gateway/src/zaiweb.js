@@ -600,6 +600,26 @@ function assertWafAvailable() {
   }
 }
 
+// Recovery probe for the WAF breaker. Hits the SAME completion path a real
+// request would, but with no account auth, no CAPTCHA proof, and no device
+// token — so it can never burn a single-use credential. The edge either
+// returns its block page (still blocked) or anything else (an auth/validation
+// error means the edge is reachable again → recovered). Returns true when the
+// egress is no longer blocked. Best-effort; any transport error is inconclusive
+// and the breaker treats it as "still blocked" (handled by the controller).
+async function zaiWafRecoveryProbe(fetchImpl) {
+  const fetcher = fetchImpl || globalThis.fetch;
+  const res = await fetcher(ZAI_CHAT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": ZAI_USER_AGENT },
+    body: JSON.stringify({ probe: true })
+  });
+  const status = Number(res && res.status) || 0;
+  const text = res ? String(await res.text().catch(() => "")).slice(0, 8192) : "";
+  return !isZaiWafBlock(status, text);
+}
+zaiWaf.setProbe(() => zaiWafRecoveryProbe());
+
 function credentialError() {
   return new ZaiWebError(503, "Z.ai session has no usable user id: guest bootstrap failed and no account token was supplied in the provider key.", "zai_credentials");
 }
@@ -808,7 +828,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   const thinking = resolveThinking(modelId, payload, entry);
   const features = resolveFeatures(payload, prepared.shim.active);
   const poolKey = String(route.zai_session_key || route.route_id || route.id || ("uid:" + userId));
-  const { chatId } = acquireZaiChatId(poolKey, route.zai_session_pool_size);
+  const { chatId } = acquireZaiChatId(poolKey, route.zai_session_pool_size, route.zai_session_reuse_count);
 
   // Match the reference's defer-style retirement: once a completion may have
   // referenced this UUID, every terminal path retires it. WAF blocks skip the
@@ -930,7 +950,11 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
 
   if (!up || !up.ok || !up.body) {
     const status = Number(up && up.status) || 502;
-    const text = up ? String(await up.text().catch(() => "")).slice(0, 300) : "";
+    // Detection reads a wide window (block markers can sit past the first few
+    // hundred bytes of an Aliyun HTML page); the user-facing message stays
+    // short and never echoes the block HTML.
+    const raw = up ? String(await up.text().catch(() => "")) : "";
+    const text = raw.slice(0, 8192);
     if (isZaiWafBlock(status, text)) {
       const state = zaiWaf.recordBlock("reference-http");
       retire();
@@ -941,7 +965,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     retire();
     if (/captcha\s+verification\s+failed/i.test(text))
       throw new ZaiWebError(502, "Z.ai rejected the freshly minted captcha proof.", "zai_captcha_rejected");
-    throw new ZaiWebError(status, "Z.ai completion error: " + text, "zai_completion");
+    throw new ZaiWebError(status, "Z.ai completion error: " + text.slice(0, 300), "zai_completion");
   }
 
   zaiWaf.recordSuccess();
