@@ -139,6 +139,10 @@ function isRetryableTransportError(err) {
     || /ECONNRESET|UND_ERR_SOCKET|ETIMEDOUT|ECONNREFUSED|socket connection was closed|fetch failed/i.test(msg);
 }
 function sseUpstreamDisconnect(message) {
+  // An interrupted stream must still end with a recognized terminal chunk.
+  // finish_reason "length" is the OpenAI-recognized non-success terminal: it
+  // tells clients the turn did NOT complete cleanly and can be retried. Never
+  // "stop" — that would read as a successful completion and suppress retries.
   return "data: " + JSON.stringify({
     error: {
       message: "Upstream stream disconnected",
@@ -146,6 +150,12 @@ function sseUpstreamDisconnect(message) {
       code: "upstream_socket_closed",
       retryable: true
     }
+  }) + "\n\ndata: " + JSON.stringify({
+    id: "gen-interrupted",
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: "unknown",
+    choices: [{ index: 0, delta: {}, finish_reason: "length" }]
   }) + "\n\ndata: [DONE]\n\n";
 }
 function closeSseGracefully(controller, enc, err) {
@@ -1937,6 +1947,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   let firstTokenAt = null;
   let lastUsage = usageHint || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
   let malformedSseSent = false;
+  let sawUpstreamError = false; // a forwarded upstream frame carried `error`
   let contentBuf = "";
   let reasoningBuf = "";
   let toolCallsBuf = [];
@@ -2047,6 +2058,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             continue;
           try {
             const obj = JSON.parse(data);
+            if (obj && typeof obj === "object" && obj.error)
+              sawUpstreamError = true; // forwarded failure frame: never stamp a clean stop below
             const u = usageFrom(obj);
             if (u && (u.total_tokens || u.completion_tokens || u.prompt_tokens))
               lastUsage = u;
@@ -2108,10 +2121,14 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       }
       if (!clientCancelled) {
         if (!finishSeen) {
+          // A stream that forwarded an upstream error frame (or malformed SSE)
+          // did not complete cleanly: the synthesized terminal must be a
+          // non-success finish ("length"), never a clean "stop".
+          const cleanEnd = !sawUpstreamError && !malformedSseSent;
           const finishReason = normalizeTerminalFinishReason(
             null,
             hasAccumulatedToolCalls(toolCallsBuf),
-            !!(contentBuf || reasoningBuf)
+            !!(contentBuf || reasoningBuf) && cleanEnd
           );
           const finishChunk = {
             id: "gen-" + requestId,
@@ -6024,7 +6041,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { stripHistoricalReasoning, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { stripHistoricalReasoning, closeSseGracefully, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
