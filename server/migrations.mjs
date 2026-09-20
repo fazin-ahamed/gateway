@@ -53,3 +53,23 @@ export function migratePrices(db) {
     console.warn("[gateway] prices provider-key migration skipped:", e.message);
   }
 }
+
+// schema.sql uses CREATE TABLE IF NOT EXISTS, so an existing DB never gets the
+// canonical_model_id column added later — the quality-observation INSERT then
+// fails on every request ("no such column: canonical_model_id"), silently
+// killing the whole quality layer on any deployment whose DB predates the
+// column. Same class as the providers.enabled/key_strategy fixes below.
+export function migrateQualityIdentity(db) {
+  try {
+    const r = db.prepare("PRAGMA table_info(quality_observations)").all();
+    const names = new Set(((r && r.results) || []).map((c) => c && c.name));
+    if (names.has("canonical_model_id")) return false;
+    db.exec("ALTER TABLE quality_observations ADD COLUMN canonical_model_id TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_quality_model_task ON quality_observations(canonical_model_id, task_type, created_at)");
+    console.warn("[gateway] migration: added quality_observations.canonical_model_id");
+    return true;
+  } catch (e) {
+    console.warn("[gateway] quality identity migration skipped:", e.message);
+    return false;
+  }
+}

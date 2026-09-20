@@ -158,7 +158,33 @@ current_head() {
 }
 
 fetch_remote() {
-  git fetch --quiet origin main 2>/dev/null || git fetch --quiet origin
+  # Never block on interactive prompts. A 401 from a private/unreachable
+  # remote makes git ask for a username on stdin; this watcher is a background
+  # job whose stdin is the terminal, so the read raises SIGTTIN and the whole
+  # watcher gets Stopped (that is the "[1]+ Stopped" death). GIT_TERMINAL_PROMPT=0
+  # turns auth failure into a fast non-zero exit the caller retries next poll.
+  # Credential helpers are kept: they serve GITHUB_PAT from $ENV_FILE/.env.
+  GIT_TERMINAL_PROMPT=0 git fetch --quiet origin main 2>/dev/null \
+    || GIT_TERMINAL_PROMPT=0 git fetch --quiet origin
+}
+
+# Idempotent: register the in-repo PAT credential helper for this clone so a
+# private origin authenticates from $ENV_FILE with no manual git config. The
+# empty value first clears helpers inherited from global config, then PAT is
+# tried first and gh (if installed and logged in) is the silent fallback.
+register_pat_helper() {
+  [ -x "$ROOT/scripts/git-credential-github-pat.sh" ] || return 0
+  helper="!$ROOT/scripts/git-credential-github-pat.sh"
+  current=$(git config --get-all credential.https://github.com.helper 2>/dev/null || true)
+  case "$current" in
+    *"$helper"*) return 0 ;;
+  esac
+  git config credential.https://github.com.helper ''
+  git config --add credential.https://github.com.helper "$helper"
+  if command -v gh >/dev/null 2>&1; then
+    git config --add credential.https://github.com.helper '!gh auth git-credential'
+  fi
+  log "registered PAT credential helper (GITHUB_PAT from $ENV_FILE)"
 }
 
 remote_head() {
@@ -168,6 +194,7 @@ remote_head() {
     git rev-parse FETCH_HEAD
   fi
 }
+register_pat_helper
 
 log "watching $ROOT (poll=${POLL}s port=$PORT)"
 restart_server
