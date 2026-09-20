@@ -1087,6 +1087,33 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     await releaseResponseCacheLease(c, cacheKey, cacheLeaseId);
   }
 }
+// Private reasoning is a per-generation, per-model artifact — never valid
+// conversational state to feed back into a (possibly different) provider. A
+// client that echoes assistant `reasoning_content`/`thinking` from an earlier
+// turn would otherwise ship another model's stale scratch work upstream, which
+// at large context is tens of thousands of contaminating tokens. Strip these
+// fields from HISTORICAL assistant messages before forwarding; keep content +
+// tool_calls (the real conversation state). The Z.AI shim already folds to
+// content+tool_calls, so this covers the generic OpenAI/OCI/Koyeb/Anthropic
+// paths. Returns the same payload object when nothing needed stripping.
+var REASONING_FIELDS = ["reasoning_content", "reasoning", "thinking", "analysis", "thinking_blocks", "reasoning_details"];
+function stripHistoricalReasoning(payload) {
+  const msgs = payload && Array.isArray(payload.messages) ? payload.messages : null;
+  if (!msgs) return payload;
+  let dirty = false;
+  const cleaned = msgs.map((m) => {
+    if (!m || m.role !== "assistant") return m;
+    let hit = false;
+    for (const f of REASONING_FIELDS) if (f in Object(m)) { hit = true; break; }
+    if (!hit) return m;
+    dirty = true;
+    const copy = { ...m };
+    for (const f of REASONING_FIELDS) delete copy[f];
+    return copy;
+  });
+  if (!dirty) return payload;
+  return { ...payload, messages: cleaned };
+}
 async function forwardToProvider(c, route, apiKey, payload, isStream, requestId) {
   const fmt2 = (route.fmt || "openai").toLowerCase();
   // Auto proxy-pool: resolve the sticky egress once per request for Z.AI
@@ -1116,6 +1143,13 @@ async function forwardToProvider(c, route, apiKey, payload, isStream, requestId)
     blog("FWD zaiweb model=" + (route.upstream_model || (payload && payload.model)));
     return callZaiWeb(c, route, apiKey, payload, isStream, (url, init) => upstreamFetch(c, url, init));
   }
+  // Non-Z.AI paths forward the caller's messages to the provider; scrub any
+  // stale cross-model private reasoning first (the Z.AI shim already strips it).
+  // A provider that genuinely needs its own opaque reasoning artifact for
+  // continuation opts out EXPLICITLY via route.preserve_reasoning — the default
+  // cross-model path never carries another model's hidden reasoning.
+  if (!route.preserve_reasoning)
+    payload = stripHistoricalReasoning(payload);
   const transport = routeTransport(route, c.env);
   if (transport === "oci" && route.proxy_url) {
     blog("FWD proxy_url present len=" + route.proxy_url.length);
@@ -5909,7 +5943,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { stripHistoricalReasoning, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
