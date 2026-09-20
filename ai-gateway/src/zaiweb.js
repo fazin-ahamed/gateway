@@ -484,12 +484,27 @@ function toOpenAiStream(source, model, id, agent = false, tools = [], onComplete
           try { onComplete({ reasoning: accReasoning, toolCalls: accToolCalls }); } catch {}
         }
       };
+      // Transport/upstream failure: never drain the interceptor tail (a
+      // half-parsed tool call must not be flushed and executed) and never
+      // report tool_calls/stop — the turn did not complete. finish_reason
+      // "length" marks an interrupted generation so clients can retry cleanly.
+      const finishInterrupted = (errObj) => {
+        if (finished)
+          return;
+        finished = true;
+        if (errObj)
+          send(errObj);
+        const usage = { prompt_tokens: 0, completion_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), total_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), cost_usd: 0 };
+        send(chunk(id, created, model, {}, "length", usage));
+        controller.enqueue(enc.encode("data: [DONE]\n\n"));
+        if (onComplete) {
+          try { onComplete({ reasoning: accReasoning, toolCalls: accToolCalls }); } catch {}
+        }
+      };
       try {
         await readDeltas(source, (delta) => {
           if (delta.error) {
-            finished = true;
-            send({ error: { message: "Upstream stream failed", type: "upstream_stream_error", code: "upstream_stream_error", retryable: true } });
-            controller.enqueue(enc.encode("data: [DONE]\n\n"));
+            finishInterrupted({ error: { message: "Upstream stream failed", type: "upstream_stream_error", code: "upstream_stream_error", retryable: true } });
             return true;
           }
           if (delta.reasoning) {
@@ -535,8 +550,7 @@ function toOpenAiStream(source, model, id, agent = false, tools = [], onComplete
         controller.close();
       } catch (e) {
         try {
-          send({ error: { message: "Upstream stream disconnected", type: "upstream_stream_error", code: "upstream_socket_closed", retryable: true } });
-          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          finishInterrupted({ error: { message: "Upstream stream disconnected", type: "upstream_stream_error", code: "upstream_socket_closed", retryable: true } });
           controller.close();
         } catch {
         }

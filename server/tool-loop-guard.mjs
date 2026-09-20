@@ -10,13 +10,14 @@ export function repairEditToolArguments(name, rawArgs, tools = []) {
 const enc = new TextEncoder();
 
 export function normalizeTerminalFinishReason(reason, sawToolCalls, cleanDone = true) {
+  if (!cleanDone) return "length";
   const value = reason == null ? null : String(reason);
   if (sawToolCalls) {
     if (value === "length" || value === "content_filter") return value;
     return "tool_calls";
   }
   if (value) return value;
-  return cleanDone ? "stop" : null;
+  return "stop";
 }
 
 function terminalChunk(model, finishReason) {
@@ -83,9 +84,10 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
         }
         const payload = line.slice(5).trim();
         if (payload === "[DONE]") {
-          flushPending();
-          if (sawToolCalls && !terminalSeen && !streamFailed) {
-            emitObj(terminalChunk(model, "tool_calls"));
+          if (!streamFailed) flushPending();
+          if (!terminalSeen) {
+            const fr = streamFailed ? "length" : (sawToolCalls ? "tool_calls" : "stop");
+            emitObj(terminalChunk(model, fr));
             terminalSeen = true;
           }
           emit("data: [DONE]\n\n");
@@ -183,8 +185,13 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
         }
         buffer += dec.decode();
         if (buffer.trim()) handleLine(buffer);
-        // Unclean EOF: never silently discard a completed buffered edit.
+        // Unclean EOF: never silently discard a completed buffered edit if stream did not fail.
         if (!streamFailed) flushPending();
+        if (!terminalSeen) {
+          const fr = streamFailed ? "length" : (sawToolCalls ? "tool_calls" : "stop");
+          emitObj(terminalChunk(model, fr));
+          terminalSeen = true;
+        }
         controller.close();
       } catch {
         try {
@@ -196,6 +203,10 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
               retryable: true
             }
           });
+          if (!terminalSeen) {
+            emitObj(terminalChunk(model, "length"));
+            terminalSeen = true;
+          }
           emit("data: [DONE]\n\n");
           controller.close();
         } catch {}

@@ -23,7 +23,11 @@ test("plain completed text without a finish reason receives stop", () => {
 });
 
 test("an unclean EOF is not disguised as a successful stop", () => {
-  assert.equal(normalizeTerminalFinishReason(null, false, false), null);
+  // An interrupted stream normalizes to finish_reason "length" — a recognized
+  // non-success terminal — so clients retry the turn instead of treating it as
+  // cleanly completed. It must never normalize to "stop".
+  assert.equal(normalizeTerminalFinishReason(null, false, false), "length");
+  assert.notEqual(normalizeTerminalFinishReason(null, false, false), "stop");
 });
 
 test("SSE stop after a tool call is rewritten to tool_calls", async () => {
