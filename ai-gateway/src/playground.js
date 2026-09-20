@@ -171,6 +171,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="auto">Auto</button>
   <button type="button" data-tab="proxies">Proxies</button>
+  <button type="button" data-tab="tokens">Device tokens</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -414,9 +415,11 @@ var PLAYGROUND_HTML = `<!doctype html>
     </div></div>
     <div class="hero-stats" id="px-stats"></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Pool</h2></div><div class="panel-b flush" id="px-list"></div></div>
-    <div class="panel"><div class="panel-h"><h2 class="sec">Z.AI device tokens</h2></div><div class="panel-b">
-      <p class="hint" style="margin-top:0">Single-use Aliyun device tokens consumed as CAPTCHA proofs are minted. The SQLite FIFO is the live queue; the legacy <span class="mono">.txt</span> file is fallback only. Token values are never displayed.</p>
-      <div class="hero-stats" id="zt-stats"></div>
+  </section>
+  <section class="tab" id="tab-tokens">
+    <div class="pagehead"><div><h2 class="sec">Z.AI device tokens</h2><p class="sub">Single-use Aliyun device tokens consumed as CAPTCHA proofs are minted. The SQLite FIFO is the live queue; the legacy .txt file is fallback only. Token values are never displayed.</p></div></div>
+    <div class="hero-stats" id="zt-stats"></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Refill</h2></div><div class="panel-b">
       <textarea id="zt-import" rows="4" placeholder="one device token per line" style="width:100%;font-family:monospace;font-size:12px"></textarea>
       <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
         <button class="act" id="zt-import-btn">Add tokens</button>
@@ -484,7 +487,8 @@ async function selectTab(t){
     if(t==='limits') await loadLimits();
     if(t==='auto') await loadAutoSettings();
     if(t==='trajectories') await loadTrajectories();
-    if(t==='proxies'){ await loadProxies(); await loadZaiTokens(); }
+    if(t==='proxies') await loadProxies();
+    if(t==='tokens') await loadZaiTokens();
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
