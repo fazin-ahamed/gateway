@@ -5004,15 +5004,18 @@ async function resolveActiveEgress(c) {
   // attribution must use the id this request actually dialed, not the global.
   const bind = (url) => { if (c) c.zaiEgressId = activeEgress.id; return url; };
   const now = Date.now();
-  // Re-validate the sticky choice cheaply; only re-pick if it is no longer a
-  // healthy/untested enabled row.
-  if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS)
+  // WAF-blocked is NOT transport-dead: the proxy may be perfectly healthy
+  // for other destinations. Exclude it from Z.AI auto-selection only.
+  const wafBlocked = (id) => zaiWaf.isBlocked(id == null ? "direct" : "proxy:" + id);
+  // Sticky TTL: drop the sticky pick if ITS breaker just opened, rather than
+  // keep routing onto a blocked egress for up to 30s.
+  if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS && !wafBlocked(activeEgress.id))
     return bind(activeEgress.url);
   const rows = await c.env.DB.prepare(
     "SELECT id, scheme, host, port, username, password_enc, status, last_latency_ms, success_count FROM proxy_pool WHERE enabled=1 AND status='healthy'"
   ).all();
-  const candidates = (rows.results || []).slice().sort(compareProxyRank);
-  // Keep the current sticky pick if it is still a healthy candidate.
+  const candidates = (rows.results || []).slice().filter((r) => !wafBlocked(r.id)).sort(compareProxyRank);
+  // Keep the current sticky pick if it is still a healthy, unblocked candidate.
   if (activeEgress.id != null) {
     const keep = candidates.find((r) => r.id === activeEgress.id);
     if (keep) {
@@ -5455,11 +5458,9 @@ app.get("/admin/zai/status", async (c) => {
   return c.json({
     waf: {
       blocked: waf.blocked,
-      probing: waf.probing,
-      consecutiveBlocks: waf.consecutiveBlocks,
-      retryInSec: waf.retryAfterSec,
-      cooldownMs: waf.cooldownMs,
-      lastReason: waf.lastReason || null
+      anyProbing: waf.anyProbing,
+      blockedEgresses: waf.blockedEgresses || [],
+      egresses: waf.egresses || []
     },
     sessions: zaiSessionPoolStatus()
   });

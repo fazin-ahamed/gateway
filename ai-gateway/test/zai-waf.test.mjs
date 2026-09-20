@@ -3,88 +3,89 @@ import assert from "node:assert/strict";
 
 import { createZaiWafController, isZaiWafBlock } from "../src/zai-waf.js";
 
-test("WAF breaker fails fast, escalates cooldown, and stays blocked past the timer (probe owns recovery)", () => {
+test("breaker fails fast, escalates cooldown, and stays blocked past the timer (probe owns recovery)", () => {
   let now = 1_000;
   const waf = createZaiWafController({
-    now: () => now,
-    sleep: async () => {},
-    random: () => 0,
-    baseCooldownMs: 60_000,
-    maxCooldownMs: 30 * 60_000,
-    minPaceMs: 200,
-    maxPaceMs: 200
+    now: () => now, sleep: async () => {}, random: () => 0,
+    baseCooldownMs: 60_000, maxCooldownMs: 30 * 60_000, minPaceMs: 200, maxPaceMs: 200
   });
 
-  waf.recordBlock("completion");
-  assert.equal(waf.status().blocked, true);
-  assert.equal(waf.status().cooldownMs, 60_000);
-  assert.throws(() => waf.assertAvailable(), (err) => err?.code === "zai_waf_blocked" && err?.retryAfterSec === 60);
+  waf.recordBlock("direct", "completion");
+  assert.equal(waf.status("direct").blocked, true);
+  assert.equal(waf.status("direct").cooldownMs, 60_000);
+  assert.throws(() => waf.assertAvailable("direct"), (err) => err?.code === "zai_waf_blocked" && err?.retryAfterSec === 60);
 
-  // Timer expiry alone must NOT reopen the breaker: with no probe registered,
-  // a user request still fails fast. This is the core fix — traffic never
-  // becomes the recovery test.
+  // Timer expiry alone must NOT reopen the breaker: with no probe registered, a
+  // user request still fails fast. Traffic never becomes the recovery test.
   now += 60_001;
-  assert.throws(() => waf.assertAvailable(), (err) => err?.code === "zai_waf_blocked");
-  assert.equal(waf.status().blocked, true, "still blocked after the timer with no successful probe");
+  assert.throws(() => waf.assertAvailable("direct"), (err) => err?.code === "zai_waf_blocked");
+  assert.equal(waf.status("direct").blocked, true, "still blocked after the timer with no successful probe");
 });
 
-test("recovery probe owns reopening: a passing probe clears the block, a failing one escalates backoff", async () => {
+test("WAF state is per-egress: one blocked proxy never blocks the others or direct", () => {
+  const waf = createZaiWafController({ now: () => 0, sleep: async () => {}, random: () => 0 });
+  waf.recordBlock("proxy:17", "completion");
+  assert.equal(waf.isBlocked("proxy:17"), true, "the blocked proxy's lane is open");
+  assert.equal(waf.isBlocked("proxy:23"), false, "a different proxy is unaffected");
+  assert.equal(waf.isBlocked("direct"), false, "direct is unaffected");
+  assert.doesNotThrow(() => waf.assertAvailable("proxy:23"));
+  assert.throws(() => waf.assertAvailable("proxy:17"));
+
+  const roll = waf.status();
+  assert.equal(roll.blocked, true, "rolled-up blocked = any egress blocked");
+  assert.deepEqual(roll.blockedEgresses, ["proxy:17"]);
+  assert.equal(roll.egresses.length, 3, "direct + proxy:17 + proxy:23 lanes seen");
+});
+
+test("recovery probe receives the frozen target of the blocked egress, not whatever is active now", async () => {
   let now = 0;
+  const seenTargets = [];
   let healthy = false;
-  let probes = 0;
   const waf = createZaiWafController({
-    now: () => now,
-    sleep: async () => {},
-    random: () => 0,
-    baseCooldownMs: 60_000,
-    maxCooldownMs: 30 * 60_000,
-    probe: async () => { probes++; return healthy; }
+    now: () => now, sleep: async () => {}, random: () => 0,
+    baseCooldownMs: 60_000, maxCooldownMs: 30 * 60_000,
+    probe: async ({ egress, target }) => { seenTargets.push({ egress, target }); return healthy; }
   });
 
-  waf.recordBlock("completion");
-  assert.equal(waf.status().cooldownMs, 60_000);
-
-  // Probe not yet due -> assertAvailable throws and does not probe.
-  assert.throws(() => waf.assertAvailable());
-  assert.equal(probes, 0, "no probe before the cooldown window elapses");
-
-  // Cooldown elapsed, still blocked upstream: probe fires, fails, backs off.
+  // proxy:17 blocked; freeze its exact dialed URL as the probe target.
+  waf.recordBlock("proxy:17", "completion", { egressId: 17, egressUrl: "http://user:pw@proxy17:8080" });
   now += 60_001;
-  assert.throws(() => waf.assertAvailable());
+  assert.throws(() => waf.assertAvailable("proxy:17"));
   await new Promise((r) => setTimeout(r, 0));
-  assert.equal(probes, 1, "one recovery probe fired when due");
-  assert.equal(waf.status().blocked, true, "failed probe keeps the breaker open");
-  assert.equal(waf.status().cooldownMs, 120_000, "failed probe escalates the cooldown");
+  assert.equal(seenTargets.length, 1, "one probe fired for proxy:17");
+  assert.equal(seenTargets[0].egress, "proxy:17");
+  assert.equal(seenTargets[0].target.egressId, 17, "probe re-dials the exact frozen egress");
+  assert.equal(seenTargets[0].target.egressUrl, "http://user:pw@proxy17:8080");
+  assert.equal(waf.status("proxy:17").cooldownMs, 120_000, "failed probe escalates that lane's backoff");
 
-  // Upstream recovers: the next due probe passes and clears the block.
+  // Upstream recovers on proxy:17: next due probe clears only that lane.
   healthy = true;
   now += 120_001;
-  assert.throws(() => waf.assertAvailable());
+  assert.throws(() => waf.assertAvailable("proxy:17"));
   await new Promise((r) => setTimeout(r, 0));
-  assert.equal(waf.status().blocked, false, "a passing probe reopens the breaker");
-  assert.doesNotThrow(() => waf.assertAvailable());
+  assert.equal(waf.isBlocked("proxy:17"), false, "a passing probe clears the blocked lane");
 });
 
-test("a confirmed healthy response resets WAF backoff immediately", () => {
+test("a confirmed healthy response resets that egress's backoff immediately", () => {
   let now = 0;
   const waf = createZaiWafController({ now: () => now, sleep: async () => {}, random: () => 0 });
-  waf.recordBlock();
+  waf.recordBlock("proxy:5");
   now += 60_001;
-  waf.recordBlock();
-  assert.ok(waf.status().blockCount >= 2);
-  waf.recordSuccess();
-  assert.deepEqual(waf.status(), { blocked: false, blockCount: 0, consecutiveBlocks: 0, cooldownMs: 0, retryAfterSec: 0, probing: false, lastReason: "" });
+  waf.recordBlock("proxy:5");
+  assert.ok(waf.status("proxy:5").blockCount >= 2);
+  waf.recordSuccess("proxy:5");
+  assert.deepEqual(waf.status("proxy:5"), {
+    egress: "proxy:5", blocked: false, blockCount: 0, consecutiveBlocks: 0,
+    cooldownMs: 0, retryAfterSec: 0, probing: false, lastReason: ""
+  });
 });
 
-test("shared pacing serializes upstream POST starts", async () => {
+test("shared pacing serializes upstream POST starts across all egresses", async () => {
   let now = 0;
   const sleeps = [];
   const waf = createZaiWafController({
-    now: () => now,
-    sleep: async (ms) => { sleeps.push(ms); now += ms; },
-    random: () => 0,
-    minPaceMs: 200,
-    maxPaceMs: 200
+    now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; }, random: () => 0,
+    minPaceMs: 200, maxPaceMs: 200
   });
 
   await Promise.all([waf.pace(), waf.pace(), waf.pace()]);

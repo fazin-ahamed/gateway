@@ -45,97 +45,127 @@ export function createZaiWafController(options = {}) {
   const minPaceMs = Math.max(0, Number(options.minPaceMs) || DEFAULT_MIN_PACE_MS);
   const maxPaceMs = Math.max(minPaceMs, Number(options.maxPaceMs) || DEFAULT_MAX_PACE_MS);
 
-  let blockCount = 0;
-  let blocked = false;
-  let nextProbeAt = 0;
-  let cooldownMs = 0;
-  let lastReason = "";
+  // WAF blocks are egress-IP conditions: one proxy can be blocked while others
+  // (and direct) stay healthy. State is therefore keyed by egress ("direct" or
+  // "proxy:<id>"), never process-global. Pacing stays global — it protects the
+  // shared upstream, not a single egress.
+  const lanes = new Map();
   let nextAllowedAt = 0;
-  let lane = Promise.resolve();
-  let probing = false;
+  let pacingLane = Promise.resolve();
   let probeFn = typeof options.probe === "function" ? options.probe : null;
 
-  // Time until the breaker will next ATTEMPT a recovery probe. Not a promise
-  // that traffic resumes then — only a passing probe (or a real success)
-  // clears the block.
-  const retryAfterSec = () => (blocked && nextProbeAt > now()) ? Math.max(1, Math.ceil((nextProbeAt - now()) / 1000)) : (blocked ? 1 : 0);
-
-  const status = () => ({
-    blocked,
-    blockCount,
-    consecutiveBlocks: blockCount,
-    cooldownMs: blocked ? cooldownMs : 0,
-    retryAfterSec: retryAfterSec(),
-    probing,
-    lastReason
-  });
-
-  const escalate = () => {
-    // 60s -> 120s -> 240s -> ... -> maxCooldownMs (default 30 min).
-    cooldownMs = Math.min(maxCooldownMs, baseCooldownMs * (2 ** Math.max(0, blockCount - 1)));
-    nextProbeAt = now() + cooldownMs;
+  const laneOf = (egressKey) => {
+    const key = String(egressKey || "direct");
+    let s = lanes.get(key);
+    if (!s) {
+      s = { key, blockCount: 0, blocked: false, nextProbeAt: 0, cooldownMs: 0, lastReason: "", probing: false, target: null };
+      lanes.set(key, s);
+    }
+    return s;
   };
 
-  // Kick a recovery probe if the breaker is open, a probe is due, none is in
-  // flight, and a probe function is registered. Fire-and-forget: a USER request
-  // must never become the recovery test, and it must not wait on the probe.
-  const maybeProbe = () => {
-    if (!blocked || probing || !probeFn || nextProbeAt > now())
+  const retryAfterSecOf = (s) => (s.blocked && s.nextProbeAt > now()) ? Math.max(1, Math.ceil((s.nextProbeAt - now()) / 1000)) : (s.blocked ? 1 : 0);
+
+  const shape = (s) => ({
+    egress: s.key,
+    blocked: s.blocked,
+    blockCount: s.blockCount,
+    consecutiveBlocks: s.blockCount,
+    cooldownMs: s.blocked ? s.cooldownMs : 0,
+    retryAfterSec: retryAfterSecOf(s),
+    probing: s.probing,
+    lastReason: s.lastReason
+  });
+
+  // status(key) -> one egress lane. status() with no key -> all lanes plus a
+  // rolled-up `blocked` (any egress blocked) for the admin surface.
+  const status = (egressKey) => {
+    if (egressKey != null)
+      return shape(laneOf(egressKey));
+    const egresses = [...lanes.values()].map(shape);
+    return {
+      blocked: egresses.some((e) => e.blocked),
+      anyProbing: egresses.some((e) => e.probing),
+      blockedEgresses: egresses.filter((e) => e.blocked).map((e) => e.egress),
+      egresses
+    };
+  };
+
+  const escalate = (s) => {
+    // 60s -> 120s -> 240s -> ... -> maxCooldownMs (default 30 min).
+    s.cooldownMs = Math.min(maxCooldownMs, baseCooldownMs * (2 ** Math.max(0, s.blockCount - 1)));
+    s.nextProbeAt = now() + s.cooldownMs;
+  };
+
+  // Kick a recovery probe for THIS egress if its breaker is open, a probe is
+  // due, none is in flight, and a probe function is registered. Fire-and-forget:
+  // a user request never becomes the recovery test. The probe is handed the
+  // frozen target captured at block time, so it always traverses the exact
+  // egress that was blocked — never whatever egress is active now.
+  const maybeProbe = (s) => {
+    if (!s.blocked || s.probing || !probeFn || s.nextProbeAt > now())
       return;
-    probing = true;
+    s.probing = true;
     Promise.resolve()
-      .then(() => probeFn())
+      .then(() => probeFn({ egress: s.key, target: s.target }))
       .then((recovered) => {
         if (recovered) {
-          blocked = false;
-          blockCount = 0;
-          cooldownMs = 0;
-          nextProbeAt = 0;
-          lastReason = "";
+          s.blocked = false;
+          s.blockCount = 0;
+          s.cooldownMs = 0;
+          s.nextProbeAt = 0;
+          s.lastReason = "";
+          s.target = null;
         } else {
-          // Still blocked: back off further before the next probe.
-          blockCount++;
-          escalate();
+          s.blockCount++;
+          escalate(s);
         }
       })
       .catch(() => {
         // Probe error is inconclusive: keep the breaker open, back off, retry.
-        blockCount++;
-        escalate();
+        s.blockCount++;
+        escalate(s);
       })
-      .finally(() => { probing = false; });
+      .finally(() => { s.probing = false; });
   };
 
-  const assertAvailable = () => {
-    if (blocked) {
-      // Opportunistically schedule recovery, then fail this caller fast.
-      maybeProbe();
-      throw new ZaiWafBlockedError(retryAfterSec());
+  const assertAvailable = (egressKey) => {
+    const s = laneOf(egressKey);
+    if (s.blocked) {
+      maybeProbe(s);
+      throw new ZaiWafBlockedError(retryAfterSecOf(s));
     }
   };
 
-  const recordBlock = (reason = "edge-block") => {
-    blockCount++;
-    blocked = true;
-    escalate();
-    lastReason = String(reason || "edge-block").slice(0, 80);
-    return status();
+  // target: { egressId, egressUrl } frozen so the recovery probe re-uses the
+  // exact blocked path (with its already-resolved credentials).
+  const recordBlock = (egressKey, reason = "edge-block", target = null) => {
+    const s = laneOf(egressKey);
+    s.blockCount++;
+    s.blocked = true;
+    if (target) s.target = target;
+    escalate(s);
+    s.lastReason = String(reason || "edge-block").slice(0, 80);
+    return shape(s);
   };
 
-  const recordSuccess = () => {
-    // A real completion is a stronger recovery signal than any probe.
-    blockCount = 0;
-    blocked = false;
-    cooldownMs = 0;
-    nextProbeAt = 0;
-    lastReason = "";
-    return status();
+  const recordSuccess = (egressKey) => {
+    const s = laneOf(egressKey);
+    s.blockCount = 0;
+    s.blocked = false;
+    s.cooldownMs = 0;
+    s.nextProbeAt = 0;
+    s.lastReason = "";
+    s.target = null;
+    return shape(s);
   };
+
+  const isBlocked = (egressKey) => laneOf(egressKey).blocked;
 
   const setProbe = (fn) => { probeFn = typeof fn === "function" ? fn : null; };
 
   const pace = () => {
-    const task = lane.catch(() => {}).then(async () => {
+    const task = pacingLane.catch(() => {}).then(async () => {
       const before = now();
       const delay = Math.max(0, nextAllowedAt - before);
       if (delay > 0)
@@ -145,19 +175,19 @@ export function createZaiWafController(options = {}) {
       const after = now();
       nextAllowedAt = Math.max(after, nextAllowedAt) + interval;
     });
-    lane = task;
+    pacingLane = task;
     return task;
   };
 
-  const beforeRequest = async () => {
-    assertAvailable();
+  const beforeRequest = async (egressKey) => {
+    assertAvailable(egressKey);
     await pace();
     // A block might have been recorded while this caller waited in the shared
     // pacing lane. Re-check before it spends a captcha or sends the POST.
-    assertAvailable();
+    assertAvailable(egressKey);
   };
 
-  return { status, assertAvailable, recordBlock, recordSuccess, pace, beforeRequest, setProbe, maybeProbe };
+  return { status, assertAvailable, recordBlock, recordSuccess, isBlocked, pace, beforeRequest, setProbe, maybeProbe };
 }
 
 export const zaiWaf = createZaiWafController();

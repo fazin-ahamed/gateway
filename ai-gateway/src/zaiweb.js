@@ -584,31 +584,43 @@ function asWafError(err) {
   return out;
 }
 
-async function awaitWafSlot() {
+// Egress identity for the WAF breaker: a bound proxy id keys its own breaker
+// lane, so one blocked proxy never shuts down healthy egresses. Manual/direct
+// mode (no bound id) shares the "direct" lane.
+function egressKeyOf(c) {
+  const id = c && c.zaiEgressId != null ? c.zaiEgressId : null;
+  return id != null ? "proxy:" + id : "direct";
+}
+
+async function awaitWafSlot(egressKey) {
   try {
-    await zaiWaf.beforeRequest();
+    await zaiWaf.beforeRequest(egressKey);
   } catch (err) {
     throw asWafError(err);
   }
 }
 
-function assertWafAvailable() {
+function assertWafAvailable(egressKey) {
   try {
-    zaiWaf.assertAvailable();
+    zaiWaf.assertAvailable(egressKey);
   } catch (err) {
     throw asWafError(err);
   }
 }
 
 // Recovery probe for the WAF breaker. Hits the SAME completion path a real
-// request would, but with no account auth, no CAPTCHA proof, and no device
-// token — so it can never burn a single-use credential. The edge either
-// returns its block page (still blocked) or anything else (an auth/validation
-// error means the edge is reachable again → recovered). Returns true when the
-// egress is no longer blocked. Best-effort; any transport error is inconclusive
-// and the breaker treats it as "still blocked" (handled by the controller).
-async function zaiWafRecoveryProbe(fetchImpl) {
-  const fetcher = fetchImpl || globalThis.fetch;
+// request would — through the EXACT egress that was blocked (frozen at block
+// time), the same uTLS helper, and the same proxy — but with no account auth,
+// no CAPTCHA proof, and no device token, so it can never burn a single-use
+// credential. The edge either returns its block page (still blocked) or
+// anything else (an auth/validation error means the edge is reachable again →
+// recovered). Best-effort; any transport error is inconclusive and the
+// controller treats it as "still blocked".
+async function zaiWafRecoveryProbe({ target } = {}) {
+  // Reuse the frozen egress URL so the probe traverses the blocked proxy, not
+  // whatever egress happens to be active now. null target -> direct.
+  const egressUrl = target && target.egressUrl ? target.egressUrl : null;
+  const fetcher = wrapUtlsFetcher(globalThis.fetch, egressUrl);
   const res = await fetcher(ZAI_CHAT_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": ZAI_USER_AGENT },
@@ -618,7 +630,7 @@ async function zaiWafRecoveryProbe(fetchImpl) {
   const text = res ? String(await res.text().catch(() => "")).slice(0, 8192) : "";
   return !isZaiWafBlock(status, text);
 }
-zaiWaf.setProbe(() => zaiWafRecoveryProbe());
+zaiWaf.setProbe((ctx) => zaiWafRecoveryProbe(ctx));
 
 function credentialError() {
   return new ZaiWebError(503, "Z.ai session has no usable user id: guest bootstrap failed and no account token was supplied in the provider key.", "zai_credentials");
@@ -729,6 +741,10 @@ export function wrapUtlsFetcher(fetcher, egressProxy, onEgressFailure) {
 async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options = {}) {
   const baseFetcher = options.fetchImpl || (c && c.upstreamFetch) || globalThis.fetch;
   const fetcher = wrapUtlsFetcher(baseFetcher, options.egressProxy || (c && c.zaiEgress), (cls) => { if (c) c.__egressFailure = cls || "egress"; });
+  // Which egress this request rides — its own WAF breaker lane. The frozen
+  // target lets a later recovery probe re-dial this exact egress.
+  const egressKey = egressKeyOf(c);
+  const egressTarget = { egressId: (c && c.zaiEgressId != null) ? c.zaiEgressId : null, egressUrl: options.egressProxy || (c && c.zaiEgress) || null };
   const modelId = route.upstream_model || payload.model || ZAI_DEFAULT_MODEL;
   const staticCaps = getModelCapabilities(modelId);
 
@@ -748,7 +764,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
 
   // Reference flow rejects early during an IP/WAF block, before image uploads
   // and before burning a single-use device token.
-  assertWafAvailable();
+  assertWafAvailable(egressKey);
 
   const active = await session.acquire();
   let token = active.token;
@@ -769,7 +785,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     let host = "";
     try { host = new URL(String(url)).hostname; } catch {}
     if (host === "chat.z.ai")
-      await awaitWafSlot();
+      await awaitWafSlot(egressKey);
     return fetcher(url, init);
   };
 
@@ -834,10 +850,10 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   // referenced this UUID, every terminal path retires it. WAF blocks skip the
   // DELETE because poking a blocked edge only extends the problem.
   const cleanup = async (idToDelete) => {
-    if (!idToDelete || zaiWaf.status().blocked)
+    if (!idToDelete || zaiWaf.isBlocked(egressKey))
       return;
     try {
-      await awaitWafSlot();
+      await awaitWafSlot(egressKey);
       const res = await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
         method: "DELETE",
         headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
@@ -845,7 +861,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
       if (res.status === 401) {
         session.invalidate("chat delete 401");
         await session.refresh("chat delete 401").catch(() => {});
-        await awaitWafSlot();
+        await awaitWafSlot(egressKey);
         await fetcher(ZAI_DELETE_CHAT_URL(idToDelete), {
           method: "DELETE",
           headers: session.headers({ Accept: "application/json", "Content-Type": "application/json" })
@@ -889,7 +905,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
   };
 
   const postOnce = async (proof) => {
-    await awaitWafSlot();
+    await awaitWafSlot(egressKey);
     const timestamp = Date.now();
     const requestId = crypto.randomUUID();
     const signature = await buildSignature({ prompt, requestId, timestamp, userId });
@@ -956,7 +972,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     const raw = up ? String(await up.text().catch(() => "")) : "";
     const text = raw.slice(0, 8192);
     if (isZaiWafBlock(status, text)) {
-      const state = zaiWaf.recordBlock("reference-http");
+      const state = zaiWaf.recordBlock(egressKey, "reference-http", egressTarget);
       retire();
       const err = new ZaiWebError(503, "Z.ai temporarily blocked this gateway egress.", "zai_waf");
       err.retryAfterSec = state.retryAfterSec;
@@ -968,7 +984,7 @@ async function runReferenceZaiHttp(c, route, rawKey, payload, isStream, options 
     throw new ZaiWebError(status, "Z.ai completion error: " + text.slice(0, 300), "zai_completion");
   }
 
-  zaiWaf.recordSuccess();
+  zaiWaf.recordSuccess(egressKey);
 
   // Adopt any token rotation captured by the session cookie jar. The provider
   // key persistence layer above this adapter will reseal it after the call.
@@ -1209,7 +1225,8 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
   if (entry && entry.available === false)
     throw new ZaiWebError(503, 'Z.ai model "' + unprefixedModelId(modelId) + '" is not available for this account.', "zai_model_unavailable");
 
-  assertWafAvailable();
+  const browserEgressKey = egressKeyOf(c);
+  assertWafAvailable(browserEgressKey);
   const { runBrowserTurn, ZaiBrowserUnavailable } = c && c.zaiRunBrowserTurn
     ? { runBrowserTurn: c.zaiRunBrowserTurn, ZaiBrowserUnavailable: class extends Error {} }
     : await import("./zaibrowser.js");
@@ -1227,7 +1244,7 @@ export async function callZaiBrowser(c, route, rawKey, payload, isStream) {
     throw new ZaiWebError(502, "Z.AI browser transport failed: " + String(e && e.message || e).slice(0, 300), "zai_browser");
   }
 
-  zaiWaf.recordSuccess();
+  zaiWaf.recordSuccess(browserEgressKey);
   const id = "chatcmpl-zaib-" + Date.now().toString(36);
   const promptTokens = estimatePromptTokens(messages, 0) + images * IMAGE_TOKEN_ALLOWANCE;
   // The frame converter reads a stream; wrap the captured response text.

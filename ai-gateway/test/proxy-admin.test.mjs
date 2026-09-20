@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createApp, __test as t } from "../src/index.js";
 import { createDb } from "../../server/db.mjs";
 import { readFileSync } from "node:fs";
+import { zaiWaf } from "../src/zai-waf.js";
 
 function appWithDb() {
   const db = createDb(":memory:");
@@ -183,6 +184,29 @@ test("auto-select never picks an untested proxy (must prove health first)", asyn
   db.prepare("UPDATE proxy_pool SET status='healthy', last_latency_ms=100 WHERE host='1.2.3.4'").run();
   t.__resetActiveEgress();
   assert.match(await t.resolveActiveEgress(c), /1\.2\.3\.4:1080/);
+});
+
+test("WAF-blocked proxy is excluded from auto-select without being marked transport-dead", async () => {
+  const { db, env } = appWithDb();
+  const c = { env };
+  const now = new Date().toISOString();
+  await db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('proxy_egress_mode','auto',?)").bind(now).run();
+  db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, enabled, status, last_latency_ms, success_count, created_at, updated_at) VALUES ('socks5h','blocked.example',1080,'',1,'healthy',50,1,?,?)").bind(now, now).run();
+  db.prepare("INSERT INTO proxy_pool (scheme, host, port, username, enabled, status, last_latency_ms, success_count, created_at, updated_at) VALUES ('socks5h','healthy.example',1080,'',1,'healthy',200,1,?,?)").bind(now, now).run();
+  t.__resetActiveEgress();
+  const pick1 = await t.resolveActiveEgress(c);
+  assert.match(pick1, /blocked\.example:1080/, "picks the faster healthy proxy first");
+  const blockedId = db.prepare("SELECT id FROM proxy_pool WHERE host='blocked.example'").all().results[0].id;
+  zaiWaf.recordBlock("proxy:" + blockedId, "test");
+  try {
+    // Sticky TTL must not keep routing onto the just-blocked egress.
+    const pick2 = await t.resolveActiveEgress(c);
+    assert.match(pick2, /healthy\.example:1080/, "skips the WAF-blocked proxy, uses the next healthy one");
+    const stillHealthy = db.prepare("SELECT status FROM proxy_pool WHERE host='blocked.example'").all().results[0].status;
+    assert.equal(stillHealthy, "healthy", "WAF block is not a transport-dead mark");
+  } finally {
+    zaiWaf.recordSuccess("proxy:" + blockedId);
+  }
 });
 
 test("auto-select fails closed on credential decrypt error (config error != proxy fault)", async () => {
