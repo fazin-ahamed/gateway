@@ -1885,6 +1885,7 @@ function wrapAnthropicStream(upReq, model) {
     async start(controller) {
       let buf = "";
       let finishSeen = false;
+      let sawMessageStop = false; // upstream sent message_stop: the protocol COMPLETED
       const enc = encoder;
       try {
         for (; ; ) {
@@ -1907,6 +1908,8 @@ function wrapAnthropicStream(upReq, model) {
             } catch {
               continue;
             }
+            if (obj && obj.type === "message_stop")
+              sawMessageStop = true;
             const chunk = fromAnthropicStreamChunk(obj, model);
             if (!chunk)
               continue;
@@ -1915,16 +1918,24 @@ function wrapAnthropicStream(upReq, model) {
             controller.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"));
           }
         }
-        // Anthropic upstreams sometimes end with message_stop but no
-        // message_delta carrying a stop_reason — OpenAI clients hard-fail with
-        // "stream closed before a finish_reason". Synthesize the terminal stop.
+        // No stop_reason-bearing message_delta arrived. Two very different
+        // cases:
+        //  - sawMessageStop: the Anthropic protocol COMPLETED (message_stop)
+        //    but the stop_reason-bearing message_delta was missing — a known
+        //    upstream quirk. The turn finished cleanly; synthesize "stop" so
+        //    OpenAI clients do not hard-fail with "stream closed before a
+        //    finish_reason".
+        //  - no message_stop: the upstream EOF'd mid-flight — a truncated
+        //    stream. Synthesize finish_reason "length", the recognized
+        //    non-success terminal, so clients retry instead of reading the
+        //    turn as cleanly completed. Never stamp a clean stop here.
         if (!finishSeen) {
           const finishChunk = {
             id: "gen-anthropic",
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
             model,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+            choices: [{ index: 0, delta: {}, finish_reason: sawMessageStop ? "stop" : "length" }]
           };
           controller.enqueue(enc.encode("data: " + JSON.stringify(finishChunk) + "\n\n"));
         }
@@ -6041,7 +6052,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { stripHistoricalReasoning, closeSseGracefully, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
