@@ -258,6 +258,33 @@ function renderRecent(messages) {
   return out;
 }
 
+// A tool-continuation turn is one whose final message is a tool result: the
+// client executed the model's tool call and posted the output back. On these
+// turns the ORIGINAL user task is still the last `user`-role message, so
+// re-planting it verbatim at the prompt tail (the strongest recency slot,
+// right before <output_rules>) tells the model to solve the original task
+// again — the exact "restart the analysis" loop. Instead, keep the goal as
+// earlier background and make the tail imperative a continuation directive.
+function lastMeaningful(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m) continue;
+    if (m.role === "tool") return m;
+    if (m.role === "user" || m.role === "assistant" || m.role === "system") return m;
+  }
+  return null;
+}
+
+function originalGoal(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === "user") {
+      const text = textOf(messages[i].content);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
 export function buildAgentPrompt(messages, tools) {
   const msgs = (Array.isArray(messages) ? messages : []).filter((m) => {
     const text = textOf(m && m.content);
@@ -278,12 +305,20 @@ export function buildAgentPrompt(messages, tools) {
   if (recent.length) out += "<recent>\n" + renderRecent(recent) + "</recent>\n\n";
   const already = alreadyCalled(msgs, toolList);
   if (already) out += already + "\n\n";
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i] && msgs[i].role === "user") {
-      const text = textOf(msgs[i].content);
-      if (text) out += "<current_task>\n" + text + "\n</current_task>\n\n";
-      break;
-    }
+  const last = lastMeaningful(msgs);
+  const goal = originalGoal(msgs);
+  const isContinuation = !!(last && last.role === "tool");
+  if (isContinuation) {
+    // Goal stays present as background, NOT as the newest instruction.
+    if (goal) out += "<original_goal>\n" + goal + "\n</original_goal>\n\n";
+    out += "<continuation>\n" +
+      "This is a continuation turn: the most recent <tool_result> above is the newest state, produced by the tool call you just made.\n" +
+      "- Continue from that result; do NOT restart the task.\n" +
+      "- Do NOT repeat analysis or reasoning already established above unless the latest result contradicts it.\n" +
+      "- Use the latest <tool_result> to choose the NEXT unfinished action, or give the final answer if the task is complete.\n" +
+      "</continuation>\n\n";
+  } else if (goal) {
+    out += "<current_task>\n" + goal + "\n</current_task>\n\n";
   }
   return out + FINAL_REMINDER;
 }

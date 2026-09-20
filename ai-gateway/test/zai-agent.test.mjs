@@ -53,6 +53,36 @@ test("prior tool exchanges land in <already_called> and <tool_result>", () => {
   assert.match(prompt, /<current_task>\nnow hostname/);
 });
 
+test("a tool-result tail is a continuation turn: goal becomes background, tail is a continuation directive", () => {
+  const prompt = buildAgentPrompt([
+    { role: "user", content: "audit the repo and fix the routing bug" },
+    { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"grep resolveActiveEgress"}' } }] },
+    { role: "tool", tool_call_id: "call_1", content: "src/index.js:4200: resolveActiveEgress(...)" }
+  ], tools);
+  // The original goal is NOT re-planted as the newest instruction.
+  assert.doesNotMatch(prompt, /<current_task>/);
+  assert.match(prompt, /<continuation>/);
+  assert.match(prompt, /do NOT restart the task/i);
+  // The goal is retained, but as earlier background context.
+  assert.match(prompt, /<original_goal>\naudit the repo and fix the routing bug/);
+  // The tail imperative (last block before <output_rules>) is the continuation,
+  // NOT the original task text.
+  const goalIdx = prompt.indexOf("audit the repo and fix the routing bug");
+  const contIdx = prompt.indexOf("<continuation>");
+  const rulesIdx = prompt.indexOf("<output_rules>");
+  assert.ok(goalIdx < contIdx, "goal appears before the continuation directive");
+  assert.ok(contIdx < rulesIdx, "continuation directive is the last block before output_rules");
+});
+
+test("a first turn (no tool exchange yet) still gets a plain <current_task>, no continuation", () => {
+  const prompt = buildAgentPrompt([
+    { role: "user", content: "list files" }
+  ], tools);
+  assert.match(prompt, /<current_task>\nlist files/);
+  assert.doesNotMatch(prompt, /<continuation>/);
+  assert.doesNotMatch(prompt, /<original_goal>/);
+});
+
 test("parseAgentToolCalls accepts canonical and flat payloads, strips markers", () => {
   const canonical = 'hello\n<<<TOOL_CALL>>>\n{"name":"bash","arguments":{"command":"uname"}}\n<<<END_TOOL_CALL>>>\n';
   const calls = parseAgentToolCalls(canonical);
