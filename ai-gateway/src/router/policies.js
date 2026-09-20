@@ -235,12 +235,117 @@ export function explainPolicy(policy, taskIR, routes) {
   };
 }
 
+// ---------- constraint-first quality policy (SHADOW) ----------
+//
+// Reliability and answer quality are SEPARATE requirements a route must CLEAR,
+// not terms in one weighted sum. There is no principled common unit between a
+// Beta reliability estimate (operational health) and a Beta quality estimate
+// (answer evidence), and a weighted sum would let a slightly better answer
+// estimate compensate for an operationally unreliable route. So:
+//
+//   eligible = hard capability gates
+//              AND operational reliability >= floor
+//              AND (quality immature OR quality >= floor)
+//   then, among eligible: cheapest, latency as secondary.
+//
+// Floors are calibratable STARTING values for shadow observation, not truths.
+
+export const QUALITY_FLOORS = {
+  chat: { reliability: 0.92, quality: 0.60 },
+  code: { reliability: 0.95, quality: 0.72 },
+  agent: { reliability: 0.97, quality: 0.78 }
+};
+export const QUALITY_FLOOR_DEFAULT = { reliability: 0.90, quality: 0.55 };
+
+export function floorsFor(taskIR) {
+  const task = String((taskIR && taskIR.task) || "");
+  const prefix = task.split(":")[0];
+  return QUALITY_FLOORS[prefix] || QUALITY_FLOOR_DEFAULT;
+}
+
+// route.quality is attached upstream, after canonical identity is resolved and
+// the maturity gate applied:
+//   { state: "known_good" | "known_bad" | "cold", mean, evidence }
+export function qualityStateOf(route) {
+  const q = route && route.quality;
+  if (!q || !q.state) return { state: "cold", mean: null, evidence: 0 };
+  return q;
+}
+
+export function reliabilityGate(route, taskIR, floors) {
+  const f = floors || floorsFor(taskIR);
+  const reliability = successOf(route, taskIR);
+  return { pass: reliability >= f.reliability, reliability, floor: f.reliability };
+}
+
+export function qualityGate(route, taskIR, floors) {
+  const f = floors || floorsFor(taskIR);
+  const q = qualityStateOf(route);
+  // An immature (cold) route is NOT treated as quality=0.5 and is NOT rejected:
+  // it stays eligible as an explicit cold-start allowance, and the explanation
+  // says so rather than pretending a measured quality exists.
+  if (q.state === "cold")
+    return { pass: true, cold: true, quality: null, floor: f.quality, reason: "quality insufficient evidence (cold-start allowance)" };
+  const pass = Number(q.mean) >= f.quality;
+  return { pass, cold: false, quality: Number(q.mean), floor: f.quality, reason: pass ? "quality ok" : "below quality floor" };
+}
+
+// Among routes clearing every constraint, cheapest then fastest. Deliberately
+// not a blended score.
+export function constraintFirstPick(routes, taskIR, floors) {
+  const f = floors || floorsFor(taskIR);
+  const rows = (routes || []).filter((r) => r && r.slug && r.hardEligible === true).map((route) => {
+    const rel = reliabilityGate(route, taskIR, f);
+    const q = qualityGate(route, taskIR, f);
+    return { route, rel, q, eligible: rel.pass && q.pass };
+  });
+  const eligible = rows.filter((x) => x.eligible);
+  const rejected = rows.filter((x) => !x.eligible);
+  eligible.sort((a, b) => (economicCost(a.route) - economicCost(b.route)) || (latencyOf(a.route) - latencyOf(b.route)));
+  const best = eligible[0] || null;
+  return {
+    floors: f,
+    pick: best ? best.route : null,
+    eligibleCount: eligible.length,
+    consideredCount: rows.length,
+    rejected: rejected.map((x) => ({
+      slug: x.route.slug,
+      canonicalModelId: x.route.canonicalModelId || null,
+      reason: !x.rel.pass ? "below reliability floor" : "below quality floor",
+      reliability: Number(x.rel.reliability.toFixed(4)),
+      quality: x.q.quality,
+      qualityState: qualityStateOf(x.route).state
+    }))
+  };
+}
+
 export function shadowDecide({ routes, taskIR, preference }) {
   const policies = candidatePolicies(routes, taskIR);
   const front = pareto(policies);
   const picked = pickPolicy(front, preference, taskIR);
+  // Constraint-first quality-aware pick, computed alongside the operational
+  // pick so the two can be compared from real traffic. Shadow-only: this does
+  // not change what is served.
+  const qa = constraintFirstPick(routes, taskIR);
+  const qualityAware = qa.pick && {
+    slug: qa.pick.slug,
+    canonicalModelId: qa.pick.canonicalModelId || null,
+    quality: qualityStateOf(qa.pick),
+    cost: economicCost(qa.pick),
+    latency: latencyOf(qa.pick)
+  };
+  const operationalOnly = { slug: picked && picked.primary, id: picked && picked.id };
   return {
     version: 2,
+    shadow: {
+      operational_only_pick: operationalOnly,
+      quality_aware_pick: qualityAware,
+      changed: Boolean(qualityAware && operationalOnly.slug && qualityAware.slug !== operationalOnly.slug),
+      floors: qa.floors,
+      considered: qa.consideredCount,
+      eligible: qa.eligibleCount,
+      rejected_by_constraint: qa.rejected
+    },
     taskIR: taskIR && {
       task: taskIR.task,
       confidence: taskIR.confidence,
