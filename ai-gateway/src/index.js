@@ -7,15 +7,38 @@ import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from
 import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
-import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShadow } from "./router/quality.js";
+import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShadow, rebuildQualityStats } from "./router/quality.js";
+import { seedModelRegistry, backfillQualityCanonicalIds, loadAliasIndex, resolveCanonicalModel } from "./router/model-registry.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
 var app = new Hono();
+var registrySeededDbs = new WeakSet();
+var registrySeedInflight = new WeakMap();
+// Idempotent, once per distinct DB handle: the known Z.AI canonical mappings
+// must exist for resolveCanonicalModel to resolve x-preview-l/GLM-5.3-Flash etc.
+// INSERT OR IGNORE never clobbers operator-authored aliases; failure is logged
+// but never blocks serving (unresolved identity falls back to "raw:<upstream>").
+// Keyed on the DB handle (not a process global) so a second DB — every test's
+// fresh in-memory DB — is seeded independently instead of reusing the first.
+async function ensureRegistrySeed(c) {
+  const db = c && c.env && c.env.DB;
+  if (!db || registrySeededDbs.has(db)) return;
+  let inflight = registrySeedInflight.get(db);
+  if (!inflight) {
+    inflight = seedModelRegistry(c)
+      .then(() => { registrySeededDbs.add(db); })
+      .catch((e) => { blog("registry seed failed: " + String(e && e.message || e)); })
+      .finally(() => { registrySeedInflight.delete(db); });
+    registrySeedInflight.set(db, inflight);
+  }
+  await inflight;
+}
 app.use("/*", async (c, next) => {
   c.header("X-Content-Type-Options", "nosniff");
   c.header("Referrer-Policy", "no-referrer");
   c.header("X-Frame-Options", "DENY");
+  await ensureRegistrySeed(c);
   await next();
 });
 app.use("/v1/*", cors({
@@ -2884,20 +2907,27 @@ async function pickAutoModel(c, payload, key) {
     });
     v2 = shadowV2({ payload, routes: world.routes, preference: cfg.preference });
     // Shadow-only answer-quality block, attached AFTER selection math so it can
-    // never influence candidatePolicies ordering. Identity is provisional
-    // ("raw:"+upstream_model verbatim) until the canonical registry (#4)
-    // replaces it and backfills quality_observations.canonical_model_id.
+    // never influence candidatePolicies ordering. Primary route is resolved by
+    // primaryRoute.routeId (or routeKey), NEVER by public slug — two providers
+    // can expose the same public slug with different upstreams/identities.
+    // Quality identity prefers the canonical model id from the registry,
+    // falling back to "raw:<upstream>" when unresolved.
     if (v2 && v2.explain && world && Array.isArray(world.routes)) {
-      const _qRoute = world.routes.find((r) => r.slug === v2.explain.primary) || world.routes.find((r) => r.slug === v2.primary) || null;
-      const _qUpstream = _qRoute ? (_qRoute.upstream_model || _qRoute.slug) : null;
-      if (_qUpstream) {
+      const _pr = v2.explain.primaryRoute || null;
+      const _qRoute = (_pr && _pr.routeId != null && world.routes.find((r) => r.routeId === _pr.routeId))
+        || (_pr && _pr.routeKey && world.routes.find((r) => r.key === _pr.routeKey))
+        || world.routes.find((r) => r.slug === v2.explain.primary)
+        || world.routes.find((r) => r.slug === v2.primary)
+        || null;
+      const _qIdentity = _qRoute
+        ? (_qRoute.canonicalModelId || ("raw:" + (_qRoute.upstream_model || _qRoute.slug)))
+        : null;
+      if (_qIdentity) {
         const _qTask = v2.taskIR ? String(v2.taskIR.task || "") : "";
         v2.explain.quality = {
-          identity: "raw:" + _qUpstream,
+          identity: _qIdentity,
           task: _qTask,
-          // null below the evidence threshold or on read failure — the UI then
-          // shows "insufficient evidence (prior only)", never the prior mean.
-          stats: await loadQualityShadow(c, "raw:" + _qUpstream, _qTask)
+          stats: await loadQualityShadow(c, _qIdentity, _qTask)
         };
       }
     }
@@ -4805,6 +4835,76 @@ app.get("/admin/router/reconcile", async (c) => {
     by_route: routes,
     by_failure_class: Object.fromEntries([...failureClassAgg.entries()].sort((a, b) => b[1] - a[1])),
     warnings: []
+  });
+});
+
+// Canonical model registry admin. Identity is DATA: two names are the same
+// model only when an explicit alias row says so. Seeding is idempotent
+// (INSERT OR IGNORE) and never clobbers operator-authored aliases.
+app.post("/admin/router/registry/seed", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const seed = await seedModelRegistry(c);
+  const backfill = await backfillQualityCanonicalIds(c);
+  const rebuilt = await rebuildQualityStats(c);
+  return c.json({ ok: true, seed, backfill, rebuilt });
+});
+// Rebuild the derived model_quality_stats cache from immutable
+// quality_observations. Safe to call any time; never merges old Beta rows.
+app.post("/admin/router/registry/rebuild-quality", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const backfill = await backfillQualityCanonicalIds(c);
+  const rebuilt = await rebuildQualityStats(c);
+  return c.json({ ok: true, backfill, rebuilt });
+});
+// Registry visibility: canonical models, alias rows, and — most importantly —
+// the identities live traffic actually used (route_attempts + model_routes)
+// that NO alias resolves. An unresolved alias silently trains a provisional
+// "raw:<upstream>" quality bucket, so operators must be able to see and fix it.
+app.get("/admin/router/registry", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const models = await c.env.DB.prepare(
+    "SELECT id, family, display_name, reasoning, tools, vision, context_limit, output_limit FROM canonical_models ORDER BY id"
+  ).all();
+  const aliases = await c.env.DB.prepare(
+    "SELECT alias, canonical_model_id, alias_type, provider_id, confidence, source FROM model_aliases ORDER BY canonical_model_id, alias"
+  ).all();
+  const index = await loadAliasIndex(c);
+  // Distinct (provider_id, public_slug, upstream_model) live traffic has seen,
+  // from both the configured routes and recorded attempts.
+  const seen = new Map();
+  const addSeen = (providerId, publicSlug, upstreamModel) => {
+    const pid = providerId == null ? null : Number(providerId);
+    const key = pid + "\u0000" + String(publicSlug || "") + "\u0000" + String(upstreamModel || "");
+    if (!seen.has(key))
+      seen.set(key, { provider_id: pid, public_slug: publicSlug || null, upstream_model: upstreamModel || null });
+  };
+  const routeRows = await c.env.DB.prepare(
+    "SELECT DISTINCT provider_id, slug, upstream_model FROM model_routes"
+  ).all();
+  for (const r of routeRows.results || [])
+    addSeen(r.provider_id, r.slug, r.upstream_model);
+  const attemptRows = await c.env.DB.prepare(
+    "SELECT DISTINCT provider_id, public_slug, upstream_model FROM route_attempts WHERE upstream_model IS NOT NULL OR public_slug IS NOT NULL"
+  ).all();
+  for (const r of attemptRows.results || [])
+    addSeen(r.provider_id, r.public_slug, r.upstream_model);
+  const unresolved = [];
+  for (const s of seen.values()) {
+    const hit = resolveCanonicalModel(index, { providerId: s.provider_id, publicSlug: s.public_slug, upstreamModel: s.upstream_model });
+    if (!hit)
+      unresolved.push(s);
+  }
+  return c.json({
+    canonical_models: models.results || [],
+    aliases: aliases.results || [],
+    unresolved: unresolved.slice(0, 200),
+    unresolved_count: unresolved.length
   });
 });
 // ---- Proxy pool: egress inventory + connectivity testing ----

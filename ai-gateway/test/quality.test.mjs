@@ -105,7 +105,7 @@ test("emission: tool evidence writes observations, folds fractional stats, and r
   const w = Object.fromEntries(obs.map((o) => [o.signal_type, o.weight]));
   assert.equal(w.tool_valid, TOOL_VALID_WEIGHT_DEDUPED);
   assert.equal(w.tool_success, SIGNALS.tool_success.weight);
-  const s1 = db.prepare("SELECT quality_alpha, quality_beta, observation_weight, objective_weight FROM model_quality_stats WHERE model_identity='raw:up-m' AND task_type='code:debug'").all().results[0];
+  const s1 = db.prepare("SELECT quality_alpha, quality_beta, observation_weight, objective_weight FROM model_quality_stats WHERE canonical_model_id='raw:up-m' AND task_type='code:debug'").all().results[0];
   assert.ok(Math.abs(s1.quality_alpha - (QUALITY_PRIOR_ALPHA + TOOL_VALID_WEIGHT_DEDUPED + SIGNALS.tool_success.weight)) < 1e-9);
   assert.ok(Math.abs(s1.quality_beta - QUALITY_PRIOR_BETA) < 1e-9);
   assert.ok(Math.abs(s1.observation_weight - (TOOL_VALID_WEIGHT_DEDUPED + SIGNALS.tool_success.weight)) < 1e-9);
@@ -113,14 +113,14 @@ test("emission: tool evidence writes observations, folds fractional stats, and r
   // Replay the same (request, attempt, signal, source) — UNIQUE dedup, no double-count.
   await emitQualityObservations(c, 11, a);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM quality_observations WHERE route_attempt_id=11").all().results[0].n, 2);
-  const s2 = db.prepare("SELECT quality_alpha FROM model_quality_stats WHERE model_identity='raw:up-m' AND task_type='code:debug'").all().results[0];
+  const s2 = db.prepare("SELECT quality_alpha FROM model_quality_stats WHERE canonical_model_id='raw:up-m' AND task_type='code:debug'").all().results[0];
   assert.ok(Math.abs(s2.quality_alpha - s1.quality_alpha) < 1e-9, "replay must not double-count");
 });
 
 test("shadow loader withholds the mean until evidence matures", async () => {
   const db = memDb();
   const c = ctxOf(db);
-  db.prepare("INSERT INTO model_quality_stats (model_identity, task_type, quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight, updated_at) VALUES ('raw:m1','code:debug',8,2,10,10,0,?)")
+  db.prepare("INSERT INTO model_quality_stats (canonical_model_id, task_type, quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight, updated_at) VALUES ('raw:m1','code:debug',8,2,10,10,0,?)")
     .bind(new Date().toISOString()).run();
   const mature = await loadQualityShadow(c, "raw:m1", "code:debug");
   assert.equal(mature.sufficient, true);
@@ -210,7 +210,7 @@ test("end-to-end: plain 200 trains nothing; a tool-call 200 trains tool_valid at
     assert.deepEqual(obs.map((o) => o.signal_type), ["tool_valid"]);
     assert.equal(obs[0].value, 1);
     assert.equal(obs[0].weight, TOOL_VALID_WEIGHT_SOLO);
-    const s = db.prepare("SELECT quality_alpha, quality_beta FROM model_quality_stats WHERE model_identity='raw:up-m'").all().results[0];
+    const s = db.prepare("SELECT quality_alpha, quality_beta FROM model_quality_stats WHERE canonical_model_id='raw:up-m'").all().results[0];
     assert.ok(Math.abs(s.quality_alpha - (QUALITY_PRIOR_ALPHA + TOOL_VALID_WEIGHT_SOLO)) < 1e-9);
     assert.ok(Math.abs(s.quality_beta - QUALITY_PRIOR_BETA) < 1e-9);
   } finally {

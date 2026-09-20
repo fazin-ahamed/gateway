@@ -1,3 +1,4 @@
+import { seedAliasFamily } from "./router/model-registry.js";
 // Live chat.z.ai model registry.
 //
 // Which models a Z.AI account can actually use varies per account (tier), so a
@@ -91,13 +92,7 @@ export function normalizeModels(payload) {
 }
 function modelAliases(id) {
   const raw = String(id || "").trim();
-  const lower = raw.toLowerCase();
-  const out = [raw];
-  if (lower === "glm-5.3-flash" || lower === "glm-5-3-flash")
-    out.push("x-preview-l", "GLM-5.3-Flash");
-  if (lower === "x-preview-l")
-    out.push("glm-5.3-flash", "GLM-5.3-Flash");
-  return [...new Set(out)];
+  return seedAliasFamily(raw);
 }
 export class ZaiModelRegistry {
   constructor({ session, fetcher, ttlMs = DEFAULT_TTL_MS, fallback = () => null } = {}) {

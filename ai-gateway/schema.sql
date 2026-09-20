@@ -334,16 +334,55 @@ CREATE INDEX IF NOT EXISTS idx_quality_model_task ON quality_observations(canoni
 CREATE INDEX IF NOT EXISTS idx_quality_upstream ON quality_observations(upstream_model, task_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_quality_route ON quality_observations(route_id, created_at);
 
+-- Canonical model registry — the one place that knows which names mean the
+-- same intelligence. Two routes serving the same canonical model share
+-- answer-quality learning (model_quality_stats); they never share operational
+-- posteriors, latency, cost, or credential health (those stay route-level in
+-- router_stats). Identity is DATA, never a similarity heuristic: two names
+-- are the same model only when an explicit alias row says so — no punctuation
+-- normalization pretending two spellings are one model.
+CREATE TABLE IF NOT EXISTS canonical_models (
+  id TEXT PRIMARY KEY,
+  family TEXT,
+  display_name TEXT,
+  reasoning INTEGER,
+  tools INTEGER,
+  vision INTEGER,
+  context_limit INTEGER,
+  output_limit INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- alias_type separates fundamentally different identities:
+--   public_slug | upstream_model | wire_model | catalog_id | provider_alias | legacy_alias
+-- provider_id NULL means the alias is global; a provider-scoped alias wins
+-- over a global one (resellers can reuse generic upstream names for different
+-- models). alias is the PRIMARY KEY: one name, one canonical meaning.
+CREATE TABLE IF NOT EXISTS model_aliases (
+  alias TEXT PRIMARY KEY,
+  canonical_model_id TEXT NOT NULL,
+  alias_type TEXT NOT NULL,
+  provider_id INTEGER,
+  confidence REAL NOT NULL DEFAULT 1.0,
+  source TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(canonical_model_id) REFERENCES canonical_models(id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_aliases_canonical ON model_aliases(canonical_model_id);
+CREATE INDEX IF NOT EXISTS idx_model_aliases_provider ON model_aliases(provider_id);
+
 -- Derived cache over quality_observations — rebuildable, never authoritative.
 -- Fractional Beta(2,2) updates: alpha += weight*value, beta += weight*(1-value).
 -- The prior is deliberately unconfident (unlike the operational route prior):
 -- "unmeasured" must look unmeasured, not 50%-confident. SHADOW-ONLY: routing
 -- must not read this table until calibration is reviewed.
--- model_identity is provisional ("raw:"+upstream_model verbatim — no
--- punctuation normalization pretending two spellings are one model) until
--- the canonical registry replaces the resolver.
+-- Keyed by canonical_model_id once the registry resolves the alias; an
+-- unresolved identity keeps the provisional "raw:<upstream_model>" verbatim
+-- key until it is resolved. Rebuilt from quality_observations by the admin
+-- rebuild endpoint, never mathematically merged from old Beta rows.
 CREATE TABLE IF NOT EXISTS model_quality_stats (
-  model_identity TEXT NOT NULL,
+  canonical_model_id TEXT NOT NULL,
   task_type TEXT NOT NULL DEFAULT '',
   quality_alpha REAL NOT NULL DEFAULT 2,
   quality_beta REAL NOT NULL DEFAULT 2,
@@ -351,7 +390,7 @@ CREATE TABLE IF NOT EXISTS model_quality_stats (
   objective_weight REAL NOT NULL DEFAULT 0,
   subjective_weight REAL NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY(model_identity, task_type)
+  PRIMARY KEY(canonical_model_id, task_type)
 );
 
 -- Egress proxy inventory for the Z.AI uTLS helper. Credentials are AES-GCM

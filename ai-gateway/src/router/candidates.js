@@ -12,6 +12,7 @@ import { isTinyModel, normalizeModelId, routeKey } from "./identity.js";
 import { age, seedBeta, samples as posteriorSamples } from "./posterior.js";
 import { compileTaskIR } from "./task-ir.js";
 import { shadowDecide } from "./policies.js";
+import { loadAliasIndex, resolveCanonicalModel } from "./model-registry.js";
 
 // A task-specific route posterior only overrides the global one once it has
 // its own evidence; below this it is noise and the global posterior is the
@@ -151,6 +152,8 @@ export function shapeV2Route(row, taskIR) {
   return {
     slug,
     model: normalizeModelId(row.upstream_model || slug),
+    upstream_model: row.upstream_model || slug,
+    canonicalModelId: row.canonicalModelId ?? row.canonical_model_id ?? null,
     routeId: row.route_id ?? row.id ?? null,
     providerId: row.provider_id ?? null,
     transport: String(row.transport || row.fmt || "direct"),
@@ -210,8 +213,8 @@ function resolveEntry(row, overlay, catalogById) {
   const upstream = row.upstream_model || "";
   const slug = row.slug || "";
   return (
-    overlay.get(slug) ||
     overlay.get(upstream) ||
+    overlay.get(slug) ||
     matchEntry(catalogById, upstream) ||
     matchEntry(catalogById, slug) ||
     null
@@ -267,6 +270,7 @@ export async function loadV2World(c, {
   const allow = allowed ? new Set(allowed) : null;
   const skip = new Set((excluded || []).map((s) => String(s)));
   skip.add("auto");
+  const aliasIndex = await loadAliasIndex(c);
   const world = [];
   for (const r of rows.results || []) {
     if (skip.has(r.slug))
@@ -280,6 +284,7 @@ export async function loadV2World(c, {
       route_id: r.id,
       slug: r.slug,
       upstream_model: r.upstream_model,
+      canonicalModelId: (resolveCanonicalModel(aliasIndex, { providerId: r.provider_id, publicSlug: r.slug, upstreamModel: r.upstream_model }) || {}).canonicalModelId || null,
       provider_id: r.provider_id,
       fmt: r.fmt,
       transport: r.transport,

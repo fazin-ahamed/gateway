@@ -1,3 +1,4 @@
+import { loadAliasIndex, resolveCanonicalModel } from "./model-registry.js";
 // Quality observations — evidence about the ANSWER, kept strictly separate
 // from operational outcomes (route success / latency / cost in router_stats).
 // Invariant: a bare 200 NEVER creates a quality observation. Quality only
@@ -39,14 +40,24 @@ export const TOOL_VALID_WEIGHT_DEDUPED = 0.2;
 
 const clamp01 = (v) => Math.min(1, Math.max(0, Number(v) || 0));
 
-// Provisional identity resolver. The #4 canonical model registry replaces
-// this and backfills quality_observations.canonical_model_id. Until then the
-// raw upstream_model is used VERBATIM under a "raw:" prefix — no punctuation
-// normalization pretending two spellings are one intelligence.
+// Synchronous fallback identity used when no DB-backed alias resolves (or no DB
+// handle is available): the raw upstream_model VERBATIM under a "raw:" prefix —
+// no punctuation normalization pretending two spellings are one intelligence.
+// resolveQualityIdentity is the authoritative async path (registry first).
 export function qualityIdentity(a = {}) {
   if (a.canonical_model_id) return String(a.canonical_model_id);
   const raw = String(a.upstream_model || a.public_slug || "").trim();
   return raw ? "raw:" + raw : null;
+}
+
+export async function resolveQualityIdentity(c, a = {}) {
+  if (a.canonical_model_id) return String(a.canonical_model_id);
+  try {
+    const index = await loadAliasIndex(c);
+    const hit = resolveCanonicalModel(index, { providerId: a.provider_id, publicSlug: a.public_slug, upstreamModel: a.upstream_model });
+    if (hit && hit.canonicalModelId) return hit.canonicalModelId;
+  } catch {}
+  return qualityIdentity(a);
 }
 
 // Structural validity of the model's EMITTED tool calls. NULL when the
@@ -125,8 +136,9 @@ export async function emitQualityObservations(c, attemptId, a) {
     if (!c || !c.env || !c.env.DB || !attemptId) return [];
     const allSignals = deriveQualityFromAttempt(a);
     if (!allSignals.length) return [];
-    const identity = qualityIdentity(a);
+    const identity = await resolveQualityIdentity(c, a);
     if (!identity) return [];
+    const canonicalToStore = a.canonical_model_id || (identity.startsWith("raw:") ? null : identity);
     // Idempotency: a replayed (request, attempt, signal, source) has its
     // observation rows silently ignored by the UNIQUE constraint — but the
     // derived-stats fold below must consume only NEWLY recorded signals, or a
@@ -146,7 +158,7 @@ export async function emitQualityObservations(c, attemptId, a) {
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       ).bind(
         a.request_id ?? null, attemptId, a.route_id ?? null, a.provider_id ?? null,
-        a.public_slug ?? null, a.upstream_model ?? null, a.canonical_model_id ?? null,
+        a.public_slug ?? null, a.upstream_model ?? null, canonicalToStore,
         String(a.task_type || ""), s.signal_type, s.value, s.weight, s.objective ? 1 : 0, s.source, now
       ).run();
     }
@@ -154,7 +166,7 @@ export async function emitQualityObservations(c, attemptId, a) {
     const task = String(a.task_type || "");
     const prevRow = await c.env.DB.prepare(
       `SELECT quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight
-       FROM model_quality_stats WHERE model_identity=? AND task_type=?`
+       FROM model_quality_stats WHERE canonical_model_id=? AND task_type=?`
     ).bind(identity, task).all();
     const prev = prevRow && prevRow.results && prevRow.results[0];
     if (prev) {
@@ -164,12 +176,12 @@ export async function emitQualityObservations(c, attemptId, a) {
            observation_weight = observation_weight + ?,
            objective_weight = objective_weight + ?, subjective_weight = subjective_weight + ?,
            updated_at = ?
-         WHERE model_identity=? AND task_type=?`
+         WHERE canonical_model_id=? AND task_type=?`
       ).bind(dAlpha, dBeta, w, ow, sw, now, identity, task).run();
     } else {
       await c.env.DB.prepare(
         `INSERT INTO model_quality_stats
-         (model_identity, task_type, quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight, updated_at)
+         (canonical_model_id, task_type, quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight, updated_at)
          VALUES (?,?,?,?,?,?,?,?)`
       ).bind(
         identity, task,
@@ -202,7 +214,7 @@ export async function loadQualityShadow(c, identity, task) {
     if (!c || !c.env || !c.env.DB || !identity) return null;
     const r = await c.env.DB.prepare(
       `SELECT quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight
-       FROM model_quality_stats WHERE model_identity=? AND task_type=?`
+       FROM model_quality_stats WHERE canonical_model_id=? AND task_type=?`
     ).bind(identity, String(task || "")).all();
     const s = r && r.results && r.results[0];
     const evidence = s ? Number(s.observation_weight) || 0 : 0;
@@ -218,4 +230,42 @@ export async function loadQualityShadow(c, identity, task) {
   } catch {
     return null;
   }
+}
+
+// Rebuild the derived model_quality_stats cache from immutable quality_observations.
+// Never mathematically merges old Beta rows. Unresolved observations keep their
+// provisional "raw:<upstream>" key until a canonical mapping resolves them.
+export async function rebuildQualityStats(c) {
+  if (!c || !c.env || !c.env.DB) return { stats: 0 };
+  const obs = await c.env.DB.prepare(
+    "SELECT canonical_model_id, upstream_model, public_slug, task_type, value, weight, objective FROM quality_observations"
+  ).all();
+  const index = await loadAliasIndex(c);
+  const acc = new Map();
+  for (const o of obs.results || []) {
+    let identity = o.canonical_model_id ? String(o.canonical_model_id) : null;
+    if (!identity) {
+      const hit = resolveCanonicalModel(index, { publicSlug: o.public_slug, upstreamModel: o.upstream_model });
+      identity = hit ? hit.canonicalModelId : ("raw:" + String(o.upstream_model || o.public_slug || ""));
+    }
+    if (!identity || identity === "raw:") continue;
+    const task = String(o.task_type || "");
+    const key = identity + "\u0000" + task;
+    let a = acc.get(key);
+    if (!a) { a = { identity, task, dAlpha: 0, dBeta: 0, w: 0, ow: 0, sw: 0 }; acc.set(key, a); }
+    a.dAlpha += o.weight * o.value;
+    a.dBeta += o.weight * (1 - o.value);
+    a.w += o.weight;
+    if (o.objective) a.ow += o.weight; else a.sw += o.weight;
+  }
+  const now = new Date().toISOString();
+  await c.env.DB.prepare("DELETE FROM model_quality_stats").run();
+  for (const a of acc.values()) {
+    await c.env.DB.prepare(
+      `INSERT INTO model_quality_stats
+       (canonical_model_id, task_type, quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight, updated_at)
+       VALUES (?,?,?,?,?,?,?,?)`
+    ).bind(a.identity, a.task, QUALITY_PRIOR_ALPHA + a.dAlpha, QUALITY_PRIOR_BETA + a.dBeta, a.w, a.ow, a.sw, now).run();
+  }
+  return { stats: acc.size };
 }

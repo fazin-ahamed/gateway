@@ -16,6 +16,7 @@ import { acquireZaiChatId, releaseZaiChatId } from "./zai-session-pool.js";
 import { getZaiCaptchaProof } from "./zai-captcha-cache.js";
 import { attachZaiImageParts, processZaiVisionMessages } from "./zai-vision.js";
 
+import { seedWireToCanonical } from "./router/model-registry.js";
 const ZAI_BASE_URL = "https://chat.z.ai";
 const ZAI_CHAT_URL = ZAI_BASE_URL + "/api/v2/chat/completions";
 const ZAI_SETTINGS_URL = ZAI_BASE_URL + "/api/v1/users/user/settings";
@@ -53,7 +54,7 @@ function unprefixedModelId(modelId) {
 
 function capabilityModelId(modelId) {
   const id = unprefixedModelId(modelId).toLowerCase();
-  return id === "x-preview-l" ? "glm-5.3-flash" : id;
+  return seedWireToCanonical(id) || id;
 }
 
 function getModelCapabilities(modelId) {
