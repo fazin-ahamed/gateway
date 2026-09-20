@@ -5,6 +5,8 @@ import { PLAYGROUND_HTML } from "./playground.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { zaiWaf } from "./zai-waf.js";
 import { zaiSessionPoolStatus } from "./zai-session-pool.js";
+import { peekDeviceTokens, appendDeviceTokens } from "./zai-tokens.js";
+import { zaiCaptchaCacheStatus } from "./zai-captcha-cache.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
@@ -5497,6 +5499,85 @@ app.get("/admin/zai/status", async (c) => {
       egresses: waf.egresses || []
     },
     sessions: zaiSessionPoolStatus()
+  });
+});
+// Z.AI device-token pool: operational refill visibility + live import into the
+// canonical SQLite FIFO (zai_device_tokens). Tokens are single-use Aliyun
+// device tokens consumed as CAPTCHA proofs are minted. Admin-only; token VALUES
+// are never returned by either endpoint — only counts.
+var LOW_TOKEN_THRESHOLD = 25;
+function zaiTokenStorePath(c) {
+  return (c && c.env && c.env.ZAI_TOKEN_STORE) || undefined;
+}
+function captchaProofsReady() {
+  try {
+    return (zaiCaptchaCacheStatus() || []).reduce((n, cache) => n + (Number(cache.ready) || 0), 0);
+  } catch {
+    return 0;
+  }
+}
+app.get("/admin/zai/device-tokens/status", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const available = await peekDeviceTokens(zaiTokenStorePath(c), c.env.DB);
+  return c.json({
+    available,
+    captcha_ready: captchaProofsReady(),
+    low: available < LOW_TOKEN_THRESHOLD
+  });
+});
+// Accepts a JSON token array (`{"tokens":[...]}`) or a newline-delimited string
+// (`{"tokens":"a\nb"}` or a raw text body). Inserts directly into the FIFO; the
+// table's UNIQUE(token) constraint dedupes against existing rows. Counts:
+//   invalid    = submitted entries that are empty after trimming (non-tokens)
+//   duplicates = repeats within the batch PLUS entries already in the store
+//   accepted   = genuinely new rows (measured by the store count delta)
+// Token format is opaque, so validation is only "non-empty after trim" — the
+// same contract the token store itself applies; no admin-only length rules.
+app.post("/admin/zai/device-tokens/import", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  let raw;
+  const ctype = String(c.req.header("content-type") || "");
+  if (ctype.includes("application/json")) {
+    let body;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: { message: "Invalid JSON body" } }, 400);
+    }
+    raw = body && body.tokens != null ? body.tokens : body;
+  } else {
+    raw = await c.req.text();
+  }
+  // A raw text body may have a trailing newline; trimming first avoids counting
+  // that as an invalid empty entry. Array entries are coerced/trimmed the same.
+  const list = Array.isArray(raw) ? raw : String(raw || "").trim().split(/[\r\n]+/);
+  const unique = [];
+  const seen = new Set();
+  let invalid = 0;
+  let batchDuplicates = 0;
+  for (const item of list) {
+    const t = String(item == null ? "" : item).trim();
+    if (!t) { invalid++; continue; }
+    if (seen.has(t)) { batchDuplicates++; continue; }
+    seen.add(t);
+    unique.push(t);
+  }
+  const before = await peekDeviceTokens(zaiTokenStorePath(c), c.env.DB);
+  if (unique.length)
+    await appendDeviceTokens(unique, zaiTokenStorePath(c), c.env.DB);
+  const after = await peekDeviceTokens(zaiTokenStorePath(c), c.env.DB);
+  const accepted = after - before;
+  // Repeats inside the batch + tokens already present both count as duplicates.
+  const existingDuplicates = unique.length - accepted;
+  return c.json({
+    accepted,
+    duplicates: batchDuplicates + existingDuplicates,
+    invalid,
+    available: after
   });
 });
 // ---- Trajectory exporters ----

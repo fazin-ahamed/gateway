@@ -414,6 +414,16 @@ var PLAYGROUND_HTML = `<!doctype html>
     </div></div>
     <div class="hero-stats" id="px-stats"></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Pool</h2></div><div class="panel-b flush" id="px-list"></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Z.AI device tokens</h2></div><div class="panel-b">
+      <p class="hint" style="margin-top:0">Single-use Aliyun device tokens consumed as CAPTCHA proofs are minted. The SQLite FIFO is the live queue; the legacy <span class="mono">.txt</span> file is fallback only. Token values are never displayed.</p>
+      <div class="hero-stats" id="zt-stats"></div>
+      <textarea id="zt-import" rows="4" placeholder="one device token per line" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <button class="act" id="zt-import-btn">Add tokens</button>
+        <label class="ghost" style="margin:0;cursor:pointer">Load .txt<input type="file" id="zt-file" accept=".txt,text/plain" style="display:none"></label>
+        <span id="zt-msg" class="hint" style="margin:0"></span>
+      </div>
+    </div></div>
   </section>
 
 
@@ -474,7 +484,7 @@ async function selectTab(t){
     if(t==='limits') await loadLimits();
     if(t==='auto') await loadAutoSettings();
     if(t==='trajectories') await loadTrajectories();
-    if(t==='proxies') await loadProxies();
+    if(t==='proxies'){ await loadProxies(); await loadZaiTokens(); }
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
@@ -1702,6 +1712,46 @@ document.getElementById('px-list').addEventListener('click',function(e){
   const t=e.target.closest('button[data-px-test]'); if(t){ pxTest({ids:[Number(t.dataset.pxTest)]},'proxy'); return; }
   const g=e.target.closest('button[data-px-toggle]'); if(g){ api('/admin/proxies/'+Number(g.dataset.pxToggle)+'/toggle',{method:'POST'}).then(loadProxies); return; }
   const d=e.target.closest('button[data-px-del]'); if(d){ confirmAction('Delete proxy','Remove this proxy from the pool?','Delete',async function(){ await api('/admin/proxies/delete',{method:'POST',body:JSON.stringify({ids:[Number(d.dataset.pxDel)]})}); loadProxies(); }); return; }
+});
+
+// ---------- Z.AI DEVICE TOKENS ----------
+async function loadZaiTokens(){
+  const statsEl=document.getElementById('zt-stats'); if(!statsEl) return;
+  paintSkeleton(statsEl,'stats');
+  let data; try{ data=(await api('/admin/zai/device-tokens/status')).data; }catch(e){ statsEl.innerHTML='<div class="empty">Could not load token status: '+esc(e.message)+'</div>'; return; }
+  const available=Number(data&&data.available||0);
+  const band=available===0?{t:'Empty',c:'warn'}:(data&&data.low?{t:'Low',c:'warn'}:{t:'Healthy',c:'ok'});
+  const stats=[
+    {k:'Available',v:fmt(available),c:band.c,s:'in FIFO'},
+    {k:'CAPTCHA proofs',v:fmt(Number(data&&data.captcha_ready||0)),s:'cached'},
+    {k:'Status',v:band.t,c:band.c,s:data&&data.low?'refill soon':'ok'}
+  ];
+  statsEl.innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div><div class="sub2">'+esc(s.s||'')+'</div></div>';}).join('');
+}
+async function submitZaiTokens(text){
+  const msg=document.getElementById('zt-msg');
+  const body=String(text||'').trim();
+  if(!body){ if(msg) msg.textContent='Paste or load some tokens first.'; return; }
+  if(msg) msg.textContent='Importing...';
+  try{
+    const res=await api('/admin/zai/device-tokens/import',{method:'POST',body:JSON.stringify({tokens:body})});
+    const d=res.data||{};
+    if(msg) msg.textContent='Accepted '+fmt(d.accepted||0)+', '+fmt(d.duplicates||0)+' duplicate, '+fmt(d.invalid||0)+' invalid \u2014 '+fmt(d.available||0)+' available.';
+    const ta=document.getElementById('zt-import'); if(ta) ta.value='';
+    await loadZaiTokens();
+  }catch(e){ if(msg) msg.textContent='Import failed: '+e.message; }
+}
+document.addEventListener('click',function(e){
+  if(e.target&&e.target.id==='zt-import-btn'){ const ta=document.getElementById('zt-import'); submitZaiTokens(ta?ta.value:''); }
+});
+document.addEventListener('change',function(e){
+  if(e.target&&e.target.id==='zt-file'){
+    const f=e.target.files&&e.target.files[0]; if(!f) return;
+    const reader=new FileReader();
+    reader.onload=function(){ const ta=document.getElementById('zt-import'); if(ta) ta.value=String(reader.result||''); };
+    reader.readAsText(f);
+    e.target.value='';
+  }
 });
 
 // ---------- TRAJECTORIES ----------
