@@ -7,6 +7,7 @@ import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from
 import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
+import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShadow } from "./router/quality.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
@@ -921,6 +922,16 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               break;
             }
             _att.success = 1; _att.prompt = Number(usage.prompt_tokens) || 0; _att.completion = Number(usage.completion_tokens) || 0; _att.cost = costUsd;
+            // Answer-quality evidence (NOT operational success): did the model
+            // emit structurally valid tool calls? NULL when none were emitted —
+            // a plain-text 200 is not quality evidence and must not train the
+            // quality channel. An unparseable success envelope is an operational
+            // concern, likewise left as no-evidence here.
+            try {
+              const _respObj = JSON.parse(clientTxt);
+              _att.tool_valid = deriveToolValidFromToolCalls(_respObj && _respObj.choices && _respObj.choices[0] && _respObj.choices[0].message && _respObj.choices[0].message.tool_calls);
+            } catch {
+            }
             await recordUsage(c, key, { ...usage, cost_usd: costUsd });
             await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
             if (cacheKey && isCacheableResponse(clientTxt)) {
@@ -1032,7 +1043,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
             }
             c.__egressFailure = null;
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, deferPosterior: false });
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false });
           }
         }
         }
@@ -1880,15 +1891,23 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     // Terminal outcome, computed once and shared by the route_attempts patch
     // and the trajectory dual-write so both telemetry systems agree.
     const outcome = streamTerminalOutcome({ clientCancelled, streamError, finishSeen });
+    // Answer-quality evidence for the streamed attempt: structural validity of
+    // the tool calls accumulated across chunks. NULL when none were emitted.
+    const _streamToolValid = deriveToolValidFromToolCalls(toolCallsBuf);
     if (extra && extra.attemptId) {
       const attLatency = Date.now() - (extra.attemptStart || started);
       const hi = outcome.health_impact;
       const ttft = firstTokenAt ? (firstTokenAt - (extra.attemptStart || started)) : null;
       try {
-        await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, health_impact=?, ttft_ms=COALESCE(?, ttft_ms), latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=? WHERE id=?").bind(outcome.success, outcome.failure_class, hi, ttft, attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), extra.attemptId).run();
+        await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, health_impact=?, ttft_ms=COALESCE(?, ttft_ms), latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=?, tool_valid=? WHERE id=?").bind(outcome.success, outcome.failure_class, hi, ttft, attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), _streamToolValid, extra.attemptId).run();
       } catch (e) {
         blog("route_attempt stream patch failed: " + String(e.message || e));
       }
+      // Quality channel, separate from the operational posterior above: fires
+      // only when the terminal outcome carries real answer evidence (valid or
+      // invalid tool calls). A bare completed stream with no tool calls emits
+      // nothing. Idempotent per (request, attempt, signal, source).
+      await emitQualityObservations(c, extra.attemptId, { request_id: requestId, success: outcome.success ? 1 : 0, route_id: route.id, provider_id: route.provider_id, public_slug: slug, upstream_model: route.upstream_model, task_type: extra.attemptTaskType || "", tool_valid: _streamToolValid });
       // Posterior deferred at handoff; observe the real terminal outcome once,
       // and never for a client cancel.
       if (outcome.observe) {
@@ -2864,6 +2883,24 @@ async function pickAutoModel(c, payload, key) {
       priceResolver
     });
     v2 = shadowV2({ payload, routes: world.routes, preference: cfg.preference });
+    // Shadow-only answer-quality block, attached AFTER selection math so it can
+    // never influence candidatePolicies ordering. Identity is provisional
+    // ("raw:"+upstream_model verbatim) until the canonical registry (#4)
+    // replaces it and backfills quality_observations.canonical_model_id.
+    if (v2 && v2.explain && world && Array.isArray(world.routes)) {
+      const _qRoute = world.routes.find((r) => r.slug === v2.explain.primary) || world.routes.find((r) => r.slug === v2.primary) || null;
+      const _qUpstream = _qRoute ? (_qRoute.upstream_model || _qRoute.slug) : null;
+      if (_qUpstream) {
+        const _qTask = v2.taskIR ? String(v2.taskIR.task || "") : "";
+        v2.explain.quality = {
+          identity: "raw:" + _qUpstream,
+          task: _qTask,
+          // null below the evidence threshold or on read failure — the UI then
+          // shows "insufficient evidence (prior only)", never the prior mean.
+          stats: await loadQualityShadow(c, "raw:" + _qUpstream, _qTask)
+        };
+      }
+    }
   } catch (e) {
     blog("AUTO v2 shadow failed: " + String(e && e.message || e).slice(0, 200));
   }
@@ -3247,15 +3284,17 @@ async function recordRouteAttempt(c, a) {
       `INSERT INTO route_attempts
        (request_id, parent_slug, route_id, provider_id, provider_key_id, public_slug, upstream_model, transport, task_type,
         attempt_index, key_attempt_index, started_at, finished_at, success, health_impact, http_status, failure_class, failure_code,
-        ttft_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, fallback_from_route_id, rescue_used)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        ttft_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, fallback_from_route_id, rescue_used,
+        tool_valid, tool_success, verification_score)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       a.request_id, a.parent_slug ?? null, a.route_id ?? null, a.provider_id ?? null, a.provider_key_id ?? null,
       a.public_slug, a.upstream_model ?? null, a.transport ?? null, a.task_type ?? "",
       a.attempt_index ?? 0, a.key_attempt_index ?? 0, a.started_at, a.finished_at ?? nowIso(),
       a.success ? 1 : 0, a.health_impact ? 1 : 0, a.http_status ?? null, a.failure_class ?? null, a.failure_code ?? null,
       a.ttft_ms ?? null, a.latency_ms ?? null, a.prompt_tokens ?? 0, a.completion_tokens ?? 0,
-      a.estimated_cost_usd ?? null, a.actual_cost_usd ?? null, a.fallback_from_route_id ?? null, a.rescue_used ? 1 : 0
+      a.estimated_cost_usd ?? null, a.actual_cost_usd ?? null, a.fallback_from_route_id ?? null, a.rescue_used ? 1 : 0,
+      a.tool_valid ?? null, a.tool_success ?? null, a.verification_score ?? null
     ).run();
     if ((a.success || a.health_impact) && !a.deferPosterior) {
       const ok = !!a.success;
@@ -3264,6 +3303,12 @@ async function recordRouteAttempt(c, a) {
       if (a.task_type)
         await updateRouterStat(c, "route_task", scopeId, a.task_type, ok, a.latency_ms, a.actual_cost_usd);
     }
+    // Quality observations are a separate channel from the operational
+    // posterior: only attempts carrying real answer evidence emit anything,
+    // and a bare 200 emits nothing (see router/quality.js). Idempotent per
+    // (request, attempt, signal, source) via the table's UNIQUE constraint.
+    if (r && r.meta && r.meta.last_row_id)
+      await emitQualityObservations(c, r.meta.last_row_id, a);
     return (r && r.meta && r.meta.last_row_id) || null;
   } catch (e) {
     blog("route_attempt record failed: " + String(e.message || e));

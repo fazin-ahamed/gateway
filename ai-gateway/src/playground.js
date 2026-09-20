@@ -1864,7 +1864,10 @@ document.getElementById('ar-run').onclick=async function(){
       (v2.challenger?(' vs '+esc(String(v2.challenger))):'')+
       ' · operational reliability '+Math.round((v2.expectedSuccess||0)*100)+'%'+
       ' · '+secs(v2.expectedLatencyMs)+(v2.latencyKnown===false?' <span class="hint">(default)</span>':'')+
-      ' · '+money(v2.expectedCost||0)+'/req'+(v2.costKnown===false?' <span class="hint">(default)</span>':'')+'</span></div>'):
+      ' · '+money(v2.expectedCost||0)+'/req'+(v2.costKnown===false?' <span class="hint">(default)</span>':'')+
+      (v2.quality&&v2.quality.stats&&v2.quality.stats.sufficient
+        ?' · predicted quality '+Math.round(v2.quality.stats.mean*100)+'% <span class="hint">('+Number(v2.quality.stats.evidence).toFixed(1)+' weighted evidence)</span>'
+        :' · quality <span class="hint">insufficient evidence (prior only)</span>')+'</span></div>'):
     '<div class="small" style="margin-top:10px">V2 shadow: no policy (router off or no eligible routes)</div>';
   out.innerHTML='<div class="kvrow"><span class="pill '+(d.fallback?'warn':'acc')+'">'+(d.fallback?'fallback (nothing eligible)':'V1 picked')+'</span><span class="grow"><b>'+esc(d.picked)+'</b> · complexity '+esc(String(d.complexity))+' → quality floor '+d.need.toFixed(2)+' · preference '+d.preference+'</span></div>'+
     v2Html+

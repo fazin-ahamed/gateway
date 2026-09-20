@@ -303,6 +303,57 @@ CREATE INDEX IF NOT EXISTS idx_route_attempts_request ON route_attempts(request_
 CREATE INDEX IF NOT EXISTS idx_zai_device_tokens_fifo
   ON zai_device_tokens(id);
 
+-- Quality observations: evidence about the ANSWER itself, kept strictly
+-- separate from the operational outcomes in route_attempts/router_stats.
+-- A bare 200 NEVER creates a quality-success observation here — rows appear
+-- only when something spoke about the response (a tool call that validated
+-- and executed, a verifier score, explicit user feedback). value is always
+-- normalized to 0..1; weight is the epistemic mass of the signal (objective
+-- execution evidence > user feedback > model-graded judgement).
+-- canonical_model_id stays NULL until the canonical model registry lands,
+-- which will also backfill it; until then identity is provisional.
+CREATE TABLE IF NOT EXISTS quality_observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL,
+  route_attempt_id INTEGER,
+  route_id INTEGER,
+  provider_id INTEGER,
+  public_slug TEXT,
+  upstream_model TEXT,
+  canonical_model_id TEXT,
+  task_type TEXT NOT NULL DEFAULT '',
+  signal_type TEXT NOT NULL,
+  value REAL NOT NULL,
+  weight REAL NOT NULL DEFAULT 1.0,
+  objective INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(request_id, route_attempt_id, signal_type, source)
+);
+CREATE INDEX IF NOT EXISTS idx_quality_model_task ON quality_observations(canonical_model_id, task_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_quality_upstream ON quality_observations(upstream_model, task_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_quality_route ON quality_observations(route_id, created_at);
+
+-- Derived cache over quality_observations — rebuildable, never authoritative.
+-- Fractional Beta(2,2) updates: alpha += weight*value, beta += weight*(1-value).
+-- The prior is deliberately unconfident (unlike the operational route prior):
+-- "unmeasured" must look unmeasured, not 50%-confident. SHADOW-ONLY: routing
+-- must not read this table until calibration is reviewed.
+-- model_identity is provisional ("raw:"+upstream_model verbatim — no
+-- punctuation normalization pretending two spellings are one model) until
+-- the canonical registry replaces the resolver.
+CREATE TABLE IF NOT EXISTS model_quality_stats (
+  model_identity TEXT NOT NULL,
+  task_type TEXT NOT NULL DEFAULT '',
+  quality_alpha REAL NOT NULL DEFAULT 2,
+  quality_beta REAL NOT NULL DEFAULT 2,
+  observation_weight REAL NOT NULL DEFAULT 0,
+  objective_weight REAL NOT NULL DEFAULT 0,
+  subjective_weight REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(model_identity, task_type)
+);
+
 -- Egress proxy inventory for the Z.AI uTLS helper. Credentials are AES-GCM
 -- envelopes written by the worker (same providerCryptoKey machinery as
 -- provider api_key), never plaintext. status is the explicit lifecycle:
