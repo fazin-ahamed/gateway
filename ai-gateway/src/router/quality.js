@@ -232,6 +232,44 @@ export async function loadQualityShadow(c, identity, task) {
   }
 }
 
+// Turn a raw model_quality_stats row into the shadow quality state consumed by
+// the V2 constraint-first policy. Below the maturity threshold the mean is
+// withheld — state "cold" is an explicit cold-start allowance, never a fake
+// 50%. Mature rows are named against the task's quality floor so admin
+// payloads can show known_good/known_bad without recomputing policy.
+export function qualityStateFromStats(s, floorQuality) {
+  if (!s)
+    return { state: "cold", mean: null, evidence: 0 };
+  const evidence = Number(s.observation_weight) || 0;
+  if (!(evidence >= QUALITY_EVIDENCE_MATURE))
+    return { state: "cold", mean: null, evidence };
+  const alpha = Number(s.quality_alpha) || 0;
+  const beta = Number(s.quality_beta) || 0;
+  const mean = alpha + beta > 0 ? alpha / (alpha + beta) : 0;
+  return { state: mean >= Number(floorQuality) ? "known_good" : "known_bad", mean, evidence };
+}
+
+// Batched shadow-quality read for a whole V2 world: canonical_model_id -> raw
+// stats row for ONE task type. One query instead of one per route; callers
+// pair rows with qualityStateFromStats to attach route.quality.
+export async function loadQualityStatsByCanonical(c, task) {
+  try {
+    if (!c || !c.env || !c.env.DB) return new Map();
+    const r = await c.env.DB.prepare(
+      `SELECT canonical_model_id, quality_alpha, quality_beta, observation_weight
+       FROM model_quality_stats WHERE task_type=?`
+    ).bind(String(task || "")).all();
+    const map = new Map();
+    for (const row of (r && r.results) || []) {
+      if (row && row.canonical_model_id != null)
+        map.set(String(row.canonical_model_id), row);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
 // Rebuild the derived model_quality_stats cache from immutable quality_observations.
 // Never mathematically merges old Beta rows. Unresolved observations keep their
 // provisional "raw:<upstream>" key until a canonical mapping resolves them.

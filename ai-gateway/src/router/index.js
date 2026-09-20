@@ -8,7 +8,16 @@
 import { compileTaskIR } from "./task-ir.js";
 import { normalizeModelId, routeKey } from "./identity.js";
 import { observe, seedBeta, summarize } from "./posterior.js";
-import { shadowDecide } from "./policies.js";
+import {
+  shadowDecide,
+  constraintFirstPick,
+  floorsFor,
+  qualityGate,
+  qualityStateOf,
+  reliabilityGate,
+  QUALITY_FLOORS,
+  QUALITY_FLOOR_DEFAULT
+} from "./policies.js";
 import { buildV2Universe, loadV2World, shadowFromUniverse, shapeV2Route } from "./candidates.js";
 
 export const ROUTER_V2_MODE = () => {
@@ -85,5 +94,12 @@ export {
   buildV2Universe,
   loadV2World,
   shadowFromUniverse,
-  shapeV2Route
+  shapeV2Route,
+  constraintFirstPick,
+  floorsFor,
+  qualityGate,
+  qualityStateOf,
+  reliabilityGate,
+  QUALITY_FLOORS,
+  QUALITY_FLOOR_DEFAULT
 };

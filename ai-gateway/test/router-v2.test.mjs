@@ -349,3 +349,42 @@ test("loadV2World reads route_task scope rows and keeps task evidence task-scope
   assert.ok(r2.posterior.alpha > 19.99, "a code:debug task row must not leak into a chat:casual request");
 });
 
+test("loadV2World attaches shadow quality keyed by canonical identity: one model's spellings share one posterior, unknown stays cold", async () => {
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const { seedModelRegistry } = await import("../src/router/model-registry.js");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const now = new Date().toISOString();
+  const c = { env: { DB: db } };
+  await seedModelRegistry(c);
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, created_at) VALUES (1,'P','http://up.local/v1','direct','openai',1,1,?)").bind(now).run();
+  db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (1,'plain','k',1,?)").bind(now).run();
+  // Route 1 rides the wire alias x-preview-l; route 3 the display alias
+  // GLM-5.3-Flash — two seeded spellings of canonical glm-5.3-flash. Route 2's
+  // upstream resolves to nothing and must keep a provisional raw key.
+  db.prepare("INSERT INTO model_routes (id, slug, provider_id, upstream_model, rank, enabled) VALUES (1,'m',1,'x-preview-l',0,1)").run();
+  db.prepare("INSERT INTO model_routes (id, slug, provider_id, upstream_model, rank, enabled) VALUES (2,'m2',1,'up-m2',1,1)").run();
+  db.prepare("INSERT INTO model_routes (id, slug, provider_id, upstream_model, rank, enabled) VALUES (3,'m3',1,'GLM-5.3-Flash',2,1)").run();
+  // Mature, good posterior for the CANONICAL model on chat:casual
+  // (mean 8/10 = 0.8 >= chat quality floor 0.60, evidence 10 >= 5).
+  db.prepare("INSERT INTO model_quality_stats (canonical_model_id, task_type, quality_alpha, quality_beta, observation_weight, objective_weight, subjective_weight, updated_at) VALUES ('glm-5.3-flash','chat:casual',8,2,10,10,0,?)").bind(now).run();
+  const { loadV2World } = await import("../src/router/candidates.js");
+
+  const world = await loadV2World(c, { payload: { messages: [{ role: "user", content: "hi" }] } });
+  const r1 = world.routes.find((r) => r.slug === "m");
+  const r2 = world.routes.find((r) => r.slug === "m2");
+  const r3 = world.routes.find((r) => r.slug === "m3");
+  assert.ok(r1 && r2 && r3, "all three routes are in the V2 universe");
+
+  // Both spellings of one canonical share the SAME posterior — quality follows
+  // identity, not slug/upstream spelling.
+  assert.deepEqual(r1.quality, { state: "known_good", mean: 0.8, evidence: 10 });
+  assert.deepEqual(r3.quality, r1.quality, "GLM-5.3-Flash folds to the same canonical posterior");
+  assert.ok(r1.eligible, "route is hard-eligible so the quality state is not vacuous");
+
+  // No alias resolves up-m2: it falls to the provisional raw bucket, which has
+  // no stats row -> cold with zero evidence (never a fake 50%).
+  assert.deepEqual(r2.quality, { state: "cold", mean: null, evidence: 0 });
+});
+

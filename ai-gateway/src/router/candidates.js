@@ -11,8 +11,9 @@
 import { isTinyModel, normalizeModelId, routeKey } from "./identity.js";
 import { age, seedBeta, samples as posteriorSamples } from "./posterior.js";
 import { compileTaskIR } from "./task-ir.js";
-import { shadowDecide } from "./policies.js";
+import { shadowDecide, floorsFor } from "./policies.js";
 import { loadAliasIndex, resolveCanonicalModel } from "./model-registry.js";
+import { loadQualityStatsByCanonical, qualityStateFromStats } from "./quality.js";
 
 // A task-specific route posterior only overrides the global one once it has
 // its own evidence; below this it is noise and the global posterior is the
@@ -176,6 +177,9 @@ export function shapeV2Route(row, taskIR) {
     contextLimit: caps.unknown ? 0 : caps.context,
     reason,
     posterior,
+    // Shadow answer-quality state attached by loadV2World, keyed by canonical
+    // identity (null when routes are built without a quality pass, e.g. tests).
+    quality: row.quality ?? null,
     key: rk
   };
 }
@@ -296,6 +300,16 @@ export async function loadV2World(c, {
       taskStats: taskStats.get(scope) || null,
       circuitOpen: !!(circuitOpen("route", r.id) || circuitOpen("provider", r.provider_id))
     });
+  }
+  // Shadow answer-quality, keyed by CANONICAL identity — two routes serving
+  // one model share one quality posterior regardless of slug/upstream
+  // spelling. Unresolved identities fall back to the provisional "raw:"
+  // bucket, matching resolveQualityIdentity on the write path.
+  const qualityMap = await loadQualityStatsByCanonical(c, taskIR.task);
+  const floorQuality = floorsFor(taskIR).quality;
+  for (const r of world) {
+    const identity = r.canonicalModelId || ("raw:" + String(r.upstream_model || r.slug || ""));
+    r.quality = qualityStateFromStats(qualityMap.get(identity), floorQuality);
   }
   return buildV2Universe(world, payload);
 }
