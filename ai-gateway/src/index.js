@@ -139,24 +139,23 @@ function isRetryableTransportError(err) {
     || /ECONNRESET|UND_ERR_SOCKET|ETIMEDOUT|ECONNREFUSED|socket connection was closed|fetch failed/i.test(msg);
 }
 function sseUpstreamDisconnect(message) {
-  // An interrupted stream must still end with a recognized terminal chunk.
-  // finish_reason "length" is the OpenAI-recognized non-success terminal: it
-  // tells clients the turn did NOT complete cleanly and can be retried. Never
-  // "stop" — that would read as a successful completion and suppress retries.
+  // Priority-zero stream continuity contract: an interrupted stream must
+  // terminate with a RECOGNIZED terminal and nothing else on the client wire.
+  //
+  // The raw upstream exception is never emitted as an SSE data frame: it can
+  // carry relay URLs, credentials or internal hostnames, and a client that
+  // surfaces it leaks them. Clients key retries off finish_reason, so the
+  // terminal chunk alone carries the signal. finish_reason "length" is the
+  // OpenAI-recognized non-success terminal — it tells clients the turn did
+  // NOT complete cleanly and can be retried. Never "stop": that reads as a
+  // successful completion and suppresses retries.
   return "data: " + JSON.stringify({
-    error: {
-      message: "Upstream stream disconnected",
-      type: "upstream_stream_error",
-      code: "upstream_socket_closed",
-      retryable: true
-    }
-  }) + "\n\ndata: " + JSON.stringify({
     id: "gen-interrupted",
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
     model: "unknown",
     choices: [{ index: 0, delta: {}, finish_reason: "length" }]
-  }) + "\n\ndata: [DONE]\n\n";
+  }) + String.fromCharCode(10) + String.fromCharCode(10) + "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10);
 }
 function closeSseGracefully(controller, enc, err) {
   if (!controller)
@@ -1539,6 +1538,7 @@ async function koyebExchange(c, opts) {
     }
     const chunks = [];
     let received = 0;
+    let prematureEof = false;
     for (; ;) {
       const msg = await nextFrame();
       if (typeof msg === "string") {
@@ -1556,11 +1556,13 @@ async function koyebExchange(c, opts) {
             respHeaders = frame.headers;
           continue;
         }
-        if (frame.type === "response_end")
+        if (frame.type === "response_end") {
+          if (frame.prematureEof)
+            prematureEof = true;
           break;
+        }
         if (frame.type === "error")
           throw new Error("koyeb relay: " + String(frame.code || "error") + ": " + String(frame.message || "unknown"));
-        continue;
       }
       const bytes = new Uint8Array(msg);
       if (!firstByteAt)
@@ -1587,6 +1589,14 @@ async function koyebExchange(c, opts) {
       ws.close();
     } catch {
     }
+    if (opts.isStream && streamController) {
+      // The relay tunnel is closed. The reader must see done or it parks
+      // forever waiting for a frame that will never arrive.
+      try {
+        streamController.close();
+      } catch {
+      }
+    }
     let body = null;
     if (!opts.isStream) {
       body = new Uint8Array(received);
@@ -1596,7 +1606,7 @@ async function koyebExchange(c, opts) {
         at += chunk.length;
       }
     }
-    return { status, headers: respHeaders, stream, bytes: body, connectMs, ttfbMs: firstByteAt ? firstByteAt - t0 : 0 };
+    return { status, headers: respHeaders, stream, bytes: body, connectMs, ttfbMs: firstByteAt ? firstByteAt - t0 : 0, prematureEof };
   } catch (e) {
     try {
       ws.close();
@@ -1698,6 +1708,7 @@ async function fetchViaKoyeb(c, route, apiKey, payload, isStream, requestId) {
     return { response: new Response(res.bytes, { status: res.status, headers: upHeaders }), usage: null };
   }
   const up = new Response(isStream ? res.stream : res.bytes, { status: res.status, headers: upHeaders });
+  if (res.prematureEof) Object.defineProperty(up, "prematureEof", { value: true, enumerable: false });
   let usage = null;
   if (!isStream && res.bytes) {
     try {
@@ -2051,15 +2062,23 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     }
   });
   let finishSeen = false; // a forwarded chunk carried a real finish_reason
+  let truncatedEof = false; // relay closed the tunnel on a non-EOF body read
   const pump = (async () => {
     try {
-      for (; ; ) {
+      for (;;) {
         const { done, value } = await reader.read();
-        if (done)
+        if (done) {
+          // The relay closed the tunnel. A premature upstream EOF (anything
+          // other than io.EOF on the relay's body read) is surfaced as
+          // prematureEof on the handle; record it but still terminate with a
+          // recognized terminal chunk below, never a raw error SSE frame.
+          if (upReq && upReq.prematureEof)
+            truncatedEof = true;
           break;
+        }
         buf += dec.decode(value, { stream: true });
         let idx;
-        while ((idx = buf.indexOf("\n")) >= 0) {
+        while ((idx = buf.indexOf(String.fromCharCode(10))) >= 0) {
           const line = buf.slice(0, idx).trim();
           buf = buf.slice(idx + 1);
           if (!line.startsWith("data:"))
@@ -2132,10 +2151,11 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       }
       if (!clientCancelled) {
         if (!finishSeen) {
-          // A stream that forwarded an upstream error frame (or malformed SSE)
-          // did not complete cleanly: the synthesized terminal must be a
-          // non-success finish ("length"), never a clean "stop".
-          const cleanEnd = !sawUpstreamError && !malformedSseSent;
+          // A stream that forwarded an upstream error frame (or malformed
+          // SSE, or a relay tunnel closed on a non-EOF body read) did not
+          // complete cleanly: the synthesized terminal must be a non-success
+          // finish ("length"), never a clean "stop".
+          const cleanEnd = !sawUpstreamError && !malformedSseSent && !truncatedEof;
           const finishReason = normalizeTerminalFinishReason(
             null,
             hasAccumulatedToolCalls(toolCallsBuf),

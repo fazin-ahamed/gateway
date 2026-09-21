@@ -96,18 +96,17 @@ test("max_tokens stop_reason maps to length verbatim", async () => {
   assert.equal(stops[0].choices[0].finish_reason, "length");
 });
 
-test("an upstream throw terminates with the shared error shape, never a clean stop", async () => {
+test("an upstream throw terminates with a recognized terminal, never a clean stop and never a raw error frame", async () => {
   const res = wrapAnthropicStream(upstream([textDelta("hi")], { fail: true }), "claude-x");
   const sse = await readAll(res);
   const frames = dataFrames(sse);
-  const err = JSON.parse(frames[0]);
-  assert.equal(err.error.code, "upstream_socket_closed");
-  assert.equal(err.error.retryable, true);
-  const term = JSON.parse(frames[1]);
-  assert.equal(term.choices[0].finish_reason, "length");
-  assert.equal(frames[2], "[DONE]");
+  assert.equal(frames.length, 2, "terminal + DONE — nothing else on the wire");
+  const term = JSON.parse(frames[0]);
+  assert.equal(term.choices[0].finish_reason, "length", "interrupted stream is a non-success terminal");
+  assert.equal(frames[1], "[DONE]");
   assert.doesNotMatch(sse, /"finish_reason":"stop"/);
   assert.doesNotMatch(sse, /secret-relay/, "no raw exception echo");
+  assert.doesNotMatch(sse, /upstream_socket_closed/, "no raw error SSE frame on the client wire");
 });
 
 test("fromAnthropicStreamChunk maps tool_use to tool_calls; unknown stop_reason is not a finish", () => {

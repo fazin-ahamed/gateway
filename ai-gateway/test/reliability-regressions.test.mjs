@@ -377,7 +377,7 @@ test("outer SSE guard never exposes raw source exception text", async () => {
   const guarded = guardToolLoopResponse(new Response(source, { headers: { "content-type": "text/event-stream" } }), "public-model");
   const text = await guarded.text();
   assert.doesNotMatch(text, /SECRET_PROVIDER_RELbackend|internal-relay\.example/);
-  assert.match(text, /upstream_socket_closed/);
+  assert.match(text, /"finish_reason":"length"/, "interrupted stream terminates with a recognized non-success terminal");
 });
 
 test("typed provider errors are converted to gateway-owned provider-neutral public errors", () => {

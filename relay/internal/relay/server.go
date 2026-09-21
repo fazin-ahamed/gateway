@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -300,6 +301,7 @@ func (s *Server) serveSession(ws *wsConn) {
 	}()
 	buf := make([]byte, 32*1024)
 	var total int64
+	var prematureEOF bool
 	for {
 		n, readErr := upResp.Body.Read(buf)
 		if n > 0 {
@@ -314,6 +316,11 @@ func (s *Server) serveSession(ws *wsConn) {
 			total += int64(n)
 		}
 		if readErr != nil {
+			// io.EOF is the normal end of a well-formed body. Any other read
+			// error (connection reset, unexpected EOF, read deadline) means
+			// the upstream truncated mid-flight. The gateway must be told the
+			// difference: both end the tunnel, only one is a clean completion.
+			prematureEOF = readErr != io.EOF
 			break
 		}
 	}
@@ -325,12 +332,15 @@ func (s *Server) serveSession(ws *wsConn) {
 		Log(fields)
 		return
 	}
-	// Always terminate the exchange, including empty-body errors: the gateway
-	// waits for response_end and would otherwise surface a tunnel-closed error.
-	s.sendResponseEnd(ws, open.RequestID, total)
-	if fields.Disconnect == "" {
+	if prematureEOF {
+		fields.Disconnect, fields.ErrorClass = "premature_eof", "upstream_truncated"
+	} else if fields.Disconnect == "" {
 		fields.Disconnect = "complete"
 	}
+	// Always terminate the exchange, including empty-body errors and truncated
+	// streams: the gateway waits for response_end and would otherwise surface a
+	// tunnel-closed error. PrematureEOF tells it the turn was truncated.
+	s.sendResponseEnd(ws, open.RequestID, total, prematureEOF)
 	Log(fields)
 }
 
@@ -344,8 +354,8 @@ func (s *Server) sendResponse(ws *wsConn, requestID string, status int, headers 
 	_ = ws.writeText(raw)
 }
 
-func (s *Server) sendResponseEnd(ws *wsConn, requestID string, total int64) {
-	raw, _ := json.Marshal(ResponseEndMessage{Type: "response_end", RequestID: requestID, Bytes: total})
+func (s *Server) sendResponseEnd(ws *wsConn, requestID string, total int64, prematureEOF bool) {
+	raw, _ := json.Marshal(ResponseEndMessage{Type: "response_end", RequestID: requestID, Bytes: total, PrematureEOF: prematureEOF})
 	_ = ws.writeText(raw)
 }
 

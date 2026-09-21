@@ -67,10 +67,15 @@ test("OpenAI-shaped ZAI SSE starts with role only and never leaks provider ident
   ]);
   const text = await new Response(zaiTest.toOpenAiStream(source, "public-model", "test-id")).text();
   assert.doesNotMatch(text, /z\.ai|chat\.z\.ai|SECRET_PROVIDER|relbackend/i);
-  const payloads = text.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+  const payloads = text.split(String.fromCharCode(10)).filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
   const firstChoice = payloads.find((p) => Array.isArray(p.choices));
   assert.deepEqual(firstChoice.choices[0].delta, { role: "assistant" });
-  assert.ok(payloads.some((p) => p.error?.code === "upstream_stream_error"));
+  // Priority-zero contract: the interrupted stream ends with a recognized
+  // terminal (finish_reason "length") and [DONE], with no raw error frame
+  // on the client wire.
+  assert.ok(payloads.some((p) => p.choices?.[0]?.finish_reason === "length"), "interrupted stream terminates with length");
+  assert.equal(payloads.some((p) => p.error), false, "no raw error SSE frame reaches the client");
+  assert.ok(/data: \[DONE\]/.test(text), "stream ends with [DONE]");
   assert.equal(payloads.some((p) => p.choices?.[0]?.finish_reason === "stop" && payloads.some((x) => x.error)), false, "an errored stream must not also claim a successful stop");
 });
 

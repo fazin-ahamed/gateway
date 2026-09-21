@@ -488,12 +488,13 @@ function toOpenAiStream(source, model, id, agent = false, tools = [], onComplete
       // half-parsed tool call must not be flushed and executed) and never
       // report tool_calls/stop — the turn did not complete. finish_reason
       // "length" marks an interrupted generation so clients can retry cleanly.
+      // The raw error object is never emitted as an SSE data frame: it can
+      // carry relay URLs or internal hostnames, and the terminal chunk alone
+      // carries the retry signal clients key off.
       const finishInterrupted = (errObj) => {
         if (finished)
           return;
         finished = true;
-        if (errObj)
-          send(errObj);
         const usage = { prompt_tokens: 0, completion_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), total_tokens: Math.ceil(chars / OUTPUT_CHARS_PER_TOKEN), cost_usd: 0 };
         send(chunk(id, created, model, {}, "length", usage));
         controller.enqueue(enc.encode("data: [DONE]\n\n"));

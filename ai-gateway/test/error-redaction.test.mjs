@@ -22,7 +22,6 @@ test("sseUpstreamDisconnect never echoes the raw exception", () => {
   const sse = t.sseUpstreamDisconnect("The socket connection was closed unexpectedly at https://internal-relay.example");
   assert.doesNotMatch(sse, /internal-relay/);
   assert.doesNotMatch(sse, /https?:\/\//i);
-  assert.match(sse, /upstream_socket_closed/);
   assert.match(sse, /data: \[DONE\]/);
 });
 

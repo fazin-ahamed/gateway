@@ -39,6 +39,11 @@ type ResponseEndMessage struct {
 	Type      string `json:"type"`
 	RequestID string `json:"requestId"`
 	Bytes     int64  `json:"bytes"`
+	// PrematureEOF distinguishes a clean upstream completion from a body read
+	// that failed with anything other than io.EOF. The gateway uses it to
+	// decide between a terminal finish and a stream-error frame; treating the
+	// two identistically would hide truncation as success.
+	PrematureEOF bool `json:"prematureEof,omitempty"`
 }
 
 type ErrorMessage struct {
