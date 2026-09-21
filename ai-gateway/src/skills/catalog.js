@@ -28,7 +28,7 @@ export const SKILL_CATALOG = [
     id: "ui-repair",
     version: 1,
     description: "Fix layout, visual mismatch, or accessibility failures in existing UI.",
-    taskPrefixes: ["code:review", "ui:repair", "ui:visual_match"],
+    taskPrefixes: ["ui:repair", "ui:visual_match"],
     helperFor: ["ui-build"]
   }
 ];

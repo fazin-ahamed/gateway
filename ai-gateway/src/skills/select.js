@@ -13,11 +13,14 @@ function byPrefix(task) {
 }
 
 function uiSkill(taskIR) {
-  const text = String((taskIR && taskIR.features && (taskIR.features.lastUser || taskIR.features.text)) || "");
+  const f = (taskIR && taskIR.features) || {};
+  // extractFeatures emits sessionBlob (the joined non-system text); lastUser/text are defensive fallbacks.
+  const text = String(f.sessionBlob || f.lastUser || f.text || "");
   const task = String(taskIR && taskIR.task || "");
   const looksUi = FRONTEND_TASKS.has(task) || UI_RE.test(text) || UI_RE.test(task);
   if (!looksUi) return null;
-  if (REPAIR_RE.test(text) || task === "ui:repair" || task === "ui:visual_match" || task === "code:review")
+  // code:review is a UI task only when the request text says it is.
+  if (REPAIR_RE.test(text) || task === "ui:repair" || task === "ui:visual_match")
     return SKILL_CATALOG.find((s) => s.id === "ui-repair") || null;
   return SKILL_CATALOG.find((s) => s.id === "ui-build") || null;
 }
@@ -29,7 +32,10 @@ export function selectSkills(taskIR) {
 
   const ui = uiSkill(taskIR);
   const mapped = byPrefix(task);
-  let primary = ui && (task.startsWith("ui:") || task === "code:frontend" || task === "code:review") ? ui : (mapped || ui);
+  // Only a specific-intent mapping overrides lexical UI detection: a debug
+  // request is a debug request even if the broken thing is a React layout.
+  // Generic mappings (code:generation, code:architecture, agent:*) yield to it.
+  let primary = mapped && mapped.id === "swe-debug" ? mapped : (ui || mapped);
   if (!primary)
     return { primary: null, helper: null, reason: "no matching skill" };
 

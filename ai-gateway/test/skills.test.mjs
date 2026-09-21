@@ -57,6 +57,21 @@ test("loadSkill returns body and cache reuses until mtime changes", () => {
   assert.ok(c.body.length < 6000, "skill body should stay under ~6k chars");
 });
 
+test("code:review without UI keywords is not forced to ui-repair", () => {
+  const got = selectSkills({ task: "code:review", features: { sessionBlob: "Please review this Python PR for logging bugs" } });
+  assert.equal(got.primary, null);
+});
+
+test("code:review of frontend code routes to ui-repair", () => {
+  const got = selectSkills({ task: "code:review", features: { sessionBlob: "Review the React component, the flexbox layout is broken" } });
+  assert.equal(got.primary.id, "ui-repair");
+});
+
+test("selectSkills reads features.sessionBlob for lexical UI detection", () => {
+  const got = selectSkills({ task: "code:generation", features: { sessionBlob: "build a tailwind landing page with a hero and cards" } });
+  assert.equal(got.primary.id, "ui-build");
+});
+
 test("every catalog entry has a loadable SKILL.md", () => {
   for (const s of SKILL_BY_ID.keys()) {
     const got = loadSkill(s);
