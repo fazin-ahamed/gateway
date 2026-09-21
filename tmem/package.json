@@ -1,0 +1,8 @@
+{
+  "name": "tmem",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-sqlite --test tmem.test.mjs"
+  }
+}

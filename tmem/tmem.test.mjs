@@ -4,8 +4,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { normalizeFailure, generateTriggers, reciprocalRankFusion, TMEM_SCHEMA } from "../src/tmem/index.js";
-import { migrateTmem, recordEpisode, recall } from "../src/tmem/index.js";
+import { normalizeFailure, generateTriggers, reciprocalRankFusion, TMEM_SCHEMA } from "./index.js";
+import { migrateTmem, recordEpisode, recall } from "./index.js";
 
 // node:sqlite in-memory DB (synchronous API, matches the store's contract).
 // The export is DatabaseSync on Node 22; fall back to nothing when the
