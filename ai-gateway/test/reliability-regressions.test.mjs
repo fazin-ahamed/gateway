@@ -377,6 +377,7 @@ test("outer SSE guard never exposes raw source exception text", async () => {
   const guarded = guardToolLoopResponse(new Response(source, { headers: { "content-type": "text/event-stream" } }), "public-model");
   const text = await guarded.text();
   assert.doesNotMatch(text, /SECRET_PROVIDER_RELbackend|internal-relay\.example/);
+  assert.doesNotMatch(text, /upstream_socket_closed/, "no raw error SSE frame reaches the client");
   assert.match(text, /"finish_reason":"length"/, "interrupted stream terminates with a recognized non-success terminal");
 });
 

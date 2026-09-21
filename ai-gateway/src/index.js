@@ -1612,6 +1612,15 @@ async function koyebExchange(c, opts) {
       ws.close();
     } catch {
     }
+    if (opts.isStream && streamController) {
+      // The tunnel failed mid-stream. The reader must see the stream end or
+      // it parks forever waiting for a frame that will never arrive. Error
+      // it so the downstream pump runs its own terminal path.
+      try {
+        streamController.error(e);
+      } catch {
+      }
+    }
     throw e;
   }
 }

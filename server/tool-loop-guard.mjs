@@ -167,6 +167,10 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
             terminalSeen = !!fixed;
           }
         }
+        // Priority-zero contract: a raw upstream error object never reaches
+        // the client wire (it can carry relay URLs or internal hostnames).
+        // streamFailed is already set at the parse gate; just drop the frame.
+        if (obj && obj.error) return;
         emitObj(obj);
       };
 
@@ -194,20 +198,17 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
         }
         controller.close();
       } catch {
+        // Priority-zero stream continuity contract: terminate with a
+        // recognized terminal (finish_reason "length") + [DONE]. The raw
+        // error object is never emitted to the client wire — it can carry
+        // relay URLs or internal hostnames, and the terminal chunk alone
+        // carries the retry signal clients key off.
         try {
-          emitObj({
-            error: {
-              message: "Upstream stream disconnected",
-              type: "upstream_stream_error",
-              code: "upstream_socket_closed",
-              retryable: true
-            }
-          });
           if (!terminalSeen) {
             emitObj(terminalChunk(model, "length"));
             terminalSeen = true;
           }
-          emit("data: [DONE]\n\n");
+          emit("data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10));
           controller.close();
         } catch {}
       } finally {

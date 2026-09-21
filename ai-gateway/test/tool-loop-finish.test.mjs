@@ -74,6 +74,7 @@ test("partial tool call then an upstream error never ends in tool_calls", async 
   const guarded = guardToolLoopResponse(response, "glm-5.3");
   const text = await guarded.text();
   assert.doesNotMatch(text, /"finish_reason":"tool_calls"/);
+  assert.doesNotMatch(text, /upstream_socket_closed/, "no raw error SSE frame reaches the client");
   assert.match(text, /data: \[DONE\]/, "stream still terminates with [DONE]");
 });
 
@@ -88,6 +89,7 @@ test("a mid-stream source failure emits a structured SSE error then DONE", async
   const response = new Response(source, { headers: { "content-type": "text/event-stream" } });
   const guarded = guardToolLoopResponse(response, "grok-4.6");
   const text = await guarded.text();
+  assert.doesNotMatch(text, /upstream_socket_closed/, "no raw error SSE frame reaches the client");
   assert.match(text, /"finish_reason":"length"/, "interrupted stream terminates with a recognized non-success terminal");
   assert.match(text, /data: \[DONE\]/);
 });
