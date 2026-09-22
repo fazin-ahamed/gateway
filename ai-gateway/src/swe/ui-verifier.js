@@ -219,11 +219,14 @@ const AUDIT_TEMPLATE = String.raw`(() => {
   return { findings, text: visibleTextNodes.length, tabbable: tabOrder.length, docWidth, innerWidth: innerWidth };
 })();
 `;
-async function loadPlaywright() {
+// importer is injectable so the skip path can be tested against the real
+// function with a rejecting importer — a local try/catch in a test would
+// only prove JavaScript semantics, not that this function keeps them.
+export async function loadPlaywright(importer = (specifier) => import(specifier)) {
   // A missing ESM module REJECTS the returned promise; a synchronous try/catch
   // around import() never sees it. The await is what makes the skip path real.
   try {
-    return await import("playwright");
+    return await importer("playwright");
   } catch {
     return null;
   }

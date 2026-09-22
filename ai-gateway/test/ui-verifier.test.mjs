@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { verifySurface, verifyHtml, compareScreenshots, VERIFIER_DEFAULTS } from "../src/swe/ui-verifier.js";
+import { verifySurface, verifyHtml, compareScreenshots, loadPlaywright, VERIFIER_DEFAULTS } from "../src/swe/ui-verifier.js";
 import { deflateSync, crc32 } from "node:zlib";
 
 // A page whose audit findings we control: every evaluate runs the real
@@ -187,26 +187,20 @@ test("verifySurface flags a real failing page", async () => {
   assert.ok(codes.includes("contrast"), JSON.stringify(codes));
 });
 
-test("an import failure settles to null instead of rejecting", async () => {
+test("loadPlaywright settles a failed import to null instead of rejecting", async () => {
   // Regression: import() of a missing module rejects ASYNCHRONOUSLY. A
   // synchronous try/catch around `return import(...)` never catches it, so
   // the failure used to leak a rejection out of verifySurface instead of
   // returning { skipped: true, reason: "playwright-not-installed" }.
   //
-  // The loader's contract is "a failed import resolves to null". Exercise it
-  // with a specifier that cannot resolve; the await is exactly what the old
-  // code was missing.
-  const load = async (specifier) => {
-    try {
-      return await import(specifier);
-    } catch {
-      return null;
-    }
-  };
-  const present = await load("node:assert");
-  const missing = await load("./does-not-exist-" + Date.now() + ".js");
-  assert.ok(present, "a resolvable module must still load");
-  assert.equal(missing, null, "an unresolvable module must settle to null");
+  // This calls the real exported loader with an importer that rejects, so a
+  // future regression in loadPlaywright itself fails here — not a local
+  // reimplementation that only proves the language semantics.
+  const reject = async () => { throw new Error("Cannot find package 'playwright'"); };
+  const missing = await loadPlaywright(reject);
+  assert.equal(missing, null, "a failed import must settle to null");
+  const present = await loadPlaywright(async () => ({ chromium: "stub" }));
+  assert.equal(present.chromium, "stub", "a successful import must pass through");
 });
 
 test("a decorative image with alt=\"\" is not a failure", async () => {
@@ -259,12 +253,17 @@ test("compareScreenshots penalizes a changed image", async () => {
   assert.ok(out.visualSimilarity < 1, String(out.visualSimilarity));
 });
 
-test("compareScreenshots reports a dimension mismatch", async () => {
+test("compareScreenshots reports a dimension mismatch without a fake MAD score", async () => {
+  // Two uniform images of different sizes: edge density and pHash agree, so
+  // the only honest signals are the null MAD and the lost dimension axis.
+  // The old null/48 coercion gave these a perfect MAD score and similarity
+  // of 0.9; the fix caps the MAD axis at 0, leaving 0.5.
   const a = minimalPng(2, 2);
   const b = minimalPng(4, 4);
   const out = compareScreenshots(a, b);
   assert.equal(out.dimensionMatch, false);
-  assert.ok(out.visualSimilarity < 1, String(out.visualSimilarity));
+  assert.equal(out.meanAbsoluteDifference, null);
+  assert.equal(out.visualSimilarity, 0.5, String(out.visualSimilarity));
 });
 
 // minimalPng builds a tiny valid PNG by hand: raw IDAT from zlib over the

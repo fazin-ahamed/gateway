@@ -46,12 +46,6 @@ export function compareImages(a, b) {
     return null;
   const dimensionMatch = ma.width === mb.width && ma.height === mb.height;
 
-  let channelDiff = 0;
-  if (dimensionMatch) {
-    // Only comparable at equal size; otherwise the pixel diff is meaningless.
-    const len = Math.min(ma.rgbaLength ?? 0, mb.rgbaLength ?? 0);
-  }
-
   const mad = meanAbsoluteDifference(a, b);
   const edgeDensityDifference = Math.abs(ma.edgeDensity - mb.edgeDensity);
   const phashDistance = hamming(ma.phash, mb.phash);
@@ -59,7 +53,13 @@ export function compareImages(a, b) {
   // Normalize each axis to 0-1 and blend. The weights are chosen so a
   // pixel-identical render is exactly 1.00 and a totally different layout
   // with the same dimensions still scores low, not zero.
-  const madScore = 1 - Math.min(mad / 48, 1);
+  // meanAbsoluteDifference is null on a size mismatch (the pixel diff is
+  // meaningless across dimensions); scoring it as 0, not 1, is the fix —
+  // null / 48 coerces to 0 and would award a perfect MAD score to two
+  // differently sized images.
+  const madScore = mad == null
+    ? 0
+    : 1 - Math.min(mad / 48, 1);
   const edgeScore = 1 - Math.min(edgeDensityDifference / 0.5, 1);
   const phashScore = 1 - phashDistance / 64;
   const dimScore = dimensionMatch ? 1 : 0;
