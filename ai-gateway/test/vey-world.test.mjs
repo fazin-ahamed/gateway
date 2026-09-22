@@ -220,7 +220,7 @@ test("a decision snapshot attaches its candidate set and policy", () => {
   assert.equal(ep.provenance.decision_snapshot, "present");
 });
 
-test("a malformed candidate snapshot degrades to unavailable, not a crash", () => {
+test("a malformed candidate snapshot is marked invalid, not silently present", () => {
   const ep = exportVeyEpisode({
     trajectory: traj(),
     attempts: [attempt()],
@@ -228,7 +228,15 @@ test("a malformed candidate snapshot degrades to unavailable, not a crash", () =
     decision: { candidate_set_json: "{not json", policy_name: "router-v2" }
   });
   assert.equal(ep.candidate_set, null);
-  assert.equal(ep.provenance.decision_snapshot, "present");
+  assert.equal(ep.provenance.decision_snapshot, "invalid", "pipelines must be able to filter corrupt snapshots");
+  const notArray = exportVeyEpisode({
+    trajectory: traj(),
+    attempts: [attempt()],
+    evidence: new Map(),
+    decision: { candidate_set_json: JSON.stringify({ oops: true }) }
+  });
+  assert.equal(notArray.candidate_set, null);
+  assert.equal(notArray.provenance.decision_snapshot, "invalid");
 });
 
 test("reward stays null in the raw dataset", () => {
@@ -262,18 +270,60 @@ test("caller-side and 5xx failures are classified as operational", () => {
   assert.equal(VEY_INTERNALS.isOperationalFailure(null, null), false);
 });
 
-test("context features are derived from the request body only", () => {
+test("state context is pre-action only and separates offered tools from history", () => {
+  // The request body carries 2 offered tool definitions, one image, an
+  // assistant tool_call and a tool result in history. Prompt tokens are
+  // post-action usage and must not leak into state.
   const ep = exportVeyEpisode({
-    trajectory: traj({ request_json: JSON.stringify({ messages: [
-      { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "x" } }] },
-      { role: "assistant", content: "ok", tool_calls: [{ id: "t1", function: { name: "run" } }] },
-      { role: "tool", tool_call_id: "t1", name: "run", content: "done" }
-    ] }) }),
+    trajectory: traj({
+      prompt_tokens: 99999,
+      request_json: JSON.stringify({
+        messages: [
+          { role: "system", content: "sys" },
+          { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "x" } }] },
+          { role: "assistant", content: "ok", tool_calls: [{ id: "t1", function: { name: "run" } }] },
+          { role: "tool", tool_call_id: "t1", name: "run", content: "done" }
+        ],
+        tools: [{ type: "function", function: { name: "run" } }, { type: "function", function: { name: "read" } }]
+      })
+    }),
     attempts: [attempt()],
     evidence: new Map(),
     decision: null
   });
-  assert.equal(ep.state.context.image_count, 1);
-  assert.equal(ep.state.context.has_tools, true);
-  assert.equal(ep.state.context.tool_count, 2);
+  const ctx = ep.state.context;
+  assert.equal(ctx.available_tool_count, 2, "request.tools must be reflected in available_tool_count");
+  assert.equal(ctx.has_available_tools, true);
+  assert.equal(ctx.tool_calls_in_history, 1);
+  assert.equal(ctx.tool_results_in_history, 1);
+  assert.equal(ctx.image_count, 1);
+  assert.equal(ctx.token_source, "request_approximation");
+  assert.notEqual(ctx.estimated_input_tokens, 99999, "post-action prompt_tokens must never leak into state");
+  assert.ok(ctx.estimated_input_tokens > 0);
+});
+
+test("a first-turn agent request with tools and empty history is labelled correctly", () => {
+  const defs = Array.from({ length: 50 }, (_, i) => ({ type: "function", function: { name: "tool_" + i } }));
+  const ep = exportVeyEpisode({
+    trajectory: traj({ request_json: JSON.stringify({ messages: [{ role: "user", content: "go" }], tools: defs }) }),
+    attempts: [attempt()],
+    evidence: new Map(),
+    decision: null
+  });
+  assert.equal(ep.state.context.available_tool_count, 50);
+  assert.equal(ep.state.context.has_available_tools, true);
+  assert.equal(ep.state.context.tool_calls_in_history, 0);
+  assert.equal(ep.state.context.tool_results_in_history, 0);
+});
+
+test("a decision snapshot supplies context tokens and the token source", () => {
+  const decision = {
+    policy_name: "router-v2",
+    policy_version: "router-v2@x",
+    context_features_json: JSON.stringify({ context_tokens: 2811, difficulty: 0.68 }),
+    candidate_set_json: JSON.stringify([{ action_id: "route:17", route_id: 17 }])
+  };
+  const ep = exportVeyEpisode({ trajectory: traj(), attempts: [attempt()], evidence: new Map(), decision });
+  assert.equal(ep.state.context.estimated_input_tokens, 2811);
+  assert.equal(ep.state.context.token_source, "decision_snapshot");
 });

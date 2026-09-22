@@ -1946,6 +1946,7 @@ function downloadTraj(fmt){ const a=document.createElement('a'); a.href=API+'/ad
 document.getElementById('tj-export-openai').onclick=function(){ downloadTraj('openai'); };
 document.getElementById('tj-export-sharegpt').onclick=function(){ downloadTraj('sharegpt'); };
 document.getElementById('tj-export-trl').onclick=function(){ downloadTraj('trl'); };
+document.getElementById('tj-export-rl').onclick=function(){ downloadTraj('rl'); };
 document.getElementById('tj-export-vey').onclick=function(){ downloadTraj('vey'); };
 
 // ---------- LIMITS ----------

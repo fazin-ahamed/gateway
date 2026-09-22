@@ -14,6 +14,8 @@
 
 import { exportVeyEpisode, VEY_SCHEMA } from "./vey-world.js";
 
+export const __test = { loadAliasIndex };
+
 // Export one episode fully (single request_id) as pretty JSON.
 export async function exportVeyEpisodeFull(db, requestId) {
   const traj = await db.prepare(
@@ -96,12 +98,24 @@ async function assembleEpisode(db, traj) {
   }
 
   // Canonical identity per attempt, resolved through the alias index the same
-  // way serving does — but read-only, at export time.
+  // way serving does — but read-only, at export time. resolveCanonicalModel
+  // takes an options object and returns { canonicalModelId, alias, step }, so
+  // the string is unwrapped; an unresolved identity stays null rather than
+  // being turned into a bogus id.
   let resolve = (row) => row.canonical_model_id || null;
   try {
     const { resolveCanonicalModel } = await import("../router/model-registry.js");
     const aliasIndex = await loadAliasIndex(db);
-    resolve = (row) => resolveCanonicalModel(aliasIndex, row.public_slug, row.upstream_model, row.provider_id);
+    resolve = (row) => {
+      if (!aliasIndex || !aliasIndex.size)
+        return null;
+      const hit = resolveCanonicalModel(aliasIndex, {
+        providerId: row.provider_id,
+        publicSlug: row.public_slug,
+        upstreamModel: row.upstream_model
+      });
+      return hit && hit.canonicalModelId ? hit.canonicalModelId : null;
+    };
   } catch {
     // Registry unavailable: identity stays provisional, which is honest.
   }
@@ -134,10 +148,13 @@ async function assembleEpisode(db, traj) {
 }
 
 async function loadAliasIndex(db) {
+  // model-registry expects a gateway context (c.env.DB), not the raw handle.
+  // An empty index makes every resolve a miss, which is honest — never a
+  // fabricated id.
   try {
     const { loadAliasIndex: load } = await import("../router/model-registry.js");
-    return load(db);
+    return await load({ env: { DB: db } });
   } catch {
-    return null;
+    return new Map();
   }
 }

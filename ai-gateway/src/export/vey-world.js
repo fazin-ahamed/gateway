@@ -206,12 +206,7 @@ export function exportVeyEpisode({ trajectory, attempts = [], evidence = new Map
       messages: request ? request.messages : [],
       task_type: trajectory.task_type || attempts[0]?.task_type || null,
       stream: Boolean(trajectory.stream),
-      context: {
-        estimated_input_tokens: trajectory.prompt_tokens ?? null,
-        image_count: request ? countImages(request.messages) : 0,
-        has_tools: request ? hasTools(request.messages) : false,
-        tool_count: request ? countTools(request.messages) : 0
-      },
+      context: buildStateContext(request, decision),
       task_ir: null
     },
     candidate_set: null,
@@ -250,9 +245,19 @@ export function exportVeyEpisode({ trajectory, attempts = [], evidence = new Map
   // of "this existed but failed the reliability floor").
   if (decision && decision.candidate_set_json) {
     try {
-      episode.candidate_set = JSON.parse(decision.candidate_set_json);
+      const parsed = JSON.parse(decision.candidate_set_json);
+      if (Array.isArray(parsed)) {
+        episode.candidate_set = parsed;
+      } else {
+        episode.candidate_set = null;
+        episode.provenance.decision_snapshot = "invalid";
+      }
     } catch {
       episode.candidate_set = null;
+      // Distinguish "snapshot exists but is unreadable" from "no snapshot":
+      // training pipelines can filter invalid deterministically instead of
+      // guessing whether null means absent or corrupt.
+      episode.provenance.decision_snapshot = "invalid";
     }
   }
   if (decision && decision.task_ir_version)
@@ -289,37 +294,78 @@ function finishReason(response) {
   return (choice && choice.finish_reason) || "stop";
 }
 
-function countImages(messages) {
-  let n = 0;
-  for (const m of messages || []) {
-    const content = m && m.content;
-    if (Array.isArray(content))
-      for (const part of content)
-        if (part && part.type === "image_url")
-          n++;
+// State context must contain ONLY what existed before the policy chose.
+// trajectory.prompt_tokens is provider-side usage known AFTER the action —
+// putting it in state leaks the outcome into the observation and teaches the
+// model to condition on the future. The decision snapshot's context_tokens
+// is used when present; otherwise a provider-independent approximation is
+// computed from the request itself, exactly the way TaskIR does
+// (message chars + system chars + tool-schema chars, /4, plus images).
+function buildStateContext(request, decision) {
+  let snapshotTokens = null;
+  if (decision && decision.context_features_json) {
+    try {
+      const cf = JSON.parse(decision.context_features_json);
+      snapshotTokens = Number.isFinite(cf.context_tokens) ? cf.context_tokens : null;
+    } catch {
+      snapshotTokens = null;
+    }
   }
-  return n;
-}
 
-function hasTools(messages) {
-  for (const m of messages || []) {
-    if (m && Array.isArray(m.tool_calls) && m.tool_calls.length)
-      return true;
-    if (m && m.role === "tool")
-      return true;
+  const msgs = request && Array.isArray(request.messages) ? request.messages : [];
+  const tools = request && (request.tools || request.functions);
+  const availableToolCount = Array.isArray(tools) ? tools.length : tools ? 1 : 0;
+
+  let imageCount = 0;
+  let textChars = 0;
+  let systemChars = 0;
+  for (const m of msgs) {
+    const c = m && m.content;
+    const add = (part) => {
+      if (typeof part === "string") return part.length;
+      if (part && typeof part.text === "string") return part.text.length;
+      return 0;
+    };
+    if (typeof c === "string") {
+      if (m.role === "system" || m.role === "developer") systemChars += c.length;
+      else textChars += c.length;
+    } else if (Array.isArray(c)) {
+      for (const p of c) {
+        const n = add(p);
+        if (m.role === "system" || m.role === "developer") systemChars += n;
+        else textChars += n;
+        if (p && (p.type === "image_url" || p.type === "image")) imageCount++;
+      }
+    }
   }
-  return false;
-}
+  let toolSchemaChars = 0;
+  try {
+    if (tools) toolSchemaChars = JSON.stringify(tools).length;
+  } catch {}
 
-function countTools(messages) {
-  let n = 0;
-  for (const m of messages || []) {
+  // Offered tools and historical tool traffic are different signals: a
+  // first-turn agent request with 50 tool definitions and zero history has
+  // available_tool_count=50, tool_calls_in_history=0. Overloading one
+  // tool_count conflated them into bad policy-training data.
+  let toolCallsInHistory = 0;
+  let toolResultsInHistory = 0;
+  for (const m of msgs) {
     if (m && Array.isArray(m.tool_calls))
-      n += m.tool_calls.length;
+      toolCallsInHistory += m.tool_calls.length;
     if (m && m.role === "tool")
-      n++;
+      toolResultsInHistory++;
   }
-  return n;
+
+  const approximatedTokens = Math.ceil((textChars + systemChars + toolSchemaChars) / 4) + imageCount * 500;
+  return {
+    estimated_input_tokens: snapshotTokens != null ? snapshotTokens : approximatedTokens,
+    token_source: snapshotTokens != null ? "decision_snapshot" : "request_approximation",
+    image_count: imageCount,
+    has_available_tools: availableToolCount > 0,
+    available_tool_count: availableToolCount,
+    tool_calls_in_history: toolCallsInHistory,
+    tool_results_in_history: toolResultsInHistory
+  };
 }
 
 function nowIso() {
