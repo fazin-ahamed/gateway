@@ -4739,12 +4739,14 @@ app.get("/admin/trajectories-export", async (c) => {
   const format = String(c.req.query("format") || "openai");
   if (format === "vey" || format === "world") {
     // Vey exports the whole episode — including failed attempts — so it must
-    // NOT run through the successful-completion query below. See
-    // exportVeyDataset in src/export/vey-world-serve.js.
-    const denied2 = await exportVeyDataset(c, format);
-    if (denied2)
-      return denied2;
-    return;
+    // NOT run through the successful-completion query below. The Response it
+    // builds has to be returned: dropping it sends the browser an empty body
+    // (NS_ERROR_NET_EMPTY_RESPONSE).
+    // See exportVeyDataset in src/export/vey-serve.js.
+    const vey = await exportVeyDataset(c, format);
+    if (vey)
+      return vey;
+    return c.json({ error: { message: "vey export produced no response" } }, 500);
   }
   if (!["openai", "sharegpt", "trl", "rl"].includes(format))
     return c.json({ error: { message: "format must be one of openai, sharegpt, trl, rl, vey" } }, 400);
