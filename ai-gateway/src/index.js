@@ -18,6 +18,7 @@ import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
+import { contextLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
 var registrySeedInflight = new WeakMap();
@@ -636,14 +637,37 @@ app.get("/v1/models", async (c) => {
   // providers are all disabled or all marked down would 503 on use, which is
   // exactly the "client picked a model that fails" trap.
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id AS route_id, mr.slug FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
   ).bind(...allowed).all();
+  const live = [];
   const liveSlugs = new Set();
   for (const r of routes.results || []) {
-    if (!circuitOpen("route:" + String(r.route_id)))
-      liveSlugs.add(r.slug);
+    if (circuitOpen("route:" + String(r.route_id)))
+      continue;
+    live.push(r);
+    liveSlugs.add(r.slug);
   }
-  const data = [{ id: AUTO_SLUG, object: "model", created: 0, owned_by: "gateway" }];
+  const data = [];
+  const cfg = await autoSettings(c);
+  if (cfg.enabled && live.length) {
+    if (!modelsDevCache.catalog)
+      await fetchModelsDevCatalog().catch(() => {});
+    const catalog = modelsDevCache.catalog;
+    const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
+    const envelope = buildCapabilityEnvelope(live.map((r) => {
+      const entry = byId ? matchModelsDevPrice(byId, r.slug) : null;
+      const caps = entryCapabilities(entry);
+      return {
+        providerId: r.provider_id,
+        context: contextLimit(caps),
+        output: caps.output,
+        tools: !!caps.tools,
+        vision: !!caps.vision,
+        reasoning: !!(entry && entry.reasoning)
+      };
+    }));
+    data.push(autoModelEntry(envelope));
+  }
   for (const slug of [...liveSlugs].sort())
     data.push({ id: slug, object: "model", created: 0, owned_by: "gateway" });
   return c.json({ object: "list", data });
@@ -2901,7 +2925,7 @@ async function pickAutoModel(c, payload, key) {
     if (Number.isFinite(mult) && mult > 0)
       q *= Math.min(3, mult);
     const caps = entryCapabilities(entry);
-    const ctxOk = caps.unknown ? reqTokens < 32000 : (!caps.context || reqTokens <= Math.floor(caps.context * 0.9));
+    const ctxOk = reqTokens <= Math.floor(contextLimit(caps) * 0.9);
     const ctxTight = !!(caps.context && reqTokens > caps.context * 0.55);
     const visionOk = reqImages === 0 || (!caps.unknown && caps.vision);
     const toolsOk = !hasTools || caps.tools || caps.unknown;
@@ -3078,6 +3102,7 @@ async function fetchModelsDevCatalog() {
     clearTimeout(t);
   }
 }
+function __setModelsDevCache(catalog) { modelsDevCache = { at: catalog ? Date.now() : 0, catalog: catalog || null }; }
 function numOrNull(value) {
   if (value === void 0 || value === null || value === "")
     return null;
@@ -6298,7 +6323,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };
