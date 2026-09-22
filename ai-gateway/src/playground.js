@@ -380,7 +380,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-trajectories">
-    <div class="pagehead"><div><h2 class="sec">Trajectories</h2><p class="sub">Every request with its full multi-turn conversation, tool calls, and route chain. Exports are industry-standard training formats with tool traffic preserved.</p></div><div class="actions"><button class="ghost" id="tj-export-openai" title="OpenAI fine-tuning messages format">OpenAI</button><button class="ghost" id="tj-export-sharegpt" title="ShareGPT conversations format">ShareGPT</button><button class="ghost" id="tj-export-trl" title="HuggingFace TRL conversational format">TRL</button><button class="ghost" id="tj-export-rl" title="RL episode: prompt, completion, reward slot">RL</button><button class="ghost" id="tj-refresh">Refresh</button><button class="danger" id="tj-purge">Purge</button></div></div>
+    <div class="pagehead"><div><h2 class="sec">Trajectories</h2><p class="sub">Every request with its full multi-turn conversation, tool calls, and route chain. Exports are industry-standard training formats with tool traffic preserved. Vey is the native routing/world-model format: candidate sets, every failed and successful attempt, operational outcomes separate from answer-quality evidence.</p></div><div class="actions"><button class="ghost" id="tj-export-openai" title="OpenAI fine-tuning messages format">OpenAI</button><button class="ghost" id="tj-export-sharegpt" title="ShareGPT conversations format">ShareGPT</button><button class="ghost" id="tj-export-trl" title="HuggingFace TRL conversational format">TRL</button><button class="ghost" id="tj-export-rl" title="RL episode: prompt, completion, reward slot">RL</button><button class="ghost" id="tj-export-vey" title="Vey World — native routing/world-model episodes with candidate sets, attempts, operational outcomes and semantic evidence">Vey</button><button class="ghost" id="tj-refresh">Refresh</button><button class="danger" id="tj-purge">Purge</button></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Settings</h2></div><div class="panel-b">
       <label class="pg-check" style="margin:0"><input type="checkbox" id="tj-capture"> Capture trajectories</label>
       <p class="hint">Bodies are capped at 128KB per side and secrets are stripped. Turn off to record nothing.</p>
@@ -1946,7 +1946,7 @@ function downloadTraj(fmt){ const a=document.createElement('a'); a.href=API+'/ad
 document.getElementById('tj-export-openai').onclick=function(){ downloadTraj('openai'); };
 document.getElementById('tj-export-sharegpt').onclick=function(){ downloadTraj('sharegpt'); };
 document.getElementById('tj-export-trl').onclick=function(){ downloadTraj('trl'); };
-document.getElementById('tj-export-rl').onclick=function(){ downloadTraj('rl'); };
+document.getElementById('tj-export-vey').onclick=function(){ downloadTraj('vey'); };
 
 // ---------- LIMITS ----------
 async function loadLimits(){

@@ -478,3 +478,44 @@ CREATE TABLE IF NOT EXISTS agent_loop_events (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_loop_turn ON agent_loop_events(logical_turn_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_loop_time ON agent_loop_events(created_at);
+
+-- Immutable decision snapshot: what the policy knew and chose AT DECISION
+-- TIME. Body-free (no prompt, no sessionBlob, no source code — those live in
+-- trajectories.request_json when capture is explicitly enabled).
+--
+-- Exists so the Vey exporter never has to reconstruct a historical candidate
+-- set from today's model_routes. Routes change price, health, circuit state,
+-- posteriors and capabilities over time; exporting a request from yesterday
+-- against today's route table would manufacture fake training data.
+--
+-- candidate_set_json is the full set the policy considered, INCLUDING
+-- rejected candidates: a learned decision model must see "this option
+-- existed but failed the reliability floor", not only the options that
+-- passed. propensity stays NULL while the policy is deterministic — do not
+-- invent one; record the real value only if randomized exploration ships.
+--
+-- WRITING this table is a post-window concern. The schema is shipped now so
+-- the Vey exporter and its tests have a real shape to bind against; live
+-- capture from the routing path stays disabled until the Router V2
+-- measurement window closes.
+CREATE TABLE IF NOT EXISTS router_decisions (
+  request_id TEXT PRIMARY KEY,
+
+  policy_name TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+
+  task_type TEXT,
+  task_ir_version TEXT,
+
+  context_features_json TEXT,
+  candidate_set_json TEXT NOT NULL,
+
+  selected_action_id TEXT,
+
+  propensity REAL,
+  exploration INTEGER NOT NULL DEFAULT 0,
+  decision_type TEXT NOT NULL DEFAULT 'deterministic',
+
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_router_decisions_created ON router_decisions(created_at);

@@ -16,6 +16,7 @@ import { seedModelRegistry, backfillQualityCanonicalIds, loadAliasIndex, resolve
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
+import { exportVeyDataset } from "./export/vey-serve.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
 var registrySeedInflight = new WeakMap();
@@ -4736,8 +4737,17 @@ app.get("/admin/trajectories-export", async (c) => {
   if (denied)
     return denied;
   const format = String(c.req.query("format") || "openai");
+  if (format === "vey" || format === "world") {
+    // Vey exports the whole episode — including failed attempts — so it must
+    // NOT run through the successful-completion query below. See
+    // exportVeyDataset in src/export/vey-world-serve.js.
+    const denied2 = await exportVeyDataset(c, format);
+    if (denied2)
+      return denied2;
+    return;
+  }
   if (!["openai", "sharegpt", "trl", "rl"].includes(format))
-    return c.json({ error: { message: "format must be one of openai, sharegpt, trl, rl" } }, 400);
+    return c.json({ error: { message: "format must be one of openai, sharegpt, trl, rl, vey" } }, 400);
   const slugFilter = String(c.req.query("slug") || "").trim();
   let sql = "SELECT slug, stream, status, provider, attempts, steps_json, request_json, response_json, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at FROM trajectories WHERE status='ok' AND request_json IS NOT NULL AND response_json IS NOT NULL";
   const binds = [];
