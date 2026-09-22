@@ -65,6 +65,10 @@ export function openCapsule(input = {}) {
 // noteCapsule(capsule, patch): append observations. List fields grow (still
 // bounded and deduped); text fields are replaced only when the patch carries
 // a non-empty value, so a partial note cannot blank the goal.
+//
+// Sealed is a terminal status, not content immutability: noting a sealed
+// capsule keeps verified/failed and still records the observation. If a
+// caller wants a frozen record, copy it — note always returns a new object.
 export function noteCapsule(capsule, patch = {}) {
   const next = openCapsule(capsule);
   for (const field of FIELDS) {
@@ -77,9 +81,10 @@ export function noteCapsule(capsule, patch = {}) {
   return next;
 }
 
-// sealCapsule(capsule, outcome): freeze the handoff. "verified" is the only
-// outcome that marks the attempt done; anything else stays a failure the
-// next attempt must read. Sealing drops nothing — it only sets the status.
+// sealCapsule(capsule, outcome): mark the handoff terminal. "verified" is
+// the only outcome that ends the attempt; anything else stays a failure the
+// next attempt must read. Sealing sets the status and drops nothing. It does
+// not lock the fields — see noteCapsule above for what sealed means.
 export function sealCapsule(capsule, outcome = "failed") {
   const next = openCapsule(capsule);
   next.status = outcome === "verified" ? "verified" : "failed";

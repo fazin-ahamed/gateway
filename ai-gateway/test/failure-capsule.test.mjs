@@ -84,3 +84,16 @@ test("renderCapsule omits empty sections and keeps every filled one", () => {
   assert.equal(text.includes("hypothesis"), false);
   assert.equal(text.includes("unknowns"), false);
 });
+
+test("noting a sealed capsule keeps its terminal status", () => {
+  // Sealed is a terminal status, not content immutability: a late observation
+  // is recorded without reopening verified/failed. Callers wanting a frozen
+  // record must copy; note always returns a new object.
+  const sealed = sealCapsule(openCapsule({ goal: "stop the leak" }), "failed");
+  const noted = noteCapsule(sealed, { ruledOut: "the sse helper" });
+  assert.equal(noted.status, "failed");
+  assert.deepEqual(noted.ruledOut, ["the sse helper"]);
+  assert.equal(sealed.ruledOut.length, 0);
+  const verified = sealCapsule(openCapsule({ goal: "stop the leak" }), "verified");
+  assert.equal(noteCapsule(verified, { unknowns: "nothing" }).status, "verified");
+});

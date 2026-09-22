@@ -9,16 +9,23 @@
 //   - DOM geometry: horizontal overflow, clipped content, zero-size boxes
 //   - tap targets: interactive elements with a hit area under 24px
 //   - contrast: visible text against its painted background, WCAG AA
-//   - keyboard reachability: every interactive element reachable in Tab order
+//   - keyboard reachability: offscreen focus targets; tab-order vs visual
+//     order is advisory, not a hard fail (real flex/grid/RTL layouts differ)
 //   - document language, page title, image alt text, form labels, headings
+//   - screenshot metrics: dimension match, mean absolute pixel difference,
+//     edge-density difference, perceptual hash distance, and a normalized
+//     visualSimilarity. Computed by image-metrics.js, no model involved.
+//
+// Accessibility here is a custom deterministic audit, not axe: contrast and
+// geometry are computed from the painted DOM directly, so the harness adds
+// nothing to the dependency set. axe stays optional and offline if a caller
+// later wants it; these checks cover the claims the skills make.
 //
 // No filesystem, no network, no gateway serving import. The browser is
 // injected as one bag, so the module is testable without a display: pass a
 // fake browser and the measurements come from your fixtures.
-//
-// No axe-core dependency: contrast and geometry are computed from the DOM
-// directly, so the harness adds nothing to the dependency set.
 
+import { describeImage, compareImages } from "./image-metrics.js";
 const DEFAULT_WIDTHS = [375, 768, 1024, 1440];
 
 // WCAG AA. Body text needs 4.5:1; large text (18pt+ or 14pt bold+) needs 3:1.
@@ -48,12 +55,21 @@ function contrastRatio(a, b) {
 
 // The DOM side: one evaluate per page that collects every finding at once, so
 // a viewport never costs more than one round trip into the browser.
-const PAGE_AUDIT = String.raw`
-(() => {
+// Built from a tokenized template: String.raw does NOT interpolate, so the
+// thresholds are bound here and the page script receives plain numbers.
+function pageAuditScript() {
+  const bind = (s) => s
+    .replaceAll("__MIN_TARGET__", String(MIN_TARGET_PX))
+    .replaceAll("__LARGE_PX__", String(LARGE_PX))
+    .replaceAll("__BOLD_LARGE_PX__", String(BOLD_LARGE_PX))
+    .replaceAll("__LARGE_CONTRAST__", String(LARGE_CONTRAST))
+    .replaceAll("__BODY_CONTRAST__", String(BODY_CONTRAST));
+  return bind(AUDIT_TEMPLATE);
+}
+const AUDIT_TEMPLATE = String.raw`(() => {
+  const MIN_TARGET = __MIN_TARGET__;
   const findings = [];
   const add = (code, message, ctx) => findings.push({ code, message, context: ctx || null });
-  // WCAG luminance + contrast inlined: this runs in the page, so it cannot
-  // call the module's helpers.
   const luminance = (c) => {
     const ch = (s) => {
       const v = s / 255;
@@ -102,8 +118,8 @@ const PAGE_AUDIT = String.raw`
   for (const { el, text, style, rect } of visibleTextNodes) {
     const size = parseFloat(style.fontSize);
     const bold = parseInt(style.fontWeight, 10) >= 700;
-    const large = size >= ${LARGE_PX} || (bold && size >= ${BOLD_LARGE_PX});
-    const need = large ? ${LARGE_CONTRAST} : ${BODY_CONTRAST};
+    const large = size >= __LARGE_PX__ || (bold && size >= __BOLD_LARGE_PX__);
+    const need = large ? __LARGE_CONTRAST__ : __BODY_CONTRAST__;
     const fg = style.color.match(/rgba?\(([^)]+)\)/);
     if (!fg) continue;
     const fgp = fg[1].split(",").map((s) => parseFloat(s.trim()));
@@ -128,8 +144,8 @@ const PAGE_AUDIT = String.raw`
       add("invisible-interactive", "Interactive element renders with no box: " + (el.textContent.trim().slice(0, 32) || el.tagName), el.tagName.toLowerCase());
       continue;
     }
-    if (r.width < ${MIN_TARGET_PX} || r.height < ${MIN_TARGET_PX})
-      add("small-target", "Hit area " + Math.round(r.width) + "x" + Math.round(r.height) + " is under ${MIN_TARGET_PX}px: " + (el.textContent.trim().slice(0, 32) || el.tagName), el.tagName.toLowerCase());
+    if (r.width < MIN_TARGET || r.height < MIN_TARGET)
+      add("small-target", "Hit area " + Math.round(r.width) + "x" + Math.round(r.height) + " is under " + MIN_TARGET + "px: " + (el.textContent.trim().slice(0, 32) || el.tagName), el.tagName.toLowerCase());
 
     if (el.tagName === "A" && !el.getAttribute("href"))
       add("link-no-href", "Anchor has no href: \"" + el.textContent.trim().slice(0, 32) + "\"", "a");
@@ -164,8 +180,10 @@ const PAGE_AUDIT = String.raw`
     const src = img.getAttribute("src") || "";
     const role = img.getAttribute("role");
     if (role === "presentation" || img.getAttribute("aria-hidden") === "true") continue;
-    if (!img.getAttribute("alt"))
-      add("img-no-alt", "Image has no alt text: " + src.slice(0, 48), "img");
+    // alt="" is a deliberate "decorative, ignore me" and is valid. The
+    // failure is a missing attribute, not an empty one.
+    if (!img.hasAttribute("alt"))
+      add("img-no-alt", "Image has no alt attribute: " + src.slice(0, 48), "img");
   }
 
   for (const b of document.querySelectorAll("button")) {
@@ -173,8 +191,10 @@ const PAGE_AUDIT = String.raw`
       add("button-no-label", "Button has no accessible name", "button");
   }
 
-  // Keyboard path: DOM order must be the tab order, and nothing reachable may
-  // be offscreen (a focus target the user cannot see is a dead end).
+  // Keyboard path: nothing reachable may be offscreen (a focus target the user
+  // cannot see is a dead end). DOM-vs-geometry order is advisory only: real
+  // flex/grid and RTL layouts reorder visually without harming keyboard use,
+  // so it warns instead of failing.
   const tabbable = Array.from(document.querySelectorAll("a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex=\"-1\"]), summary"))
     .filter((el) => {
       const st = getComputedStyle(el);
@@ -188,7 +208,7 @@ const PAGE_AUDIT = String.raw`
   const misordered = [];
   for (let i = 0; i < tabOrder.length; i++)
     if (tabOrder[i].y !== sorted[i].y || tabOrder[i].x !== sorted[i].x) misordered.push(tabOrder[i].label);
-  if (misordered.length) add("tab-order", "Tab order does not match DOM/visual order at: " + misordered.slice(0, 3).join(", "));
+  if (misordered.length) add("tab-order-advisory", "Tab order does not match DOM/visual order at: " + misordered.slice(0, 3).join(", ") + " (advisory: verify by real keyboard traversal)");
 
   const offscreen = tabbable.filter((el) => {
     const r = el.getBoundingClientRect();
@@ -199,12 +219,11 @@ const PAGE_AUDIT = String.raw`
   return { findings, text: visibleTextNodes.length, tabbable: tabOrder.length, docWidth, innerWidth: innerWidth };
 })();
 `;
-function loadPlaywright() {
-  // This package is ESM: import() is the only CommonJS-interop path. The
-  // root node_modules holds playwright, but importing it must stay optional
-  // so a host without Chromium still loads this module and reports skipped.
+async function loadPlaywright() {
+  // A missing ESM module REJECTS the returned promise; a synchronous try/catch
+  // around import() never sees it. The await is what makes the skip path real.
   try {
-    return import("playwright");
+    return await import("playwright");
   } catch {
     return null;
   }
@@ -249,22 +268,30 @@ async function withPage(browser, url, width, { screenshot = null, fullPage = fal
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "load", timeout: 15000 });
-    const audit = (await page.evaluate(PAGE_AUDIT)) || { findings: [] };
+    const audit = (await page.evaluate(pageAuditScript())) || { findings: [] };
     const shots = {};
     if (screenshot) {
-      shots.viewport = await page.screenshot({ type: "png" }).then((b) => b.toString("base64"));
+      const viewportPng = await page.screenshot({ type: "png" });
+      shots.viewport = viewportPng.toString("base64");
       if (fullPage)
-        shots.full = await page.screenshot({ type: "png", fullPage: true }).then((b) => b.toString("base64"));
+        shots.full = (await page.screenshot({ type: "png", fullPage: true })).toString("base64");
+      // Screenshot metrics run on the raw PNG bytes: dimension match, mean
+      // absolute pixel difference, edge-density difference, and a perceptual
+      // hash distance. Model-free, one pass over the decoded image.
+      shots.metrics = describeImage(viewportPng);
     }
     if (evaluate) {
       const extra = await page.evaluate(evaluate);
-      return { width, audit, screenshots: shots, extra };
+      return { width, audit: { findings: audit.findings, text: audit.text, tabbable: audit.tabbable, docWidth: audit.docWidth, innerWidth: audit.innerWidth }, screenshots: shots, extra };
     }
-    return { width, audit, screenshots: shots };
+    return { width, audit: { findings: audit.findings, text: audit.text, tabbable: audit.tabbable, docWidth: audit.docWidth, innerWidth: audit.innerWidth }, screenshots: shots };
   } finally {
     await context.close();
   }
 }
+// Codes that fail a run. tab-order is advisory and stays out of this set:
+// real flex/grid/RTL layouts reorder visually without harming keyboard use.
+const DEFAULT_FAIL_CODES = ["horizontal-overflow", "contrast", "no-h1", "no-lang", "no-title", "input-no-label", "img-no-alt", "button-no-label", "small-target", "invisible-interactive", "focus-offscreen", "heading-skip"];
 
 export async function verifySurface(url, {
   widths = DEFAULT_WIDTHS,
@@ -302,7 +329,14 @@ export async function verifyHtml(html, options = {}) {
   return verifySurface(encoded, options);
 }
 
-const DEFAULT_FAIL_CODES = ["horizontal-overflow", "contrast", "no-h1", "no-lang", "no-title", "input-no-label", "img-no-alt", "button-no-label", "small-target", "invisible-interactive", "tab-order", "focus-offscreen", "heading-skip"];
+// compareScreenshots(a, b): the metrics entry point for a ui-repair that
+// needs "did the fix change what the user sees?" as a number. Accepts raw
+// PNG buffers or base64 strings.
+export function compareScreenshots(a, b) {
+  const decode = (value) => (typeof value === "string" ? Buffer.from(value, "base64") : value);
+  return compareImages(decode(a), decode(b));
+}
+
 
 function summarize(url, results, failOn) {
   const allFindings = results.flatMap((r) => r.audit.findings.map((f) => ({ ...f, width: r.width })));
