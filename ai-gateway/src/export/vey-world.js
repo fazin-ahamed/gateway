@@ -142,6 +142,7 @@ function buildAttempt(attempt, evidence) {
       failure_code: attempt.failure_code ?? null,
       health_impact: attempt.health_impact === 1 || attempt.health_impact === true,
       ttft_ms: attempt.ttft_ms ?? null,
+      headers_ms: attempt.headers_ms ?? null,
       latency_ms: attempt.latency_ms ?? null,
       prompt_tokens: attempt.prompt_tokens ?? 0,
       completion_tokens: attempt.completion_tokens ?? 0,

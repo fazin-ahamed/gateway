@@ -54,6 +54,18 @@ function attempt(extra = {}) {
   };
 }
 
+test("the attempt carries the route that served and the time headers arrived", () => {
+  const ep = exportVeyEpisode({
+    trajectory: traj(),
+    attempts: [attempt({ route_id: 22, headers_ms: 640, ttft_ms: 2100 })],
+    evidence: new Map(),
+    decision: null
+  });
+  assert.equal(ep.attempts[0].action.route_id, 22, "the serving route is recorded on the attempt");
+  assert.equal(ep.attempts[0].outcome.headers_ms, 640);
+  assert.equal(ep.attempts[0].outcome.ttft_ms, 2100, "first token stays distinct from headers");
+});
+
 test("episode carries the vey.world.v1 schema and the request id", () => {
   const ep = exportVeyEpisode({ trajectory: traj(), attempts: [attempt()], evidence: new Map(), decision: null });
   assert.equal(ep.schema, VEY_SCHEMA);

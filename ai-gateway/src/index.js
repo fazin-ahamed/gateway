@@ -893,7 +893,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         const _attemptIndex = ++realAttemptSeq;
         const _fallbackFrom = (previousRealRouteId != null && previousRealRouteId !== route.id) ? previousRealRouteId : null;
         previousRealRouteId = route.id;
-        const _att = { recorded: false, success: 0, status: null, why: null, errKind: null, ttft: null, prompt: 0, completion: 0, cost: null };
+        const _att = { recorded: false, success: 0, status: null, why: null, errKind: null, headers: null, ttft: null, prompt: 0, completion: 0, cost: null };
         try {
           // Stable Z.AI session/browser identity must be server-controlled and
           // credential-specific. Never derive pool identity from JWT claims.
@@ -902,7 +902,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             : route;
           const res = await forwardToProvider(c, attemptRoute, k.key, payload, isStream, requestId);
           const up = res.response;
-          _att.ttft = Date.now() - _attStart;
+          _att.headers = Date.now() - _attStart;
           _att.status = up.status;
           // chat.z.ai retires its session cookie as it issues a new one; keep
           // the stored secret current so the route survives past the rotation.
@@ -1008,7 +1008,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           blog("TRACE id=" + requestId + " stream provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank);
           traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart, streaming: true });
           _att.recorded = true;
-          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: 1, health_impact: 0, http_status: up.status, fallback_from_route_id: _fallbackFrom, deferPosterior: true, ...shadowAttemptFields(autoDecision) });
+          const _streamAttemptId = await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, headers_ms: _att.headers, ttft_ms: null, success: 1, health_impact: 0, http_status: up.status, fallback_from_route_id: _fallbackFrom, deferPosterior: true, ...shadowAttemptFields(autoDecision) });
           const horizonHdrs = { "x-gateway-model": liveSlug };
           if (autoDecision && autoDecision.horizon)
             horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
@@ -1083,7 +1083,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               cls = _att.success ? null : classifyAttempt(_att.status, _att.why, _att.errKind);
             }
             c.__egressFailure = null;
-            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, ttft_ms: _att.ttft, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false, ...(_att.success ? shadowAttemptFields(autoDecision) : {}) });
+            await recordRouteAttempt(c, { request_id: requestId, parent_slug: slug, route_id: route.id, provider_id: route.provider_id, provider_key_id: k.keyId, public_slug: liveSlug, upstream_model: route.upstream_model, transport: route.transport || route.fmt, task_type: attemptTaskType, attempt_index: _attemptIndex, key_attempt_index: transportAttempt, started_at: _attStartIso, finished_at: nowIso(), latency_ms: Date.now() - _attStart, headers_ms: _att.headers, ttft_ms: null, success: _att.success, health_impact: _att.success ? 1 : cls.health_impact, http_status: _att.status, failure_class: _att.success ? "success" : cls.failure_class, failure_code: _att.success ? null : (egressCls ? "egress:" + egressCls : (_att.why || _att.errKind || null)), prompt_tokens: _att.prompt, completion_tokens: _att.completion, actual_cost_usd: _att.cost, fallback_from_route_id: _fallbackFrom, tool_valid: _att.tool_valid ?? null, deferPosterior: false, ...(_att.success ? shadowAttemptFields(autoDecision) : {}) });
           }
         }
         }
@@ -3449,17 +3449,17 @@ async function recordRouteAttempt(c, a) {
       `INSERT INTO route_attempts
        (request_id, parent_slug, route_id, provider_id, provider_key_id, public_slug, upstream_model, transport, task_type,
         attempt_index, key_attempt_index, started_at, finished_at, success, health_impact, http_status, failure_class, failure_code,
-        ttft_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, fallback_from_route_id, rescue_used,
+        ttft_ms, headers_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, fallback_from_route_id, rescue_used,
         tool_valid, tool_success, verification_score,
         v2_operational_route_id, v2_quality_route_id, v2_quality_changed, v2_quality_state, v2_quality_reason,
         v2_reliability_floor, v2_quality_floor)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       a.request_id, a.parent_slug ?? null, a.route_id ?? null, a.provider_id ?? null, a.provider_key_id ?? null,
       a.public_slug, a.upstream_model ?? null, a.transport ?? null, a.task_type ?? "",
       a.attempt_index ?? 0, a.key_attempt_index ?? 0, a.started_at, a.finished_at ?? nowIso(),
       a.success ? 1 : 0, a.health_impact ? 1 : 0, a.http_status ?? null, a.failure_class ?? null, a.failure_code ?? null,
-      a.ttft_ms ?? null, a.latency_ms ?? null, a.prompt_tokens ?? 0, a.completion_tokens ?? 0,
+      a.ttft_ms ?? null, a.headers_ms ?? null, a.latency_ms ?? null, a.prompt_tokens ?? 0, a.completion_tokens ?? 0,
       a.estimated_cost_usd ?? null, a.actual_cost_usd ?? null, a.fallback_from_route_id ?? null, a.rescue_used ? 1 : 0,
       a.tool_valid ?? null, a.tool_success ?? null, a.verification_score ?? null,
       a.v2_operational_route_id ?? null, a.v2_quality_route_id ?? null, a.v2_quality_changed ?? null,
@@ -3494,13 +3494,16 @@ async function recordRouteAttempt(c, a) {
 // Explicit-model requests write nothing. A failure here never blocks serving.
 function decisionSnapshot(decision) {
   const list = Array.isArray(decision && decision.candidates) ? decision.candidates : [];
-  const selected = list.find((x) => x && x.slug === decision.slug) || null;
-  const selectedRoute = selected && selected.routeIds && selected.routeIds.length ? selected.routeIds[0] : null;
+  // V1 chooses a slug. The serving loop picks the route later, so naming
+  // routeIds[0] as the selected action would record a route the policy never
+  // chose. route_ids stays on the candidate so the episode can still show
+  // which routes existed; the attempts carry the ones that were tried.
+  const task = decision.v2 && decision.v2.taskIR && decision.v2.taskIR.task;
   return {
     policyName: "router-v1",
     policyVersion: "router-v1@live",
-    taskType: decision.horizon && decision.horizon.role || null,
-    taskIrVersion: null,
+    taskType: task || null,
+    taskIrVersion: task ? "taskir-v1" : null,
     context: {
       context_tokens: Number(decision.estInputTokens) || 0,
       images: Number(decision.images) || 0,
@@ -3508,9 +3511,9 @@ function decisionSnapshot(decision) {
       complexity: decision.complexity != null ? Number(decision.complexity) : null
     },
     candidates: list.map((x) => ({
-      action_id: x.routeIds && x.routeIds.length ? "route:" + x.routeIds[0] : "slug:" + x.slug,
-      route_id: x.routeIds && x.routeIds.length ? x.routeIds[0] : null,
+      action_id: "slug:" + x.slug,
       slug: x.slug,
+      route_ids: Array.isArray(x.routeIds) ? x.routeIds.slice() : [],
       eligible: !!x.eligible,
       reason: x.reason || null,
       quality: x.quality,
@@ -3521,7 +3524,7 @@ function decisionSnapshot(decision) {
       context: x.context || 0,
       output: x.output || 0
     })),
-    selectedAction: selectedRoute != null ? "route:" + selectedRoute : "slug:" + decision.slug
+    selectedAction: "slug:" + decision.slug
   };
 }
 async function recordRouterDecision(c, requestId, decision) {
@@ -4888,7 +4891,7 @@ app.get("/admin/router/reconcile", async (c) => {
 
   const atts = await c.env.DB.prepare(
     `SELECT id, request_id, public_slug, route_id, transport, task_type, success, health_impact,
-            failure_class, failure_code, ttft_ms, latency_ms, started_at, finished_at, fallback_from_route_id
+            failure_class, failure_code, ttft_ms, headers_ms, latency_ms, started_at, finished_at, fallback_from_route_id
      FROM route_attempts WHERE started_at >= ?`
   ).bind(cutoff).all();
   const attemptRows = atts.results || [];

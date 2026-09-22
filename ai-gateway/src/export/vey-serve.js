@@ -189,7 +189,7 @@ async function assembleEpisode(db, traj) {
   const id = traj.id;
 
   const attempts = await db.prepare(
-    "SELECT id, request_id, route_id, provider_id, public_slug, upstream_model, transport, task_type, attempt_index, started_at, finished_at, success, health_impact, http_status, failure_class, failure_code, ttft_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, tool_valid, tool_success, verification_score, fallback_from_route_id, rescue_used FROM route_attempts WHERE request_id=? ORDER BY attempt_index, id"
+    "SELECT id, request_id, route_id, provider_id, public_slug, upstream_model, transport, task_type, attempt_index, started_at, finished_at, success, health_impact, http_status, failure_class, failure_code, ttft_ms, headers_ms, latency_ms, prompt_tokens, completion_tokens, estimated_cost_usd, actual_cost_usd, tool_valid, tool_success, verification_score, fallback_from_route_id, rescue_used FROM route_attempts WHERE request_id=? ORDER BY attempt_index, id"
   ).bind(id).all();
   const attemptRows = attempts.results || [];
 

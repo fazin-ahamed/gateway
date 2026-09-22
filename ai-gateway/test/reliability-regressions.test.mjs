@@ -150,15 +150,40 @@ test("pickAutoModel does not throw on healthy zaiminted routes", async () => {
     const decision = await t.pickAutoModel({ env: { DB: db } }, { messages: [{ role: "user", content: "hi" }] }, null);
     assert.ok(decision);
     assert.equal(decision.slug, "zai/glm-5.3-flash");
-    assert.deepEqual(decision.candidates[0].routeIds, [1], "the snapshot needs the route id, not just the slug");
+    assert.deepEqual(decision.candidates[0].routeIds, [1]);
     const snap = t.decisionSnapshot(decision);
-    assert.equal(snap.selectedAction, "route:1");
-    assert.equal(snap.candidates.length, 1);
-    assert.equal(snap.candidates[0].eligible, true);
+    assert.equal(snap.selectedAction, "slug:zai/glm-5.3-flash", "V1 chooses a slug, not a route");
+    assert.equal(snap.candidates[0].action_id, "slug:zai/glm-5.3-flash");
+    assert.deepEqual(snap.candidates[0].route_ids, [1]);
+    assert.equal(JSON.stringify(snap).includes("\"route:"), false, "no route id may be presented as the chosen action");
     assert.equal(JSON.stringify(snap).includes("hi"), false, "the snapshot must not carry the prompt");
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test("a slug served by several routes snapshots as the slug, not its first route", () => {
+  const decision = {
+    slug: "model-x",
+    candidates: [
+      { slug: "model-x", routeIds: [17, 22, 34], eligible: true, quality: 4, cost: 1, avgMs: 800, okRate: 0.9, samples: 20, context: 128000, output: 8192 },
+      { slug: "model-y", routeIds: [40], eligible: false, reason: "degraded", quality: 3, cost: 0.5, avgMs: 400, okRate: 0.4, samples: 10, context: 32000, output: 4096 }
+    ],
+    v2: { taskIR: { task: "code:generation" } },
+    estInputTokens: 1500,
+    images: 0,
+    need: 3,
+    complexity: 4
+  };
+  const snap = t.decisionSnapshot(decision);
+  assert.equal(snap.selectedAction, "slug:model-x");
+  assert.equal(snap.taskType, "code:generation", "task_type is the TaskIR task, not a horizon role");
+  assert.equal(snap.taskIrVersion, "taskir-v1");
+  assert.deepEqual(snap.candidates[0].route_ids, [17, 22, 34]);
+  assert.equal(snap.candidates[0].action_id, "slug:model-x");
+  assert.equal(snap.candidates[1].action_id, "slug:model-y");
+  assert.equal(snap.candidates[1].eligible, false, "a rejected candidate stays in the set");
+  assert.equal(JSON.stringify(snap).includes("route:17"), false);
 });
 
 test("round_robin orders every enabled key so a dead credential can fail over", () => {

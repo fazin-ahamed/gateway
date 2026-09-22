@@ -89,7 +89,8 @@ export function migrateRouteAttemptsV2(db) {
       ["v2_quality_state", "TEXT"],
       ["v2_quality_reason", "TEXT"],
       ["v2_reliability_floor", "REAL"],
-      ["v2_quality_floor", "REAL"]
+      ["v2_quality_floor", "REAL"],
+      ["headers_ms", "INTEGER"]
     ];
     for (const [name, type] of cols) {
       if (names.has(name)) continue;

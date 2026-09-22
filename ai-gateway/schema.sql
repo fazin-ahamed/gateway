@@ -285,6 +285,7 @@ CREATE TABLE IF NOT EXISTS route_attempts (
   failure_class TEXT,
   failure_code TEXT,
   ttft_ms INTEGER,
+  headers_ms INTEGER,
   latency_ms INTEGER,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,

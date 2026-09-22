@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { migrateQualityIdentity, migratePrices } from "../../server/migrations.mjs";
+import { migrateQualityIdentity, migratePrices, migrateRouteAttemptsV2 } from "../../server/migrations.mjs";
 
 
 // A legacy DB: quality_observations exists WITHOUT canonical_model_id, exactly
@@ -103,4 +103,38 @@ test("migratePrices is unchanged and importable alongside the new migration", ()
   // An empty prices table simply skips both branches.
   migratePrices(wrapper);
   assert.equal(typeof migratePrices, "function");
+});
+
+test("migrateRouteAttemptsV2 adds headers_ms to a legacy route_attempts table", () => {
+  const raw = new DatabaseSync(":memory:");
+  raw.exec(`CREATE TABLE route_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    public_slug TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    success INTEGER NOT NULL DEFAULT 0,
+    ttft_ms INTEGER,
+    latency_ms INTEGER
+  )`);
+  const wrapper = {
+    exec: (sql) => raw.exec(sql),
+    prepare: (sql) => {
+      const stmt = raw.prepare(sql);
+      const api = { bind(...p) { api._p = p; return api; } };
+      api.run = () => { stmt.run(...(api._p || [])); return { meta: {} }; };
+      api.all = () => ({ results: stmt.all(...(api._p || [])) });
+      api.first = () => stmt.get(...(api._p || [])) ?? null;
+      return api;
+    }
+  };
+  const before = raw.prepare("PRAGMA table_info(route_attempts)").all().map((c) => c.name);
+  assert.ok(!before.includes("headers_ms"));
+  const added = migrateRouteAttemptsV2(wrapper);
+  assert.ok(added.includes("headers_ms"));
+  raw.prepare("INSERT INTO route_attempts (request_id, public_slug, started_at, headers_ms, ttft_ms) VALUES (?,?,?,?,?)").run("r1", "m", "t", 640, null);
+  const row = raw.prepare("SELECT headers_ms, ttft_ms FROM route_attempts").get();
+  assert.equal(row.headers_ms, 640);
+  assert.equal(row.ttft_ms, null, "header time must not be stored as first-token time");
+  assert.deepEqual(migrateRouteAttemptsV2(wrapper), [], "a second run adds nothing");
+  raw.close();
 });
