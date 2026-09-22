@@ -108,3 +108,30 @@ test("evidence weights are frozen and sum below 1", () => {
   const sum = Object.values(EVIDENCE_WEIGHTS).reduce((a, b) => a + b, 0);
   assert.ok(sum <= 1 + 1e-9, "weights must not exceed 1 in total");
 });
+
+test("observePosterior moves the latency EMA instead of freezing the first sample", async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { migrateReflexPosteriors, observePosterior, loadPosterior } = await import("../src/reflex/posteriors.js");
+  const raw = new DatabaseSync(":memory:");
+  const db = {
+    prepare(sql) {
+      const stmt = raw.prepare(sql);
+      return {
+        bind(...args) {
+          return { run: () => stmt.run(...args), first: () => stmt.get(...args), all: () => ({ results: stmt.all(...args) }) };
+        },
+        run: () => stmt.run()
+      };
+    }
+  };
+  assert.equal(await migrateReflexPosteriors(db), true);
+  await observePosterior(db, "route", "route:7", "chat", { success: true, latencyMs: 1000, costUsd: 0.01 });
+  await observePosterior(db, "route", "route:7", "chat", { success: false, latencyMs: 100, costUsd: 0.01 });
+  const row = await loadPosterior(db, "route", "route:7", "chat");
+  assert.equal(row.samples, 2);
+  assert.equal(row.alpha, 2, "prior 1 plus one success");
+  assert.equal(row.beta, 2, "prior 1 plus one failure");
+  assert.ok(row.latencyEma < 1000, "the second, faster sample must pull the EMA down");
+  assert.ok(row.latencyEma > 100, "one sample must not erase the first");
+  raw.close();
+});

@@ -74,9 +74,9 @@ export async function observePosterior(db, scope, scopeId, taskType, { success, 
          success_alpha = success_alpha + ?,
          failure_beta = failure_beta + ?,
          samples = samples + 1,
-         latency_ema = COALESCE(latency_ema, ?),
-         cost_ema = COALESCE(cost_ema, ?),
-         verified_ema = COALESCE(verified_ema, ?),
+        latency_ema = CASE WHEN ? IS NULL THEN latency_ema WHEN latency_ema IS NULL THEN ? ELSE latency_ema * 0.8 + ? * 0.2 END,
+        cost_ema = CASE WHEN ? IS NULL THEN cost_ema WHEN cost_ema IS NULL THEN ? ELSE cost_ema * 0.8 + ? * 0.2 END,
+        verified_ema = CASE WHEN ? IS NULL THEN verified_ema WHEN verified_ema IS NULL THEN ? ELSE verified_ema * 0.8 + ? * 0.2 END,
          updated_at = ?`
     ).bind(
       scope, scopeId, tt,
@@ -84,8 +84,9 @@ export async function observePosterior(db, scope, scopeId, taskType, { success, 
       latencyMs, costUsd, verified == null ? null : (verified ? 1 : 0),
       now,
       alphaInc, betaInc,
-      latencyMs, costUsd, verified == null ? null : (verified ? 1 : 0),
-      now
+      latencyMs, latencyMs, latencyMs,
+      costUsd, costUsd, costUsd,
+      verified == null ? null : (verified ? 1 : 0), verified == null ? null : (verified ? 1 : 0), verified == null ? null : (verified ? 1 : 0), now
     ).run();
     return true;
   } catch {

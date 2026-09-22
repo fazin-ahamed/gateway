@@ -494,10 +494,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_loop_time ON agent_loop_events(created_at);
 -- passed. propensity stays NULL while the policy is deterministic — do not
 -- invent one; record the real value only if randomized exploration ships.
 --
--- WRITING this table is a post-window concern. The schema is shipped now so
--- the Vey exporter and its tests have a real shape to bind against; live
--- capture from the routing path stays disabled until the Router V2
--- measurement window closes.
+-- Written once per auto request by recordRouterDecision, before any upstream
+-- attempt. Explicit-model requests write nothing. The row is what the policy
+-- scored at decision time, rejected candidates included.
 CREATE TABLE IF NOT EXISTS router_decisions (
   request_id TEXT PRIMARY KEY,
 

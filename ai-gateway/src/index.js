@@ -17,6 +17,7 @@ import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs"
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
+import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
 var registrySeedInflight = new WeakMap();
@@ -748,6 +749,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   const started = Date.now();
   const isStream = !!payload.stream;
   const traj = trajectorySeed(c, payload, key, slug || "unknown", isStream, requestId);
+  if (autoDecision)
+    await recordRouterDecision(c, requestId, autoDecision);
   if (autoDecision)
     traj.steps.push({ provider: "horizon", rank: 0, ok: true, picked: slug, costPer1M: autoDecision.cost, quality: autoDecision.quality, fallback: !!autoDecision.fallback, speed: autoDecision.horizon && autoDecision.horizon.speed, role: autoDecision.horizon && autoDecision.horizon.role, queue: autoDecision.queue || [] });
   if (!slug) {
@@ -2020,6 +2023,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
           await updateRouterStat(c, "route", scopeId, "", outcome.success === 1, attLatency, costUsd);
           if (extra.attemptTaskType)
             await updateRouterStat(c, "route_task", scopeId, extra.attemptTaskType, outcome.success === 1, attLatency, costUsd);
+          await observeReflex(c, route.id, extra.attemptTaskType || "", outcome.success === 1, attLatency, costUsd);
         } catch (e) {
           blog("route_attempt stream posterior failed: " + String(e.message || e));
         }
@@ -2938,7 +2942,7 @@ async function pickAutoModel(c, payload, key) {
     const rawCost = entry ? Number(entry.prompt_per_1m) + Number(entry.completion_per_1m) : 0.5;
     const cost = Number.isFinite(rawCost) ? rawCost : 0.5;
     const rawMs = h ? Number(h.avg_ms) : 0;
-    candidates.push({ slug: r.slug, cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, hardEligible: eligible, samples: h ? Number(h.n) : 0, lcb: rel.lcb, relBand: relOk ? rel.band : "degraded", reason, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
+    candidates.push({ slug: r.slug, routeIds: routeIds.map((id) => Number(id)).filter((id) => Number.isFinite(id)), cost, quality: q, okRate, avgMs: Number.isFinite(rawMs) ? rawMs : 0, eligible, hardEligible: eligible, samples: h ? Number(h.n) : 0, lcb: rel.lcb, relBand: relOk ? rel.band : "degraded", reason, capable, ctxOk, visionOk, toolsOk, wob, ctxTight, context: caps.context || 0, output: caps.output || 0, unknown: !!caps.unknown, luxury: isLuxuryFlagship(r.slug), workhorse: isWorkhorse(r.slug), tiny: isTinySlug(r.slug) });
   }
   // Every hard-eligible route competes. Workhorse/tiny are soft priors applied
   // in scoring below, never a hard membership filter, so a fast reliable
@@ -3401,6 +3405,21 @@ async function updateRouterStat(c, scope, scopeId, taskType, success, latencyMs,
     }
   });
 }
+
+// ReflexCore sees the same operational outcomes router_stats does: one sample
+// per route, plus one per route x task type when the attempt carried one.
+// A client cancel never reaches here. Failure to record never blocks serving.
+async function observeReflex(c, routeId, taskType, success, latencyMs, costUsd) {
+  try {
+    await migrateReflexPosteriors(c.env.DB);
+    const scopeId = "route:" + (routeId ?? "?");
+    await observePosterior(c.env.DB, "route", scopeId, "", { success, latencyMs, costUsd });
+    if (taskType)
+      await observePosterior(c.env.DB, "route", scopeId, taskType, { success, latencyMs, costUsd });
+  } catch (e) {
+    blog("reflex posterior failed: " + String(e.message || e));
+  }
+}
 // Flatten the Router V2 shadow decision into the nullable route_attempts
 // columns. Only the final serving attempt of an auto-routed request carries
 // these, so the experiment ("how often would quality change the choice?") is
@@ -3453,6 +3472,7 @@ async function recordRouteAttempt(c, a) {
       await updateRouterStat(c, "route", scopeId, "", ok, a.latency_ms, a.actual_cost_usd);
       if (a.task_type)
         await updateRouterStat(c, "route_task", scopeId, a.task_type, ok, a.latency_ms, a.actual_cost_usd);
+      await observeReflex(c, a.route_id, a.task_type, ok, a.latency_ms, a.actual_cost_usd);
     }
     // Quality observations are a separate channel from the operational
     // posterior: only attempts carrying real answer evidence emit anything,
@@ -3464,6 +3484,63 @@ async function recordRouteAttempt(c, a) {
   } catch (e) {
     blog("route_attempt record failed: " + String(e.message || e));
     return null;
+  }
+}
+
+// One row per auto decision, written once, before any upstream attempt. The
+// candidate set is exactly what the policy scored, rejected routes included,
+// so a later Vey export reads history instead of rebuilding it from today's
+// route table. Body-free: counts and route ids only, never the prompt.
+// Explicit-model requests write nothing. A failure here never blocks serving.
+function decisionSnapshot(decision) {
+  const list = Array.isArray(decision && decision.candidates) ? decision.candidates : [];
+  const selected = list.find((x) => x && x.slug === decision.slug) || null;
+  const selectedRoute = selected && selected.routeIds && selected.routeIds.length ? selected.routeIds[0] : null;
+  return {
+    policyName: "router-v1",
+    policyVersion: "router-v1@live",
+    taskType: decision.horizon && decision.horizon.role || null,
+    taskIrVersion: null,
+    context: {
+      context_tokens: Number(decision.estInputTokens) || 0,
+      images: Number(decision.images) || 0,
+      need: decision.need != null ? Number(decision.need) : null,
+      complexity: decision.complexity != null ? Number(decision.complexity) : null
+    },
+    candidates: list.map((x) => ({
+      action_id: x.routeIds && x.routeIds.length ? "route:" + x.routeIds[0] : "slug:" + x.slug,
+      route_id: x.routeIds && x.routeIds.length ? x.routeIds[0] : null,
+      slug: x.slug,
+      eligible: !!x.eligible,
+      reason: x.reason || null,
+      quality: x.quality,
+      cost: x.cost,
+      avg_ms: x.avgMs,
+      ok_rate: x.okRate,
+      samples: x.samples,
+      context: x.context || 0,
+      output: x.output || 0
+    })),
+    selectedAction: selectedRoute != null ? "route:" + selectedRoute : "slug:" + decision.slug
+  };
+}
+async function recordRouterDecision(c, requestId, decision) {
+  if (!decision || !requestId)
+    return false;
+  try {
+    const snap = decisionSnapshot(decision);
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO router_decisions
+       (request_id, policy_name, policy_version, task_type, task_ir_version, context_features_json, candidate_set_json, selected_action_id, propensity, exploration, decision_type, created_at)
+       VALUES (?,?,?,?,?,?,?,?,NULL,0,'deterministic',?)`
+    ).bind(
+      requestId, snap.policyName, snap.policyVersion, snap.taskType, snap.taskIrVersion,
+      JSON.stringify(snap.context), JSON.stringify(snap.candidates), snap.selectedAction, nowIso()
+    ).run();
+    return true;
+  } catch (e) {
+    blog("router_decision record failed: " + String(e.message || e));
+    return false;
   }
 }
 function trajectorySeed(c, payload, key, slug, isStream, requestId) {
@@ -6218,7 +6295,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

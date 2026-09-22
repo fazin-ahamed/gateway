@@ -150,6 +150,12 @@ test("pickAutoModel does not throw on healthy zaiminted routes", async () => {
     const decision = await t.pickAutoModel({ env: { DB: db } }, { messages: [{ role: "user", content: "hi" }] }, null);
     assert.ok(decision);
     assert.equal(decision.slug, "zai/glm-5.3-flash");
+    assert.deepEqual(decision.candidates[0].routeIds, [1], "the snapshot needs the route id, not just the slug");
+    const snap = t.decisionSnapshot(decision);
+    assert.equal(snap.selectedAction, "route:1");
+    assert.equal(snap.candidates.length, 1);
+    assert.equal(snap.candidates[0].eligible, true);
+    assert.equal(JSON.stringify(snap).includes("hi"), false, "the snapshot must not carry the prompt");
   } finally {
     globalThis.fetch = origFetch;
   }
