@@ -163,6 +163,47 @@ test("GET /admin/trajectories-export?format=vey streams one episode per row with
   assert.ok(pages.length >= 1, "the export must page over ids");
 });
 
+test("a slow reader never has more than one trajectory body loaded", async () => {
+  const { createApp } = await import("../src/index.js");
+  const rows = [];
+  for (let i = 0; i < 5; i++)
+    rows.push(trajRow("req_" + i, "2026-01-01T00:00:0" + i + ".000Z"));
+  const db = trajectoryDb(rows);
+  let inFlight = 0;
+  let peak = 0;
+  const realPrepare = db.prepare;
+  db.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (String(sql).includes("FROM trajectories WHERE id=")) {
+      const real = stmt.first;
+      stmt.first = () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        const row = real();
+        inFlight--;
+        return row;
+      };
+    }
+    return stmt;
+  };
+  const app = createApp({ DB: db, ADMIN_TOKEN: "secret" });
+  const res = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey", {
+    headers: { authorization: "Bearer secret" }
+  }));
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let text = "";
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done)
+      break;
+    text += dec.decode(chunk.value, { stream: true });
+    assert.ok(peak <= 1, "pull loaded " + peak + " bodies before the reader consumed the chunk");
+  }
+  assert.equal(text.trim().split("\n").length, 5);
+  assert.equal(peak, 1);
+});
+
 test("a second vey export is refused while the first stream is still open", async () => {
   const { createApp } = await import("../src/index.js");
   let release;

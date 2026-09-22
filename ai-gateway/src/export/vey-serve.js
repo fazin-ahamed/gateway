@@ -61,8 +61,11 @@ export async function exportVeyDataset(c, format) {
 
   let cursor = { created_at: "", id: "" };
   let emitted = 0;
-  let skipped = 0;
   let stopped = false;
+  // Ids only. The bodies they name are loaded one per pull, so a slow reader
+  // never queues more than the chunk it has not consumed yet.
+  let pending = [];
+  let exhausted = false;
 
   let controllerRef = null;
   const finish = () => {
@@ -81,21 +84,27 @@ export async function exportVeyDataset(c, format) {
       try {
         if (limit != null && emitted >= limit)
           return finish();
-        const page = await loadIdPage(c.env.DB, { slugFilter, since, until, cursor });
-        if (!page.length)
-          return finish();
-        for (const meta of page) {
-          cursor = { created_at: meta.created_at, id: meta.id };
-          if (limit != null && emitted >= limit)
+        while (!pending.length && !exhausted) {
+          const page = await loadIdPage(c.env.DB, { slugFilter, since, until, cursor });
+          if (!page.length) {
+            exhausted = true;
             break;
+          }
+          cursor = { created_at: page[page.length - 1].created_at, id: page[page.length - 1].id };
+          pending = page;
+        }
+        while (pending.length) {
+          const meta = pending.shift();
+          if (limit != null && emitted >= limit)
+            return finish();
           const episode = await loadAndAssembleOne(c.env.DB, meta.id);
           if (!episode)
             continue;
           controller.enqueue(encoder.encode(JSON.stringify(episode) + "\n"));
           emitted++;
+          return;
         }
-        if (limit != null && emitted >= limit)
-          finish();
+        finish();
       } catch (e) {
         stopped = true;
         exportInFlight = false;
@@ -104,6 +113,7 @@ export async function exportVeyDataset(c, format) {
     },
     cancel() {
       stopped = true;
+      pending = [];
       exportInFlight = false;
     }
   });
