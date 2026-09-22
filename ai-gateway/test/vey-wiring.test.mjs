@@ -84,48 +84,116 @@ test("an empty alias index resolves to null, never a fabricated id", () => {
   assert.equal(nullIndex, null);
 });
 
-// The Vey branch used to build the Response and then return nothing. Hono
-// sends that as a closed connection with no body, which Firefox reports as
-// NS_ERROR_NET_EMPTY_RESPONSE. The endpoint must hand the body back.
-test("GET /admin/trajectories-export?format=vey returns the dataset body", async () => {
-  const { createApp } = await import("../src/index.js");
-  const request = JSON.stringify({ messages: [{ role: "user", content: "go" }] });
-  const response = JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] });
+// Two regressions, both observed in production:
+//   * returning nothing closed the connection with an empty body, which
+//     Firefox reports as NS_ERROR_NET_EMPTY_RESPONSE;
+//   * selecting every request_json and response_json in one .all() tripled the
+//     dataset in the heap and killed Node at its ~2GB limit.
+// The page query must select ids only. Bodies load one row at a time, the
+// export streams, a second overlapping export is refused, and ?limit= bounds it.
+function trajectoryDb(rows) {
+  const seen = [];
   const db = {
+    seen,
     prepare(sql) {
       const text = String(sql);
+      let bound = [];
       return {
-        bind() { return this; },
-        first() { return null; },
+        bind(...args) { bound = args; return this; },
+        first() {
+          seen.push({ sql: text, bound });
+          const id = bound[0];
+          return rows.find((r) => r.id === id) || null;
+        },
         run() { return { meta: { changes: 0 } }; },
         all() {
-          if (text.includes("FROM trajectories"))
-            return { results: [{
-              id: "req_1", created_at: "2026-01-01T00:00:00.000Z", slug: "glm-5.3",
-              stream: 0, status: "ok", http_status: 200, provider: "z-ai", attempts: 1,
-              prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost_usd: 0,
-              latency_ms: 30, error: null, request_json: request, response_json: response
-            }] };
+          seen.push({ sql: text, bound });
+          if (/SELECT\s+(?!id, created_at\b)[^]*?\bFROM trajectories\b/.test(text) && /\b(request_json|response_json)\b/.test(text.split(/\bFROM trajectories\b/)[0]))
+            throw new Error("page query selected trajectory bodies: " + text);
+          if (text.includes("FROM trajectories")) {
+            const lim = bound[bound.length - 1];
+            const cursorAt = text.includes("created_at>?") ? bound.length - 4 : -1;
+            const after = cursorAt >= 0 ? { created_at: bound[cursorAt], id: bound[cursorAt + 2] } : null;
+            const page = rows
+              .filter((r) => r.request_json != null)
+              .filter((r) => !after || r.created_at > after.created_at || (r.created_at === after.created_at && r.id > after.id))
+              .slice(0, lim)
+              .map((r) => ({ id: r.id, created_at: r.created_at }));
+            return { results: page };
+          }
           if (text.includes("FROM route_attempts"))
-            return { results: [{
-              id: 1, request_id: "req_1", route_id: 7, provider_id: 1, public_slug: "glm-5.3",
-              upstream_model: "GLM-5.3", transport: "openai", task_type: "chat", attempt_index: 0,
-              success: 1, health_impact: 1, http_status: 200, latency_ms: 30
-            }] };
+            return { results: [{ id: 1, request_id: bound[0], route_id: 7, provider_id: 1, public_slug: "glm-5.3", upstream_model: "GLM-5.3", transport: "openai", task_type: "chat", attempt_index: 0, success: 1, health_impact: 1, http_status: 200, latency_ms: 30 }] };
           return { results: [] };
         }
       };
     }
   };
+  return db;
+}
+
+function trajRow(id, created) {
+  return {
+    id, created_at: created, slug: "glm-5.3", stream: 0, status: "ok", http_status: 200,
+    provider: "z-ai", attempts: 1, prompt_tokens: 4, completion_tokens: 2, total_tokens: 6,
+    cost_usd: 0, latency_ms: 30, error: null,
+    request_json: JSON.stringify({ messages: [{ role: "user", content: "go " + id }] }),
+    response_json: JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] })
+  };
+}
+
+test("GET /admin/trajectories-export?format=vey streams one episode per row without bulk body reads", async () => {
+  const { createApp } = await import("../src/index.js");
+  const rows = [trajRow("req_1", "2026-01-01T00:00:00.000Z"), trajRow("req_2", "2026-01-01T00:00:01.000Z"), trajRow("req_3", "2026-01-01T00:00:02.000Z")];
+  const db = trajectoryDb(rows);
   const app = createApp({ DB: db, ADMIN_TOKEN: "secret" });
-  const res = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey", {
+  const res = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey&limit=2", {
     headers: { authorization: "Bearer secret" }
   }));
-  assert.equal(res.status, 200, "a dropped Response is a null body, not a 200");
+  assert.equal(res.status, 200);
   const body = await res.text();
-  assert.ok(body.length > 0, "the export body must not be empty");
-  const line = JSON.parse(body.trim().split("\n")[0]);
-  assert.equal(line.schema, "vey.world.v1");
-  assert.equal(line.id, "req_1");
+  const lines = body.trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(lines.map((l) => l.id), ["req_1", "req_2"], "limit must bound the export");
+  assert.ok(lines.every((l) => l.schema === "vey.world.v1"));
   assert.equal(res.headers.get("content-disposition"), "attachment; filename=trajectories-vey.jsonl");
+  const bulk = db.seen.filter((q) => q.sql.includes("FROM trajectories") && !q.sql.includes("WHERE id=?") && /\b(request_json|response_json)\b/.test(q.sql.split("FROM trajectories")[0]));
+  assert.equal(bulk.length, 0, "no multi-row query may select trajectory bodies");
+  const singles = db.seen.filter((q) => q.sql.includes("FROM trajectories WHERE id=?"));
+  assert.equal(singles.length, 2, "each emitted episode loads exactly one body");
+  const pages = db.seen.filter((q) => q.sql.startsWith("SELECT id, created_at FROM trajectories"));
+  assert.ok(pages.length >= 1, "the export must page over ids");
+});
+
+test("a second vey export is refused while the first stream is still open", async () => {
+  const { createApp } = await import("../src/index.js");
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const db = trajectoryDb([trajRow("req_9", "2026-01-02T00:00:00.000Z")]);
+  const realPrepare = db.prepare;
+  db.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (String(sql).includes("FROM trajectories WHERE id=")) {
+      const real = stmt.first;
+      stmt.first = () => gate.then(() => real());
+    }
+    return stmt;
+  };
+  const app = createApp({ DB: db, ADMIN_TOKEN: "secret" });
+  const first = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey", {
+    headers: { authorization: "Bearer secret" }
+  }));
+  assert.equal(first.status, 200);
+  const reader = first.body.getReader();
+  const pending = reader.read();
+  const second = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey", {
+    headers: { authorization: "Bearer secret" }
+  }));
+  assert.equal(second.status, 409, "two exports at once is how the heap death repeated");
+  release();
+  await pending;
+  await reader.cancel();
+  const third = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey", {
+    headers: { authorization: "Bearer secret" }
+  }));
+  assert.equal(third.status, 200, "the lock must release when the client disconnects");
+  await third.text();
 });

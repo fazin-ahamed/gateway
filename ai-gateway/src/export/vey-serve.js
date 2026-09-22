@@ -11,61 +11,165 @@
 // Vey must NOT inherit that filter: the failed operational attempts are the
 // signal an OpsWorld model learns from, so an all-failed episode is still a
 // complete record with response: null.
+//
+// Memory: a dataset export must never hold more than one trajectory body.
+// The previous exporter did `.all()` over every request_json and response_json,
+// then kept the serialized episodes and their joined string at the same time.
+// That tripled the dataset in the V8 heap and killed Node at its ~2GB limit
+// inside node::sqlite::StatementSync::All. The page query below selects ids
+// only; each body is loaded with `.first()`, emitted, and dropped.
 
 import { exportVeyEpisode, VEY_SCHEMA } from "./vey-world.js";
 
-export const __test = { loadAliasIndex };
+// One page of id-only rows. Bodies stay out of this query on purpose.
+const PAGE_SIZE = 100;
+
+export const __test = { loadAliasIndex, PAGE_SIZE };
+
+const TRAJECTORY_COLUMNS = "id, created_at, key_id, key_name, slug, stream, status, http_status, provider, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error, request_json, response_json";
 
 // Export one episode fully (single request_id) as pretty JSON.
 export async function exportVeyEpisodeFull(db, requestId) {
   const traj = await db.prepare(
-    "SELECT id, created_at, key_id, key_name, slug, stream, status, http_status, provider, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error, request_json, response_json FROM trajectories WHERE id=?"
+    "SELECT " + TRAJECTORY_COLUMNS + " FROM trajectories WHERE id=?"
   ).bind(requestId).first();
   if (!traj)
     return null;
-  const episode = await assembleEpisode(db, traj);
-  return episode;
+  return assembleEpisode(db, traj);
 }
 
 // Dataset export for the admin endpoint. NDJSON, one vey.world.v1 record per
 // line, ordered by creation time. Includes failed episodes; skips rows with no
 // request body at all (there is no state to learn from).
+//
+// The body is a stream. Peak memory is one page of ids plus one episode,
+// however large the table is. A second overlapping export gets 409: two of
+// these running together is how the heap death repeated.
+let exportInFlight = false;
+
 export async function exportVeyDataset(c, format) {
+  if (exportInFlight)
+    return c.json({ error: { message: "a vey export is already running" } }, 409);
+  exportInFlight = true;
+
   const slugFilter = String(c.req.query("slug") || "").trim();
-  let sql = "SELECT id, created_at, key_id, key_name, slug, stream, status, http_status, provider, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error, request_json, response_json FROM trajectories WHERE request_json IS NOT NULL";
+  const since = bound(c.req.query("since"));
+  const until = bound(c.req.query("until"));
+  const limit = clampLimit(c.req.query("limit"));
+  const name = format === "world" ? "vey" : format;
+  const encoder = new TextEncoder();
+
+  let cursor = { created_at: "", id: "" };
+  let emitted = 0;
+  let skipped = 0;
+  let stopped = false;
+
+  let controllerRef = null;
+  const finish = () => {
+    if (stopped)
+      return;
+    stopped = true;
+    exportInFlight = false;
+    controllerRef.close();
+  };
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      controllerRef = controller;
+      if (stopped)
+        return;
+      try {
+        if (limit != null && emitted >= limit)
+          return finish();
+        const page = await loadIdPage(c.env.DB, { slugFilter, since, until, cursor });
+        if (!page.length)
+          return finish();
+        for (const meta of page) {
+          cursor = { created_at: meta.created_at, id: meta.id };
+          if (limit != null && emitted >= limit)
+            break;
+          const episode = await loadAndAssembleOne(c.env.DB, meta.id);
+          if (!episode)
+            continue;
+          controller.enqueue(encoder.encode(JSON.stringify(episode) + "\n"));
+          emitted++;
+        }
+        if (limit != null && emitted >= limit)
+          finish();
+      } catch (e) {
+        stopped = true;
+        exportInFlight = false;
+        controller.error(e);
+      }
+    },
+    cancel() {
+      stopped = true;
+      exportInFlight = false;
+    }
+  });
+
+  // No content-length and no count header: both require reading every row
+  // before the first byte, which is the heap bug this stream exists to avoid.
+  return new Response(stream, {
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "content-disposition": `attachment; filename=trajectories-${name}.jsonl`,
+      "x-schema": VEY_SCHEMA,
+      "cache-control": "no-store"
+    }
+  });
+}
+
+function bound(value) {
+  const text = String(value || "").trim();
+  return text || null;
+}
+
+function clampLimit(value) {
+  if (value == null || value === "")
+    return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1)
+    return null;
+  return Math.min(100000, Math.floor(n));
+}
+
+async function loadIdPage(db, { slugFilter, since, until, cursor }) {
+  let sql = "SELECT id, created_at FROM trajectories WHERE request_json IS NOT NULL";
   const binds = [];
   if (slugFilter) {
     sql += " AND slug=?";
     binds.push(slugFilter);
   }
-  sql += " ORDER BY created_at";
-  const rows = await c.env.DB.prepare(sql).bind(...binds).all();
-
-  const lines = [];
-  let skipped = 0;
-  for (const traj of rows.results || []) {
-    try {
-      const episode = await assembleEpisode(c.env.DB, traj);
-      if (!episode) {
-        skipped++;
-        continue;
-      }
-      lines.push(JSON.stringify(episode));
-    } catch {
-      skipped++;
-    }
+  if (since) {
+    sql += " AND created_at>=?";
+    binds.push(since);
   }
+  if (until) {
+    sql += " AND created_at<=?";
+    binds.push(until);
+  }
+  if (cursor.created_at) {
+    sql += " AND (created_at>? OR (created_at=? AND id>?))";
+    binds.push(cursor.created_at, cursor.created_at, cursor.id);
+  }
+  sql += " ORDER BY created_at, id LIMIT ?";
+  binds.push(PAGE_SIZE);
+  const rows = await db.prepare(sql).bind(...binds).all();
+  return rows.results || [];
+}
 
-  const name = format === "world" ? "vey" : format;
-  return new Response(lines.join("\n") + (lines.length ? "\n" : ""), {
-    headers: {
-      "content-type": "application/x-ndjson; charset=utf-8",
-      "content-disposition": `attachment; filename=trajectories-${name}.jsonl`,
-      "x-trajectory-count": String(lines.length),
-      "x-trajectory-skipped": String(skipped),
-      "x-schema": VEY_SCHEMA
-    }
-  });
+async function loadAndAssembleOne(db, id) {
+  const traj = await db.prepare(
+    "SELECT " + TRAJECTORY_COLUMNS + " FROM trajectories WHERE id=?"
+  ).bind(id).first();
+  if (!traj)
+    return null;
+  try {
+    return await assembleEpisode(db, traj);
+  } catch {
+    return null;
+  }
 }
 
 // Assemble one episode from a trajectory row: every route attempt, the quality
@@ -143,8 +247,7 @@ async function assembleEpisode(db, traj) {
     }
   }
 
-  const episode = exportVeyEpisode({ trajectory: traj, attempts: attemptRows, evidence, decision, response });
-  return episode;
+  return exportVeyEpisode({ trajectory: traj, attempts: attemptRows, evidence, decision, response });
 }
 
 async function loadAliasIndex(db) {
