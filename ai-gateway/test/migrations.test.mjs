@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { migrateQualityIdentity, migratePrices, migrateRouteAttemptsV2 } from "../../server/migrations.mjs";
+import { migrateQualityIdentity, migratePrices, migrateRouteAttemptsV2, migrateZaiConversations } from "../../server/migrations.mjs";
 
 
 // A legacy DB: quality_observations exists WITHOUT canonical_model_id, exactly
@@ -136,5 +136,33 @@ test("migrateRouteAttemptsV2 adds headers_ms to a legacy route_attempts table", 
   assert.equal(row.headers_ms, 640);
   assert.equal(row.ttft_ms, null, "header time must not be stored as first-token time");
   assert.deepEqual(migrateRouteAttemptsV2(wrapper), [], "a second run adds nothing");
+  raw.close();
+});
+
+test("migrateZaiConversations creates the affinity table and its match index, idempotently", () => {
+  const raw = new DatabaseSync(":memory:");
+  const wrapper = {
+    exec: (sql) => raw.exec(sql),
+    prepare: (sql) => {
+      const stmt = raw.prepare(sql);
+      const api = { bind(...p) { api._p = p; return api; } };
+      api.run = () => { stmt.run(...(api._p || [])); return { meta: {} }; };
+      api.all = () => ({ results: stmt.all(...(api._p || [])) });
+      api.first = () => stmt.get(...(api._p || [])) ?? null;
+      return api;
+    }
+  };
+  assert.equal(migrateZaiConversations(wrapper), true);
+  const cols = raw.prepare("PRAGMA table_info(zai_conversations)").all().map((c) => c.name);
+  assert.ok(cols.includes("upstream_chat_id") && cols.includes("chain_hash") && cols.includes("state"));
+  // The exact runtime insert must succeed.
+  raw.prepare("INSERT INTO zai_conversations (id, tenant_key, contract_hash, provider_id, provider_key_id, upstream_chat_id, message_count, chain_hash, created_at, last_used_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+    .run("cv_1", "k:sk|u:|c:|m:glm-5.3", "hc", 4, 17, "chat_a", 6, "h6", "t", "t", "t2");
+  const row = raw.prepare("SELECT state, revision FROM zai_conversations WHERE id=?").get("cv_1");
+  assert.equal(row.state, "ready");
+  assert.equal(row.revision, 0);
+  const idx = raw.prepare("PRAGMA index_list(zai_conversations)").all().map((i) => i.name);
+  assert.ok(idx.includes("idx_zai_conv_match"));
+  assert.equal(migrateZaiConversations(wrapper), true, "a second run is a no-op");
   raw.close();
 });
