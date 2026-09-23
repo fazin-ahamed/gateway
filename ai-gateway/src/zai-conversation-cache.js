@@ -24,8 +24,10 @@ async function sha256hex(text) {
 
 // Text of one message, matching the chat.z.ai prompt view: role + visible
 // text, plus the tool identity/calls so a tool turn is distinct from a plain
-// one. Image parts collapse to a stable reference, never the raw bytes.
-export function canonicalizeMessage(message) {
+// one. An image part is reduced to a digest of its COMPLETE reference — never
+// a prefix, because two different large data URLs that share a prefix must not
+// canonicalize the same under an exact matcher. Async because the digest is.
+export async function canonicalizeMessage(message) {
   const m = message && typeof message === "object" ? message : {};
   const parts = [];
   const content = m.content;
@@ -40,7 +42,7 @@ export function canonicalizeMessage(message) {
         if (typeof text === "string")
           parts.push(text);
       } else if (part.type === "image_url" && part.image_url && typeof part.image_url.url === "string") {
-        parts.push("[image:" + part.image_url.url.slice(0, 2048) + "]");
+        parts.push("[image:" + (await sha256hex(part.image_url.url)) + "]");
       }
     }
   }
@@ -59,17 +61,20 @@ export function canonicalizeMessage(message) {
   };
   return stableJson(shape);
 }
-
-// The contract is everything a turn silently depends on: the system/developer
 // instructions and the tool schemas. Changing it must force a rebootstrap, so
 // it is hashed separately and seeds the chain as H0.
 export async function contractHash({ system = null, tools = null } = {}) {
   const sys = typeof system === "string" ? system : (system == null ? "" : stableJson(system));
   const toolList = Array.isArray(tools)
     ? tools
-        .map((t) => (t && t.function ? { name: String(t.function.name || ""), parameters: t.function.parameters ?? null, description: t.function.description ?? null } : t))
-        .slice()
-        .sort((a, b) => String(a && a.name).localeCompare(String(b && b.name)))
+        .map((t) => (t && t.function
+          ? { name: String(t.function.name || ""), parameters: t.function.parameters ?? null, description: t.function.description ?? null }
+          : t))
+        // Sort by the COMPLETE normalized definition, not just the name, so
+        // non-function tools and duplicate names are still order-independent.
+        .map((t) => ({ t, key: stableJson(t) }))
+        .sort((a, b) => a.key.localeCompare(b.key))
+        .map((x) => x.t)
     : null;
   return sha256hex(stableJson({ system: sys, tools: toolList }));
 }
@@ -81,21 +86,25 @@ export async function chainHashes(contractHashValue, messages) {
   const chain = [String(contractHashValue || "")];
   let prev = chain[0];
   for (const message of Array.isArray(messages) ? messages : []) {
-    prev = await sha256hex(prev + NUL + canonicalizeMessage(message));
+    prev = await sha256hex(prev + NUL + (await canonicalizeMessage(message)));
     chain.push(prev);
   }
   return chain;
 }
 
-// A conversation is matched only within its tenant, optional user, and the
-// canonical model identity. Two callers on one API key are only merged when
-// they share an explicit user or conversation id; otherwise the model scope
-// still separates by identity, never globally.
-export function scopeKey({ apiKey = "", user = null, conversationId = null, canonicalModelId = null } = {}) {
+// Scope keys a conversation to a NON-SECRET tenant id (never the raw bearer),
+// an affinity id, and the canonical model. The multi-user-safe default is that
+// an anonymous caller with no affinity id gets no persistent reuse: two users
+// sharing one API key with no conversation id must never resolve to the same
+// scope. Only a key explicitly marked single-user opts into implicit affinity.
+// Returns null when reuse is not permitted.
+export function scopeKey({ tenantId = "", affinityId = null, canonicalModelId = null, allowImplicitAffinity = false } = {}) {
+  const affinity = affinityId != null && String(affinityId) !== "" ? String(affinityId) : null;
+  if (!affinity && !allowImplicitAffinity)
+    return null;
   return [
-    "k:" + String(apiKey || ""),
-    "u:" + String(user || ""),
-    "c:" + String(conversationId || ""),
+    "t:" + String(tenantId || ""),
+    "a:" + (affinity || "implicit"),
     "m:" + String(canonicalModelId || "")
   ].join("|");
 }
@@ -169,8 +178,21 @@ export function isFork(plan, currentRevision) {
   return Number(plan.revision) !== Number(currentRevision);
 }
 
-// Advance committed state ONLY after a clean terminal. The new prefix is the
-// full incoming length, so the next turn's delta is measured from here.
+// The committed prefix after a successful turn is the incoming history PLUS
+// the assistant turn the client just received — because chat.z.ai now holds
+// that answer server-side, and the client will replay it in the next request.
+// Committing only the incoming messages would omit the answer, so the next
+// delta would re-send it and duplicate the model's own reply. Commit the
+// gateway-normalized, client-visible assistant message (repaired tool_calls
+// included); never private reasoning, which the canonicalizer already drops.
+export async function postTurnCommitState({ contractHash: contractHashValue, incomingMessages, assistantMessage }) {
+  const committed = [...(Array.isArray(incomingMessages) ? incomingMessages : []), assistantMessage];
+  const chain = await chainHashes(contractHashValue, committed);
+  return { messageCount: committed.length, chainHash: chain[committed.length] };
+}
+
+// Advance committed state ONLY after a clean terminal, from the count/hash
+// postTurnCommitState computed (incoming + assistant turn).
 export function commitTurn(conversation, { messageCount, chainHash, at }) {
   return {
     ...conversation,

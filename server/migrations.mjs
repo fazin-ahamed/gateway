@@ -154,6 +154,8 @@ export function migrateZaiConversations(db) {
       chain_hash TEXT NOT NULL,
       revision INTEGER NOT NULL DEFAULT 0,
       state TEXT NOT NULL DEFAULT 'ready',
+      lease_id TEXT,
+      lease_expires_at TEXT,
       created_at TEXT NOT NULL,
       last_used_at TEXT NOT NULL,
       expires_at TEXT NOT NULL
