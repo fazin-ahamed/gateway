@@ -192,9 +192,13 @@ export function guardOpenAiSse(source, modelHint = "", tools = []) {
         // Unclean EOF: never silently discard a completed buffered edit if stream did not fail.
         if (!streamFailed) flushPending();
         if (!terminalSeen) {
-          const fr = streamFailed ? "length" : (sawToolCalls ? "tool_calls" : "stop");
-          emitObj(terminalChunk(model, fr));
+          // The body ended with no [DONE] and no finish_reason. A partial tool
+          // call is not a finished one, and some text is not a completion, so
+          // this is a truncation: emit the non-success terminal and close the
+          // SSE stream with [DONE] so the client sees a complete termination.
+          emitObj(terminalChunk(model, "length"));
           terminalSeen = true;
+          emit("data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10));
         }
         controller.close();
       } catch {

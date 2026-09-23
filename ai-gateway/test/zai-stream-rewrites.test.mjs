@@ -103,3 +103,42 @@ test("inline SSE errors at data.error also terminate the stream", () => {
   assert.ok(err);
   assert.match(String(err.error), /model overloaded/);
 });
+
+function payloadsOf(text) {
+  return text.split("\n").filter((l) => l.startsWith("data: {")).map((l) => JSON.parse(l.slice(6)));
+}
+
+test("a trailing control token is dropped and a raw EOF reads as length", async () => {
+  const text = "The holdout removed every training session.\nThe holdout removed every training session.\n<|eos|>";
+  const source = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: " + JSON.stringify({ data: { content: text } }) + "\n\n"));
+      controller.close();
+    }
+  });
+  const out = await new Response(zaiTest.toOpenAiStream(source, "glm", "id")).text();
+  const payloads = payloadsOf(out);
+  const body = payloads.map((p) => p.choices?.[0]?.delta?.content || "").join("");
+  assert.equal(body.includes("<|eos|>"), false, "the control token must not reach the client");
+  assert.ok(body.trimEnd().endsWith("training session."), "the answer text is kept");
+  assert.ok(payloads.some((p) => p.choices?.[0]?.finish_reason === "length"), "a raw EOF is a truncation");
+  assert.equal(payloads.some((p) => p.choices?.[0]?.finish_reason === "stop"), false);
+});
+
+test("an explicit done frame is a clean stop and strips the trailing control token", async () => {
+  const source = sseSource([
+    { data: { content: "answer <|eos|>" } },
+    { data: { phase: "done" } }
+  ]);
+  const out = await new Response(zaiTest.toOpenAiStream(source, "glm", "id")).text();
+  const payloads = payloadsOf(out);
+  const body = payloads.map((p) => p.choices?.[0]?.delta?.content || "").join("");
+  assert.equal(body.trim(), "answer");
+  assert.ok(payloads.some((p) => p.choices?.[0]?.finish_reason === "stop"));
+});
+
+test("a control token quoted in the middle of the answer is preserved", () => {
+  const n = createZaiFrameNormalizer({ holdback: 0 });
+  const events = collect(n, [{ data: { content: "the marker <|eos|> ends a sequence" } }]);
+  assert.equal(events.map((e) => e.content || "").join(""), "the marker <|eos|> ends a sequence");
+});

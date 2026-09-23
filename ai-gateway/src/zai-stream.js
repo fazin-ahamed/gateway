@@ -8,6 +8,28 @@
 
 const DEFAULT_HOLDBACK = 24;
 
+// Tokenizer control markers. They belong to the model, not the answer, and
+// only ever as a suffix: a user asking what the marker means must still see
+// it when it appears in the middle of the text.
+const TERMINAL_CONTROL_TOKENS = ["<|eos|>", "<|endoftext|>", "<|im_end|>"];
+
+function stripTerminalControlTokens(value) {
+  let s = String(value || "");
+  for (;;) {
+    const before = s;
+    const trimmed = s.replace(/\s+$/, "");
+    let cut = false;
+    for (const token of TERMINAL_CONTROL_TOKENS) {
+      if (trimmed.endsWith(token)) {
+        s = trimmed.slice(0, -token.length);
+        cut = true;
+      }
+    }
+    if (!cut || s === before)
+      return s;
+  }
+}
+
 function clampUtf16Index(value, index) {
   let i = Number.isFinite(Number(index)) ? Math.trunc(Number(index)) : 0;
   i = Math.max(0, Math.min(String(value).length, i));
@@ -46,10 +68,18 @@ function commonPrefixUtf16(a, b) {
 
 function holdBackTail(value, count) {
   const n = Math.max(0, Math.trunc(Number(count) || 0));
-  if (!n) return String(value || "");
   const chars = Array.from(String(value || ""));
-  if (chars.length <= n) return "";
-  return chars.slice(0, chars.length - n).join("");
+  // A trailing control marker must stay un-emitted until the finish, which
+  // strips it. The fixed holdback is shorter than the longest marker.
+  let marker = 0;
+  const joined = chars.join("");
+  for (const token of TERMINAL_CONTROL_TOKENS)
+    if (joined.endsWith(token))
+      marker = Math.max(marker, Array.from(token).length);
+  const keep = Math.max(n, marker);
+  if (!keep) return joined;
+  if (chars.length <= keep) return "";
+  return chars.slice(0, chars.length - keep).join("");
 }
 
 function holdBackPartialDetailsTag(value) {
@@ -119,6 +149,12 @@ class AppendOnlyEmitter {
     this.clientView = next;
     return out;
   }
+
+  // What the client has actually been sent, so a finish can append only the
+  // part still held back.
+  emitted() {
+    return this.clientView;
+  }
 }
 
 // chat.z.ai sometimes answers HTTP 200 with the failure embedded in the SSE
@@ -187,16 +223,25 @@ export function createZaiFrameNormalizer(options = {}) {
     return events;
   };
 
-  const finish = () => {
+  const finish = (interrupted = false) => {
     if (terminal) return [];
-    const events = sawDetails ? flushSnapshot(true) : flushPhaseReasoning(true).concat(fullText ? (() => {
-      const d = contentEmitter.delta(fullText);
-      return d ? [{ content: d, reasoning: "", done: false }] : [];
-    })() : []);
+    fullText = stripTerminalControlTokens(fullText);
+    const events = sawDetails ? flushSnapshot(true) : flushPhaseReasoning(true).concat((() => {
+      const sent = contentEmitter.emitted();
+      if (!fullText.startsWith(sent)) return [];
+      const rest = fullText.slice(sent.length);
+      return rest ? [{ content: rest, reasoning: "", done: false }] : [];
+    })());
     terminal = true;
-    events.push({ content: "", reasoning: "", done: true });
+    events.push(interrupted
+      ? { content: "", reasoning: "", done: true, error: "premature_eof" }
+      : { content: "", reasoning: "", done: true });
     return events;
   };
+
+  // The body ended with no protocol terminal. A bare socket close is a
+  // truncation, so the caller must report finish_reason "length".
+  const interrupt = () => finish(true);
 
   const push = (raw) => {
     if (terminal || !raw || typeof raw !== "object") return [];
@@ -257,5 +302,5 @@ export function createZaiFrameNormalizer(options = {}) {
     return events;
   };
 
-  return { push, finish };
+  return { push, finish, interrupt };
 }

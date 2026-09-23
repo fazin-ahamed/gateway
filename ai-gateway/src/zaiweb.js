@@ -386,6 +386,7 @@ async function readDeltas(source, onDelta, options = {}) {
   const normalizer = createZaiFrameNormalizer(options);
   let buffer = "";
   let stopped = false;
+  let protocolTerminal = false;
   const emit = (events) => {
     for (const event of events) {
       if (onDelta(event)) {
@@ -407,6 +408,7 @@ async function readDeltas(source, onDelta, options = {}) {
         const payload = line.slice(5).trim();
         if (!payload) continue;
         if (payload === "[DONE]") {
+          protocolTerminal = true;
           emit(normalizer.finish());
           stopped = true;
           break;
@@ -417,11 +419,14 @@ async function readDeltas(source, onDelta, options = {}) {
         } catch {
           continue;
         }
-        if (emit(normalizer.push(frame))) break;
+        const events = normalizer.push(frame);
+        if (events.some((e) => e.done && !e.error))
+          protocolTerminal = true;
+        if (emit(events)) break;
       }
     }
     if (!stopped)
-      emit(normalizer.finish());
+      emit(protocolTerminal ? normalizer.finish() : normalizer.interrupt());
   } finally {
     try { reader.releaseLock(); } catch {}
   }
@@ -538,7 +543,8 @@ function toOpenAiStream(source, model, id, agent = false, tools = [], onComplete
             }
           }
           if (delta.done) {
-            finish();
+            if (delta.error) finishInterrupted();
+            else finish();
             return true;
           }
           return false;
@@ -546,7 +552,7 @@ function toOpenAiStream(source, model, id, agent = false, tools = [], onComplete
         if (!finished) {
           if (!started)
             send(chunk(id, created, model, { role: "assistant" }));
-          finish();
+          finishInterrupted();
         }
         controller.close();
       } catch (e) {

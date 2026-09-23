@@ -93,3 +93,26 @@ test("a mid-stream source failure emits a structured SSE error then DONE", async
   assert.match(text, /"finish_reason":"length"/, "interrupted stream terminates with a recognized non-success terminal");
   assert.match(text, /data: \[DONE\]/);
 });
+
+test("content then a raw EOF with no DONE terminates as length, never stop", async () => {
+  const source = [
+    'data: {"id":"x","model":"m","choices":[{"index":0,"delta":{"content":"partial answer"},"finish_reason":null}]}',
+    ''
+  ].join('\n');
+  const guarded = guardToolLoopResponse(new Response(source, { headers: { "content-type": "text/event-stream" } }), "m", []);
+  const text = await guarded.text();
+  assert.match(text, /"finish_reason":"length"/, "a raw EOF is a truncation, not a completion");
+  assert.doesNotMatch(text, /"finish_reason":"stop"/);
+  assert.match(text, /data: \[DONE\]/);
+});
+
+test("a partial tool call then a raw EOF is never promoted to tool_calls", async () => {
+  const source = [
+    'data: {"id":"x","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_z","type":"function","function":{"name":"read","arguments":"{\\"path\\":"}}]},"finish_reason":null}]}',
+    ''
+  ].join('\n');
+  const guarded = guardToolLoopResponse(new Response(source, { headers: { "content-type": "text/event-stream" } }), "m", []);
+  const text = await guarded.text();
+  assert.doesNotMatch(text, /"finish_reason":"tool_calls"/, "a half-produced tool call must not look executable");
+  assert.match(text, /"finish_reason":"length"/);
+});

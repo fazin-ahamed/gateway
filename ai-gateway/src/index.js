@@ -1030,6 +1030,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             circuitRecordOk("key", k.keyId);
             traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart });
             await recordTrajectory(c, { ...traj, slug: liveSlug, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
+            if (autoDecision)
+              await finishLatencyShadow(c, requestId, { headersMs: _att.headers, ttftMs: null, finishedMs: Date.now() - _attStart, cancelled: false });
             return new Response(clientTxt, { status: up.status, headers: hdrs });
           }
           circuitRecordOk("provider", route.provider_id);
@@ -2109,6 +2111,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
     }
   });
   let finishSeen = false; // a forwarded chunk carried a real finish_reason
+  let protocolDoneSeen = false; // the upstream sent an explicit [DONE]
   let truncatedEof = false; // relay closed the tunnel on a non-EOF body read
   const pump = (async () => {
     try {
@@ -2131,8 +2134,10 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
           if (!line.startsWith("data:"))
             continue;
           const data = line.slice(5).trim();
-          if (data === "[DONE]")
+          if (data === "[DONE]") {
+            protocolDoneSeen = true;
             continue;
+          }
           try {
             const obj = JSON.parse(data);
             if (obj && typeof obj === "object" && obj.error)
@@ -2202,11 +2207,14 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
           // SSE, or a relay tunnel closed on a non-EOF body read) did not
           // complete cleanly: the synthesized terminal must be a non-success
           // finish ("length"), never a clean "stop".
-          const cleanEnd = !sawUpstreamError && !malformedSseSent && !truncatedEof;
+          // Bytes received prove nothing about completion. Only an explicit
+          // [DONE] with no transport fault is a clean end; a raw EOF after
+          // some text is a truncation and must read as "length".
+          const cleanProtocolEnd = protocolDoneSeen && !sawUpstreamError && !malformedSseSent && !truncatedEof;
           const finishReason = normalizeTerminalFinishReason(
             null,
             hasAccumulatedToolCalls(toolCallsBuf),
-            !!(contentBuf || reasoningBuf) && cleanEnd
+            cleanProtocolEnd
           );
           const finishChunk = {
             id: "gen-" + requestId,
@@ -3637,7 +3645,7 @@ async function ttftSamples(c, primary, taskType, bucket) {
   const out = [];
   try {
     const rows = await c.env.DB.prepare(
-      "SELECT task_type, AVG(ttft_ms) avg, COUNT(*) n FROM route_attempts WHERE route_id=? AND ttft_ms IS NOT NULL GROUP BY task_type"
+      "SELECT task_type, AVG(ttft_ms) avg, COUNT(*) n FROM route_attempts WHERE route_id=? AND ttft_ms IS NOT NULL AND headers_ms > 0 GROUP BY task_type"
     ).bind(primary.id).all();
     let routeN = 0;
     let routeSum = 0;
