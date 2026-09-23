@@ -104,3 +104,35 @@ export function migrateRouteAttemptsV2(db) {
   }
   return added;
 }
+
+// The shadow table is new. CREATE TABLE IF NOT EXISTS is a no-op on a database
+// that already has it and creates it on one that predates it.
+export function migrateLatencyShadow(db) {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS latency_shadow_decisions (
+      request_id TEXT PRIMARY KEY,
+      primary_route_id INTEGER NOT NULL,
+      primary_provider_id INTEGER,
+      primary_slug TEXT,
+      backup_route_id INTEGER,
+      backup_provider_id INTEGER,
+      backup_slug TEXT,
+      task_type TEXT,
+      context_bucket TEXT,
+      deadline_ms INTEGER NOT NULL,
+      baseline_ms REAL,
+      baseline_samples INTEGER NOT NULL DEFAULT 0,
+      deadline_source TEXT NOT NULL,
+      observed_headers_ms INTEGER,
+      observed_ttft_ms INTEGER,
+      would_hedge INTEGER,
+      hedge_possible INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      finished_at TEXT
+    )`);
+    return true;
+  } catch (e) {
+    console.warn("[gateway] latency shadow migration skipped:", e.message);
+    return false;
+  }
+}

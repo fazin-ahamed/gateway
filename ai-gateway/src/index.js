@@ -19,6 +19,7 @@ import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
 import { contextLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
+import { contextBucket, deadlineFor, chooseBackup, wouldHedge } from "./router/latency-governor.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
 var registrySeedInflight = new WeakMap();
@@ -655,7 +656,7 @@ app.get("/v1/models", async (c) => {
     const catalog = modelsDevCache.catalog;
     const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
     const envelope = buildCapabilityEnvelope(live.map((r) => {
-      const entry = byId ? matchModelsDevPrice(byId, r.slug) : null;
+      const entry = capabilityEntryForRoute(r, byId);
       const caps = entryCapabilities(entry);
       return {
         providerId: r.provider_id,
@@ -871,7 +872,12 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     try { attemptTaskType = (compileTaskIR(originalPayload) || {}).task || ""; } catch {}
     let realAttemptSeq = 0;
     let previousRealRouteId = null;
+    let shadowRecorded = false;
     for (const route of routes.results) {
+      if (autoDecision && !shadowRecorded) {
+        shadowRecorded = true;
+        await recordLatencyShadow(c, requestId, route, autoDecision, attemptTaskType, routes.results);
+      }
       const liveSlug = route.public_slug || slug;
       if (payload.model !== liveSlug)
         payload = { ...payload, model: liveSlug };
@@ -1036,7 +1042,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           const horizonHdrs = { "x-gateway-model": liveSlug };
           if (autoDecision && autoDecision.horizon)
             horizonHdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
-          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs, attemptId: _streamAttemptId, attemptStart: _attStart, attemptTaskType });
+          const result = await handleStream(c, up, key, liveSlug, route, requestId, payload, started, res.usage, { traj: { ...traj, slug: liveSlug }, attempts: attempts + 1, cacheKey, cacheTtlSeconds: cacheTtlSeconds(c), gatewayHeaders: horizonHdrs, attemptId: _streamAttemptId, attemptStart: _attStart, attemptTaskType, headersMs: _att.headers });
           return result;
         } catch (e) {
           // Adapter diagnostics stay internal; only gateway-owned errors cross
@@ -1113,6 +1119,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         }
       }
     }
+    if (autoDecision && shadowRecorded)
+      await finishLatencyShadow(c, requestId, { headersMs: null, ttftMs: null, finishedMs: Date.now() - started, cancelled: false });
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
     const finalStatus = lastErrStatus || 503;
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
@@ -2031,6 +2039,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       const ttft = firstTokenAt ? (firstTokenAt - (extra.attemptStart || started)) : null;
       try {
         await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, health_impact=?, ttft_ms=COALESCE(?, ttft_ms), latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=?, tool_valid=? WHERE id=?").bind(outcome.success, outcome.failure_class, hi, ttft, attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), _streamToolValid, extra.attemptId).run();
+        await finishLatencyShadow(c, requestId, { headersMs: extra.headersMs, ttftMs: ttft, finishedMs: attLatency, cancelled: clientCancelled });
       } catch (e) {
         blog("route_attempt stream patch failed: " + String(e.message || e));
       }
@@ -2789,6 +2798,19 @@ function hasImageContent(payload) {
   }
   return false;
 }
+
+// One capability lookup for the router and the model list. A Z.AI consumer
+// route is absent from models.dev, so its local catalog entry wins; everything
+// else resolves through the public catalog. Both callers must see the same row.
+function capabilityEntryForRoute(route, catalogById) {
+  if (route && isZaiWebFormat(route.fmt)) {
+    const local = modelCatalogEntry(route.upstream_model, route.fmt);
+    if (local)
+      return local;
+  }
+  return catalogById && route ? matchModelsDevPrice(catalogById, route.slug) : null;
+}
+
 // Capability gate from the models.dev catalog entry. Unknown models are
 // conservative on auto: no assumed vision/tools, and a 32k context ceiling.
 // Known models: only an explicit toolCall=false blocks tools.
@@ -2911,15 +2933,16 @@ async function pickAutoModel(c, payload, key) {
   // (priors land between ~0.5 and ~5). need in [1, 6].
   const reqTokens = cx.estInputTokens || 0;
   const reqImages = cx.images || 0;
-  let need = Math.min(6, 1 + Math.max(0, score) / 2.2);
+  const requestedOut = Math.max(0, Number(payload.max_completion_tokens ?? payload.max_tokens) || 0);
   const hasTools = !!(payload.tools || payload.functions);
+  let need = Math.min(6, 1 + Math.max(0, score) / 2.2);
   if (hasTools)
     need = Math.min(6, Math.max(need, 2.6));
   if (reqImages)
     need = Math.min(6, Math.max(need, 2.4));
   const candidates = [];
   for (const r of enabled) {
-    const entry = overlay.get(r.slug) || (byId ? matchModelsDevPrice(byId, r.slug) : null);
+    const entry = overlay.get(r.slug) || capabilityEntryForRoute({ slug: r.slug }, byId);
     const mult = Number(cfg.overrides[r.slug]);
     let q = qualityPrior(entry, r.slug);
     if (Number.isFinite(mult) && mult > 0)
@@ -2929,7 +2952,8 @@ async function pickAutoModel(c, payload, key) {
     const ctxTight = !!(caps.context && reqTokens > caps.context * 0.55);
     const visionOk = reqImages === 0 || (!caps.unknown && caps.vision);
     const toolsOk = !hasTools || caps.tools || caps.unknown;
-    const capable = ctxOk && visionOk && toolsOk;
+    const outOk = requestedOut === 0 || (!caps.unknown && caps.output > 0 && requestedOut <= caps.output);
+    const capable = ctxOk && outOk && visionOk && toolsOk;
     // Runtime health is route-scoped: one model route cannot poison siblings
     // that happen to share the same provider.
     const routeIds = String(r.route_ids || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -2960,6 +2984,7 @@ async function pickAutoModel(c, payload, key) {
     if (!ctxOk) reason = "context";
     else if (!visionOk) reason = "vision";
     else if (!toolsOk) reason = "tools";
+    else if (!outOk) reason = "output";
     else if (allOpen) reason = "circuit open";
     else if (!qualityOk) reason = "quality low";
     else if (!relOk) reason = "degraded";
@@ -3569,6 +3594,82 @@ async function recordRouterDecision(c, requestId, decision) {
   } catch (e) {
     blog("router_decision record failed: " + String(e.message || e));
     return false;
+  }
+}
+
+// One shadow row per auto request, written when the first real route is tried
+// and filled in when that attempt ends. INSERT OR IGNORE keeps retries and
+// fallbacks from adding a second row. It reads and writes; it never calls out.
+async function recordLatencyShadow(c, requestId, primary, decision, taskType, routes) {
+  if (!decision || !requestId || !primary)
+    return false;
+  try {
+    const bucket = contextBucket(decision.estInputTokens);
+    const samples = await ttftSamples(c, primary, taskType, bucket);
+    const deadline = deadlineFor({ taskType, samples });
+    const providerOf = new Map((routes || []).map((r) => [r.id, r.provider_id]));
+    const backup = chooseBackup(
+      { routeId: primary.id, providerId: primary.provider_id, quality: decision.quality },
+      (decision.candidates || []).filter((x) => x.eligible).flatMap((x) =>
+        (x.routeIds || []).map((id) => ({
+          routeId: id, providerId: providerOf.get(id) ?? null, slug: x.slug, eligible: true,
+          quality: x.quality, expectedTtftMs: x.avgMs
+        }))
+      )
+    );
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO latency_shadow_decisions
+       (request_id, primary_route_id, primary_provider_id, primary_slug, backup_route_id, backup_provider_id, backup_slug, task_type, context_bucket, deadline_ms, baseline_ms, baseline_samples, deadline_source, hedge_possible, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      requestId, primary.id, primary.provider_id, primary.public_slug || decision.slug,
+      backup ? backup.routeId : null, backup ? backup.providerId : null, backup ? backup.slug : null,
+      taskType || null, bucket, deadline.deadlineMs, deadline.baselineMs, deadline.samples, deadline.source,
+      backup ? 1 : 0, nowIso()
+    ).run();
+    return true;
+  } catch (e) {
+    blog("latency shadow record failed: " + String(e.message || e));
+    return false;
+  }
+}
+async function ttftSamples(c, primary, taskType, bucket) {
+  const out = [];
+  try {
+    const rows = await c.env.DB.prepare(
+      "SELECT task_type, AVG(ttft_ms) avg, COUNT(*) n FROM route_attempts WHERE route_id=? AND ttft_ms IS NOT NULL GROUP BY task_type"
+    ).bind(primary.id).all();
+    let routeN = 0;
+    let routeSum = 0;
+    for (const r of rows.results || []) {
+      const n = Number(r.n) || 0;
+      routeN += n;
+      routeSum += (Number(r.avg) || 0) * n;
+      if (r.task_type === taskType)
+        out.push({ key: "route-task", ttftMs: Number(r.avg), n });
+    }
+    if (routeN)
+      out.push({ key: "route", ttftMs: routeSum / routeN, n: routeN });
+  } catch {
+  }
+  void bucket;
+  return out;
+}
+async function finishLatencyShadow(c, requestId, { headersMs, ttftMs, finishedMs, cancelled }) {
+  if (!requestId)
+    return;
+  try {
+    const row = await c.env.DB.prepare(
+      "SELECT deadline_ms FROM latency_shadow_decisions WHERE request_id=?"
+    ).bind(requestId).first();
+    if (!row)
+      return;
+    const late = wouldHedge({ deadlineMs: row.deadline_ms, ttftMs, finishedMs, cancelled });
+    await c.env.DB.prepare(
+      "UPDATE latency_shadow_decisions SET observed_headers_ms=?, observed_ttft_ms=?, would_hedge=?, finished_at=? WHERE request_id=? AND finished_at IS NULL"
+    ).bind(headersMs ?? null, ttftMs ?? null, late ? 1 : 0, nowIso(), requestId).run();
+  } catch (e) {
+    blog("latency shadow finish failed: " + String(e.message || e));
   }
 }
 function trajectorySeed(c, payload, key, slug, isStream, requestId) {

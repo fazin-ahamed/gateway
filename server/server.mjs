@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
-import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2 } from "./migrations.mjs";
+import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow } from "./migrations.mjs";
 import { configureSessionStore } from "../ai-gateway/src/zai-session.js";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -87,6 +87,7 @@ try {
 }
 migrateQualityIdentity(db);
 migrateRouteAttemptsV2(db);
+migrateLatencyShadow(db);
 const env = {
   DB: db,
   ADMIN_TOKEN,

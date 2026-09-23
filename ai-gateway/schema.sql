@@ -519,3 +519,28 @@ CREATE TABLE IF NOT EXISTS router_decisions (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_router_decisions_created ON router_decisions(created_at);
+
+-- What the latency governor WOULD have done. Written once per auto request,
+-- after the serving route is known and updated when the attempt finishes.
+-- Observational: nothing here launches a request. Body-free.
+CREATE TABLE IF NOT EXISTS latency_shadow_decisions (
+  request_id TEXT PRIMARY KEY,
+  primary_route_id INTEGER NOT NULL,
+  primary_provider_id INTEGER,
+  primary_slug TEXT,
+  backup_route_id INTEGER,
+  backup_provider_id INTEGER,
+  backup_slug TEXT,
+  task_type TEXT,
+  context_bucket TEXT,
+  deadline_ms INTEGER NOT NULL,
+  baseline_ms REAL,
+  baseline_samples INTEGER NOT NULL DEFAULT 0,
+  deadline_source TEXT NOT NULL,
+  observed_headers_ms INTEGER,
+  observed_ttft_ms INTEGER,
+  would_hedge INTEGER,
+  hedge_possible INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);

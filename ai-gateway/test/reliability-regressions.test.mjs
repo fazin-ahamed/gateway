@@ -162,6 +162,36 @@ test("pickAutoModel does not throw on healthy zaiminted routes", async () => {
   }
 });
 
+test("a route whose output limit is below the request is not eligible", async () => {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("offline"); };
+  try {
+    t.__resetCircuitState();
+    t.__setModelsDevCache({
+      p: { models: { small: { cost: { input: 1, output: 1 }, limit: { context: 128000, output: 8192 }, tool_call: true } } }
+    });
+    const db = {
+      prepare(sql) {
+        const stmt = {
+          bind() { return stmt; },
+          async first() { return null; },
+          async all() {
+            if (sql.includes("route_ids"))
+              return { results: [{ slug: "small", healthy: 1, route_ids: "9" }] };
+            return { results: [] };
+          }
+        };
+        return stmt;
+      }
+    };
+    const decision = await t.pickAutoModel({ env: { DB: db } }, { messages: [{ role: "user", content: "hi" }], max_tokens: 65536 }, null);
+    assert.equal(decision, null, "the only route cannot produce 65536 tokens");
+    t.__setModelsDevCache(null);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test("a slug served by several routes snapshots as the slug, not its first route", () => {
   const decision = {
     slug: "model-x",
