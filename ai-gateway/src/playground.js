@@ -977,8 +977,9 @@ async function loadRoutes(){
     const verdict=r.probe_verdict
       ? '<span class="pill '+verdictClass(r.probe_verdict)+'" title="'+(r.probe_measured_family?('measured '+r.probe_measured_family):'')+'">'+esc(r.probe_verdict)+'</span>'
       : '<span class="pill mut">unverified</span>';
-    return '<tr><td class="mono">'+esc(r.slug)+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+label+'</span></td><td>'+verdict+'</td>'+
-      '<td class="rowact"><button class="ghost" data-act="rverify" data-id="'+esc(String(r.provider_id))+'" data-slug="'+esc(r.slug)+'" title="Probe this slug only: tokenizer fingerprint, relay routing, identity, limits">verify</button> <button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+'">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
+    const kindPill=String(r.model_kind||'chat')==='decision'?' <span class="pill warn" title="Answers /v1/systemone, never /v1/chat/completions">decision</span>':'';
+    return '<tr><td class="mono">'+esc(r.slug)+kindPill+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+label+'</span></td><td>'+verdict+'</td>'+
+      '<td class="rowact"><button class="ghost" data-act="rverify" data-id="'+esc(String(r.provider_id))+'" data-slug="'+esc(r.slug)+'" title="Probe this slug only: tokenizer fingerprint, relay routing, identity, limits">verify</button> <button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+' data-kind="'+esc(String(r.model_kind||"chat"))+'" data-wire="'+esc(String(r.wire_format||""))+'"">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
   }).join('') || '<tr><td colspan="7"><div class="empty">No model routes yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Slug</th><th>Role</th><th>Provider</th><th>Upstream model</th><th>Route</th><th>Integrity</th><th></th></tr>'+rows+'</table>';
 }
@@ -993,9 +994,13 @@ document.getElementById('r-add').onclick=async function(){
     {key:'provider_id',label:'Provider',type:'select',options:opts},
     {key:'upstream_model',label:'Upstream model id',placeholder:'gpt-4o-mini'},
     {key:'rank',label:'Rank (0 = primary)',type:'number',value:'0'},
+    {key:'model_kind',label:'Model type',type:'select',value:'chat',options:[{value:'chat',label:'Chat'},{value:'decision',label:'Decision / System-One'}]},
+    {key:'wire_format',label:'Wire format (blank = inherit provider)',type:'select',value:'',options:[{value:'',label:'Inherit provider'},{value:'openai',label:'OpenAI'},{value:'anthropic',label:'Anthropic'},{value:'systemone',label:'SystemOne'}]},
+    {key:'endpoint_path',label:'Endpoint path (blank = default)',placeholder:'/v1/systemone'},
     {key:'enabled',label:'State',type:'select',value:'1',options:[{value:'1',label:'enabled'},{value:'0',label:'disabled'}]}
   ], async function(v){
     v.provider_id=Number(v.provider_id); v.rank=Number(v.rank); v.enabled=v.enabled==='1';
+    v.wire_format=v.wire_format||null; v.endpoint_path=v.endpoint_path||null;
     const {status,data}=await api('/admin/routes',{method:'POST',body:JSON.stringify(v)});
     if(status===201){ toast('route added','ok'); closeModal(); loadRoutes(); }
     else toast('add failed: '+(data&&data.error&&data.error.message||status),'err');
@@ -1009,9 +1014,13 @@ async function editRoute(id){
     {key:'provider_id',label:'Provider',type:'select',value:String(r.provider_id),options:opts},
     {key:'upstream_model',label:'Upstream model id',value:r.upstream_model},
     {key:'rank',label:'Rank',type:'number',value:r.rank},
+    {key:'model_kind',label:'Model type',type:'select',value:String(r.model_kind||'chat'),options:[{value:'chat',label:'Chat'},{value:'decision',label:'Decision / System-One'}]},
+    {key:'wire_format',label:'Wire format (blank = inherit provider)',type:'select',value:String(r.wire_format||''),options:[{value:'',label:'Inherit provider'},{value:'openai',label:'OpenAI'},{value:'anthropic',label:'Anthropic'},{value:'systemone',label:'SystemOne'}]},
+    {key:'endpoint_path',label:'Endpoint path (blank = default)',value:r.endpoint_path||''},
     {key:'enabled',label:'State',type:'select',value:r.enabled?'1':'0',options:[{value:'1',label:'enabled'},{value:'0',label:'disabled'}]}
   ], async function(v){
     v.provider_id=Number(v.provider_id); v.rank=Number(v.rank); v.enabled=v.enabled==='1';
+    v.wire_format=v.wire_format||null; v.endpoint_path=v.endpoint_path||null;
     const {status,data:rr}=await api('/admin/routes/'+id,{method:'PATCH',body:JSON.stringify(v)});
     if(status===200){ toast('route updated','ok'); closeModal(); loadRoutes(); }
     else toast('update failed: '+(rr&&rr.error&&rr.error.message||status),'err');
@@ -1033,10 +1042,11 @@ async function addFallbackRoute(btn){
     {key:'provider_id',label:'Fallback provider',type:'select',value:btn.getAttribute('data-provider')||'',options:opts},
     {key:'upstream_model',label:'Fallback upstream model id',value:btn.getAttribute('data-model')||''},
     {key:'rank',label:'Rank (higher than '+esc(String(nextRank-1))+')',type:'number',value:String(nextRank)},
+    {key:'model_kind',label:'Model type',type:'select',value:String(btn.getAttribute('data-kind')||'chat'),options:[{value:'chat',label:'Chat'},{value:'decision',label:'Decision / System-One'}]},
     {key:'enabled',label:'State',type:'select',value:'1',options:[{value:'1',label:'enabled'},{value:'0',label:'disabled'}]}
   ], async function(v){
     v.provider_id=Number(v.provider_id); v.rank=Number(v.rank)||nextRank; v.enabled=v.enabled==='1';
-    const {status,data}=await api('/admin/routes',{method:'POST',body:JSON.stringify({slug:slug,provider_id:v.provider_id,upstream_model:v.upstream_model,rank:v.rank,enabled:v.enabled})});
+    const {status,data}=await api('/admin/routes',{method:'POST',body:JSON.stringify({slug:slug,provider_id:v.provider_id,upstream_model:v.upstream_model,rank:v.rank,model_kind:v.model_kind,wire_format:v.model_kind==='decision'?(btn.getAttribute('data-wire')||null):null,enabled:v.enabled})});
     if(status===201){ toast('fallback added at rank '+v.rank,'ok'); closeModal(); loadRoutes(); }
     else toast('add failed: '+(data&&data.error&&data.error.message||status),'err');
   });

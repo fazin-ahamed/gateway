@@ -5026,8 +5026,10 @@ app.patch("/admin/routes/:id", async (c) => {
   }
   const sets = [];
   const binds = [];
-  for (const f of ["slug", "provider_id", "upstream_model", "rank"]) {
+  for (const f of ["slug", "provider_id", "upstream_model", "rank", "model_kind", "wire_format", "endpoint_path"]) {
     if (b[f] !== void 0) {
+      if (f === "model_kind" && !["chat", "decision"].includes(String(b[f])))
+        return c.json({ error: { message: "model_kind must be chat or decision" } }, 400);
       sets.push(f + "=?");
       binds.push(f === "rank" || f === "provider_id" ? Number(b[f]) : b[f]);
     }
