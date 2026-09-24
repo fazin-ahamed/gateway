@@ -8,16 +8,77 @@ var PLAYGROUND_HTML = `<!doctype html>
 <style>
   :root{
     color-scheme:dark;
-    --bg:#08090c; --surface:#0f1218; --surface-hi:#151b25; --surface-deep:#0a0d12;
-    --line:#1c222d; --line-hi:#2d3a4e; --text:#e4eaf2; --muted:#5f6d82;
-    --accent:#2fd4b5; --accent-dim:#26aa90; --accent-soft:rgba(47,212,181,.08); --ink:#06211b;
-    --good:#3ec98c; --warn:#dcae4f; --bad:#e45b5b;
-    --r-lg:8px; --radius:8px; --radius-sm:4px; --r-pill:999px;
+    /* Deeper OLED ground with a cool cast; surfaces read as machined trays
+       rather than flat panels, so hierarchy comes from light, not borders. */
+    --bg:#05070b; --surface:#0b0f16; --surface-hi:#111826; --surface-deep:#070a10;
+    --line:rgba(148,178,220,.10); --line-hi:rgba(148,178,220,.22);
+    --text:#e8eefb; --muted:#7d8ba6; --muted-dim:#55637d;
+    --accent:#3fe0c4; --accent-dim:#2bbf9f; --accent-soft:rgba(63,224,196,.10); --ink:#04211c;
+    --good:#4ade9a; --warn:#e8bd62; --bad:#f06a6a;
+    --violet:#a78bfa; --violet-soft:rgba(167,139,250,.12);
+    --r-lg:14px; --radius:10px; --radius-sm:6px; --r-pill:999px;
     --w-med:500; --w-bold:600;
-    --mono:ui-monospace,"SF Mono",Consolas,monospace;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Consolas,monospace;
     --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
-    --ease:cubic-bezier(.2,0,.13,1);
-    --dur:120ms;
+    /* Custom spring curves only: no linear, no ease-in-out. */
+    --ease:cubic-bezier(.32,.72,0,1);
+    --ease-out:cubic-bezier(.16,1,.3,1);
+    --dur:180ms;
+    --dur-slow:420ms;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+    --shadow-lift:0 2px 4px rgba(0,0,0,.45),0 18px 40px -16px rgba(0,0,0,.7);
+    --inset:inset 0 1px 0 rgba(255,255,255,.05);
+  }
+
+  /* Ambient depth: two slow radial washes, fixed so they never repaint on
+     scroll, plus a faint grain to kill gradient banding on OLED. */
+  body::before{
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+    background:
+      radial-gradient(900px 520px at 12% -8%, rgba(63,224,196,.09), transparent 62%),
+      radial-gradient(760px 480px at 92% 4%, rgba(167,139,250,.08), transparent 60%);
+  }
+  body::after{
+    content:""; position:fixed; inset:0; z-index:1; pointer-events:none; opacity:.028;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* --- decision mode ------------------------------------------------- */
+  /* A display rule beats the hidden attribute; restore it explicitly so
+     mode switches actually hide their controls. */
+  [hidden]{display:none !important;}
+
+  .pg-modes{display:flex; gap:4px; padding:4px; margin-bottom:14px;
+    background:var(--surface-deep); border:1px solid var(--line); border-radius:var(--r-pill);
+    box-shadow:var(--inset);}
+  .pg-modes .pg-mode{flex:1; padding:8px 14px; border:0; border-radius:var(--r-pill);
+    background:transparent; color:var(--muted); font:600 12px/1 var(--sans); letter-spacing:.01em;
+    cursor:pointer; transition:color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease);}
+  .pg-modes .pg-mode:hover{color:var(--text);}
+  .pg-modes .pg-mode.is-on{color:var(--ink); background:var(--accent);
+    box-shadow:0 2px 10px -4px rgba(63,224,196,.7);}
+  .pg-modes .pg-mode:active{transform:scale(.985);}
+  .pg-modes .pg-mode:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+
+  .pg-decision-results{display:grid; gap:10px; margin-top:14px;}
+  .pg-dec-card{padding:14px 16px; border-radius:var(--r-lg);
+    background:linear-gradient(180deg,var(--surface-hi),var(--surface));
+    border:1px solid var(--line); box-shadow:var(--shadow),var(--inset);
+    animation:pgDecIn var(--dur-slow) var(--ease-out) both;}
+  .pg-dec-card .k{font:600 11px/1 var(--sans); letter-spacing:.08em; text-transform:uppercase;
+    color:var(--muted); display:flex; align-items:center; gap:8px; margin-bottom:8px;}
+  .pg-dec-choice{font:600 16px/1.3 var(--sans); color:var(--text); margin-bottom:10px;}
+  .pg-dec-bar{display:grid; grid-template-columns:minmax(72px,auto) 1fr auto; align-items:center;
+    gap:10px; margin:6px 0; font:500 11px/1 var(--mono); color:var(--muted);}
+  .pg-dec-bar i{display:block; height:5px; border-radius:var(--r-pill); min-width:2px;
+    background:linear-gradient(90deg,var(--accent-dim),var(--accent));
+    box-shadow:0 0 12px -2px rgba(63,224,196,.5);}
+  .pg-dec-bar b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums;}
+  @keyframes pgDecIn{from{opacity:0; transform:translateY(8px) scale(.985);} to{opacity:1; transform:none;}}
+
+  @media (prefers-reduced-motion:reduce){
+    .pg-dec-card{animation:none;}
+    *{transition-duration:1ms !important;}
   }
   *{box-sizing:border-box} html,body{margin:0;min-height:100%}
   body{font:14px/1.45 var(--sans);background:var(--bg);color:var(--text);letter-spacing:.005em;text-rendering:optimizeLegibility;font-feature-settings:"cv01","cv08","cv10","tnum"}
@@ -242,10 +303,28 @@ var PLAYGROUND_HTML = `<!doctype html>
     </div>
     <div class="pg-shell">
       <aside class="pg-config">
+        <div class="pg-modes" id="c-modes" role="tablist" aria-label="Model class">
+          <button class="pg-mode is-on" id="c-mode-chat" role="tab" aria-selected="true">Chat</button>
+          <button class="pg-mode" id="c-mode-decision" role="tab" aria-selected="false">Decision</button>
+        </div>
         <div class="card">
           <h2 class="sec" style="margin-top:0">Run</h2>
-          <label for="c-model">Model slug</label>
+          <label for="c-model" id="c-model-label">Model slug</label>
           <select id="c-model"><option value="">Loading enabled models...</option></select>
+          <div class="pg-decision-only" id="c-decision-config" hidden>
+            <label for="c-dec-state">State (JSON)</label>
+            <textarea id="c-dec-state" spellcheck="false">{
+  "task": "fix the session writer race"
+}</textarea>
+            <label for="c-dec-questions">Questions (JSON)</label>
+            <textarea id="c-dec-questions" spellcheck="false">{
+  "verify": {
+    "type": "noul",
+    "instructions": "Does this change require objective verification?"
+  }
+}</textarea>
+            <p class="hint">choice, score and noul questions against one shared state. A choice may only return an option you defined here.</p>
+          </div>
           <div class="small" id="c-route-hint" style="margin-top:6px">Pick a slug to see its last integrity verdict.</div>
           <label class="pg-check" for="c-stream"><input type="checkbox" id="c-stream"> Stream responses</label>
           <div class="form-actions">
@@ -286,6 +365,7 @@ var PLAYGROUND_HTML = `<!doctype html>
             <button class="ghost" id="c-redo" title="Regenerate the last response">Regenerate</button>
             <button class="act" id="c-send">Send</button>
           </div>
+          <div class="pg-decision-results" id="c-dec-answers" hidden></div>
         </section>
         <section class="card pg-probe" id="c-probe-panel">
           <header class="pg-probe-head">
@@ -985,7 +1065,7 @@ document.addEventListener('click', function(e){
   else if(act==='kdel') delKey(id);
 });
 
-async function publicModelOptions(){ const {data}=await api('/admin/routes'); return [...new Set((data&&data.routes||[]).filter(function(r){return r.enabled;}).map(function(r){return r.slug;}))].sort().map(function(slug){return {value:slug,label:slug};}); }
+async function publicModelOptions(kind){ const {data}=await api('/admin/routes'); const want=kind||'chat'; const seen=[]; const out=[]; for(const r of (data&&data.routes||[])){ if(!r.enabled) continue; if(String(r.model_kind||'chat')!==want) continue; if(seen.indexOf(r.slug)>=0) continue; seen.push(r.slug); out.push({value:r.slug,label:r.slug}); } return out.sort(function(a,b){return a.value.localeCompare(b.value);}); }
 async function refreshTierSlugSelect(){ const select=document.getElementById('tier-slugs'); if(!select)return; const opts=await publicModelOptions(); select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';}).join('')||'<option disabled>No enabled public models</option>'; }
 async function tierOptions(){ const {data}=await api('/admin/model-tiers'); return (data&&data.tiers||[]).map(function(t){return {value:String(t.id),label:t.name+' - '+t.models};}); }
 async function refreshKeyTierSelect(){
@@ -1103,10 +1183,29 @@ function appendStreamingMessage(){
   return { el:d, append:function(chunk){ if(body.textContent==='…') body.textContent=''; body.textContent+=chunk; const box=document.getElementById('c-chat'); box.scrollTop=box.scrollHeight; }, done:function(){ d.classList.remove('streaming'); } };
 }
 async function refreshPlaygroundModels(){
-  const select=document.getElementById('c-model'); if(!select)return;
-  const selected=select.value; const opts=await publicModelOptions();
-  select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===selected?' selected':'')+'>'+esc(o.label)+'</option>';}).join('') || '<option value="">No enabled public models</option>';
+  var select=document.getElementById('c-model'); if(!select)return;
+  var selected=select.value; var opts=await publicModelOptions(playgroundMode==='decision'?'decision':'chat');
+  var empty=playgroundMode==='decision'?'No decision models configured':'No enabled public models';
+  select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===selected?' selected':'')+'>'+esc(o.label)+'</option>';}).join('') || '<option value="">'+esc(empty)+'</option>';
   if(!select.value&&select.options.length&&select.options[0].value) select.value=select.options[0].value;
+}
+function setPlaygroundMode(mode){
+  playgroundMode = mode==='decision' ? 'decision' : 'chat';
+  var dec=document.getElementById('c-decision-config');
+  var ans=document.getElementById('c-dec-answers');
+  var label=document.getElementById('c-model-label');
+  var streamBox=document.getElementById('c-stream');
+  var chat=document.getElementById('c-mode-chat');
+  var decBtn=document.getElementById('c-mode-decision');
+  if(dec) dec.hidden=playgroundMode!=='decision';
+  if(ans) ans.hidden=playgroundMode!=='decision';
+  if(label) label.textContent=playgroundMode==='decision'?'Decision model slug':'Model slug';
+  if(streamBox) streamBox.closest('label').hidden=playgroundMode==='decision';
+  if(chat){ chat.classList.toggle('is-on',playgroundMode==='chat'); chat.setAttribute('aria-selected',playgroundMode==='chat'?'true':'false'); }
+  if(decBtn){ decBtn.classList.toggle('is-on',playgroundMode==='decision'); decBtn.setAttribute('aria-selected',playgroundMode==='decision'?'true':'false'); }
+  var send=document.getElementById('c-send');
+  if(send) send.textContent=playgroundMode==='decision'?'Ask':'Send';
+  refreshPlaygroundModels();
 }
 function setPlaygroundTrace(info){
   const id=document.getElementById('c-trace-id');
@@ -1187,8 +1286,8 @@ async function verifyPlaygroundSlug(){
     toast(run&&run.verdict?run.verdict:'probed','ok');
   }catch(e){ toast('verify failed: '+e.message,'err'); setPlaygroundStatus('Verify failed.'); }
 }
-document.getElementById('c-send').onclick=async function(){ await sendPlaygroundMessage(); };
-document.getElementById('c-prompt').addEventListener('keydown',function(e){ if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){ e.preventDefault(); sendPlaygroundMessage(); } });
+document.getElementById('c-send').onclick=async function(){ if(playgroundMode==='decision'){ await sendPlaygroundDecision(); return; } await sendPlaygroundMessage(); };
+document.getElementById('c-prompt').addEventListener('keydown',function(e){ if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){ e.preventDefault(); if(playgroundMode==='decision') sendPlaygroundDecision(); else sendPlaygroundMessage(); } });
 document.getElementById('c-clear').onclick=function(){
   pgMessages=[];
   document.getElementById('c-messages').value=JSON.stringify(playgroundDefaultMessages(),null,2);
@@ -1197,6 +1296,8 @@ document.getElementById('c-clear').onclick=function(){
 };
 document.getElementById('c-verify').onclick=function(){ verifyPlaygroundSlug(); };
 document.getElementById('c-model').addEventListener('change',function(){ refreshPlaygroundIntegrity(); });
+document.getElementById('c-mode-chat').addEventListener('click',function(){ setPlaygroundMode('chat'); });
+document.getElementById('c-mode-decision').addEventListener('click',function(){ setPlaygroundMode('decision'); });
 let pgLastRun=null;
 let pgBusy=false;
 function pgRateMeta(elapsedMs, totalTokens){
@@ -1207,6 +1308,66 @@ document.getElementById('c-redo').onclick=async function(){
   if(!pgLastRun){ toast('nothing to redo yet','err'); return; }
   await sendPlaygroundMessage(pgLastRun.prompt, pgLastRun.history);
 };
+var playgroundMode='chat';
+function renderDecisionAnswers(answers,meta){
+  var box=document.getElementById('c-dec-answers'); if(!box) return;
+  if(!answers){ box.innerHTML='<div class="empty">No decision answers yet.</div>'; return; }
+  var html='';
+  for(const name of Object.keys(answers)){
+    var a=answers[name]||{};
+    var head='<div class="pg-dec-card"><div class="k">'+esc(name)+' <span class="pill mut">'+esc(a.type)+'</span></div>';
+    if(a.type==='choice'){
+      head+='<div class="pg-dec-choice">'+esc(a.choice==null?'—':a.choice)+'</div>';
+      var probs=a.probabilities||{}; var keys=Object.keys(probs);
+      for(const k of keys){
+        var pct=Math.round((Number(probs[k])||0)*100);
+        head+='<div class="pg-dec-bar"><span>'+esc(k)+'</span><i style="width:'+pct+'%"></i><b>'+pct+'%</b></div>';
+      }
+    } else if(a.type==='score'){
+      head+='<div class="pg-dec-choice">'+esc(a.label==null?String(a.score):a.label)+'</div>';
+    } else {
+      var p=Math.round((Number(a.probability)||0)*100);
+      head+='<div class="pg-dec-choice">'+p+'%</div><div class="pg-dec-bar"><i style="width:'+p+'%"></i></div>';
+    }
+    head+='<div class="small">confidence '+(a.confidence==null?'—':Math.round(a.confidence*100)+'%')+'</div></div>';
+    html+=head;
+  }
+  if(meta) html+='<div class="small" style="margin-top:8px">'+esc(meta)+'</div>';
+  box.innerHTML=html;
+}
+async function sendPlaygroundDecision(){
+  var modelEl=document.getElementById('c-model'); var model=modelEl?modelEl.value.trim():'';
+  if(!model){ toast('choose a decision model','err'); return; }
+  var state,questions;
+  try{ state=JSON.parse(document.getElementById('c-dec-state').value); }
+  catch(e){ toast('State must be valid JSON','err'); return; }
+  try{ questions=JSON.parse(document.getElementById('c-dec-questions').value); }
+  catch(e){ toast('Questions must be valid JSON','err'); return; }
+  if(pgBusy) return;
+  pgBusy=true;
+  var btn=document.getElementById('c-send'); if(btn) btn.disabled=true;
+  setPlaygroundStatus('Asking '+model+'…');
+  var startedAt=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
+  try{
+    var r=await fetch(API+'/v1/systemone',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({model:model,state:state,questions:questions})});
+    var data=null; try{ data=await r.json(); }catch(e){}
+    var elapsed=(((typeof performance!=='undefined'&&performance.now)?performance.now():Date.now())-startedAt)/1000;
+    if(!r.ok){
+      var msg=(data&&data.error&&data.error.message)||('HTTP '+r.status);
+      setPlaygroundStatus('Decision failed: '+msg);
+      renderDecisionAnswers(null,msg);
+      return;
+    }
+    renderDecisionAnswers(data.answers, (data.upstream_model||'')+' · '+(data.source||'remote')+' · '+elapsed.toFixed(2)+'s');
+    setPlaygroundStatus('Answered in '+elapsed.toFixed(2)+'s');
+  }catch(e){
+    setPlaygroundStatus('Decision failed: '+e.message);
+    renderDecisionAnswers(null,e.message);
+  }finally{
+    pgBusy=false; if(btn) btn.disabled=false;
+  }
+}
+
 async function sendPlaygroundMessage(promptOverride, historyOverride){
   const modelEl=document.getElementById('c-model'); const model=modelEl?modelEl.value.trim():'';
   const streamBox=document.getElementById('c-stream'); const stream=streamBox?streamBox.checked:false;
