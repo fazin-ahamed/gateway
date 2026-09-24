@@ -33,7 +33,14 @@ CREATE TABLE IF NOT EXISTS model_routes (
   provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
   upstream_model TEXT NOT NULL,
   rank INTEGER NOT NULL DEFAULT 0,
-  enabled INTEGER NOT NULL DEFAULT 1
+  enabled INTEGER NOT NULL DEFAULT 1,
+  -- 'chat' models answer /chat/completions. 'decision' models answer a
+  -- structured decision endpoint (/v1/systemone) and must never be selected
+  -- as an Auto answer generator. wire_format overrides the provider default
+  -- so one provider can host several model kinds.
+  model_kind TEXT NOT NULL DEFAULT 'chat',
+  wire_format TEXT,
+  endpoint_path TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_model_routes_slug_rank
   ON model_routes(slug, rank);

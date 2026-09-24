@@ -20,6 +20,8 @@ import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
 import { contextLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
 import { contextBucket, deadlineFor, chooseBackup, wouldHedge } from "./router/latency-governor.js";
+import { validateRequest as validateDecisionRequest } from "./decision/types.js";
+import { callSystemOne, mapSystemOneResponse, isSystemOneFormat, systemOnePath } from "./decision/providers/systemone.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
 var registrySeedInflight = new WeakMap();
@@ -638,13 +640,21 @@ app.get("/v1/models", async (c) => {
   // providers are all disabled or all marked down would 503 on use, which is
   // exactly the "client picked a model that fails" trap.
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
   ).bind(...allowed).all();
   const live = [];
   const liveSlugs = new Set();
+  const decisionSlugs = new Map();
   for (const r of routes.results || []) {
     if (circuitOpen("route:" + String(r.route_id)))
       continue;
+    // A decision model is a real model, advertised on its own endpoint, and
+    // it is never part of the chat capability envelope or the Auto pool.
+    if (effectiveModelKind(r) === "decision") {
+      if (!decisionSlugs.has(r.slug))
+        decisionSlugs.set(r.slug, { route_id: r.route_id, upstream_model: r.upstream_model, wire_format: r.wire_format, fmt: r.fmt });
+      continue;
+    }
     live.push(r);
     liveSlugs.add(r.slug);
   }
@@ -670,7 +680,19 @@ app.get("/v1/models", async (c) => {
     data.push(autoModelEntry(envelope));
   }
   for (const slug of [...liveSlugs].sort())
-    data.push({ id: slug, object: "model", created: 0, owned_by: "gateway" });
+    data.push({ id: slug, object: "model", created: 0, owned_by: "gateway", model_kind: "chat" });
+  for (const [slug, info] of [...decisionSlugs.entries()].sort())
+    data.push({
+      id: slug,
+      object: "model",
+      created: 0,
+      owned_by: "gateway",
+      model_kind: "decision",
+      protocol: String(info.wire_format || info.fmt || "systemone"),
+      endpoint: "/v1/systemone",
+      upstream_model: info.upstream_model,
+      capabilities: { choice: true, score: true, noul: true }
+    });
   return c.json({ object: "list", data });
 });
 app.get("/status", async (c) => {
@@ -740,6 +762,116 @@ app.post("/admin/playground/completions", async (c) => {
     return denied;
   return runChatCompletion(c, null, true);
 });
+// POST /v1/systemone — decision models, reached through the same auth, route
+// ranking, key rotation, circuit breakers and limits as every other model.
+// A decision model is never a chat model: the two endpoints refuse each other.
+app.post("/v1/systemone", async (c) => {
+  await ensureUpstreamDispatcher();
+  const auth = await authClient(c);
+  if (auth instanceof Response)
+    return auth;
+  const key = auth.key;
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }, 400);
+  }
+  const problem = validateDecisionRequest(body);
+  if (problem)
+    return c.json({ error: { message: problem, type: "invalid_request_error" } }, 400);
+  const slug = String(body.model || "");
+  if (!slug)
+    return c.json({ error: { message: "model is required", type: "invalid_request_error" } }, 400);
+  if (!await slugAllowed(c, key, slug))
+    return c.json({ error: { message: "Model \"" + slug + "\" is not enabled for this key", type: "model_not_allowed" } }, 403);
+
+  const routes = await c.env.DB.prepare(
+    "SELECT mr.*, p.name AS provider_name, p.healthy, p.enabled AS provider_enabled, p.fmt, p.base_url, p.transport, p.proxy_url, p.extra_headers, p.key_strategy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
+  ).bind(slug).all();
+  const candidates = (routes.results || []).filter((r) => effectiveModelKind(r) === "decision");
+  if (!candidates.length) {
+    const chatOnly = (routes.results || []).length > 0;
+    return c.json({
+      error: {
+        message: chatOnly
+          ? "This model is a chat model and answers /v1/chat/completions, not the decision API."
+          : "No healthy decision route for \"" + slug + "\"",
+        type: chatOnly ? "model_endpoint_mismatch" : "no_route"
+      }
+    }, chatOnly ? 400 : 503);
+  }
+
+  const requestId = c.req.header("x-request-id") || uuid();
+  const started = Date.now();
+  let lastReason = "no decision route answered";
+  for (const route of candidates) {
+    const circuit = circuitKey(route);
+    if (circuitOpen(circuit) || circuitOpen("provider", route.provider_id)) {
+      lastReason = "circuit open";
+      continue;
+    }
+    const keys = await providerKeys(c, route.provider_id);
+    if (!keys.length) {
+      lastReason = "provider has no key";
+      continue;
+    }
+    let extraHeaders = {};
+    try {
+      extraHeaders = JSON.parse(route.extra_headers || "{}") || {};
+    } catch {
+      extraHeaders = {};
+    }
+    for (const k of orderKeys(keys, route.key_strategy || "round_robin", route.provider_id)) {
+      const res = await callSystemOne({
+        base: providerBaseFor(route, route),
+        path: decisionPathFor(route, route),
+        model: route.upstream_model,
+        state: body.state,
+        questions: body.questions,
+        apiKey: k.key,
+        headers: extraHeaders,
+        fetchImpl: c.__fetchImpl,
+        timeoutMs: Number(c.env.DECISION_TIMEOUT_MS) || 20000
+      });
+      if (res.ok) {
+        circuitRecordOk("provider", route.provider_id);
+        circuitRecordOk("route", route.id);
+        circuitRecordOk("key", k.keyId);
+        const answers = mapSystemOneResponse({ json: res.json, questions: body.questions });
+        await recordModelUsage(c, slug, 0, 0);
+        blog("TRACE id=" + requestId + " decision provider=" + route.provider_name + " model=" + route.upstream_model + " ms=" + (Date.now() - started));
+        return c.json({
+          model: slug,
+          upstream_model: route.upstream_model,
+          answers,
+          source: "remote",
+          latency_ms: Date.now() - started
+        });
+      }
+      lastReason = res.reason || "decision provider failed";
+      blog("FWD FAIL decision provider=" + route.provider_name + " -> " + lastReason);
+    }
+  }
+  await recordTrajectory(c, { id: requestId, keyId: key && key.key_id || null, keyName: key && key.name || null, slug, stream: false, requestJson: JSON.stringify({ model: slug, state: body.state, questions: Object.keys(body.questions) }), steps: [], status: "fail", httpStatus: 502, attempts: candidates.length, latencyMs: Date.now() - started, error: lastReason });
+  return c.json({ error: { message: "The decision model did not answer. The gateway falls back to its own policy.", type: "decision_unavailable" } }, 502);
+});
+// A route's wire format wins over the provider default, so one provider can
+// host a chat model and a decision model without becoming two providers.
+function effectiveFormat(route, provider) {
+  return String((route && route.wire_format) || (provider && provider.fmt) || "openai");
+}
+function effectiveModelKind(route) {
+  return String((route && route.model_kind) || "chat");
+}
+function decisionPathFor(route, provider) {
+  if (route && route.endpoint_path) {
+    const p = String(route.endpoint_path);
+    return p.startsWith("/") ? p : "/" + p;
+  }
+  return "/v1/systemone";
+}
+
 async function runChatCompletion(c, key, isAdminPlayground) {
   let payload;
   try {
@@ -782,6 +914,17 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model is required" });
     return c.json({ error: { message: "model is required" } }, 400);
   }
+  // A decision model answers /v1/systemone, never this endpoint. Refuse before
+  // any upstream call so it can never be picked to generate an assistant reply.
+  if (String(slug).toLowerCase() !== AUTO_SLUG) {
+    const kindRow = await c.env.DB.prepare(
+      "SELECT model_kind FROM model_routes WHERE slug=? AND enabled=1 AND COALESCE(model_kind,'chat')<>'chat' LIMIT 1"
+    ).bind(slug).first();
+    if (kindRow) {
+      await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model_endpoint_mismatch" });
+      return c.json({ error: { message: "This model uses the decision inference API at /v1/systemone and cannot answer chat completions.", type: "model_endpoint_mismatch" } }, 400);
+    }
+  }
   if (!isAdminPlayground && !autoDecision && slug !== AUTO_SLUG && !await slugAllowed(c, key, slug)) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 403, attempts: 0, latencyMs: Date.now() - started, error: "model not enabled for this key" });
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
@@ -796,7 +939,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   const combined = [];
   for (const s of slugQueue) {
     const rows = await c.env.DB.prepare(
-      "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
+      "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat')='chat' ORDER BY mr.rank"
     ).bind(s).all();
     for (const r of rows.results || [])
       combined.push({ ...r, public_slug: s });
@@ -2906,9 +3049,9 @@ async function pickAutoModel(c, payload, key) {
   const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
   const routes = await c.env.DB.prepare(
     `SELECT mr.slug,
-            COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1 AND p2.enabled=1),0) AS healthy,
-            (SELECT GROUP_CONCAT(mr3.id) FROM model_routes mr3 JOIN providers p3 ON p3.id=mr3.provider_id WHERE mr3.slug=mr.slug AND mr3.enabled=1 AND p3.enabled=1 AND p3.healthy=1) AS route_ids
-     FROM model_routes mr WHERE mr.enabled=1 GROUP BY mr.slug`
+            COALESCE((SELECT MAX(p2.healthy) FROM model_routes mr2 JOIN providers p2 ON p2.id=mr2.provider_id WHERE mr2.slug=mr.slug AND mr2.enabled=1 AND p2.enabled=1 AND COALESCE(mr2.model_kind,'chat')='chat'),0) AS healthy,
+            (SELECT GROUP_CONCAT(mr3.id) FROM model_routes mr3 JOIN providers p3 ON p3.id=mr3.provider_id WHERE mr3.slug=mr.slug AND mr3.enabled=1 AND p3.enabled=1 AND p3.healthy=1 AND COALESCE(mr3.model_kind,'chat')='chat') AS route_ids
+     FROM model_routes mr WHERE mr.enabled=1 AND COALESCE(mr.model_kind,'chat')='chat' GROUP BY mr.slug`
   ).all();
   let enabled = (routes.results || []).filter((r) => r.slug !== AUTO_SLUG && Number(r.healthy) === 1 && !cfg.excluded.includes(r.slug));
   if (key) {
@@ -2920,7 +3063,7 @@ async function pickAutoModel(c, payload, key) {
   const routes2 = await c.env.DB.prepare(
     `SELECT mr.slug, p.fmt, MIN(mr.upstream_model) AS upstream_model
      FROM model_routes mr JOIN providers p ON p.id=mr.provider_id
-     WHERE mr.enabled=1 AND p.enabled=1 GROUP BY mr.slug`
+     WHERE mr.enabled=1 AND p.enabled=1 AND COALESCE(mr.model_kind,'chat')='chat' GROUP BY mr.slug`
   ).all();
   const overlay = new Map();
   for (const r of routes2.results || []) {
@@ -4640,7 +4783,40 @@ async function declaredLimitForSlug(c, slug) {
     return { input: 0, context: 0, entry: null };
   }
 }
+// A decision model does not answer /chat/completions, so tokenizer and chat
+// probes would mark a perfectly healthy Jev as broken. Probe it with a tiny
+// structured SystemOne request instead and judge that.
+async function runDecisionIntegrityProbe(c, provider, route, key, options) {
+  const started = Date.now();
+  const res = await callSystemOne({
+    base: providerBaseFor(provider, route),
+    path: decisionPathFor(route, provider),
+    model: route.upstream_model || route.slug,
+    state: { probe: "integrity", request: "answer one yes/no question" },
+    questions: { ok: { type: "noul", instructions: "Is this endpoint reachable and answering structured questions?" } },
+    apiKey: key,
+    timeoutMs: (options && options.timeoutMs) || 20000
+  });
+  const elapsed = Date.now() - started;
+  const verdict = res.ok ? "ok" : (res.http === 401 || res.http === 403 ? "auth_error" : "broken");
+  return {
+    result: {
+      model: route.upstream_model || route.slug,
+      base: providerBaseFor(provider, route),
+      model_kind: "decision",
+      protocol: effectiveFormat(route, provider),
+      basic: { status: res.ok ? "ok" : (res.http ? "http_" + res.http : "error"), http: res.http, detail: res.reason || res.providerMessage || "" },
+      verdict,
+      signals: [{ kind: "decision", level: res.ok ? "ok" : "alert", text: res.ok ? "structured decision endpoint answered" : (res.reason || "decision endpoint HTTP " + res.http) }]
+    },
+    base: providerBaseFor(provider, route),
+    model: route.upstream_model || route.slug,
+    declared: { input: 0, context: 0, entry: null }
+  };
+}
 async function runIntegrityProbe(c, provider, route, key, options) {
+  if (effectiveModelKind(route) === "decision")
+    return runDecisionIntegrityProbe(c, provider, route, key, options);
   const { runProbes } = await import("./modelprobe.js");
   const base = providerBaseFor(provider, route);
   const model = route.upstream_model || route.slug;
@@ -4791,10 +4967,13 @@ app.post("/admin/routes", async (c) => {
   }
   if (!b.slug || !b.provider_id || !b.upstream_model)
     return c.json({ error: { message: "slug + provider_id + upstream_model required" } }, 400);
+  const kind = String(b.model_kind || "chat").toLowerCase() === "decision" ? "decision" : "chat";
+  const wire = b.wire_format ? String(b.wire_format) : null;
+  const endpoint = b.endpoint_path ? String(b.endpoint_path) : null;
   const existing = await c.env.DB.prepare("SELECT COALESCE(MAX(rank),-1)+1 AS next FROM model_routes WHERE slug=?").bind(b.slug).first();
   const rank = b.rank != null ? Number(b.rank) : existing.next;
-  await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,?,?)").bind(b.slug, Number(b.provider_id), b.upstream_model, rank, b.enabled === false ? 0 : 1).run();
-  return c.json({ ok: true, slug: b.slug, rank }, 201);
+  await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled, model_kind, wire_format, endpoint_path) VALUES (?,?,?,?,?,?,?,?)").bind(b.slug, Number(b.provider_id), b.upstream_model, rank, b.enabled === false ? 0 : 1, kind, wire, endpoint).run();
+  return c.json({ ok: true, slug: b.slug, rank, model_kind: kind, wire_format: wire, endpoint_path: endpoint }, 201);
 });
 app.get("/admin/routes", async (c) => {
   const denied = await requireAdmin(c);
@@ -4802,6 +4981,7 @@ app.get("/admin/routes", async (c) => {
     return denied;
   const rows = await c.env.DB.prepare(
     `SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled,
+            COALESCE(mr.model_kind,'chat') AS model_kind, mr.wire_format, mr.endpoint_path,
             p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled,
             pr.verdict AS probe_verdict, pr.measured_family AS probe_measured_family, pr.created_at AS probe_at
      FROM model_routes mr

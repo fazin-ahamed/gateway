@@ -167,3 +167,30 @@ export function migrateZaiConversations(db) {
     return false;
   }
 }
+
+// model_routes becomes typed: a decision model is an ordinary route that
+// answers a structured endpoint, not a second routing system. Existing
+// databases keep the old shape because CREATE TABLE IF NOT EXISTS is a no-op,
+// so the columns are added by guarded ALTERs.
+export function migrateModelRouteKinds(db) {
+  const added = [];
+  try {
+    const r = db.prepare("PRAGMA table_info(model_routes)").all();
+    const names = new Set(((r && r.results) || []).map((c) => c && c.name));
+    const cols = [
+      ["model_kind", "TEXT NOT NULL DEFAULT 'chat'"],
+      ["wire_format", "TEXT"],
+      ["endpoint_path", "TEXT"]
+    ];
+    for (const [name, type] of cols) {
+      if (names.has(name)) continue;
+      db.exec("ALTER TABLE model_routes ADD COLUMN " + name + " " + type);
+      added.push(name);
+    }
+    if (added.length)
+      console.warn("[gateway] migration: added model_routes type columns:", added.join(", "));
+  } catch (e) {
+    console.warn("[gateway] model route kinds migration skipped:", e.message);
+  }
+  return added;
+}

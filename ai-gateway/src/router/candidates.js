@@ -240,7 +240,7 @@ export async function loadV2World(c, {
     `SELECT mr.id, mr.slug, mr.upstream_model, mr.rank, mr.provider_id, p.fmt, p.transport
      FROM model_routes mr
      JOIN providers p ON p.id=mr.provider_id
-     WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1`
+     WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat') = 'chat'`
   ).all();
   // One query for keys, one for stats — no per-route round-trips.
   const keyRows = await c.env.DB.prepare(
