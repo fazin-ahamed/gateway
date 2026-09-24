@@ -29,7 +29,7 @@ test("decision answers render typed results with probabilities", () => {
   assert.match(fn, /type==='choice'/);
   assert.match(fn, /type==='score'/);
   assert.match(fn, /probability/);
-  assert.match(SRC, /API\+'\/v1\/systemone'/);
+  assert.match(SRC, /admin\/playground\/systemone/, 'the console must ride the session-authenticated route');
 });
 
 test("decision JSON is parsed, not concatenated", () => {

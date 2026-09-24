@@ -765,12 +765,9 @@ app.post("/admin/playground/completions", async (c) => {
 // POST /v1/systemone — decision models, reached through the same auth, route
 // ranking, key rotation, circuit breakers and limits as every other model.
 // A decision model is never a chat model: the two endpoints refuse each other.
-app.post("/v1/systemone", async (c) => {
-  await ensureUpstreamDispatcher();
-  const auth = await authClient(c);
-  if (auth instanceof Response)
-    return auth;
-  const key = auth.key;
+// The decision inference path, shared by the API-key surface and the console
+// playground. `key` is null for the admin playground, exactly like chat.
+async function runSystemOneDecision(c, key) {
   let body;
   try {
     body = await c.req.json();
@@ -783,7 +780,7 @@ app.post("/v1/systemone", async (c) => {
   const slug = String(body.model || "");
   if (!slug)
     return c.json({ error: { message: "model is required", type: "invalid_request_error" } }, 400);
-  if (!await slugAllowed(c, key, slug))
+  if (key && !await slugAllowed(c, key, slug))
     return c.json({ error: { message: "Model \"" + slug + "\" is not enabled for this key", type: "model_not_allowed" } }, 403);
 
   const routes = await c.env.DB.prepare(
@@ -855,6 +852,20 @@ app.post("/v1/systemone", async (c) => {
   }
   await recordTrajectory(c, { id: requestId, keyId: key && key.key_id || null, keyName: key && key.name || null, slug, stream: false, requestJson: JSON.stringify({ model: slug, state: body.state, questions: Object.keys(body.questions) }), steps: [], status: "fail", httpStatus: 502, attempts: candidates.length, latencyMs: Date.now() - started, error: lastReason });
   return c.json({ error: { message: "The decision model did not answer. The gateway falls back to its own policy.", type: "decision_unavailable" } }, 502);
+}
+app.post("/v1/systemone", async (c) => {
+  await ensureUpstreamDispatcher();
+  const auth = await authClient(c);
+  if (auth instanceof Response)
+    return auth;
+  return runSystemOneDecision(c, auth.key);
+});
+app.post("/admin/playground/systemone", async (c) => {
+  await ensureUpstreamDispatcher();
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  return runSystemOneDecision(c, null);
 });
 // A route's wire format wins over the provider default, so one provider can
 // host a chat model and a decision model without becoming two providers.

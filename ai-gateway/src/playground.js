@@ -1359,7 +1359,7 @@ async function sendPlaygroundDecision(){
   setPlaygroundStatus('Asking '+model+'…');
   var startedAt=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
   try{
-    var r=await fetch(API+'/v1/systemone',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({model:model,state:state,questions:questions})});
+    var r=await fetch(API+'/admin/playground/systemone',{method:'POST',headers:{'Content-Type':'application/json','x-request-id':Math.random().toString(36).slice(2)},credentials:'same-origin',body:JSON.stringify({model:model,state:state,questions:questions})});
     var data=null; try{ data=await r.json(); }catch(e){}
     var elapsed=(((typeof performance!=='undefined'&&performance.now)?performance.now():Date.now())-startedAt)/1000;
     if(!r.ok){
