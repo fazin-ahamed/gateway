@@ -85,29 +85,18 @@
     <input class="input" placeholder="Search models" bind:value={query} aria-label="Search models" />
   </div>
 
-  <div class="table-scroll"><table class="table">
-    <thead>
-      <tr>
-        <th>Model</th><th>Type</th><th class="r">Context</th><th class="r">Output</th>
-        <th>Tools</th><th>Vision</th><th class="r">Cost</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#each shown as m (m.id)}
-        <tr class="clickable" onclick={() => (selected = m)}>
-          <td class="mono">{m.id}</td>
-          <td>{m.model_kind === "decision" ? "Decision" : "Chat"}</td>
-          <td class="r">{m.model_kind === "decision" ? "—" : fmtContext(m.context_window ?? m.routing?.resilient_context)}</td>
-          <td class="r">{m.model_kind === "decision" ? "—" : fmtContext(m.max_output_tokens)}</td>
-          <td>{m.model_kind === "decision" ? "—" : m.tools ? "Yes" : "No"}</td>
-          <td>{m.model_kind === "decision" ? "—" : m.vision ? "Yes" : "No"}</td>
-          <td class="r">{price(m)}</td>
-        </tr>
-      {:else}
-        <tr><td colspan="7" class="none">No models match.</td></tr>
-      {/each}
-    </tbody>
-  </table></div>
+  <div class="cards">
+    {#each shown as m (m.id)}
+      <button class="card" type="button" onclick={() => (selected = m)}>
+        <strong>{m.id}</strong>
+        <span>{m.model_kind === "decision" ? "Decision" : "Chat"} · {price(m)}</span>
+        <p>{m.description || "No description from models.dev."}</p>
+        <em>{m.knowledge ? `Knowledge ${m.knowledge}` : fmtContext(m.context_window)}</em>
+      </button>
+    {:else}
+      <p class="empty">No models match.</p>
+    {/each}
+  </div>
 {/if}
 
 {#if selected}
@@ -233,4 +222,10 @@
     overflow-x: auto;
     white-space: pre;
   }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-top: 16px; }
+  .card { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; padding: 16px; border: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; cursor: pointer; }
+  .card:hover { border-color: var(--accent); }
+  .card strong { font-size: 15px; }
+  .card span, .card em { color: var(--text-muted); font-style: normal; font-size: 12px; }
+  .card p { margin: 0; font-size: 13px; line-height: 19px; }
 </style>

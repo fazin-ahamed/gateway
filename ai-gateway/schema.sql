@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   allowed_models TEXT,
   excluded_models TEXT,
   active INTEGER NOT NULL DEFAULT 1,
+  console_auth INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -118,6 +119,15 @@ CREATE TABLE IF NOT EXISTS console_sessions (
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS console_accounts (
+  key_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 
 -- Always-on, body-free per-request ledger. This is the customer-facing
 -- operational truth: Overview, Requests and Usage read it, and it records
@@ -143,7 +153,9 @@ CREATE TABLE IF NOT EXISTS request_summaries (
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
-  attempts INTEGER NOT NULL DEFAULT 0
+  attempts INTEGER NOT NULL DEFAULT 0,
+  client_app TEXT,
+  request_headers TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_request_summaries_key_time
   ON request_summaries(key_id, created_at);

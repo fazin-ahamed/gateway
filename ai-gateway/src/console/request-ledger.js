@@ -3,11 +3,22 @@
 // trajectories stays optional body capture and route_attempts stays internal.
 // A ledger write failure is logged and swallowed: it must never block serving.
 
-export async function startRequestSummary(db, { requestId, keyId, modelKind, publicSlug, stream }) {
+function clientAppFrom(headers) {
+  const title = headers["x-title"] || headers["x-openrouter-title"] || "";
+  const agent = headers["user-agent"] || "";
+  const named = /opencode|omp|claude|cursor|cline|continue|aider|codex/i.exec(title + " " + agent);
+  return named ? named[0] : (title || agent.split(/[\/\s]/)[0] || "");
+}
+
+export async function startRequestSummary(db, { requestId, keyId, modelKind, publicSlug, stream, headers }) {
+  const kept = {};
+  for (const name of ["user-agent", "x-title", "http-referer", "x-request-id"]) {
+    if (headers && headers[name]) kept[name] = String(headers[name]).slice(0, 240);
+  }
   try {
     await db.prepare(
-      "INSERT OR IGNORE INTO request_summaries (request_id, key_id, model_kind, public_slug, created_at, status, stream, attempts) VALUES (?,?,?,?,?,'pending',?,0)"
-    ).bind(String(requestId), keyId ?? null, modelKind === "decision" ? "decision" : "chat", String(publicSlug || ""), new Date().toISOString(), stream ? 1 : 0).run();
+      "INSERT OR IGNORE INTO request_summaries (request_id, key_id, model_kind, public_slug, created_at, status, stream, attempts, client_app, request_headers) VALUES (?,?,?,?,?,'pending',?,0,?,?)"
+    ).bind(String(requestId), keyId ?? null, modelKind === "decision" ? "decision" : "chat", String(publicSlug || ""), new Date().toISOString(), stream ? 1 : 0, clientAppFrom(headers || {}), JSON.stringify(kept)).run();
   } catch (e) {
     try { console.warn("[gateway] request summary start failed: " + String(e.message || e)); } catch {}
   }

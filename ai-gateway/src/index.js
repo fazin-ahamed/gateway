@@ -817,27 +817,68 @@ async function requireConsoleSession(c) {
 
 app.post("/console/auth", async (c) => {
   let b;
-  try {
-    b = await c.req.json();
-  } catch {
-    b = {};
-  }
+  try { b = await c.req.json(); } catch { b = {}; }
   const offered = String((b && b.api_key) || "");
   if (!offered.startsWith("sk-"))
     return c.json({ error: { message: "Enter the API key to sign in.", type: "auth_error" } }, 401);
+  await ensureConsoleAuthColumn(c.env.DB);
   const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(offered).first();
   if (!key || !key.active || isKeyExpired(key))
     return c.json({ error: { message: "That key was not accepted.", type: "auth_error" } }, 401);
   if (isOverBudget(key))
     return c.json({ error: { message: "Key budget exceeded.", type: "budget_exceeded" } }, 429);
+  if (Number(key.console_auth) === 0)
+    return issueConsoleSession(c, key);
+  const account = await c.env.DB.prepare("SELECT username, password_hash FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
+  if (!account)
+    return c.json({ setup: true });
+  const username = String(b.username || "");
+  const password = String(b.password || "");
+  if (!username || !password)
+    return c.json({ account: true, username: account.username });
+  if (username !== account.username || await sha256hex(password) !== account.password_hash)
+    return c.json({ error: { message: "That username or password was not accepted.", type: "auth_error" } }, 401);
+  return issueConsoleSession(c, key);
+});
+
+app.post("/console/account", async (c) => {
+  let b;
+  try { b = await c.req.json(); } catch { b = {}; }
+  const offered = String(b.api_key || "");
+  const username = String(b.username || "").trim();
+  const password = String(b.password || "");
+  if (!offered.startsWith("sk-") || username.length < 3 || password.length < 8)
+    return c.json({ error: { message: "Choose a username of 3 or more characters and a password of 8 or more.", type: "invalid_request_error" } }, 400);
+  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(offered).first();
+  if (!key) return c.json({ error: { message: "That key was not accepted.", type: "auth_error" } }, 401);
+  const existing = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
+  if (existing) return c.json({ error: { message: "This key already has an account.", type: "invalid_request_error" } }, 409);
+  try {
+    await c.env.DB.prepare("INSERT INTO console_accounts (key_id, username, password_hash, created_at) VALUES (?,?,?,?)").bind(key.key_id, username, await sha256hex(password), nowIso()).run();
+  } catch {
+    return c.json({ error: { message: "That username is already taken.", type: "invalid_request_error" } }, 409);
+  }
+  return issueConsoleSession(c, key);
+});
+
+async function issueConsoleSession(c, key) {
   const session = "v1." + uuid() + uuid().replace(/-/g, "");
   const expiresAt = new Date(Date.now() + CONSOLE_SESSION_HOURS * 3600000).toISOString();
   await c.env.DB.prepare("DELETE FROM console_sessions WHERE expires_at <= ?").bind(nowIso()).run();
   await c.env.DB.prepare("INSERT INTO console_sessions (token_hash, key_id, expires_at, created_at) VALUES (?,?,?,?)").bind(await sha256hex(session), key.key_id, expiresAt, nowIso()).run();
-  const cookie = CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=Lax; HttpOnly";
-  c.header("Set-Cookie", cookie);
+  c.header("Set-Cookie", CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=Lax; HttpOnly");
   return c.json({ ok: true });
-});
+}
+
+async function ensureConsoleAuthColumn(db) {
+  if (!db || ensureConsoleAuthColumn.done) return;
+  try {
+    const cols = await db.prepare("PRAGMA table_info(api_keys)").all();
+    if (!(cols.results || []).some((r) => r.name === "console_auth"))
+      await db.prepare("ALTER TABLE api_keys ADD COLUMN console_auth INTEGER NOT NULL DEFAULT 1").run();
+    ensureConsoleAuthColumn.done = true;
+  } catch {}
+}
 
 app.post("/console/logout", async (c) => {
   const raw = c.req.header("cookie") || "";
@@ -1222,7 +1263,9 @@ app.get("/console/api/models", async (c) => {
       routing: null,
       prompt_per_1m: pr ? Number(pr.prompt_per_1m) : null,
       completion_per_1m: pr ? Number(pr.completion_per_1m) : null,
-      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null
+      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null,
+      description: entry && (entry.description || entry.name) || null,
+      knowledge: entry && (entry.knowledge || entry.release_date) || null
     });
   }
   for (const [slug, r] of [...decisionSlugs.entries()].sort()) {
@@ -1267,7 +1310,9 @@ app.get("/console/api/requests/:id", async (c) => {
     completion_tokens: Number(r.completion_tokens) || 0,
     cost_usd: Number(r.cost_usd) || 0,
     attempts: Number(r.attempts) || 0,
-    cache_state: r.cache_state || null
+    cache_state: r.cache_state || null,
+    client_app: r.client_app || null,
+    headers: (() => { try { return JSON.parse(r.request_headers || "{}"); } catch { return {}; } })()
   });
 });
 
@@ -1291,7 +1336,7 @@ async function runSystemOneDecision(c, key) {
     return c.json({ error: { message: "model is required", type: "invalid_request_error" } }, 400);
   const requestId = c.req.header("x-request-id") || uuid();
   const started = Date.now();
-  await startRequestSummary(c.env.DB, { requestId, keyId: key && key.key_id || null, modelKind: "decision", publicSlug: slug, stream: false });
+  await startRequestSummary(c.env.DB, { requestId, keyId: key && key.key_id || null, modelKind: "decision", publicSlug: slug, stream: false, headers: c.req.header() });
   if (key && !await slugAllowed(c, key, slug)) {
     await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 403, attempts: 0 });
     return c.json({ error: { message: "Model \"" + slug + "\" is not enabled for this key", type: "model_not_allowed" } }, 403);
@@ -3847,6 +3892,16 @@ async function ensurePriceColumns(db) {
     ensurePriceColumns.done = true;
   } catch {
   }
+}
+async function ensureSummaryColumns(db) {
+  if (!db || ensureSummaryColumns.done) return;
+  try {
+    const cols = await db.prepare("PRAGMA table_info(request_summaries)").all();
+    const names = new Set((cols.results || []).map((r) => r.name));
+    if (!names.has("client_app")) await db.prepare("ALTER TABLE request_summaries ADD COLUMN client_app TEXT").run();
+    if (!names.has("request_headers")) await db.prepare("ALTER TABLE request_summaries ADD COLUMN request_headers TEXT").run();
+    ensureSummaryColumns.done = true;
+  } catch {}
 }
 function priceFromRow(row) {
   const equivalentPrompt = Number(row && row.prompt_per_1m) || 0;

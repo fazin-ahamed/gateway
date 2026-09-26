@@ -2,31 +2,28 @@
   import { session } from "$lib/state/session.svelte";
 
   let apiKey = $state("");
+  let username = $state("");
+  let password = $state("");
+  let step = $state<"key" | "create" | "login">("key");
   let busy = $state(false);
   let error = $state<string | null>(null);
 
   async function signIn(event: SubmitEvent) {
     event.preventDefault();
-    const key = apiKey.trim();
-    if (!key) {
-      error = "Enter your API key.";
-      return;
-    }
     busy = true;
     error = null;
     try {
-      const res = await fetch("/console/auth", {
+      const res = await fetch(step === "create" ? "/console/account" : "/console/auth", {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "same-origin",
-        body: JSON.stringify({ api_key: key })
+        body: JSON.stringify({ api_key: apiKey.trim(), username, password })
       });
-      if (res.ok) {
-        await loadAndGo();
-      } else {
-        const body = await res.json().catch(() => null);
-        error = body?.error?.message ?? "That key was not accepted.";
-      }
+      const body = await res.json().catch(() => null);
+      if (body?.setup) { step = "create"; return; }
+      if (body?.account) { step = "login"; username = body.username || ""; return; }
+      if (res.ok) { await loadAndGo(); return; }
+      error = body?.error?.message ?? "That was not accepted.";
     } catch {
       error = "Could not reach the gateway.";
     } finally {
@@ -49,24 +46,21 @@
 <main class="wrap">
   <div class="panel">
     <h1 class="panel-title">Astrosphere</h1>
-    <p class="panel-sub">Sign in with your gateway API key. It is exchanged for a session cookie and never stored in the browser.</p>
+    <p class="panel-sub">
+      {step === "create" ? "This key has no account yet. Choose a username and password." : step === "login" ? "Enter the username and password for this key." : "Sign in with your gateway API key."}
+    </p>
     <form onsubmit={signIn} class="form">
-      <label for="key">API key</label>
-      <input
-        id="key"
-        class="input"
-        type="password"
-        autocomplete="off"
-        placeholder="sk-…"
-        bind:value={apiKey}
-        disabled={busy}
-      />
-      {#if error}
-        <p class="error" role="alert">{error}</p>
+      {#if step === "key"}
+        <label for="key">API key</label>
+        <input id="key" class="input" type="password" autocomplete="off" placeholder="sk-…" bind:value={apiKey} disabled={busy} />
+      {:else}
+        <label for="user">Username</label>
+        <input id="user" class="input" autocomplete="username" bind:value={username} disabled={busy || step === "login"} />
+        <label for="pass">Password</label>
+        <input id="pass" class="input" type="password" autocomplete={step === "create" ? "new-password" : "current-password"} bind:value={password} disabled={busy} />
       {/if}
-      <button class="btn btn-primary" type="submit" disabled={busy}>
-        {busy ? "Signing in…" : "Sign in"}
-      </button>
+      {#if error}<p class="error" role="alert">{error}</p>{/if}
+      <button class="btn btn-primary" type="submit" disabled={busy}>{busy ? "Working…" : step === "create" ? "Create account" : "Sign in"}</button>
     </form>
   </div>
 </main>

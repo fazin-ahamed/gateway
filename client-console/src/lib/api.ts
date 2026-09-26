@@ -54,6 +54,8 @@ export type ConsoleModel = {
   prompt_per_1m?: number | null;
   completion_per_1m?: number | null;
   per_request?: number | null;
+  description?: string | null;
+  knowledge?: string | null;
 };
 
 export type RequestDetail = {
@@ -72,6 +74,8 @@ export type RequestDetail = {
   cost_usd: number | null;
   attempts: number | null;
   cache_state: string | null;
+  client_app?: string | null;
+  headers?: Record<string, string>;
 };
 export type Activity = {
   window: { hours: number };

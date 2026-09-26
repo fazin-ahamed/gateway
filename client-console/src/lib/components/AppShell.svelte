@@ -6,7 +6,7 @@
   let { children } = $props();
   loadSession();
   $effect(() => {
-    if (session.state === "signed-out")
+    if (session.state.state === "signed-out")
       location.assign("/console/signin");
   });
 
@@ -17,15 +17,20 @@
   }
 </script>
 
-<div class="shell">
-  <Sidebar keyName={session.state === "signed-in" ? session.keyName : ""} onSignOut={signOut} />
-  <div class="main">
-    <TopBar />
-    <main class="content">
-      {@render children()}
-    </main>
+{#if session.state.state === "loading"}
+  <div class="loading" role="status" aria-label="Loading Astrosphere">
+    <span class="ring"></span>
+    <strong>Astrosphere</strong>
   </div>
-</div>
+{:else}
+  <div class="shell">
+    <Sidebar keyName={session.state.state === "signed-in" ? session.state.keyName : ""} onSignOut={signOut} />
+    <div class="main">
+      <TopBar />
+      <main class="content">{@render children()}</main>
+    </div>
+  </div>
+{/if}
 
 <style>
   .shell {
@@ -52,4 +57,24 @@
       padding: 16px;
     }
   }
+  .loading {
+    min-height: 100dvh;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 16px;
+    background: var(--canvas);
+  }
+
+  .loading .ring {
+    width: 64px;
+    height: 64px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: turn 1.1s linear infinite;
+  }
+
+  .loading strong { font-family: var(--font-display); font-size: 24px; font-weight: 500; }
+  @keyframes turn { to { transform: rotate(360deg); } }
 </style>

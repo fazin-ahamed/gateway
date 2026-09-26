@@ -34,6 +34,7 @@
       <dt>HTTP</dt><dd>{detail.http_status ?? "—"}</dd>
       <dt>Stream</dt><dd>{detail.stream ? "Streamed" : "Complete"}</dd>
       <dt>Attempts</dt><dd>{detail.attempts}</dd>
+      <dt>App</dt><dd>{detail.client_app || "Not identified"}</dd>
       <dt>Cache</dt><dd>{detail.cache_state ?? "Not used"}</dd>
     </dl>
   </section>
@@ -56,6 +57,16 @@
       <dt>Cost</dt><dd>{fmtUsd(detail.cost_usd)}</dd>
     </dl>
   </section>
+  {#if detail.headers && Object.keys(detail.headers).length}
+    <section>
+      <h3>Sent headers</h3>
+      <dl>
+        {#each Object.entries(detail.headers) as [name, value] (name)}
+          <dt>{name}</dt><dd>{value}</dd>
+        {/each}
+      </dl>
+    </section>
+  {/if}
 </div>
 
 <style>
