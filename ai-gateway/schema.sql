@@ -119,6 +119,37 @@ CREATE TABLE IF NOT EXISTS console_sessions (
   created_at TEXT NOT NULL
 );
 
+-- Always-on, body-free per-request ledger. This is the customer-facing
+-- operational truth: Overview, Requests and Usage read it, and it records
+-- chat and decision traffic through the same lifecycle. trajectories is
+-- OPTIONAL body capture (debugging, training, Vey) and route_attempts holds
+-- internal attempt detail; neither is a billing/accounting source. If an
+-- operator disables trajectory capture, nothing here changes.
+CREATE TABLE IF NOT EXISTS request_summaries (
+  request_id TEXT PRIMARY KEY,
+  key_id TEXT,
+  model_kind TEXT NOT NULL,
+  public_slug TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  http_status INTEGER,
+  stream INTEGER NOT NULL DEFAULT 0,
+  cache_state TEXT,
+  headers_ms INTEGER,
+  ttft_ms INTEGER,
+  latency_ms INTEGER,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_request_summaries_key_time
+  ON request_summaries(key_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_request_summaries_slug_time
+  ON request_summaries(public_slug, created_at);
+
 CREATE TABLE IF NOT EXISTS admin_tokens (
   token_hash TEXT PRIMARY KEY,
   created_at TEXT NOT NULL

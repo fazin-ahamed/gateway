@@ -21,6 +21,7 @@ import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.j
 import { contextLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
 import { contextBucket, deadlineFor, chooseBackup, wouldHedge } from "./router/latency-governor.js";
 import { validateRequest as validateDecisionRequest } from "./decision/types.js";
+import { startRequestSummary, finishRequestSummary } from "./console/request-ledger.js";
 import { callSystemOne, mapSystemOneResponse, isSystemOneFormat, systemOnePath } from "./decision/providers/systemone.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
@@ -781,7 +782,8 @@ async function consoleSessionFromCookie(c) {
     if (!row) return null;
     const key = await c.env.DB.prepare("SELECT key_id, name FROM api_keys WHERE key_id=? AND active=1").bind(row.key_id).first();
     return key ? { keyId: key.key_id, name: key.name } : null;
-  } catch {
+  } catch (e) {
+    console.warn("[gateway] console session read failed: " + String(e && e.message || e));
     return null;
   }
 }
@@ -830,6 +832,25 @@ app.post("/console/logout", async (c) => {
   return c.json({ ok: true });
 });
 
+app.post("/console/playground/completions", async (c) => {
+  await ensureUpstreamDispatcher();
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(sess.keyId).first();
+  if (!key)
+    return c.json({ error: { message: "The API key for this session no longer exists.", type: "auth_error" } }, 401);
+  return runChatCompletion(c, key, false);
+});
+app.post("/console/playground/systemone", async (c) => {
+  await ensureUpstreamDispatcher();
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(sess.keyId).first();
+  if (!key)
+    return c.json({ error: { message: "The API key for this session no longer exists.", type: "auth_error" } }, 401);
+  return runSystemOneDecision(c, key);
+});
+
 app.get("/console/api/me", async (c) => {
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
@@ -845,24 +866,23 @@ app.get("/console/api/overview", async (c) => {
   const since = new Date(Date.now() - days * 86400000).toISOString();
   const priorSince = new Date(Date.now() - 2 * days * 86400000).toISOString();
 
-  // trajectories is the per-request source of truth: it carries key_id,
-  // tokens, cost and latency per request. TTFT comes from route_attempts
-  // joined on request_id; rows without a real ttft simply do not count.
+  // The ledger is the customer truth: one row per request, chat and decision
+  // alike, written whether or not trajectory capture is enabled.
   const totals = await c.env.DB.prepare(
-    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM trajectories WHERE key_id=? AND created_at>=?"
+    "SELECT COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok_requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=?"
   ).bind(sess.keyId, since).first();
   const prior = await c.env.DB.prepare(
-    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM trajectories WHERE key_id=? AND created_at>=? AND created_at<?"
+    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=? AND created_at<?"
   ).bind(sess.keyId, priorSince, since).first();
 
   const ttftRows = await c.env.DB.prepare(
-    "SELECT ra.ttft_ms FROM route_attempts ra JOIN trajectories t ON t.id=ra.request_id AND t.key_id=? AND t.created_at>=? WHERE ra.ttft_ms IS NOT NULL"
+    "SELECT ttft_ms FROM request_summaries WHERE key_id=? AND created_at>=? AND ttft_ms IS NOT NULL"
   ).bind(sess.keyId, since).all();
   const ttfts = (ttftRows.results || []).map((r) => Number(r.ttft_ms)).filter((n) => Number.isFinite(n) && n >= 0).sort((a, b) => a - b);
   const p95 = ttfts.length ? ttfts[Math.min(ttfts.length - 1, Math.ceil(ttfts.length * 0.95) - 1)] : null;
 
   const seriesRows = await c.env.DB.prepare(
-    "SELECT substr(created_at,1,10) day, COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM trajectories WHERE key_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day"
+    "SELECT substr(created_at,1,10) day, COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day"
   ).bind(sess.keyId, since).all();
   const byDay = new Map((seriesRows.results || []).map((r) => [r.day, r]));
   const series = [];
@@ -879,28 +899,17 @@ app.get("/console/api/overview", async (c) => {
   }
 
   const recentRows = await c.env.DB.prepare(
-    "SELECT id, created_at, slug, status, http_status, latency_ms, total_tokens, cost_usd FROM trajectories WHERE key_id=? ORDER BY created_at DESC LIMIT 25"
+    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, ttft_ms, latency_ms, total_tokens, cost_usd FROM request_summaries WHERE key_id=? ORDER BY created_at DESC LIMIT 25"
   ).bind(sess.keyId).all();
-  const recentIds = (recentRows.results || []).map((r) => String(r.id));
-  const ttftById = new Map();
-  if (recentIds.length) {
-    const marks = recentIds.map(() => "?").join(",");
-    const attRows = await c.env.DB.prepare(
-      "SELECT request_id, ttft_ms FROM route_attempts WHERE request_id IN (" + marks + ") AND ttft_ms IS NOT NULL"
-    ).bind(...recentIds).all();
-    for (const a of attRows.results || [])
-      if (!ttftById.has(String(a.request_id)))
-        ttftById.set(String(a.request_id), Number(a.ttft_ms));
-  }
   const recent = (recentRows.results || []).map((r) => ({
-    id: String(r.id),
+    id: String(r.request_id),
     created_at: String(r.created_at),
-    slug: String(r.slug || ""),
-    model_kind: "chat",
+    slug: String(r.public_slug || ""),
+    model_kind: String(r.model_kind || "chat"),
     status: String(r.status || ""),
     http_status: r.http_status == null ? null : Number(r.http_status),
     latency_ms: r.latency_ms == null ? null : Number(r.latency_ms),
-    ttft_ms: ttftById.get(String(r.id)) ?? null,
+    ttft_ms: r.ttft_ms == null ? null : Number(r.ttft_ms),
     tokens: Number(r.total_tokens) || 0,
     cost_usd: Number(r.cost_usd) || 0
   }));
@@ -909,7 +918,7 @@ app.get("/console/api/overview", async (c) => {
     window: { days },
     totals: {
       requests: Number(totals && totals.requests) || 0,
-      ok_requests: null,
+      ok_requests: totals && totals.ok_requests != null ? Number(totals.ok_requests) : null,
       tokens: Number(totals && totals.tokens) || 0,
       spend_usd: Number(totals && totals.spend_usd) || 0,
       p95_ttft_ms: p95
@@ -922,6 +931,90 @@ app.get("/console/api/overview", async (c) => {
     series,
     recent
   });
+});
+
+// Filterable request list. Filters compose; every value is validated so a bad
+// query parameter cannot poison the SQL.
+app.get("/console/api/requests", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const q = c.req.query();
+  const kind = ["chat", "decision"].includes(String(q.kind || "")) ? String(q.kind) : null;
+  const status = ["ok", "fail", "cancelled"].includes(String(q.status || "")) ? String(q.status) : null;
+  const slug = String(q.model || "").trim().slice(0, 160) || null;
+  const search = String(q.request_id || "").trim().slice(0, 160) || null;
+  const days = Math.min(90, Math.max(1, Number(q.days) || 7));
+  const limit = Math.min(100, Math.max(1, Number(q.limit) || 50));
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+
+  let sql = "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, ttft_ms, latency_ms, prompt_tokens, completion_tokens, total_tokens, cost_usd, attempts, cache_state FROM request_summaries WHERE key_id=? AND created_at>=?";
+  const binds = [sess.keyId, since];
+  if (kind) { sql += " AND model_kind=?"; binds.push(kind); }
+  if (status) { sql += " AND status=?"; binds.push(status); }
+  if (slug) { sql += " AND public_slug=?"; binds.push(slug); }
+  if (search) { sql += " AND request_id LIKE ?"; binds.push("%" + search + "%"); }
+  sql += " ORDER BY created_at DESC LIMIT ?";
+  binds.push(limit);
+  const rows = await c.env.DB.prepare(sql).bind(...binds).all();
+  return c.json({
+    requests: (rows.results || []).map((r) => ({
+      id: String(r.request_id),
+      created_at: String(r.created_at),
+      slug: String(r.public_slug || ""),
+      model_kind: String(r.model_kind || "chat"),
+      status: String(r.status || ""),
+      http_status: r.http_status == null ? null : Number(r.http_status),
+      stream: !!r.stream,
+      ttft_ms: r.ttft_ms == null ? null : Number(r.ttft_ms),
+      latency_ms: r.latency_ms == null ? null : Number(r.latency_ms),
+      prompt_tokens: Number(r.prompt_tokens) || 0,
+      completion_tokens: Number(r.completion_tokens) || 0,
+      total_tokens: Number(r.total_tokens) || 0,
+      cost_usd: Number(r.cost_usd) || 0,
+      attempts: Number(r.attempts) || 0,
+      cache_state: r.cache_state || null
+    }))
+  });
+});
+
+// Usage aggregation by model, the same window the Overview uses. Success rate
+// is real here because the ledger records terminal status per request.
+app.get("/console/api/usage", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const days = Math.min(90, Math.max(1, Number(c.req.query("days")) || 7));
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+
+  const byModel = await c.env.DB.prepare(
+    "SELECT public_slug, model_kind, COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY public_slug, model_kind ORDER BY requests DESC"
+  ).bind(sess.keyId, since).all();
+
+  const lat = await c.env.DB.prepare(
+    "SELECT public_slug, model_kind, ttft_ms FROM request_summaries WHERE key_id=? AND created_at>=? AND ttft_ms IS NOT NULL"
+  ).bind(sess.keyId, since).all();
+  const latBy = new Map();
+  for (const r of lat.results || []) {
+    const k = r.public_slug + "|" + r.model_kind;
+    if (!latBy.has(k)) latBy.set(k, []);
+    latBy.get(k).push(Number(r.ttft_ms));
+  }
+
+  const models = (byModel.results || []).map((r) => {
+    const k = r.public_slug + "|" + r.model_kind;
+    const ts = (latBy.get(k) || []).sort((a, b) => a - b);
+    const pct = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.ceil(arr.length * p) - 1)] : null;
+    return {
+      slug: String(r.public_slug),
+      model_kind: String(r.model_kind),
+      requests: Number(r.requests) || 0,
+      ok: r.ok == null ? 0 : Number(r.ok),
+      tokens: Number(r.tokens) || 0,
+      spend_usd: Number(r.spend) || 0,
+      p50_ttft_ms: pct(ts, 0.5),
+      p95_ttft_ms: pct(ts, 0.95)
+    };
+  });
+  return c.json({ window: { days }, models });
 });
 
 // The models the signed-in key may call, with the honest Auto envelope and
@@ -1030,30 +1123,27 @@ app.get("/console/api/requests/:id", async (c) => {
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
   const id = String(c.req.param("id"));
-  const t = await c.env.DB.prepare(
-    "SELECT id, created_at, slug, status, http_status, stream, latency_ms, total_tokens, cost_usd, attempts, cache_state FROM trajectories WHERE id=? AND key_id=?"
+  const r = await c.env.DB.prepare(
+    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, cost_usd, attempts, cache_state FROM request_summaries WHERE request_id=? AND key_id=?"
   ).bind(id, sess.keyId).first();
-  if (!t)
+  if (!r)
     return c.json({ error: { message: "Request not found.", type: "not_found" } }, 404);
-  const att = await c.env.DB.prepare(
-    "SELECT headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, actual_cost_usd FROM route_attempts WHERE request_id=? ORDER BY attempt_index DESC LIMIT 1"
-  ).bind(id).first();
   return c.json({
-    id: String(t.id),
-    created_at: String(t.created_at),
-    slug: String(t.slug || ""),
-    model_kind: "chat",
-    status: String(t.status || ""),
-    http_status: t.http_status == null ? null : Number(t.http_status),
-    stream: !!t.stream,
-    headers_ms: att && att.headers_ms != null ? Number(att.headers_ms) : null,
-    ttft_ms: att && att.ttft_ms != null ? Number(att.ttft_ms) : null,
-    latency_ms: att && att.latency_ms != null ? Number(att.latency_ms) : (t.latency_ms == null ? null : Number(t.latency_ms)),
-    prompt_tokens: att && att.prompt_tokens != null ? Number(att.prompt_tokens) : null,
-    completion_tokens: att && att.completion_tokens != null ? Number(att.completion_tokens) : null,
-    cost_usd: t.cost_usd == null ? null : Number(t.cost_usd),
-    attempts: t.attempts == null ? null : Number(t.attempts),
-    cache_state: t.cache_state || null
+    id: String(r.request_id),
+    created_at: String(r.created_at),
+    slug: String(r.public_slug || ""),
+    model_kind: String(r.model_kind || "chat"),
+    status: String(r.status || ""),
+    http_status: r.http_status == null ? null : Number(r.http_status),
+    stream: !!r.stream,
+    headers_ms: r.headers_ms == null ? null : Number(r.headers_ms),
+    ttft_ms: r.ttft_ms == null ? null : Number(r.ttft_ms),
+    latency_ms: r.latency_ms == null ? null : Number(r.latency_ms),
+    prompt_tokens: Number(r.prompt_tokens) || 0,
+    completion_tokens: Number(r.completion_tokens) || 0,
+    cost_usd: Number(r.cost_usd) || 0,
+    attempts: Number(r.attempts) || 0,
+    cache_state: r.cache_state || null
   });
 });
 
@@ -1075,8 +1165,13 @@ async function runSystemOneDecision(c, key) {
   const slug = String(body.model || "");
   if (!slug)
     return c.json({ error: { message: "model is required", type: "invalid_request_error" } }, 400);
-  if (key && !await slugAllowed(c, key, slug))
+  const requestId = c.req.header("x-request-id") || uuid();
+  const started = Date.now();
+  await startRequestSummary(c.env.DB, { requestId, keyId: key && key.key_id || null, modelKind: "decision", publicSlug: slug, stream: false });
+  if (key && !await slugAllowed(c, key, slug)) {
+    await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 403, attempts: 0 });
     return c.json({ error: { message: "Model \"" + slug + "\" is not enabled for this key", type: "model_not_allowed" } }, 403);
+  }
 
   const routes = await c.env.DB.prepare(
     "SELECT mr.*, p.name AS provider_name, p.healthy, p.enabled AS provider_enabled, p.fmt, p.base_url, p.transport, p.proxy_url, p.extra_headers, p.key_strategy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
@@ -1084,6 +1179,7 @@ async function runSystemOneDecision(c, key) {
   const candidates = (routes.results || []).filter((r) => effectiveModelKind(r) === "decision");
   if (!candidates.length) {
     const chatOnly = (routes.results || []).length > 0;
+    await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: chatOnly ? 400 : 503, attempts: 0 });
     return c.json({
       error: {
         message: chatOnly
@@ -1094,8 +1190,6 @@ async function runSystemOneDecision(c, key) {
     }, chatOnly ? 400 : 503);
   }
 
-  const requestId = c.req.header("x-request-id") || uuid();
-  const started = Date.now();
   let lastReason = "no decision route answered";
   for (const route of candidates) {
     const circuit = circuitKey(route);
@@ -1132,6 +1226,9 @@ async function runSystemOneDecision(c, key) {
         circuitRecordOk("key", k.keyId);
         const answers = mapSystemOneResponse({ json: res.json, questions: body.questions });
         await recordModelUsage(c, slug, 0, 0);
+        const decPrice = await lookupPriceRow(c, slug, 0);
+        const decCost = decPrice && String(decPrice.actual_mode) === "per_request" ? Number(decPrice.actual_per_request) || 0 : 0;
+        await finishRequestSummary(c.env.DB, requestId, { status: "ok", httpStatus: res.http, ttftMs: Date.now() - started, latencyMs: Date.now() - started, costUsd: decCost, attempts: 1 });
         blog("TRACE id=" + requestId + " decision provider=" + route.provider_name + " model=" + route.upstream_model + " ms=" + (Date.now() - started));
         return c.json({
           model: slug,
@@ -1146,6 +1243,7 @@ async function runSystemOneDecision(c, key) {
     }
   }
   await recordTrajectory(c, { id: requestId, keyId: key && key.key_id || null, keyName: key && key.name || null, slug, stream: false, requestJson: JSON.stringify({ model: slug, state: body.state, questions: Object.keys(body.questions) }), steps: [], status: "fail", httpStatus: 502, attempts: candidates.length, latencyMs: Date.now() - started, error: lastReason });
+  await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 502, latencyMs: Date.now() - started, attempts: candidates.length });
   return c.json({ error: { message: "The decision model did not answer. The gateway falls back to its own policy.", type: "decision_unavailable" } }, 502);
 }
 app.post("/v1/systemone", async (c) => {
@@ -1218,6 +1316,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     traj.steps.push({ provider: "horizon", rank: 0, ok: true, picked: slug, costPer1M: autoDecision.cost, quality: autoDecision.quality, fallback: !!autoDecision.fallback, speed: autoDecision.horizon && autoDecision.horizon.speed, role: autoDecision.horizon && autoDecision.horizon.role, queue: autoDecision.queue || [] });
   if (!slug) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model is required" });
+    await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started });
     return c.json({ error: { message: "model is required" } }, 400);
   }
   // A decision model answers /v1/systemone, never this endpoint. Refuse before
@@ -1231,8 +1330,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       return c.json({ error: { message: "This model uses the decision inference API at /v1/systemone and cannot answer chat completions.", type: "model_endpoint_mismatch" } }, 400);
     }
   }
+  await startRequestSummary(c.env.DB, { requestId, keyId: key && key.key_id || null, modelKind: "chat", publicSlug: slug, stream: isStream });
   if (!isAdminPlayground && !autoDecision && slug !== AUTO_SLUG && !await slugAllowed(c, key, slug)) {
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 403, attempts: 0, latencyMs: Date.now() - started, error: "model not enabled for this key" });
+    await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 403, attempts: 0, latencyMs: Date.now() - started });
     return c.json({ error: { message: 'Model "' + slug + '" is not enabled for this key', type: "model_not_allowed" } }, 403);
   }
   const slugQueue = [];
@@ -1281,6 +1382,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     if (cached) {
       blog("TRACE id=" + requestId + " cache=HIT ms=" + (Date.now() - started));
       await recordTrajectory(c, { ...traj, status: "ok", httpStatus: 200, cacheState: "HIT", latencyMs: Date.now() - started, totalTokens: cached.source_tokens || 0, costUsd: cached.source_cost_usd || 0, responseJson: cached.response_body });
+      await finishRequestSummary(c.env.DB, requestId, { status: "ok", httpStatus: 200, cacheState: "HIT", latencyMs: Date.now() - started, totalTokens: Number(cached.source_tokens) || 0, costUsd: Number(cached.source_cost_usd) || 0 });
       return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "HIT" });
     }
   }
@@ -1301,6 +1403,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
       if (cached) {
         blog("TRACE id=" + requestId + " cache=COALESCED ms=" + (Date.now() - started));
         await recordTrajectory(c, { ...traj, status: "ok", httpStatus: 200, cacheState: "COALESCED", latencyMs: Date.now() - started, totalTokens: cached.source_tokens || 0, costUsd: cached.source_cost_usd || 0, responseJson: cached.response_body });
+        await finishRequestSummary(c.env.DB, requestId, { status: "ok", httpStatus: 200, cacheState: "COALESCED", latencyMs: Date.now() - started, totalTokens: Number(cached.source_tokens) || 0, costUsd: Number(cached.source_cost_usd) || 0 });
         return serveCachedCompletion(c, { cached, key, slug, payload, started, state: "COALESCED" });
       }
     }
@@ -1479,6 +1582,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             circuitRecordOk("key", k.keyId);
             traj.steps.push({ ...baseStep, http: up.status, ok: true, key: k.label, ms: Date.now() - stepStart });
             await recordTrajectory(c, { ...traj, slug: liveSlug, status: "ok", httpStatus: up.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, totalTokens: usage.total_tokens, costUsd, latencyMs: Date.now() - started, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, responseJson: clientTxt });
+            await finishRequestSummary(c.env.DB, requestId, { status: "ok", httpStatus: up.status, cacheState: cacheKey ? (cacheMode === "refresh" ? "REFRESH" : "MISS") : null, headersMs: _att.headers, latencyMs: Date.now() - _attStart, promptTokens: Number(usage.prompt_tokens) || 0, completionTokens: Number(usage.completion_tokens) || 0, totalTokens: Number(usage.total_tokens) || 0, costUsd, attempts: attempts + 1 });
             if (autoDecision)
               await finishLatencyShadow(c, requestId, { headersMs: _att.headers, ttftMs: null, finishedMs: Date.now() - _attStart, cancelled: false });
             return new Response(clientTxt, { status: up.status, headers: hdrs });
@@ -1527,6 +1631,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             if (e.status < 500) {
               const pub = publicProviderError(e);
               await recordTrajectory(c, { ...traj, status: "fail", httpStatus: pub.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
+              await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: pub.status, attempts: attempts + 1, latencyMs: Date.now() - started });
               return c.json({ error: pub.error }, pub.status, { "x-gateway-attempts": String(attempts + 1) });
             }
             attempts++;
@@ -1575,6 +1680,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
     const finalStatus = lastErrStatus || 503;
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
+    await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null });
     const errBody = lastErrStatus === 504
       ? { error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } }
       : genericUpstreamError();
@@ -2491,6 +2597,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       try {
         await c.env.DB.prepare("UPDATE route_attempts SET success=?, failure_class=?, health_impact=?, ttft_ms=COALESCE(?, ttft_ms), latency_ms=?, prompt_tokens=?, completion_tokens=?, actual_cost_usd=?, finished_at=?, tool_valid=? WHERE id=?").bind(outcome.success, outcome.failure_class, hi, ttft, attLatency, Number(lastUsage.prompt_tokens) || 0, Number(lastUsage.completion_tokens) || 0, costUsd, nowIso(), _streamToolValid, extra.attemptId).run();
         await finishLatencyShadow(c, requestId, { headersMs: extra.headersMs, ttftMs: ttft, finishedMs: attLatency, cancelled: clientCancelled });
+        await finishRequestSummary(c.env.DB, requestId, { status: clientCancelled ? "cancelled" : (outcome.success ? "ok" : "fail"), httpStatus: outcome.http_status, headersMs: extra.headersMs ?? null, ttftMs: ttft, latencyMs: attLatency, promptTokens: Number(lastUsage.prompt_tokens) || 0, completionTokens: Number(lastUsage.completion_tokens) || 0, totalTokens: Number(lastUsage.total_tokens) || 0, costUsd, attempts: extra.attempts || 1 });
       } catch (e) {
         blog("route_attempt stream patch failed: " + String(e.message || e));
       }

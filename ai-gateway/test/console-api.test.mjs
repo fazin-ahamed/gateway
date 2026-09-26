@@ -23,17 +23,14 @@ async function consoleGateway() {
     .bind(1, await gw.sealProviderKey(env, "sec"), "primary", now).run();
   db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,0,1)")
     .bind("glm-5.3", 1, "g").run();
-  // Real request rows the overview must aggregate.
-  const ins = db.prepare("INSERT INTO trajectories (id, created_at, key_id, slug, status, http_status, total_tokens, cost_usd, latency_ms) VALUES (?,?,?,?,?,?,?,?,?)");
-  ins.bind("req_a", day(0), "sk-console", "glm-5.3", "ok", 200, 1800, 0.002, 842).run();
-  ins.bind("req_b", day(1), "sk-console", "glm-5.3", "ok", 200, 2400, 0.003, 1210).run();
-  ins.bind("req_c", day(2), "sk-console", "glm-5.3", "error", 503, 0, 0, 4020).run();
-  db.prepare("INSERT INTO route_attempts (request_id, route_id, public_slug, started_at, success, ttft_ms, headers_ms, latency_ms) VALUES (?,?,?,?,1,?,?,?)")
-    .bind("req_a", 1, "glm-5.3", day(0), 640, 300, 842).run();
-  db.prepare("INSERT INTO route_attempts (request_id, route_id, public_slug, started_at, success, ttft_ms, headers_ms, latency_ms) VALUES (?,?,?,?,1,?,?,?)")
-    .bind("req_b", 1, "glm-5.3", day(1), 900, 350, 1210).run();
+  // Real ledger rows the console must aggregate. The overview reads
+  // request_summaries, not trajectories: capture-off must change nothing.
+  const ins = db.prepare("INSERT INTO request_summaries (request_id, key_id, model_kind, public_slug, created_at, finished_at, status, http_status, headers_ms, ttft_ms, latency_ms, total_tokens, cost_usd, attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  ins.bind("req_a", "sk-console", "chat", "glm-5.3", day(0), day(0), "ok", 200, 300, 640, 842, 1800, 0.002, 1).run();
+  ins.bind("req_b", "sk-console", "chat", "glm-5.3", day(1), day(1), "ok", 200, 350, 900, 1210, 2400, 0.003, 1).run();
+  ins.bind("req_c", "sk-console", "chat", "glm-5.3", day(2), day(2), "fail", 503, null, null, 4020, 0, 0, 1).run();
   // Another key's traffic must never leak into this console.
-  ins.bind("req_x", day(0), "sk-someone-else", "glm-5.3", "ok", 200, 999999, 999, 1).run();
+  ins.bind("req_x", "sk-someone-else", "chat", "glm-5.3", day(0), day(0), "ok", 200, null, null, 1, 999999, 999, 1).run();
   return { app: createApp(env), db };
 }
 

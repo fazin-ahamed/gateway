@@ -19,6 +19,7 @@ ROOT=${GATEWAY_ROOT:-$(CDPATH= cd -- "$HERE/.." && pwd)}
 PORT=${GATEWAY_PORT:-30012}
 POLL=${POLL_SECONDS:-30}
 LOG=${GATEWAY_LOG:-/tmp/gateway.log}
+CONSOLE_LOG=${CONSOLE_LOG:-/tmp/gateway-console-build.log}
 UPDATE_LOG=${UPDATE_LOG:-/tmp/gateway-update.log}
 ZAIHTTP_LOG=${ZAIHTTP_LOG:-/tmp/zaihttp.log}
 ENV_FILE="$ROOT/.env"
@@ -86,6 +87,22 @@ start_zaihttp() {
     sleep 1
   done
   log "zaihttp did not become ready; continuing without uTLS"
+}
+
+
+build_console() {
+  CONSOLE_DIR="$ROOT/client-console"
+  [ -d "$CONSOLE_DIR/src" ] || return 0
+  command -v npm >/dev/null || { log "npm missing; console will serve the previous build"; return 0; }
+  if [ ! -d "$CONSOLE_DIR/node_modules" ]; then
+    log "console: installing dependencies"
+    (cd "$CONSOLE_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1) \
+      || { log "console: npm install failed; serving previous build"; return 0; }
+  fi
+  log "console: building"
+  (cd "$CONSOLE_DIR" && npm run build >"$CONSOLE_LOG" 2>&1) \
+    || { log "console: build failed; serving previous build; see $CONSOLE_LOG"; return 0; }
+  log "console: build ok -> $CONSOLE_DIR/build"
 }
 
 stop_zaihttp() {
@@ -223,6 +240,7 @@ while :; do
     if [ -f "$SERVER_DIR/package.json" ]; then
       (cd "$SERVER_DIR" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1) || log "npm install failed; restarting anyway"
     fi
+    build_console
     restart_server
     log "updated to $(current_head)"
   else

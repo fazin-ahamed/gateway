@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
-import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions } from "./migrations.mjs";
+import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries } from "./migrations.mjs";
 import { configureSessionStore } from "../ai-gateway/src/zai-session.js";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -91,6 +91,7 @@ migrateLatencyShadow(db);
 migrateZaiConversations(db);
 migrateModelRouteKinds(db);
 migrateConsoleSessions(db);
+migrateRequestSummaries(db);
 const env = {
   DB: db,
   ADMIN_TOKEN,
@@ -150,7 +151,7 @@ function consoleFileResponse(path) {
 
 const handler = async (req) => {
   const path = new URL(req.url).pathname;
-  const isConsoleApi = path.startsWith("/console/api/") || path === "/console/auth" || path === "/console/logout";
+  const isConsoleApi = path.startsWith("/console/api/") || path.startsWith("/console/playground/") || path === "/console/auth" || path === "/console/logout";
   if ((path === "/console" || path === "/console/" || path.startsWith("/console/")) && !isConsoleApi) {
     const served = consoleFileResponse(path);
     if (served) return served;

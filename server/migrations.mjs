@@ -210,3 +210,36 @@ export function migrateConsoleSessions(db) {
     return false;
   }
 }
+
+// The request ledger. Customer accounting must survive trajectory capture
+// being disabled, so it is its own always-on table.
+export function migrateRequestSummaries(db) {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS request_summaries (
+      request_id TEXT PRIMARY KEY,
+      key_id TEXT,
+      model_kind TEXT NOT NULL,
+      public_slug TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      http_status INTEGER,
+      stream INTEGER NOT NULL DEFAULT 0,
+      cache_state TEXT,
+      headers_ms INTEGER,
+      ttft_ms INTEGER,
+      latency_ms INTEGER,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_request_summaries_key_time ON request_summaries(key_id, created_at)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_request_summaries_slug_time ON request_summaries(public_slug, created_at)");
+    return true;
+  } catch (e) {
+    console.warn("[gateway] request summaries migration skipped:", e.message);
+    return false;
+  }
+}
