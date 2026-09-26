@@ -94,6 +94,13 @@ build_console() {
   CONSOLE_DIR="$ROOT/client-console"
   [ -d "$CONSOLE_DIR/src" ] || return 0
   command -v npm >/dev/null || { log "npm missing; console will serve the previous build"; return 0; }
+  # Skip when nothing changed since the last build: restart_server also runs
+  # on poll-loop recovery, and an unchanged rebuild just delays the gateway.
+  STAMP="$CONSOLE_DIR/.svelte-kit/.console-built"
+  if [ -f "$STAMP" ] && [ -f "$CONSOLE_DIR/build/index.html" ]; then
+    NEWEST=$(find "$CONSOLE_DIR/src" "$CONSOLE_DIR/package.json" -type f -newer "$STAMP" 2>/dev/null | head -1)
+    [ -z "$NEWEST" ] && return 0
+  fi
   if [ ! -d "$CONSOLE_DIR/node_modules" ]; then
     log "console: installing dependencies"
     (cd "$CONSOLE_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1) \
@@ -102,6 +109,8 @@ build_console() {
   log "console: building"
   (cd "$CONSOLE_DIR" && npm run build >"$CONSOLE_LOG" 2>&1) \
     || { log "console: build failed; serving previous build; see $CONSOLE_LOG"; return 0; }
+  mkdir -p "$CONSOLE_DIR/.svelte-kit"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' >"$STAMP"
   log "console: build ok -> $CONSOLE_DIR/build"
 }
 
@@ -119,6 +128,16 @@ stop_zaihttp() {
 
 start_server() {
   mkdir -p "$SERVER_DIR"
+  # Cold boot has no node_modules until something installs them; a host
+  # restart must converge on its own, not wait for the next commit.
+  for dep_dir in "$SERVER_DIR" "$ROOT/ai-gateway"; do
+    if [ -f "$dep_dir/package.json" ] && [ ! -d "$dep_dir/node_modules/hono" ]; then
+      log "deps: installing in $dep_dir"
+      (cd "$dep_dir" && npm install --omit=dev --no-audit --no-fund >>"$LOG" 2>&1) \
+        || log "deps: install failed in $dep_dir; node may not start"
+    fi
+  done
+  build_console
   start_zaihttp
   cd "$SERVER_DIR"
   # zaiwebbrowser launches headed Chromium. On a VM with no DISPLAY, wrap
@@ -240,7 +259,6 @@ while :; do
     if [ -f "$SERVER_DIR/package.json" ]; then
       (cd "$SERVER_DIR" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1) || log "npm install failed; restarting anyway"
     fi
-    build_console
     restart_server
     log "updated to $(current_head)"
   else
