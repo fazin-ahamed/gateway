@@ -194,3 +194,19 @@ export function migrateModelRouteKinds(db) {
   }
   return added;
 }
+
+// The client-console session table. Same guarded pattern as the admin tables.
+export function migrateConsoleSessions(db) {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS console_sessions (
+      token_hash TEXT PRIMARY KEY,
+      key_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`);
+    return true;
+  } catch (e) {
+    console.warn("[gateway] console sessions migration skipped:", e.message);
+    return false;
+  }
+}

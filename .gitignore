@@ -37,3 +37,8 @@ data/*.txt
 
 # Node dependencies (installed via npm in ai-gateway/)
 node_modules/
+
+# Client console: build output and node_modules are generated locally.
+client-console/node_modules/
+client-console/build/
+client-console/.svelte-kit/

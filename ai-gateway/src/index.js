@@ -762,6 +762,301 @@ app.post("/admin/playground/completions", async (c) => {
     return denied;
   return runChatCompletion(c, null, true);
 });
+// ---------------------------------------------------------------------------
+// Client console: a separate product at /console. The admin UI stays the
+// operator cockpit; this surface belongs to API-key holders. Sessions are an
+// HttpOnly cookie exchanged once for the key, which the browser never stores.
+const CONSOLE_COOKIE = "gw_client";
+const CONSOLE_SESSION_HOURS = 24;
+
+async function consoleSessionFromCookie(c) {
+  const raw = c.req.header("cookie") || "";
+  const m = raw.match(/(?:^|;\\s*)gw_client=([^;]+)/);
+  if (!m) return null;
+  const h = await sha256hex(decodeURIComponent(m[1]));
+  try {
+    const row = await c.env.DB.prepare(
+      "SELECT s.key_id, s.expires_at FROM console_sessions s WHERE s.token_hash=? AND s.expires_at>?"
+    ).bind(h, nowIso()).first();
+    if (!row) return null;
+    const key = await c.env.DB.prepare("SELECT key_id, name FROM api_keys WHERE key_id=? AND active=1").bind(row.key_id).first();
+    return key ? { keyId: key.key_id, name: key.name } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function requireConsoleSession(c) {
+  const sess = await consoleSessionFromCookie(c);
+  if (!sess)
+    return { denied: c.json({ error: { message: "Sign in with an API key to use the console.", type: "auth_error" } }, 401) };
+  return { sess };
+}
+
+app.post("/console/auth", async (c) => {
+  let b;
+  try {
+    b = await c.req.json();
+  } catch {
+    b = {};
+  }
+  const offered = String((b && b.api_key) || "");
+  if (!offered.startsWith("sk-"))
+    return c.json({ error: { message: "Enter the API key to sign in.", type: "auth_error" } }, 401);
+  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(offered).first();
+  if (!key || !key.active || isKeyExpired(key))
+    return c.json({ error: { message: "That key was not accepted.", type: "auth_error" } }, 401);
+  if (isOverBudget(key))
+    return c.json({ error: { message: "Key budget exceeded.", type: "budget_exceeded" } }, 429);
+  const session = "v1." + uuid() + uuid().replace(/-/g, "");
+  const expiresAt = new Date(Date.now() + CONSOLE_SESSION_HOURS * 3600000).toISOString();
+  await c.env.DB.prepare("DELETE FROM console_sessions WHERE expires_at <= ?").bind(nowIso()).run();
+  await c.env.DB.prepare("INSERT INTO console_sessions (token_hash, key_id, expires_at, created_at) VALUES (?,?,?,?)").bind(await sha256hex(session), key.key_id, expiresAt, nowIso()).run();
+  const cookie = CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=Lax; HttpOnly";
+  c.header("Set-Cookie", cookie);
+  return c.json({ ok: true });
+});
+
+app.post("/console/logout", async (c) => {
+  const raw = c.req.header("cookie") || "";
+  const m = raw.match(/(?:^|;\\s*)gw_client=([^;]+)/);
+  if (m) {
+    try {
+      await c.env.DB.prepare("DELETE FROM console_sessions WHERE token_hash=?").bind(await sha256hex(decodeURIComponent(m[1]))).run();
+    } catch {}
+  }
+  const cookie = CONSOLE_COOKIE + "=; Path=/console; Max-Age=0; SameSite=Lax; HttpOnly";
+  c.header("Set-Cookie", cookie);
+  return c.json({ ok: true });
+});
+
+app.get("/console/api/me", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  return c.json({ key: { key_id: sess.keyId, name: sess.name } });
+});
+
+// One overview of real usage for the signed-in key. No fake savings, no
+// invented percentiles: p95 TTFT is computed from rows that carry a ttft.
+app.get("/console/api/overview", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const days = Math.min(90, Math.max(1, Number(c.req.query("days")) || 7));
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const priorSince = new Date(Date.now() - 2 * days * 86400000).toISOString();
+
+  // trajectories is the per-request source of truth: it carries key_id,
+  // tokens, cost and latency per request. TTFT comes from route_attempts
+  // joined on request_id; rows without a real ttft simply do not count.
+  const totals = await c.env.DB.prepare(
+    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM trajectories WHERE key_id=? AND created_at>=?"
+  ).bind(sess.keyId, since).first();
+  const prior = await c.env.DB.prepare(
+    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM trajectories WHERE key_id=? AND created_at>=? AND created_at<?"
+  ).bind(sess.keyId, priorSince, since).first();
+
+  const ttftRows = await c.env.DB.prepare(
+    "SELECT ra.ttft_ms FROM route_attempts ra JOIN trajectories t ON t.id=ra.request_id AND t.key_id=? AND t.created_at>=? WHERE ra.ttft_ms IS NOT NULL"
+  ).bind(sess.keyId, since).all();
+  const ttfts = (ttftRows.results || []).map((r) => Number(r.ttft_ms)).filter((n) => Number.isFinite(n) && n >= 0).sort((a, b) => a - b);
+  const p95 = ttfts.length ? ttfts[Math.min(ttfts.length - 1, Math.ceil(ttfts.length * 0.95) - 1)] : null;
+
+  const seriesRows = await c.env.DB.prepare(
+    "SELECT substr(created_at,1,10) day, COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM trajectories WHERE key_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day"
+  ).bind(sess.keyId, since).all();
+  const byDay = new Map((seriesRows.results || []).map((r) => [r.day, r]));
+  const series = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const day = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+    const row = byDay.get(day);
+    series.push({
+      day,
+      requests: row ? Number(row.requests) || 0 : 0,
+      tokens: row ? Number(row.tokens) || 0 : 0,
+      spend_usd: row ? Number(row.spend_usd) || 0 : 0,
+      p95_ttft_ms: null
+    });
+  }
+
+  const recentRows = await c.env.DB.prepare(
+    "SELECT id, created_at, slug, status, http_status, latency_ms, total_tokens, cost_usd FROM trajectories WHERE key_id=? ORDER BY created_at DESC LIMIT 25"
+  ).bind(sess.keyId).all();
+  const recentIds = (recentRows.results || []).map((r) => String(r.id));
+  const ttftById = new Map();
+  if (recentIds.length) {
+    const marks = recentIds.map(() => "?").join(",");
+    const attRows = await c.env.DB.prepare(
+      "SELECT request_id, ttft_ms FROM route_attempts WHERE request_id IN (" + marks + ") AND ttft_ms IS NOT NULL"
+    ).bind(...recentIds).all();
+    for (const a of attRows.results || [])
+      if (!ttftById.has(String(a.request_id)))
+        ttftById.set(String(a.request_id), Number(a.ttft_ms));
+  }
+  const recent = (recentRows.results || []).map((r) => ({
+    id: String(r.id),
+    created_at: String(r.created_at),
+    slug: String(r.slug || ""),
+    model_kind: "chat",
+    status: String(r.status || ""),
+    http_status: r.http_status == null ? null : Number(r.http_status),
+    latency_ms: r.latency_ms == null ? null : Number(r.latency_ms),
+    ttft_ms: ttftById.get(String(r.id)) ?? null,
+    tokens: Number(r.total_tokens) || 0,
+    cost_usd: Number(r.cost_usd) || 0
+  }));
+
+  return c.json({
+    window: { days },
+    totals: {
+      requests: Number(totals && totals.requests) || 0,
+      ok_requests: null,
+      tokens: Number(totals && totals.tokens) || 0,
+      spend_usd: Number(totals && totals.spend_usd) || 0,
+      p95_ttft_ms: p95
+    },
+    prior_totals: prior && Number(prior.requests) > 0 ? {
+      requests: Number(prior.requests) || 0,
+      tokens: Number(prior.tokens) || 0,
+      spend_usd: Number(prior.spend_usd) || 0
+    } : null,
+    series,
+    recent
+  });
+});
+
+// The models the signed-in key may call, with the honest Auto envelope and
+// per-model pricing — the same data /v1/models exposes, shaped for the table.
+app.get("/console/api/models", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(sess.keyId).first();
+  if (!key)
+    return c.json({ data: [] });
+  const allowed = await allowedSlugs(c, key);
+  if (!allowed.length)
+    return c.json({ data: [] });
+  const routes = await c.env.DB.prepare(
+    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
+  ).bind(...allowed).all();
+  const live = [];
+  const decisionSlugs = new Map();
+  for (const r of routes.results || []) {
+    if (circuitOpen("route:" + String(r.route_id)))
+      continue;
+    if (String(r.model_kind || "chat") === "decision") {
+      if (!decisionSlugs.has(r.slug))
+        decisionSlugs.set(r.slug, r);
+      continue;
+    }
+    live.push(r);
+  }
+  const cfg = await autoSettings(c);
+  if (!modelsDevCache.catalog)
+    await fetchModelsDevCatalog().catch(() => {});
+  const byId = modelsDevCache.catalog ? flattenModelsDevCatalog(modelsDevCache.catalog) : null;
+  const prices = await c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, actual_mode, actual_per_request FROM prices").all();
+  const priceBySlug = new Map((prices.results || []).map((p) => [p.slug, p]));
+
+  const data = [];
+  if (cfg.enabled && live.length) {
+    const envelope = buildCapabilityEnvelope(live.map((r) => {
+      const entry = capabilityEntryForRoute(r, byId);
+      const caps = entryCapabilities(entry);
+      return {
+        providerId: r.provider_id,
+        context: contextLimit(caps),
+        output: caps.output,
+        tools: !!caps.tools,
+        vision: !!caps.vision,
+        reasoning: !!(entry && entry.reasoning)
+      };
+    }));
+    const pr = priceBySlug.get("auto");
+    data.push({
+      id: "auto",
+      model_kind: "chat",
+      endpoint: "/v1/chat/completions",
+      context_window: envelope.context_window,
+      max_output_tokens: envelope.max_output_tokens,
+      tools: envelope.capabilities.tools,
+      vision: envelope.capabilities.vision,
+      reasoning: envelope.capabilities.reasoning,
+      routing: envelope.routing,
+      prompt_per_1m: pr ? Number(pr.prompt_per_1m) : null,
+      completion_per_1m: pr ? Number(pr.completion_per_1m) : null,
+      per_request: null
+    });
+  }
+  const chatSlugs = new Set(live.map((r) => r.slug));
+  for (const slug of [...chatSlugs].sort()) {
+    const r = live.find((x) => x.slug === slug);
+    const entry = capabilityEntryForRoute(r, byId);
+    const caps = entryCapabilities(entry);
+    const pr = priceBySlug.get(slug);
+    data.push({
+      id: slug,
+      model_kind: "chat",
+      endpoint: "/v1/chat/completions",
+      context_window: contextLimit(caps),
+      max_output_tokens: caps.output || null,
+      tools: !!caps.tools,
+      vision: !!caps.vision,
+      reasoning: !!(entry && entry.reasoning),
+      routing: null,
+      prompt_per_1m: pr ? Number(pr.prompt_per_1m) : null,
+      completion_per_1m: pr ? Number(pr.completion_per_1m) : null,
+      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null
+    });
+  }
+  for (const [slug, r] of [...decisionSlugs.entries()].sort()) {
+    const pr = priceBySlug.get(slug);
+    data.push({
+      id: slug,
+      model_kind: "decision",
+      protocol: String(r.wire_format || r.fmt || "systemone"),
+      endpoint: "/v1/systemone",
+      routing: null,
+      prompt_per_1m: null,
+      completion_per_1m: null,
+      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : (pr ? Number(pr.prompt_per_1m) : null)
+    });
+  }
+  return c.json({ data });
+});
+
+// Request drill-down for the drawer. Body-free facts only: status, timings,
+// tokens, cost. No provider names, no route ids, no raw upstream errors.
+app.get("/console/api/requests/:id", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const id = String(c.req.param("id"));
+  const t = await c.env.DB.prepare(
+    "SELECT id, created_at, slug, status, http_status, stream, latency_ms, total_tokens, cost_usd, attempts, cache_state FROM trajectories WHERE id=? AND key_id=?"
+  ).bind(id, sess.keyId).first();
+  if (!t)
+    return c.json({ error: { message: "Request not found.", type: "not_found" } }, 404);
+  const att = await c.env.DB.prepare(
+    "SELECT headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, actual_cost_usd FROM route_attempts WHERE request_id=? ORDER BY attempt_index DESC LIMIT 1"
+  ).bind(id).first();
+  return c.json({
+    id: String(t.id),
+    created_at: String(t.created_at),
+    slug: String(t.slug || ""),
+    model_kind: "chat",
+    status: String(t.status || ""),
+    http_status: t.http_status == null ? null : Number(t.http_status),
+    stream: !!t.stream,
+    headers_ms: att && att.headers_ms != null ? Number(att.headers_ms) : null,
+    ttft_ms: att && att.ttft_ms != null ? Number(att.ttft_ms) : null,
+    latency_ms: att && att.latency_ms != null ? Number(att.latency_ms) : (t.latency_ms == null ? null : Number(t.latency_ms)),
+    prompt_tokens: att && att.prompt_tokens != null ? Number(att.prompt_tokens) : null,
+    completion_tokens: att && att.completion_tokens != null ? Number(att.completion_tokens) : null,
+    cost_usd: t.cost_usd == null ? null : Number(t.cost_usd),
+    attempts: t.attempts == null ? null : Number(t.attempts),
+    cache_state: t.cache_state || null
+  });
+});
+
 // POST /v1/systemone — decision models, reached through the same auth, route
 // ranking, key rotation, circuit breakers and limits as every other model.
 // A decision model is never a chat model: the two endpoints refuse each other.

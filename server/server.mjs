@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
-import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds } from "./migrations.mjs";
+import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions } from "./migrations.mjs";
 import { configureSessionStore } from "../ai-gateway/src/zai-session.js";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -90,6 +90,7 @@ migrateRouteAttemptsV2(db);
 migrateLatencyShadow(db);
 migrateZaiConversations(db);
 migrateModelRouteKinds(db);
+migrateConsoleSessions(db);
 const env = {
   DB: db,
   ADMIN_TOKEN,
@@ -105,8 +106,55 @@ const env = {
 const { createApp } = await import("../ai-gateway/src/index.js");
 const app = createApp(env);
 
+// The client console is a static build served at /console. Files come off
+// disk; unknown /console paths fall back to index.html so client-side routes
+// survive a refresh. No Node/Svelte server runtime involved.
+import { existsSync, statSync } from "node:fs";
+import { extname, normalize } from "node:path";
+const CONSOLE_DIST = join(import.meta.dirname, "..", "client-console", "build");
+const CONSOLE_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".woff2": "font/woff2",
+  ".webp": "image/webp"
+};
+
+function consoleFileResponse(path) {
+  if (!existsSync(CONSOLE_DIST)) return null;
+  let rel = normalize(decodeURIComponent(path)).replace(/^([\\/])+/, "");
+  if (rel.startsWith("console/")) rel = rel.slice("console/".length);
+  if (rel) {
+    const file = join(CONSOLE_DIST, rel);
+    if (existsSync(file) && statSync(file).isFile()) {
+      const body = readFileSync(file);
+      return new Response(body, {
+        headers: {
+          "content-type": CONSOLE_TYPES[extname(file).toLowerCase()] || "application/octet-stream",
+          "cache-control": extname(file) === ".html" ? "no-store" : "public, max-age=300"
+        }
+      });
+    }
+  }
+  const indexFile = join(CONSOLE_DIST, "index.html");
+  if (existsSync(indexFile)) {
+    return new Response(readFileSync(indexFile), {
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }
+    });
+  }
+  return null;
+}
+
 const handler = async (req) => {
   const path = new URL(req.url).pathname;
+  const isConsoleApi = path.startsWith("/console/api/") || path === "/console/auth" || path === "/console/logout";
+  if ((path === "/console" || path === "/console/" || path.startsWith("/console/")) && !isConsoleApi) {
+    const served = consoleFileResponse(path);
+    if (served) return served;
+  }
   const guardedPath = path === "/v1/chat/completions" || path === "/admin/playground/completions";
   let modelHint = "";
   let requestTools = [];

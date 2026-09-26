@@ -109,6 +109,16 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   created_at TEXT NOT NULL
 );
 
+-- Client-console sessions: an API key exchanged once for an HttpOnly cookie.
+-- The key itself is never stored in the browser. Each row records which
+-- api_keys row owns the session so /console/api/* can attribute queries.
+CREATE TABLE IF NOT EXISTS console_sessions (
+  token_hash TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS admin_tokens (
   token_hash TEXT PRIMARY KEY,
   created_at TEXT NOT NULL
