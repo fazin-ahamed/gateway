@@ -274,6 +274,10 @@ while :; do
     fi
     restart_server
     log "updated to $(current_head)"
+    # This shell parsed its functions once at startup, so edits to the
+    # watcher itself (build_console, the install logic) never take effect
+    # until the script is re-executed. Re-exec after every update.
+    exec "$0"
   else
     log "reset --hard failed; leaving process on $LOCAL"
   fi
