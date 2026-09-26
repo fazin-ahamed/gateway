@@ -90,7 +90,7 @@
   color: var(--text);
 }
 
-.input, .select, textarea.input {
+.input, .select {
   height: 30px;
   padding: 0 10px;
   border: 1px solid var(--border-strong);
@@ -99,6 +99,19 @@
   color: var(--text);
   font-size: 13px;
   line-height: 18px;
+}
+
+textarea.input {
+  height: auto;
+  min-height: 96px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 20px;
+  resize: vertical;
 }
 
 

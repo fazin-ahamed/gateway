@@ -225,18 +225,18 @@
     </form>
   </section>
 {:else}
-  <section class="workspace">
+  <section class="workspace decision">
     <div class="split">
       <div class="field">
-        <label for="pg-state">State (JSON)</label>
-        <textarea id="pg-state" class="input mono" rows="8" spellcheck="false" bind:value={stateJson} disabled={busy}></textarea>
+        <label for="pg-state">State</label>
+        <textarea id="pg-state" class="input mono" rows="12" spellcheck="false" bind:value={stateJson} disabled={busy}></textarea>
       </div>
       <div class="field">
-        <label for="pg-questions">Questions (JSON)</label>
-        <textarea id="pg-questions" class="input mono" rows="8" spellcheck="false" bind:value={questionsJson} disabled={busy}></textarea>
+        <label for="pg-questions">Questions</label>
+        <textarea id="pg-questions" class="input mono" rows="12" spellcheck="false" bind:value={questionsJson} disabled={busy}></textarea>
       </div>
     </div>
-    <div class="composer">
+    <div class="run">
       <button class="btn btn-primary" onclick={sendDecision} disabled={busy || !model}>{busy ? "Running…" : "Run decision"}</button>
     </div>
     {#if answers}
@@ -369,6 +369,23 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 16px;
+  }
+  .decision {
+    min-height: 0;
+    gap: 16px;
+  }
+
+  .decision textarea {
+    width: 100%;
+    min-height: 240px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 20px;
+  }
+
+  .run {
+    display: flex;
+    justify-content: flex-end;
   }
 
   .answers {
