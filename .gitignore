@@ -42,3 +42,4 @@ node_modules/
 client-console/node_modules/
 client-console/build/
 client-console/.svelte-kit/
+client-console/package-lock.json
