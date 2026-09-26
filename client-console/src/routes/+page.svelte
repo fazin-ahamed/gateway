@@ -104,12 +104,19 @@
     </p>
   {/if}
   {#if limits?.models.length}
-    <div class="caps">
+    <div class="rings">
       {#each limits.models as cap (`${cap.slug}-${cap.kind}-${cap.period}`)}
-        <a class="cap" href="/console/limits/">
-          <span>{cap.slug}</span>
-          <strong>{cap.kind === "usd" ? fmtUsd(cap.used) : fmtInt(cap.used)} / {cap.kind === "usd" ? fmtUsd(cap.limit) : fmtInt(cap.limit)}</strong>
-          <em>{cap.period}</em>
+        {@const pct = cap.limit > 0 ? Math.max(2, Math.min(100, (cap.used / cap.limit) * 100)) : 0}
+        <a class="ring" href="/console/limits/" style="--pct:{pct}">
+          <svg viewBox="0 0 36 36" aria-hidden="true">
+            <circle cx="18" cy="18" r="15"></circle>
+            <circle class="arc" cx="18" cy="18" r="15"></circle>
+          </svg>
+          <span>
+            <strong>{cap.slug}</strong>
+            <em>{cap.kind === "usd" ? fmtUsd(cap.used) : fmtInt(cap.used)} of {cap.kind === "usd" ? fmtUsd(cap.limit) : fmtInt(cap.limit)}</em>
+            <small>per {cap.period}</small>
+          </span>
         </a>
       {/each}
     </div>
@@ -125,7 +132,7 @@
       </div>
     </div>
     {#if points.length}
-      <UsageChart series={points} {metric} />
+      <UsageChart series={points} {metric} windowHours={hours} />
     {:else}
       <div class="empty">
         <p>No requests in this window.</p>
@@ -193,26 +200,34 @@
   .limit-line a {
     color: var(--accent);
   }
-.caps {
+.rings {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 12px;
+  margin-top: 16px;
 }
 
-.cap {
+.ring {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 8px 12px;
+  align-items: center;
+  gap: 12px;
+  min-width: 220px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
-  font-size: 13px;
 }
 
-.cap strong { font-variant-numeric: tabular-nums; }
-.cap em { color: var(--text-muted); font-style: normal; }
+.ring svg { width: 52px; height: 52px; transform: rotate(-90deg); flex-shrink: 0; }
+.ring circle { fill: none; stroke: var(--border); stroke-width: 3; }
+.ring .arc {
+  stroke: var(--accent);
+  stroke-dasharray: calc(var(--pct) * 0.942) 94.2;
+  transition: stroke-dasharray 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.ring span { display: flex; flex-direction: column; min-width: 0; }
+.ring strong { font-size: 14px; }
+.ring em, .ring small { color: var(--text-muted); font-style: normal; font-size: 12px; }
 
   .block {
     margin-top: 28px;

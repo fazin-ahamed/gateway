@@ -6,7 +6,7 @@
   type Point = { t: string; requests: number; tokens: number; spend_usd: number };
   type Metric = "requests" | "tokens" | "spend_usd";
 
-  let { series, metric }: { series: Point[]; metric: Metric } = $props();
+  let { series, metric, windowHours = 0 }: { series: Point[]; metric: Metric; windowHours?: number } = $props();
 
   let container: HTMLDivElement | undefined = $state();
   let plot: UPlot | null = null;
@@ -121,7 +121,10 @@
 
   $effect(() => {
     void metric;
-    void series;
+    void windowHours;
+    void series.length;
+    void series[0]?.t;
+    void series.at(-1)?.t;
     if (container) schedule();
   });
 
