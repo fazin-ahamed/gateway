@@ -111,8 +111,8 @@
 {/if}
 
 {#if selected}
-  <div class="drawer-backdrop" onclick={() => (selected = null)}></div>
-  <aside class="drawer" role="dialog" aria-label={selected.id + " details"}>
+  <div class="drawer-backdrop" role="presentation" onclick={() => (selected = null)} onkeydown={(e) => { if (e.key === "Escape") selected = null; }}></div>
+  <div class="drawer" role="dialog" aria-modal="true" aria-label={selected.id + " details"}>
     <div class="drawer-head">
       <h2 class="section-heading mono">{selected.id}</h2>
       <button class="btn btn-quiet" onclick={() => (selected = null)}>Close</button>
@@ -148,7 +148,7 @@
         <pre class="mono">{chatExample(selected.id)}</pre>
       {/if}
     </div>
-  </aside>
+  </div>
 {/if}
 
 <style>

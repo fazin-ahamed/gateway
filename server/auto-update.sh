@@ -101,10 +101,23 @@ build_console() {
     NEWEST=$(find "$CONSOLE_DIR/src" "$CONSOLE_DIR/package.json" -type f -newer "$STAMP" 2>/dev/null | head -1)
     [ -z "$NEWEST" ] && return 0
   fi
-  if [ ! -d "$CONSOLE_DIR/node_modules" ]; then
+  # Install on a missing node_modules OR when package.json changed after the
+  # last install: a new dependency in a commit must actually be installed,
+  # not only when the tree started empty.
+  DEPS_STAMP="$CONSOLE_DIR/.svelte-kit/.console-deps"
+  # A missing stamp means this logic has never installed here: run once.
+  # After that, a package.json newer than the stamp adds dependencies.
+  if [ ! -f "$DEPS_STAMP" ] || [ "$CONSOLE_DIR/package.json" -nt "$DEPS_STAMP" ]; then
+    DEPS_NEWER=yes
+  else
+    DEPS_NEWER=no
+  fi
+  if [ ! -d "$CONSOLE_DIR/node_modules" ] || [ "$DEPS_NEWER" = yes ]; then
     log "console: installing dependencies"
-    (cd "$CONSOLE_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1) \
-      || { log "console: npm install failed; serving previous build"; return 0; }
+    (cd "$CONSOLE_DIR" && npm install --no-audit --no-fund >>"$CONSOLE_LOG" 2>&1) \
+      || { log "console: npm install failed; serving previous build; see $CONSOLE_LOG"; return 0; }
+    mkdir -p "$CONSOLE_DIR/.svelte-kit"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' >"$DEPS_STAMP"
   fi
   log "console: building"
   (cd "$CONSOLE_DIR" && npm run build >"$CONSOLE_LOG" 2>&1) \

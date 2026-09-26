@@ -136,8 +136,8 @@
 {/if}
 
 {#if detail}
-  <div class="drawer-backdrop" onclick={() => (detail = null)}></div>
-  <aside class="drawer" role="dialog" aria-label="Request detail">
+  <div class="drawer-backdrop" role="presentation" onclick={() => (detail = null)} onkeydown={(e) => { if (e.key === "Escape") detail = null; }}></div>
+  <div class="drawer" role="dialog" aria-modal="true" aria-label="Request detail">
     <div class="drawer-head">
       <h2 class="section-heading">Request</h2>
       <button class="btn btn-quiet" onclick={() => (detail = null)}>Close</button>
@@ -158,7 +158,7 @@
       <dt>Attempts</dt><dd>{detail.attempts}</dd>
       <dt>Cache</dt><dd>{detail.cache_state ?? "—"}</dd>
     </dl>
-  </aside>
+  </div>
 {/if}
 
 <style>

@@ -50,7 +50,7 @@
   <div class="panel">
     <h1 class="panel-title">Gateway console</h1>
     <p class="panel-sub">Sign in with a gateway API key. The key is exchanged for a session cookie and never stored in the browser.</p>
-    <form on:submit={signIn} class="form">
+    <form onsubmit={signIn} class="form">
       <label for="key">API key</label>
       <input
         id="key"
