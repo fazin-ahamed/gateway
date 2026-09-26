@@ -365,6 +365,13 @@
     border-top: 1px solid var(--border);
   }
 
+  .composer textarea {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    min-height: 72px;
+  }
+
   .split {
     display: grid;
     grid-template-columns: 1fr 1fr;
