@@ -79,14 +79,15 @@
               stroke: grid,
               grid: { show: false },
               ticks: { stroke: grid, size: 4 },
-              values: (_u: UPlot, vals: number[]) =>
-                vals.map((v) =>
-                  new Date(v * 1000).toLocaleDateString("en", {
-                    month: "short",
-                    day: "numeric",
-                    hour: span > 86400 * 3 ? undefined : "numeric"
-                  })
-                )
+              values: (_u: UPlot, vals: number[]) => {
+                let lastDay = "";
+                return vals.map((v) => {
+                  const day = new Date(v * 1000).toLocaleDateString("en", { month: "short", day: "numeric" });
+                  if (day === lastDay) return "";
+                  lastDay = day;
+                  return day;
+                });
+              }
             },
             {
               stroke: grid,

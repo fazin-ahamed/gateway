@@ -15,28 +15,44 @@
     cost_usd: number;
   };
 
+  type ModelUse = { slug: string; requests: number; tokens: number; spend_usd: number; ok: number };
   let activity = $state<Activity | null>(null);
   let limits = $state<Limits | null>(null);
+  let usage = $state<ModelUse[]>([]);
   let recent = $state<Recent[] | null>(null);
   let failed = $state(false);
+  let loading = $state(false);
   let detail = $state<RequestDetail | null>(null);
   let metric = $state<"requests" | "tokens" | "spend_usd">("requests");
   let hours = $state(168);
 
+  let request = 0;
   async function load(h: number) {
+    const mine = ++request;
     failed = false;
+    loading = true;
     try {
-      const [act, lim, ov] = await Promise.all([api.activity(h), api.limits(), api.overview(Math.max(1, Math.ceil(h / 24)))]);
+      const days = Math.max(1, Math.ceil(h / 24));
+      const [act, lim, used, list] = await Promise.all([
+        api.activity(h),
+        api.limits(),
+        fetch(`/console/api/usage?days=${days}`, { credentials: "same-origin" }).then((r) => r.json()),
+        fetch(`/console/api/requests?days=${days}&limit=25`, { credentials: "same-origin" }).then((r) => r.json())
+      ]);
+      if (mine !== request) return;
       activity = act;
       limits = lim;
-      recent = ov.recent;
+      usage = used.models || [];
+      recent = list.requests || [];
     } catch {
-      failed = true;
+      if (mine === request) failed = true;
+    } finally {
+      if (mine === request) loading = false;
     }
   }
 
   function changeWindow(h: number) {
-    if (hours === h) return;
+    if (hours === h || loading) return;
     hours = h;
     load(h);
   }
@@ -136,10 +152,34 @@
     {:else}
       <div class="empty">
         <p>No requests in this window.</p>
-        <p class="meta">Send one through the gateway and it will appear on the hour it landed.</p>
       </div>
     {/if}
   </section>
+
+  <section class="block">
+    <h2 class="section-heading">Usage by model</h2>
+    {#if usage.length === 0}
+      <div class="empty"><p>No model usage in this window.</p></div>
+    {:else}
+      <div class="table-scroll">
+        <table class="table">
+          <thead><tr><th>Model</th><th class="r">Requests</th><th class="r">Success</th><th class="r">Tokens</th><th class="r">Spend</th></tr></thead>
+          <tbody>
+            {#each usage as m (`${m.slug}`)}
+              <tr>
+                <td>{m.slug}</td>
+                <td class="r">{fmtInt(m.requests)}</td>
+                <td class="r">{m.requests ? Math.round((m.ok / m.requests) * 100) + "%" : "—"}</td>
+                <td class="r">{fmtInt(m.tokens)}</td>
+                <td class="r">{fmtUsd(m.spend_usd)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+
 
   <section class="block">
     <h2 class="section-heading">Recent</h2>
