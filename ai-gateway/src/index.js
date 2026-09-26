@@ -441,6 +441,26 @@ async function recordModelUsage(c, slug, tokens, costUsd) {
     }
   }
 }
+async function modelLimitStatus(c) {
+  const rows = await c.env.DB.prepare(
+    "SELECT slug, kind, period, limit_value FROM model_limits ORDER BY slug, period, kind"
+  ).all();
+  const out = [];
+  for (const row of rows.results || []) {
+    const used = await periodUsage(c, row.slug, row.kind, row.period);
+    const limit = Number(row.limit_value) || 0;
+    out.push({
+      slug: String(row.slug),
+      kind: String(row.kind),
+      period: String(row.period),
+      limit,
+      used,
+      remaining: Math.max(0, limit - used)
+    });
+  }
+  return out;
+}
+
 async function enforceRequestLimit(c, key) {
   const limit = normalizeRequestLimit(key.request_limit_per_minute);
   if (!limit)
@@ -994,7 +1014,8 @@ app.get("/console/api/limits", async (c) => {
     rate: {
       per_minute: key.request_limit_per_minute == null ? 0 : Number(key.request_limit_per_minute),
       used_this_minute: window ? Number(window.request_count) || 0 : 0
-    }
+    },
+    models: await modelLimitStatus(c)
   });
 });
 

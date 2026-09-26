@@ -103,6 +103,17 @@
       <a href="/console/limits/">Limits</a>
     </p>
   {/if}
+  {#if limits?.models.length}
+    <div class="caps">
+      {#each limits.models as cap (`${cap.slug}-${cap.kind}-${cap.period}`)}
+        <a class="cap" href="/console/limits/">
+          <span>{cap.slug}</span>
+          <strong>{cap.kind === "usd" ? fmtUsd(cap.used) : fmtInt(cap.used)} / {cap.kind === "usd" ? fmtUsd(cap.limit) : fmtInt(cap.limit)}</strong>
+          <em>{cap.period}</em>
+        </a>
+      {/each}
+    </div>
+  {/if}
 
   <section class="block">
     <div class="block-head">
@@ -182,6 +193,26 @@
   .limit-line a {
     color: var(--accent);
   }
+.caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.cap {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.cap strong { font-variant-numeric: tabular-nums; }
+.cap em { color: var(--text-muted); font-style: normal; }
 
   .block {
     margin-top: 28px;

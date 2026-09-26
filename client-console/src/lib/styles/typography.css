@@ -279,38 +279,45 @@
 }
 .tabs {
   display: inline-flex;
+  align-items: stretch;
   border: 1px solid var(--border-strong);
+  background: var(--surface-subtle);
+  padding: 3px;
+  gap: 3px;
+}
+
+button.tab {
+  appearance: none;
+  height: 32px;
+  margin: 0;
+  padding: 0 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 32px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+button.tab:hover {
+  color: var(--text);
   background: var(--surface);
 }
 
-.tab {
-  height: 30px;
-  padding: 0 14px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-muted);
-  background: transparent;
-  border: 0;
-  border-right: 1px solid var(--border);
-}
-
-.tab:last-child {
-  border-right: 0;
-}
-
-.tab:hover {
-  color: var(--text);
-  background: var(--surface-subtle);
-}
-
-.tab.on {
+button.tab.on,
+button.tab[aria-selected="true"] {
   background: var(--accent);
+  border-color: var(--accent);
   color: var(--accent-text);
 }
 
-.tab:focus-visible {
+button.tab:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  outline-offset: 1px;
 }
 
 

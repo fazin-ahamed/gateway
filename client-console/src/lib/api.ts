@@ -85,6 +85,7 @@ export type Limits = {
   expires_at: string | null;
   budget: { mode: string; limit: number; used: number; remaining: number; request_count: number };
   rate: { per_minute: number; used_this_minute: number };
+  models: Array<{ slug: string; kind: string; period: string; limit: number; used: number; remaining: number }>;
 };
 
 export type Settings = {

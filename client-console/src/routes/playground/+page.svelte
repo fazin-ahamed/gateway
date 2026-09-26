@@ -211,8 +211,8 @@
         </div>
       {:else}
         {#each messages as m, i (i)}
-          <div class="msg" class:own={m.role === "user"}>
-            <div class="who meta">{m.role === "user" ? (session.state === "signed-in" ? session.keyName : "You") : "Assistant"}</div>
+          <div class="msg" class:own={m.role === "user"} style="animation-delay: {Math.min(i, 6) * 40}ms">
+            <div class="who meta">{m.role === "user" ? "You" : model || "Model"}</div>
             <div class="body">{m.content}</div>
           </div>
         {/each}
@@ -308,48 +308,61 @@
   }
 
   .workspace {
+    display: flex;
+    flex-direction: column;
+    min-height: 520px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-panel);
-    background: var(--surface);
-    padding: 16px;
+    background:
+      linear-gradient(180deg, transparent, color-mix(in srgb, var(--accent) 6%, transparent)),
+      var(--surface);
+    padding: 20px;
   }
 
   .messages {
-    max-height: 420px;
+    flex: 1;
+    max-height: 560px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    padding: 4px;
+    gap: 18px;
+    padding: 8px 4px 20px;
   }
 
-  .msg .who {
-    margin-bottom: 4px;
+  .msg {
+    max-width: 68ch;
+    animation: arrive 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  .msg.own {
+    align-self: flex-end;
+    text-align: right;
+  }
+
+  .msg .body {
+    margin-top: 4px;
+    padding: 12px 14px;
+    background: var(--surface-subtle);
+    white-space: pre-wrap;
+    font-size: 15px;
+    line-height: 23px;
   }
 
   .msg.own .body {
-    color: var(--text-muted);
+    background: var(--accent-soft);
+    color: var(--text);
   }
 
-  .body {
-    white-space: pre-wrap;
-    font-size: 14px;
-    line-height: 21px;
+  @keyframes arrive {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
   }
 
   .composer {
     display: flex;
     gap: 12px;
-    margin-top: 16px;
     align-items: flex-end;
-  }
-
-  .grow {
-    flex: 1;
-    resize: vertical;
-    height: auto;
-    font-family: var(--font-sans);
-    line-height: 21px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
   }
 
   .split {

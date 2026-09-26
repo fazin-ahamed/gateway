@@ -56,6 +56,22 @@
       <p class="meta">The budget is the only limit on this key.</p>
     {/if}
   </section>
+  <section class="panel">
+    <h2>Model caps</h2>
+    {#if limits.models.length === 0}
+      <p class="meta">No per-model caps are set. The operator adds them in the admin console.</p>
+    {:else}
+      {#each limits.models as cap (`${cap.slug}-${cap.kind}-${cap.period}`)}
+        <div class="cap-row">
+          <div>
+            <strong>{cap.slug}</strong>
+            <p class="meta">{cap.kind} per {cap.period}</p>
+          </div>
+          <p class="figure">{cap.kind === "usd" ? fmtUsd(cap.used) : fmtInt(cap.used)} of {cap.kind === "usd" ? fmtUsd(cap.limit) : fmtInt(cap.limit)}</p>
+        </div>
+      {/each}
+    {/if}
+  </section>
 {/if}
 
 <style>
