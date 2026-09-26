@@ -1,4 +1,4 @@
-# HORIZON client console (`/console`)
+# Gateway client console (`/console`)
 
 The client console is a separate customer surface. `/_gw` remains the
 operator cockpit. The console serves from a static SvelteKit build; no Node

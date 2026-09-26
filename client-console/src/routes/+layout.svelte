@@ -5,21 +5,18 @@
 
   import AppShell from "$lib/components/AppShell.svelte";
   import { page } from "$app/state";
-  import { session, loadSession } from "$lib/state/session.svelte";
+  import { session } from "$lib/state/session.svelte";
+
+  let { children } = $props();
 
   const isSignIn = $derived(page.url.pathname === "/console/signin");
-  loadSession();
 </script>
 
 {#if isSignIn}
-  <slot />
-{:else if session.state === "loading"}
-  <div class="boot">Loading…</div>
-{:else if session.state === "signed-out"}
-  <a href="/console/signin">Sign in with an API key</a>
+  {@render children()}
 {:else}
   <AppShell>
-    <slot />
+    {@render children()}
   </AppShell>
 {/if}
 

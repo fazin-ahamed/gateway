@@ -1,25 +1,34 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, fmtInt, fmtUsd, fmtMs, type Overview, type RequestDetail } from "$lib/api";
+  import UsageChart from "$lib/components/UsageChart.svelte";
 
   let overview = $state<Overview | null>(null);
   let failed = $state(false);
   let detail = $state<RequestDetail | null>(null);
-  let canvas: HTMLCanvasElement | undefined = $state();
   let metric = $state<"requests" | "tokens" | "spend_usd">("requests");
+  let daysWindow = $state(7);
 
-  onMount(async () => {
+  let loadError = $state<string | null>(null);
+
+  async function load(w: number) {
+    failed = false;
+    loadError = null;
     try {
-      overview = await api.overview(7);
-      drawChart();
-    } catch {
+      overview = await api.overview(w);
+    } catch (e) {
       failed = true;
+      loadError = e instanceof Error ? e.message : String(e);
     }
-  });
+  }
 
-  $effect(() => {
-    if (canvas && overview) drawChart();
-  });
+  function changeWindow(w: number) {
+    if (daysWindow === w) return;
+    daysWindow = w;
+    load(w);
+  }
+
+  onMount(() => load(daysWindow));
 
   async function openRequest(id: string) {
     try {
@@ -27,60 +36,6 @@
     } catch {
       detail = null;
     }
-  }
-
-  // A thin 1.5px line. No gradient fill, no glow.
-  function drawChart() {
-    if (!canvas || !overview) return;
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, w, h);
-
-    const styles = getComputedStyle(document.documentElement);
-    const line = styles.getPropertyValue("--accent").trim() || "#c74322";
-    const border = styles.getPropertyValue("--border").trim() || "#d8dde3";
-    const text = styles.getPropertyValue("--text-muted").trim() || "#5c6470";
-
-    const points = overview.series.map((p) => ({ x: new Date(p.day + "T00:00:00Z").getTime(), y: Number(p[metric]) || 0 }));
-    if (points.length < 2) return;
-    const minX = Math.min(...points.map((p) => p.x));
-    const maxX = Math.max(...points.map((p) => p.x));
-    const maxY = Math.max(...points.map((p) => p.y), 1);
-    const padL = 44;
-    const padR = 12;
-    const padT = 12;
-    const padB = 24;
-
-    ctx.strokeStyle = border;
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 3; i++) {
-      const y = padT + ((h - padT - padB) * i) / 3;
-      ctx.beginPath();
-      ctx.moveTo(padL, y);
-      ctx.lineTo(w - padR, y);
-      ctx.stroke();
-      ctx.fillStyle = text;
-      ctx.font = "11px monospace";
-      ctx.textAlign = "right";
-      ctx.fillText(fmtInt(Math.round(maxY * (1 - i / 3))), padL - 8, y + 4);
-    }
-
-    ctx.strokeStyle = line;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    points.forEach((p, i) => {
-      const x = padL + ((p.x - minX) / (maxX - minX || 1)) * (w - padL - padR);
-      const y = padT + (1 - p.y / maxY) * (h - padT - padB);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
   }
 
   function requestDelta(): number | null {
@@ -95,8 +50,8 @@
 
 {#if failed}
   <div class="error-note">
-    <span>Usage couldn't load.</span>
-    <button class="btn" onclick={() => location.reload()}>Retry</button>
+    <span>Usage couldn't load.{loadError ? " " + loadError : ""}</span>
+    <button class="btn" onclick={() => load(daysWindow)}>Retry</button>
   </div>
 {:else if !overview}
   <div class="metrics" aria-hidden="true">
@@ -133,13 +88,20 @@
   <section class="block">
     <div class="block-head">
       <h2 class="section-heading">Usage</h2>
-      <div class="tabs" role="tablist" aria-label="Metric">
-        <button class="tab" class:on={metric === "requests"} onclick={() => (metric = "requests")}>Requests</button>
-        <button class="tab" class:on={metric === "tokens"} onclick={() => (metric = "tokens")}>Tokens</button>
-        <button class="tab" class:on={metric === "spend_usd"} onclick={() => (metric = "spend_usd")}>Spend</button>
+      <div class="head-controls">
+        <div class="tabs" role="tablist" aria-label="Metric">
+          <button class="tab" class:on={metric === "requests"} onclick={() => (metric = "requests")}>Requests</button>
+          <button class="tab" class:on={metric === "tokens"} onclick={() => (metric = "tokens")}>Tokens</button>
+          <button class="tab" class:on={metric === "spend_usd"} onclick={() => (metric = "spend_usd")}>Spend</button>
+        </div>
+        <div class="tabs" role="tablist" aria-label="Window">
+          <button class="tab" class:on={daysWindow === 7} onclick={() => changeWindow(7)}>7d</button>
+          <button class="tab" class:on={daysWindow === 30} onclick={() => changeWindow(30)}>30d</button>
+          <button class="tab" class:on={daysWindow === 90} onclick={() => changeWindow(90)}>90d</button>
+        </div>
       </div>
     </div>
-    <canvas bind:this={canvas} class="chart" height="220"></canvas>
+    <UsageChart series={overview.series} {metric} days={daysWindow} />
   </section>
 
   <section class="block">
@@ -214,6 +176,14 @@
     align-items: center;
     justify-content: space-between;
     margin-bottom: 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .head-controls {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
   }
 
   .tabs {
@@ -241,14 +211,7 @@
     font-weight: 500;
   }
 
-  .chart {
-    width: 100%;
-    height: 220px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-panel);
-    background: var(--surface);
-    display: block;
-  }
+
 
   .drawer-head {
     display: flex;

@@ -3,14 +3,13 @@
 </script>
 
 <nav class="sidebar" aria-label="Console">
-  <a class="brand" href="/console/">HORIZON</a>
+  <a class="brand" href="/console/">Gateway</a>
   <ul class="nav">
     <li><a href="/console/">Overview</a></li>
     <li><a href="/console/playground/">Playground</a></li>
     <li><a href="/console/models/">Models</a></li>
     <li><a href="/console/usage/">Usage</a></li>
     <li><a href="/console/requests/">Requests</a></li>
-    <li><a href="/console/quickstart/">Quickstart</a></li>
   </ul>
   <div class="foot">
     <div class="who">

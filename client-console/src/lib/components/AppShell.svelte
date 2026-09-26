@@ -1,9 +1,14 @@
 <script lang="ts">
   import Sidebar from "$lib/components/Sidebar.svelte";
   import TopBar from "$lib/components/TopBar.svelte";
-  import { session, signOutLocal } from "$lib/state/session.svelte";
+  import { session, signOutLocal, loadSession } from "$lib/state/session.svelte";
 
   let { children } = $props();
+  loadSession();
+  $effect(() => {
+    if (session.state === "signed-out")
+      location.assign("/console/signin");
+  });
 
   async function signOut() {
     await fetch("/console/logout", { method: "POST", credentials: "same-origin" });

@@ -139,6 +139,11 @@ function consoleFileResponse(path) {
         }
       });
     }
+    // A missing hashed asset is a real 404, never the SPA shell. Returning
+    // HTML here masks a stale-cache module load as JavaScript and hydration
+    // dies silently. Only navigations fall back to index.html.
+    if (rel.startsWith("_app/"))
+      return new Response("not found", { status: 404, headers: { "content-type": "text/plain" } });
   }
   const indexFile = join(CONSOLE_DIST, "index.html");
   if (existsSync(indexFile)) {
