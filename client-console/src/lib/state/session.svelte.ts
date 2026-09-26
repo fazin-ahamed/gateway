@@ -7,7 +7,7 @@ export type SessionState =
   | { state: "signed-out" }
   | { state: "signed-in"; keyName: string };
 
-let current: SessionState = { state: "loading" };
+let current = $state<SessionState>({ state: "loading" });
 
 export const session = {
   get state() {

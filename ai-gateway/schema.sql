@@ -125,9 +125,6 @@ CREATE TABLE IF NOT EXISTS console_accounts (
   password_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
 
 -- Always-on, body-free per-request ledger. This is the customer-facing
 -- operational truth: Overview, Requests and Usage read it, and it records
