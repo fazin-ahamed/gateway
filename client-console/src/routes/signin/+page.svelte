@@ -48,8 +48,8 @@
 
 <main class="wrap">
   <div class="panel">
-    <h1 class="panel-title">Gateway console</h1>
-    <p class="panel-sub">Sign in with a gateway API key. The key is exchanged for a session cookie and never stored in the browser.</p>
+    <h1 class="panel-title">Astrosphere</h1>
+    <p class="panel-sub">Sign in with your gateway API key. It is exchanged for a session cookie and never stored in the browser.</p>
     <form onsubmit={signIn} class="form">
       <label for="key">API key</label>
       <input

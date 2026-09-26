@@ -1,34 +1,47 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, fmtInt, fmtUsd, fmtMs, type Overview, type RequestDetail } from "$lib/api";
+  import { api, fmtInt, fmtUsd, fmtMs, type Activity, type Limits, type RequestDetail } from "$lib/api";
   import UsageChart from "$lib/components/UsageChart.svelte";
+  import RequestDrawer from "$lib/components/RequestDrawer.svelte";
 
-  let overview = $state<Overview | null>(null);
+  type Recent = {
+    id: string;
+    created_at: string;
+    slug: string;
+    model_kind: string;
+    http_status: number | null;
+    latency_ms: number | null;
+    tokens: number;
+    cost_usd: number;
+  };
+
+  let activity = $state<Activity | null>(null);
+  let limits = $state<Limits | null>(null);
+  let recent = $state<Recent[] | null>(null);
   let failed = $state(false);
   let detail = $state<RequestDetail | null>(null);
   let metric = $state<"requests" | "tokens" | "spend_usd">("requests");
-  let daysWindow = $state(7);
+  let hours = $state(168);
 
-  let loadError = $state<string | null>(null);
-
-  async function load(w: number) {
+  async function load(h: number) {
     failed = false;
-    loadError = null;
     try {
-      overview = await api.overview(w);
-    } catch (e) {
+      const [act, lim, ov] = await Promise.all([api.activity(h), api.limits(), api.overview(Math.max(1, Math.ceil(h / 24)))]);
+      activity = act;
+      limits = lim;
+      recent = ov.recent;
+    } catch {
       failed = true;
-      loadError = e instanceof Error ? e.message : String(e);
     }
   }
 
-  function changeWindow(w: number) {
-    if (daysWindow === w) return;
-    daysWindow = w;
-    load(w);
+  function changeWindow(h: number) {
+    if (hours === h) return;
+    hours = h;
+    load(h);
   }
 
-  onMount(() => load(daysWindow));
+  onMount(() => load(hours));
 
   async function openRequest(id: string) {
     try {
@@ -38,135 +51,138 @@
     }
   }
 
-  function requestDelta(): number | null {
-    if (!overview?.prior_totals) return null;
-    const prev = overview.prior_totals.requests;
-    if (!prev) return null;
-    return ((overview.totals.requests - prev) / prev) * 100;
+  const points = $derived(
+    (activity?.points || []).map((p) => ({ t: p.hour, requests: p.requests, tokens: p.tokens, spend_usd: p.spend_usd }))
+  );
+
+  function budgetText(l: Limits) {
+    if (l.budget.mode === "usd") return `${fmtUsd(l.budget.used)} of ${fmtUsd(l.budget.limit)}`;
+    return `${fmtInt(l.budget.used)} of ${fmtInt(l.budget.limit)} tokens`;
   }
 </script>
 
-<h1 class="page-title">Overview</h1>
+<div class="head">
+  <div>
+    <h1 class="page-title">Activity</h1>
+    <p class="lede">What this key has sent through Astrosphere.</p>
+  </div>
+  <div class="tabs" role="tablist" aria-label="Window">
+    <button class="tab" class:on={hours === 24} onclick={() => changeWindow(24)}>24h</button>
+    <button class="tab" class:on={hours === 168} onclick={() => changeWindow(168)}>7d</button>
+    <button class="tab" class:on={hours === 720} onclick={() => changeWindow(720)}>30d</button>
+  </div>
+</div>
 
 {#if failed}
   <div class="error-note">
-    <span>Usage couldn't load.{loadError ? " " + loadError : ""}</span>
-    <button class="btn" onclick={() => load(daysWindow)}>Retry</button>
+    <span>Activity couldn't load.</span>
+    <button class="btn" onclick={() => load(hours)}>Retry</button>
   </div>
-{:else if !overview}
+{:else if !activity}
   <div class="metrics" aria-hidden="true">
-    {#each ["Requests", "Tokens", "Spend", "p95 TTFT"] as label (label)}
-      <div class="metric">
-        <div class="label">{label}</div>
-        <div class="skeleton-row" style="margin-top:8px;width:60%"></div>
-      </div>
+    {#each ["Requests", "Succeeded", "Failed", "Spend"] as label (label)}
+      <div class="metric"><div class="label">{label}</div><div class="skeleton-row" style="margin-top:8px;width:60%"></div></div>
     {/each}
   </div>
 {:else}
   <div class="metrics">
-    <div class="metric">
-      <div class="label">Requests</div>
-      <div class="value">{fmtInt(overview.totals.requests)}</div>
-      {#if requestDelta() !== null}
-        <div class="delta">{requestDelta()!.toFixed(1)}% vs prior period</div>
-      {/if}
-    </div>
-    <div class="metric">
-      <div class="label">Tokens</div>
-      <div class="value">{fmtInt(overview.totals.tokens)}</div>
-    </div>
-    <div class="metric">
-      <div class="label">Spend</div>
-      <div class="value">{fmtUsd(overview.totals.spend_usd)}</div>
-    </div>
-    <div class="metric">
-      <div class="label">p95 TTFT</div>
-      <div class="value">{fmtMs(overview.totals.p95_ttft_ms)}</div>
-    </div>
+    <div class="metric"><div class="label">Requests</div><div class="value">{fmtInt(activity.totals.requests)}</div></div>
+    <div class="metric"><div class="label">Succeeded</div><div class="value">{fmtInt(activity.totals.ok)}</div></div>
+    <div class="metric"><div class="label">Failed</div><div class="value">{fmtInt(activity.totals.fail)}</div></div>
+    <div class="metric"><div class="label">Spend</div><div class="value">{fmtUsd(activity.totals.spend_usd)}</div></div>
   </div>
+
+  {#if limits}
+    <p class="limit-line">
+      Budget {budgetText(limits)}.
+      {#if limits.rate.per_minute}
+        Rate {fmtInt(limits.rate.used_this_minute)} of {fmtInt(limits.rate.per_minute)} this minute.
+      {:else}
+        No per-minute cap.
+      {/if}
+      <a href="/console/limits/">Limits</a>
+    </p>
+  {/if}
 
   <section class="block">
     <div class="block-head">
-      <h2 class="section-heading">Usage</h2>
-      <div class="head-controls">
-        <div class="tabs" role="tablist" aria-label="Metric">
-          <button class="tab" class:on={metric === "requests"} onclick={() => (metric = "requests")}>Requests</button>
-          <button class="tab" class:on={metric === "tokens"} onclick={() => (metric = "tokens")}>Tokens</button>
-          <button class="tab" class:on={metric === "spend_usd"} onclick={() => (metric = "spend_usd")}>Spend</button>
-        </div>
-        <div class="tabs" role="tablist" aria-label="Window">
-          <button class="tab" class:on={daysWindow === 7} onclick={() => changeWindow(7)}>7d</button>
-          <button class="tab" class:on={daysWindow === 30} onclick={() => changeWindow(30)}>30d</button>
-          <button class="tab" class:on={daysWindow === 90} onclick={() => changeWindow(90)}>90d</button>
-        </div>
+      <h2 class="section-heading">Global activity</h2>
+      <div class="tabs" role="tablist" aria-label="Metric">
+        <button class="tab" class:on={metric === "requests"} onclick={() => (metric = "requests")}>Requests</button>
+        <button class="tab" class:on={metric === "tokens"} onclick={() => (metric = "tokens")}>Tokens</button>
+        <button class="tab" class:on={metric === "spend_usd"} onclick={() => (metric = "spend_usd")}>Spend</button>
       </div>
     </div>
-    <UsageChart series={overview.series} {metric} days={daysWindow} />
+    {#if points.length}
+      <UsageChart series={points} {metric} />
+    {:else}
+      <div class="empty">
+        <p>No requests in this window.</p>
+        <p class="meta">Send one through the gateway and it will appear on the hour it landed.</p>
+      </div>
+    {/if}
   </section>
 
   <section class="block">
-    <h2 class="section-heading">Recent requests</h2>
-    {#if overview.recent.length === 0}
-      <div class="empty">
-        <p>No requests yet.</p>
-        <p class="meta">Send your first request to see latency and usage here.</p>
-      </div>
+    <h2 class="section-heading">Recent</h2>
+    {#if !recent || recent.length === 0}
+      <div class="empty"><p>Nothing recorded yet.</p></div>
     {:else}
-      <div class="table-scroll"><table class="table">
-        <thead>
-          <tr>
-            <th>Time</th><th>Model</th><th>Type</th><th>Status</th>
-            <th class="r">Latency</th><th class="r">Tokens</th><th class="r">Cost</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each overview.recent as r (r.id)}
-            <tr class="clickable" onclick={() => openRequest(r.id)}>
-              <td class="mono">{r.created_at.slice(11, 19)}</td>
-              <td>{r.slug}</td>
-              <td>{r.model_kind}</td>
-              <td>
-                <span class="status" class:status-ok={r.http_status === 200} class:status-bad={r.http_status !== 200}>
-                  {r.http_status ?? "—"}
-                </span>
-              </td>
-              <td class="r">{fmtMs(r.latency_ms)}</td>
-              <td class="r">{r.tokens ? fmtInt(r.tokens) : "—"}</td>
-              <td class="r">{fmtUsd(r.cost_usd)}</td>
+      <div class="table-scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Model</th><th>Status</th>
+              <th class="r">Latency</th><th class="r">Tokens</th><th class="r">Cost</th>
             </tr>
-          {/each}
-        </tbody>
-      </table></div>
+          </thead>
+          <tbody>
+            {#each recent as r (r.id)}
+              <tr class="clickable" onclick={() => openRequest(r.id)}>
+                <td class="mono">{r.created_at.slice(5, 16).replace("T", " ")}</td>
+                <td>{r.slug}</td>
+                <td><span class="status" class:status-ok={r.http_status === 200} class:status-bad={r.http_status !== 200}>{r.http_status ?? "—"}</span></td>
+                <td class="r">{fmtMs(r.latency_ms)}</td>
+                <td class="r">{r.tokens ? fmtInt(r.tokens) : "—"}</td>
+                <td class="r">{fmtUsd(r.cost_usd)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     {/if}
   </section>
 {/if}
 
 {#if detail}
-  <div class="drawer-backdrop" role="presentation" onclick={() => (detail = null)} onkeydown={(e) => { if (e.key === "Escape") detail = null; }}></div>
-  <div class="drawer" role="dialog" aria-modal="true" aria-label="Request detail">
-    <div class="drawer-head">
-      <h2 class="section-heading">Request</h2>
-      <button class="btn btn-quiet" onclick={() => (detail = null)}>Close</button>
-    </div>
-    <p class="mono" style="margin:8px 0 20px">{detail.id}</p>
-    <dl class="kv">
-      <dt>Status</dt><dd>{detail.http_status ?? detail.status}</dd>
-      <dt>Model</dt><dd>{detail.slug}</dd>
-      <dt>Type</dt><dd>{detail.model_kind}</dd>
-      <dt>Stream</dt><dd>{detail.stream ? "Yes" : "No"}</dd>
-      <dt>Headers</dt><dd>{fmtMs(detail.headers_ms)}</dd>
-      <dt>First token</dt><dd>{fmtMs(detail.ttft_ms)}</dd>
-      <dt>Completed</dt><dd>{fmtMs(detail.latency_ms)}</dd>
-      <dt>Input</dt><dd>{fmtInt(detail.prompt_tokens)}</dd>
-      <dt>Output</dt><dd>{fmtInt(detail.completion_tokens)}</dd>
-      <dt>Cost</dt><dd>{fmtUsd(detail.cost_usd)}</dd>
-      <dt>Attempts</dt><dd>{detail.attempts ?? "—"}</dd>
-      <dt>Cache</dt><dd>{detail.cache_state ?? "—"}</dd>
-    </dl>
-  </div>
+  <RequestDrawer {detail} onClose={() => (detail = null)} />
 {/if}
 
 <style>
+  .head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .lede {
+    margin: 4px 0 0;
+    color: var(--text-muted);
+    font-size: 14px;
+  }
+
+  .limit-line {
+    margin: 12px 0 0;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .limit-line a {
+    color: var(--accent);
+  }
+
   .block {
     margin-top: 28px;
   }
@@ -175,65 +191,14 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 12px;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .head-controls {
-    display: flex;
     gap: 12px;
-    flex-wrap: wrap;
+    margin-bottom: 12px;
   }
 
-  .tabs {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-control);
-    overflow: hidden;
-  }
-
-  .tab {
-    padding: 4px 12px;
-    font-size: 12px;
-    line-height: 17px;
-    color: var(--text-muted);
-    border-right: 1px solid var(--border);
-  }
-
-  .tab:last-child {
-    border-right: none;
-  }
-
-  .tab.on {
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-weight: 500;
-  }
-
-
-
-  .drawer-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .kv {
-    display: grid;
-    grid-template-columns: 120px 1fr;
-    gap: 8px 16px;
-    font-size: 13px;
-    line-height: 19px;
-    margin: 0;
-  }
-
-  .kv dt {
-    color: var(--text-muted);
-  }
-
-  .kv dd {
-    margin: 0;
-    font-variant-numeric: tabular-nums;
+  @media (max-width: 639px) {
+    .head, .block-head {
+      flex-direction: column;
+      align-items: flex-start;
+    }
   }
 </style>

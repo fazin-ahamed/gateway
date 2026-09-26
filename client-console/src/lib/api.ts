@@ -1,8 +1,8 @@
 // Thin fetch wrappers for the purpose-built client API. Every call rides the
 // HttpOnly session cookie; nothing here ever touches an sk- key.
 
-async function json<T>(path: string): Promise<T> {
-  const res = await fetch(path, { credentials: "same-origin" });
+async function json<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, { credentials: "same-origin", ...init });
   if (res.status === 401) {
     location.assign("/console/signin");
     throw new Error("session expired");
@@ -73,9 +73,35 @@ export type RequestDetail = {
   attempts: number | null;
   cache_state: string | null;
 };
+export type Activity = {
+  window: { hours: number };
+  totals: { requests: number; ok: number; fail: number; tokens: number; spend_usd: number };
+  points: Array<{ hour: string; requests: number; ok: number; fail: number; tokens: number; spend_usd: number }>;
+};
+
+export type Limits = {
+  name: string;
+  active: boolean;
+  expires_at: string | null;
+  budget: { mode: string; limit: number; used: number; remaining: number; request_count: number };
+  rate: { per_minute: number; used_this_minute: number };
+};
+
+export type Settings = {
+  response_cache: { enabled: boolean; entries: number; hits: number; saved_usd: number; saved_tokens: number };
+};
 
 export const api = {
   overview: (days: number) => json<Overview>(`/console/api/overview?days=${days}`),
+  activity: (hours: number) => json<Activity>(`/console/api/activity?hours=${hours}`),
+  limits: () => json<Limits>("/console/api/limits"),
+  settings: () => json<Settings>("/console/api/settings"),
+  setCache: (on: boolean) =>
+    json<{ response_cache: { enabled: boolean } }>("/console/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ response_cache: on ? "on" : "off" })
+    }),
   models: () => json<{ data: ConsoleModel[] }>("/console/api/models"),
   request: (id: string) => json<RequestDetail>(`/console/api/requests/${encodeURIComponent(id)}`)
 };

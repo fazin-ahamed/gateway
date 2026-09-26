@@ -143,3 +143,46 @@ test("request drill-down returns body-free facts for the drawer", async () => {
   const foreign = await app.fetch(new Request("http://gw/console/api/requests/req_x", { headers: { cookie } }));
   assert.equal(foreign.status, 404);
 });
+
+test("activity is hourly and stays inside the signed-in key", async () => {
+  const { app } = await consoleGateway();
+  const auth = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console" })
+  }));
+  const res = await app.fetch(new Request("http://gw/console/api/activity?hours=168", { headers: { cookie: cookieFrom(auth) } }));
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.totals.requests, 3);
+  assert.equal(body.totals.ok, 2);
+  assert.equal(body.totals.fail, 1);
+  assert.ok(body.points.length >= 1 && body.points.length <= 3, "quiet hours are omitted");
+  assert.ok(body.points.every((p) => p.hour.endsWith(":00:00Z")));
+  assert.equal(body.totals.tokens, 4200);
+});
+
+test("limits report the key budget and the settings toggle disables the response cache", async () => {
+  const { app, db } = await consoleGateway();
+  db.prepare("UPDATE api_keys SET budget_limit=?, used_usd=?, request_limit_per_minute=? WHERE key_id=?").bind(10, 2.5, 30, "sk-console").run();
+  const auth = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console" })
+  }));
+  const cookie = cookieFrom(auth);
+  const limits = await (await app.fetch(new Request("http://gw/console/api/limits", { headers: { cookie } }))).json();
+  assert.equal(limits.budget.limit, 10);
+  assert.equal(limits.budget.used, 2.5);
+  assert.equal(limits.budget.remaining, 7.5);
+  assert.equal(limits.rate.per_minute, 30);
+
+  const before = await (await app.fetch(new Request("http://gw/console/api/settings", { headers: { cookie } }))).json();
+  assert.equal(before.response_cache.enabled, true);
+  const saved = await app.fetch(new Request("http://gw/console/api/settings", {
+    method: "POST", headers: { "content-type": "application/json", cookie }, body: JSON.stringify({ response_cache: "off" })
+  }));
+  assert.equal(saved.status, 200);
+  const after = await (await app.fetch(new Request("http://gw/console/api/settings", { headers: { cookie } }))).json();
+  assert.equal(after.response_cache.enabled, false);
+  const bad = await app.fetch(new Request("http://gw/console/api/settings", {
+    method: "POST", headers: { "content-type": "application/json", cookie }, body: JSON.stringify({ response_cache: "maybe" })
+  }));
+  assert.equal(bad.status, 400);
+});

@@ -20,16 +20,3 @@
   </AppShell>
 {/if}
 
-<style>
-  .boot, a {
-    position: fixed;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 13px;
-    color: var(--text-muted);
-    text-decoration: none;
-    background: var(--canvas);
-  }
-</style>

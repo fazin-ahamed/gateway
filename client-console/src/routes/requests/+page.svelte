@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, fmtInt, fmtMs, fmtUsd, type RequestDetail } from "$lib/api";
+  import RequestDrawer from "$lib/components/RequestDrawer.svelte";
 
   type Row = {
     id: string;
@@ -136,29 +137,7 @@
 {/if}
 
 {#if detail}
-  <div class="drawer-backdrop" role="presentation" onclick={() => (detail = null)} onkeydown={(e) => { if (e.key === "Escape") detail = null; }}></div>
-  <div class="drawer" role="dialog" aria-modal="true" aria-label="Request detail">
-    <div class="drawer-head">
-      <h2 class="section-heading">Request</h2>
-      <button class="btn btn-quiet" onclick={() => (detail = null)}>Close</button>
-    </div>
-    <p class="mono" style="margin:8px 0 20px">{detail.id}</p>
-    <dl class="kv">
-      <dt>Status</dt><dd>{detail.http_status ?? detail.status}</dd>
-      <dt>Model</dt><dd>{detail.slug}</dd>
-      <dt>Type</dt><dd>{detail.model_kind}</dd>
-      <dt>Stream</dt><dd>{detail.stream ? "Yes" : "No"}</dd>
-      <dt>Created</dt><dd>{detail.created_at.slice(0, 19).replace("T", " ")}</dd>
-      <dt>Headers</dt><dd>{fmtMs(detail.headers_ms)}</dd>
-      <dt>First token</dt><dd>{fmtMs(detail.ttft_ms)}</dd>
-      <dt>Total latency</dt><dd>{fmtMs(detail.latency_ms)}</dd>
-      <dt>Input tokens</dt><dd>{fmtInt(detail.prompt_tokens)}</dd>
-      <dt>Output tokens</dt><dd>{fmtInt(detail.completion_tokens)}</dd>
-      <dt>Cost</dt><dd>{fmtUsd(detail.cost_usd)}</dd>
-      <dt>Attempts</dt><dd>{detail.attempts}</dd>
-      <dt>Cache</dt><dd>{detail.cache_state ?? "—"}</dd>
-    </dl>
-  </div>
+  <RequestDrawer {detail} onClose={() => (detail = null)} />
 {/if}
 
 <style>
@@ -199,27 +178,4 @@
     font-weight: 500;
   }
 
-  .drawer-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .kv {
-    display: grid;
-    grid-template-columns: 130px 1fr;
-    gap: 8px 16px;
-    font-size: 13px;
-    line-height: 19px;
-    margin: 0;
-  }
-
-  .kv dt {
-    color: var(--text-muted);
-  }
-
-  .kv dd {
-    margin: 0;
-    font-variant-numeric: tabular-nums;
-  }
 </style>

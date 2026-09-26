@@ -1,15 +1,20 @@
 <script lang="ts">
+  import { page } from "$app/state";
   let { keyName, onSignOut } = $props();
+  const here = $derived(page.url.pathname.replace(/\/$/, "") || "/console");
+  const current = (href: string) => (here === href.replace(/\/$/, "") ? "page" : undefined);
 </script>
 
 <nav class="sidebar" aria-label="Console">
-  <a class="brand" href="/console/">Gateway</a>
+  <a class="brand" href="/console/">Astrosphere</a>
   <ul class="nav">
-    <li><a href="/console/">Overview</a></li>
-    <li><a href="/console/playground/">Playground</a></li>
-    <li><a href="/console/models/">Models</a></li>
-    <li><a href="/console/usage/">Usage</a></li>
-    <li><a href="/console/requests/">Requests</a></li>
+    <li><a href="/console/" aria-current={current("/console/")}>Activity</a></li>
+    <li><a href="/console/requests/" aria-current={current("/console/requests/")}>Requests</a></li>
+    <li><a href="/console/usage/" aria-current={current("/console/usage/")}>Usage</a></li>
+    <li><a href="/console/models/" aria-current={current("/console/models/")}>Models</a></li>
+    <li><a href="/console/playground/" aria-current={current("/console/playground/")}>Playground</a></li>
+    <li><a href="/console/limits/" aria-current={current("/console/limits/")}>Limits</a></li>
+    <li><a href="/console/settings/" aria-current={current("/console/settings/")}>Settings</a></li>
   </ul>
   <div class="foot">
     <div class="who">
@@ -31,12 +36,12 @@
     top: 0;
     height: 100dvh;
   }
-
   .brand {
-    padding: 18px 20px 14px;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.06em;
+    padding: 20px 20px 18px;
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
     color: var(--text);
   }
 

@@ -933,6 +933,109 @@ app.get("/console/api/overview", async (c) => {
   });
 });
 
+// Hourly activity for the signed-in key. Daily buckets hide a burst that
+// lands inside one day; the chart needs the hours those requests actually
+// happened in. Zero hours stay out so a quiet week does not draw a flat line.
+app.get("/console/api/activity", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const hours = Math.min(24 * 30, Math.max(1, Number(c.req.query("hours")) || 24 * 7));
+  const since = new Date(Date.now() - hours * 3600000).toISOString();
+  const rows = await c.env.DB.prepare(
+    "SELECT substr(created_at,1,13) bucket, COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok, SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) fail, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY substr(created_at,1,13) ORDER BY bucket"
+  ).bind(sess.keyId, since).all();
+  const points = (rows.results || []).map((r) => ({
+    hour: String(r.bucket) + ":00:00Z",
+    requests: Number(r.requests) || 0,
+    ok: Number(r.ok) || 0,
+    fail: Number(r.fail) || 0,
+    tokens: Number(r.tokens) || 0,
+    spend_usd: Number(r.spend_usd) || 0
+  }));
+  const totals = points.reduce((a, p) => ({
+    requests: a.requests + p.requests,
+    ok: a.ok + p.ok,
+    fail: a.fail + p.fail,
+    tokens: a.tokens + p.tokens,
+    spend_usd: a.spend_usd + p.spend_usd
+  }), { requests: 0, ok: 0, fail: 0, tokens: 0, spend_usd: 0 });
+  return c.json({ window: { hours }, totals, points });
+});
+
+// The signed-in key's own budget and rate limit. These are operator-set;
+// the console shows them and never writes them.
+app.get("/console/api/limits", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const key = await c.env.DB.prepare(
+    "SELECT name, budget_mode, budget_limit, used_tokens, used_usd, request_count, request_limit_per_minute, expires_at, active FROM api_keys WHERE key_id=?"
+  ).bind(sess.keyId).first();
+  if (!key)
+    return c.json({ error: { message: "The API key for this session no longer exists.", type: "auth_error" } }, 401);
+  const now = new Date();
+  const bucket = now.toISOString().slice(0, 16);
+  const window = await c.env.DB.prepare(
+    "SELECT request_count FROM api_key_rate_windows WHERE key_id=? AND bucket=?"
+  ).bind(sess.keyId, bucket).first();
+  const mode = String(key.budget_mode || "usd");
+  const used = mode === "usd" ? Number(key.used_usd) || 0 : Number(key.used_tokens) || 0;
+  const limit = Number(key.budget_limit) || 0;
+  return c.json({
+    name: String(key.name || ""),
+    active: !!key.active,
+    expires_at: key.expires_at || null,
+    budget: {
+      mode,
+      limit,
+      used,
+      remaining: Math.max(0, limit - used),
+      request_count: Number(key.request_count) || 0
+    },
+    rate: {
+      per_minute: key.request_limit_per_minute == null ? 0 : Number(key.request_limit_per_minute),
+      used_this_minute: window ? Number(window.request_count) || 0 : 0
+    }
+  });
+});
+
+// Gateway-side response cache, as this key experiences it. The toggle is a
+// gateway setting: turning it off stops serving cached completions for every
+// key. The console is the place a key holder is told to look.
+app.get("/console/api/settings", async (c) => {
+  const { denied } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const enabled = (await settingValue(c, "response_cache_enabled", "on")) !== "off";
+  const row = await c.env.DB.prepare(
+    "SELECT COUNT(*) entries, COALESCE(SUM(hits),0) hits, COALESCE(SUM(source_cost_usd * hits),0) saved_usd, COALESCE(SUM(source_tokens * hits),0) saved_tokens FROM response_cache"
+  ).first();
+  return c.json({
+    response_cache: {
+      enabled,
+      entries: Number(row && row.entries) || 0,
+      hits: Number(row && row.hits) || 0,
+      saved_usd: Number(row && row.saved_usd) || 0,
+      saved_tokens: Number(row && row.saved_tokens) || 0
+    }
+  });
+});
+
+app.post("/console/api/settings", async (c) => {
+  const { denied } = await requireConsoleSession(c);
+  if (denied) return denied;
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }, 400);
+  }
+  if (body.response_cache !== "on" && body.response_cache !== "off")
+    return c.json({ error: { message: "response_cache must be on or off", type: "invalid_request_error" } }, 400);
+  await c.env.DB.prepare(
+    "INSERT INTO gateway_settings (key, value, updated_at) VALUES ('response_cache_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+  ).bind(body.response_cache, nowIso()).run();
+  return c.json({ response_cache: { enabled: body.response_cache === "on" } });
+});
+
 // Filterable request list. Filters compose; every value is validated so a bad
 // query parameter cannot poison the SQL.
 app.get("/console/api/requests", async (c) => {
@@ -1373,7 +1476,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     return modelDenied;
   }
   const cacheModeHeader = String(c.req.header("x-gateway-cache") || "true").toLowerCase();
-  const cacheMode = (cacheModeHeader === "off" || cacheModeHeader === "false" || cacheModeHeader === "0") ? "off" : cacheModeHeader;
+  const cacheSetting = (await settingValue(c, "response_cache_enabled", "on")) !== "off" ? cacheModeHeader : "off";
+  const cacheMode = (cacheSetting === "off" || cacheSetting === "false" || cacheSetting === "0") ? "off" : cacheSetting;
   const cacheable = !!key && !autoDecision && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
   blog("REQ id=" + requestId + " model=" + slug + " stream=" + isStream + " cache=" + cacheMode + (cacheKey ? "" : "-skip") + " key=" + (key ? key.name : "admin-playground"));

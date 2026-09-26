@@ -3,136 +3,185 @@
   import UPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
 
-  type Point = { day: string; requests: number; tokens: number; spend_usd: number };
+  type Point = { t: string; requests: number; tokens: number; spend_usd: number };
   type Metric = "requests" | "tokens" | "spend_usd";
 
-  let { series, metric, days }: { series: Point[]; metric: Metric; days: number } = $props();
+  let { series, metric }: { series: Point[]; metric: Metric } = $props();
 
   let container: HTMLDivElement | undefined = $state();
   let plot: UPlot | null = null;
   let ro: ResizeObserver | null = null;
   let frame: number | null = null;
+  let hover = $state<{ when: string; value: string } | null>(null);
+  const latest = $derived(series.length ? { when: when(Math.round(new Date(series[series.length - 1].t).getTime() / 1000)), value: fmt(Number(series[series.length - 1][metric]) || 0) } : null);
+  const shown = $derived(hover ?? latest);
 
-  const fmt = (v: number) =>
-    metric === "spend_usd"
-      ? "$" + (v >= 1 ? v.toFixed(0) : v.toFixed(2))
-      : Intl.NumberFormat("en", { notation: v >= 100000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(v);
+  const label = $derived(metric === "spend_usd" ? "Spend" : metric === "tokens" ? "Tokens" : "Requests");
+
+  function fmt(v: number) {
+    if (metric === "spend_usd") return "$" + (Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(4));
+    return Intl.NumberFormat("en", { notation: v >= 10000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(v);
+  }
+
+  function when(sec: number) {
+    return new Date(sec * 1000).toLocaleString("en", { month: "short", day: "numeric", hour: "numeric" });
+  }
 
   function render() {
-    if (!container || !series.length)
-      return;
+    if (!container || !series.length) return;
+    const x = series.map((p) => Math.round(new Date(p.t).getTime() / 1000));
+    const y = series.map((p) => Number(p[metric]) || 0);
+    hover = { when: when(x[x.length - 1]), value: fmt(y[y.length - 1]) };
     try {
-      const x = series.map((p) => Math.round(new Date(p.day + "T00:00:00Z").getTime() / 1000));
-      const y = series.map((p) => Number(p[metric]) || 0);
+      const span = Math.max(3600, (x[x.length - 1] || 0) - (x[0] || 0));
       const styles = getComputedStyle(document.documentElement);
-      const accent = styles.getPropertyValue("--accent").trim() || "#c74322";
-      const border = styles.getPropertyValue("--border").trim() || "#d8dde3";
+      const accent = styles.getPropertyValue("--accent").trim() || "#d7a15a";
+      const grid = styles.getPropertyValue("--border").trim() || "#2a241c";
+      const peak = Math.max(...y, 0);
 
       plot?.destroy();
       plot = new UPlot(
         {
           width: container.clientWidth,
-          height: 240,
-          padding: [8, 8, 0, 0],
-          cursor: { drag: { x: false, y: false }, points: { size: 5 } },
+          height: 280,
+          padding: [16, 12, 0, 0],
+          cursor: {
+            drag: { x: false, y: false },
+            points: { size: 8, fill: accent },
+            x: true,
+            y: false
+          },
+          hooks: {
+            setCursor: [
+              (u) => {
+                const i = u.cursor.idx;
+                if (i == null || i < 0) {
+                  hover = null;
+                  return;
+                }
+                hover = { when: when(u.data[0][i]), value: fmt(u.data[1][i] || 0) };
+              }
+            ]
+          },
           series: [
             {},
             {
-              label: metric === "spend_usd" ? "Spend" : metric.charAt(0).toUpperCase() + metric.slice(1),
+              label,
               stroke: accent,
-              width: 1.5,
-              points: { show: true, size: 4 },
+              width: 2,
+              fill: accent + "22",
+              points: { show: true, size: 6, stroke: accent, fill: accent },
               value: (_u: UPlot, v: number | null) => (v == null ? "—" : fmt(v))
             }
           ],
           axes: [
             {
+              stroke: grid,
+              grid: { show: false },
+              ticks: { stroke: grid, size: 4 },
               values: (_u: UPlot, vals: number[]) =>
-                vals.map((v) => new Date(v * 1000).toLocaleDateString("en", { month: "short", day: "numeric" }))
+                vals.map((v) =>
+                  new Date(v * 1000).toLocaleDateString("en", {
+                    month: "short",
+                    day: "numeric",
+                    hour: span > 86400 * 3 ? undefined : "numeric"
+                  })
+                )
             },
             {
-              size: 52,
+              stroke: grid,
+              size: 56,
               values: (_u: UPlot, vals: number[]) => vals.map((v) => (v === 0 ? "0" : fmt(v))),
-              grid: { stroke: border, width: 1 },
-              ticks: { stroke: border, width: 1 }
+              grid: { stroke: grid, width: 1 },
+              ticks: { show: false }
             }
           ],
           scales: {
-            x: { min: x[0] - 43200, max: x[x.length - 1] + 43200 }
+            x: { min: x[0] - span * 0.02, max: x[x.length - 1] + span * 0.02 }
           },
-          legend: { show: true, live: true }
+          legend: { show: false }
         },
         [x, y],
         container
       );
+      const last = series.length - 1;
+      hover = { when: when(x[last]), value: fmt(y[last]) };
     } catch {
       plot = null;
     }
   }
 
-  // Rerender on data change, deferred to an animation frame so nothing throws
-  // inside Svelte's reactive update. A throw there silently aborts the whole
-  // branch render, freezing the page on its skeleton.
   function schedule() {
-    if (frame != null)
-      return;
+    if (frame != null) return;
     frame = requestAnimationFrame(() => {
       frame = null;
-      if (container && Array.isArray(series) && series.length)
-        render();
+      if (container && Array.isArray(series) && series.length) render();
     });
   }
 
-  // Track inputs defensively: the effect reads only what certainly exists.
   $effect(() => {
-    if (container && series)
-      schedule();
+    void metric;
+    void series;
+    if (container) schedule();
   });
 
   onMount(() => {
     ro = new ResizeObserver(() => {
-      if (plot && container)
-        plot.setSize({ width: container.clientWidth, height: 240 });
+      if (plot && container) plot.setSize({ width: container.clientWidth, height: 280 });
     });
-    if (container)
-      ro.observe(container);
+    if (container) ro.observe(container);
   });
 
   onDestroy(() => {
     ro?.disconnect();
-    if (frame != null)
-      cancelAnimationFrame(frame);
+    if (frame != null) cancelAnimationFrame(frame);
     plot?.destroy();
     plot = null;
   });
 </script>
 
-<div bind:this={container} class="chart-wrap" aria-label="Usage chart"></div>
+<div class="chart">
+  <div class="readout" aria-live="polite">
+    {#if shown}
+      <span class="when">{shown.when}</span>
+      <span class="read">{label} {shown.value}</span>
+    {:else}
+      <span class="when">No activity in this window</span>
+    {/if}
+  </div>
+  <div bind:this={container} class="plot" aria-label="Activity chart"></div>
+</div>
 
 <style>
-  .chart-wrap {
-    width: 100%;
+  .chart {
     border: 1px solid var(--border);
-    border-radius: var(--radius-panel);
     background: var(--surface);
-    padding: 12px;
   }
 
-  .chart-wrap :global(.uplot) {
-    font-family: var(--font-sans);
+  .readout {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 16px 0;
+    font-size: 13px;
   }
 
-  .chart-wrap :global(.uplot .u-legend) {
-    font-size: 12px;
+  .when {
     color: var(--text-muted);
   }
 
-  .chart-wrap :global(.uplot .u-legend .u-series:first-child th) {
-    color: var(--text);
-    font-weight: 500;
+  .read {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--accent);
   }
 
-  .chart-wrap :global(.uplot .u-axis text) {
-    fill: var(--text-muted);
+  .plot {
+    width: 100%;
+    min-height: 280px;
+  }
+
+  .plot :global(.uplot) {
+    font-family: var(--font-sans);
   }
 </style>

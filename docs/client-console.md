@@ -1,4 +1,4 @@
-# Gateway client console (`/console`)
+# Astrosphere client console (`/console`)
 
 The client console is a separate customer surface. `/_gw` remains the
 operator cockpit. The console serves from a static SvelteKit build; no Node
@@ -78,6 +78,10 @@ POST /console/auth
 POST /console/logout
 GET  /console/api/me
 GET  /console/api/overview?days=7|30|90
+GET  /console/api/activity?hours=
+GET  /console/api/limits
+GET  /console/api/settings
+POST /console/api/settings        { "response_cache": "on" | "off" }
 GET  /console/api/requests?days=&kind=&status=&model=&request_id=&limit=
 GET  /console/api/requests/:id
 GET  /console/api/usage?days=
