@@ -48,7 +48,7 @@
     <div class="row">
       <div>
         <h2>Response cache</h2>
-        <p>Identical chat requests can be answered from a stored completion instead of calling the provider again. Tool calls are never cached. Turning this off applies to the whole gateway, not only this key.</p>
+        <p>Identical chat requests can be answered from a stored completion instead of calling the provider again. Tool calls are never cached. This applies to your key only — turning it off stops caching for your requests, not anyone else's.</p>
       </div>
       <button class="switch" type="button" role="switch" aria-checked={settings.response_cache.enabled} disabled={saving} onclick={toggle}>
         <span>{settings.response_cache.enabled ? "On" : "Off"}</span>

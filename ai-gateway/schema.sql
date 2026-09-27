@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   excluded_models TEXT,
   active INTEGER NOT NULL DEFAULT 1,
   console_auth INTEGER NOT NULL DEFAULT 1,
+  response_cache INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

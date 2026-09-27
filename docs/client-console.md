@@ -118,6 +118,12 @@ The designation is stored in `gateway_settings` under `shared_pool_key`. The
 console endpoint returns the pool's `key_id` only to an authenticated console
 session, and only because the pill needs to copy it.
 
+Because the pool key is communal — its secret is handed around for `/v1` use —
+it is barred from the console: it cannot sign in (by key or username) and cannot
+hold an account. Designating a key as the pool drops any account and live
+sessions it had, so a previously-personal key loses console access the moment it
+becomes the pool.
+
 ## The request ledger
 
 `request_summaries` is the always-on, body-free per-request ledger the

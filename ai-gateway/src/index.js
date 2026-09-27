@@ -829,6 +829,8 @@ app.post("/console/auth", async (c) => {
     const account = await c.env.DB.prepare("SELECT key_id, password_hash FROM console_accounts WHERE username=?").bind(username).first();
     if (!account || await sha256hex(password) !== account.password_hash)
       return c.json({ error: { message: "That username or password was not accepted.", type: "auth_error" } }, 401);
+    if (await isSharedPoolKey(c, account.key_id))
+      return c.json({ error: { message: "The shared pool key cannot sign in to the console.", type: "auth_error" } }, 403);
     const acctKey = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(account.key_id).first();
     if (!acctKey || !acctKey.active || isKeyExpired(acctKey))
       return c.json({ error: { message: "The key behind this account is no longer active.", type: "auth_error" } }, 401);
@@ -842,6 +844,10 @@ app.post("/console/auth", async (c) => {
   const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(offered).first();
   if (!key || !key.active || isKeyExpired(key))
     return c.json({ error: { message: "That key was not accepted.", type: "auth_error" } }, 401);
+  // The shared pool key is meant to be handed around for /v1 use; it must never
+  // grant a console session or an account.
+  if (await isSharedPoolKey(c, key.key_id))
+    return c.json({ error: { message: "The shared pool key cannot sign in to the console.", type: "auth_error" } }, 403);
   if (isOverBudget(key))
     return c.json({ error: { message: "Key budget exceeded.", type: "budget_exceeded" } }, 429);
   if (Number(key.console_auth) === 0)
@@ -866,6 +872,8 @@ app.post("/console/account", async (c) => {
     return c.json({ error: { message: "Choose a username of 3 or more characters and a password of 8 or more.", type: "invalid_request_error" } }, 400);
   const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(offered).first();
   if (!key) return c.json({ error: { message: "That key was not accepted.", type: "auth_error" } }, 401);
+  if (await isSharedPoolKey(c, key.key_id))
+    return c.json({ error: { message: "The shared pool key cannot have a console account.", type: "invalid_request_error" } }, 403);
   const existing = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
   if (existing) return c.json({ error: { message: "This key already has an account.", type: "invalid_request_error" } }, 409);
   try {
@@ -889,8 +897,11 @@ async function ensureConsoleAuthColumn(db) {
   if (!db || ensureConsoleAuthColumn.done) return;
   try {
     const cols = await db.prepare("PRAGMA table_info(api_keys)").all();
-    if (!(cols.results || []).some((r) => r.name === "console_auth"))
+    const names = new Set((cols.results || []).map((r) => r.name));
+    if (!names.has("console_auth"))
       await db.prepare("ALTER TABLE api_keys ADD COLUMN console_auth INTEGER NOT NULL DEFAULT 1").run();
+    if (!names.has("response_cache"))
+      await db.prepare("ALTER TABLE api_keys ADD COLUMN response_cache INTEGER NOT NULL DEFAULT 1").run();
     ensureConsoleAuthColumn.done = true;
   } catch {}
 }
@@ -1106,16 +1117,26 @@ async function sharedPoolStatus(c) {
   };
 }
 
-// Gateway-side response cache, as this key experiences it. The toggle is a
-// gateway setting: turning it off stops serving cached completions for every
-// key. The console is the place a key holder is told to look.
+// True when keyId is the currently designated shared pool. Used to keep the
+// communal /v1 key out of the console: it can never sign in or hold an account.
+async function isSharedPoolKey(c, keyId) {
+  if (!keyId) return false;
+  const poolId = await settingValue(c, "shared_pool_key", "");
+  return !!poolId && String(poolId) === String(keyId);
+}
+
+// The response cache as THIS key experiences it. Each key controls its own
+// caching: turning it off stops the gateway serving cached completions for this
+// key only, never for anyone else. Stats are scoped to the key too.
 app.get("/console/api/settings", async (c) => {
-  const { denied } = await requireConsoleSession(c);
+  const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
-  const enabled = (await settingValue(c, "response_cache_enabled", "on")) !== "off";
+  await ensureConsoleAuthColumn(c.env.DB);
+  const keyRow = await c.env.DB.prepare("SELECT response_cache FROM api_keys WHERE key_id=?").bind(sess.keyId).first();
+  const enabled = !keyRow || Number(keyRow.response_cache) !== 0;
   const row = await c.env.DB.prepare(
-    "SELECT COUNT(*) entries, COALESCE(SUM(hits),0) hits, COALESCE(SUM(source_cost_usd * hits),0) saved_usd, COALESCE(SUM(source_tokens * hits),0) saved_tokens FROM response_cache"
-  ).first();
+    "SELECT COUNT(*) entries, COALESCE(SUM(hits),0) hits, COALESCE(SUM(source_cost_usd * hits),0) saved_usd, COALESCE(SUM(source_tokens * hits),0) saved_tokens FROM response_cache WHERE key_id=?"
+  ).bind(sess.keyId).first();
   return c.json({
     response_cache: {
       enabled,
@@ -1128,7 +1149,7 @@ app.get("/console/api/settings", async (c) => {
 });
 
 app.post("/console/api/settings", async (c) => {
-  const { denied } = await requireConsoleSession(c);
+  const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
   let body;
   try {
@@ -1138,9 +1159,9 @@ app.post("/console/api/settings", async (c) => {
   }
   if (body.response_cache !== "on" && body.response_cache !== "off")
     return c.json({ error: { message: "response_cache must be on or off", type: "invalid_request_error" } }, 400);
-  await c.env.DB.prepare(
-    "INSERT INTO gateway_settings (key, value, updated_at) VALUES ('response_cache_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
-  ).bind(body.response_cache, nowIso()).run();
+  await ensureConsoleAuthColumn(c.env.DB);
+  await c.env.DB.prepare("UPDATE api_keys SET response_cache=?, updated_at=? WHERE key_id=?")
+    .bind(body.response_cache === "on" ? 1 : 0, nowIso(), sess.keyId).run();
   return c.json({ response_cache: { enabled: body.response_cache === "on" } });
 });
 
@@ -1647,7 +1668,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     return modelDenied;
   }
   const cacheModeHeader = String(c.req.header("x-gateway-cache") || "true").toLowerCase();
-  const cacheSetting = (await settingValue(c, "response_cache_enabled", "on")) !== "off" ? cacheModeHeader : "off";
+  // Per-key: a key that turned its response cache off in the console never serves
+  // or writes cached completions, regardless of any other key's choice.
+  const keyCacheOn = !key || Number(key.response_cache) !== 0;
+  const cacheSetting = keyCacheOn ? cacheModeHeader : "off";
   const cacheMode = (cacheSetting === "off" || cacheSetting === "false" || cacheSetting === "0") ? "off" : cacheSetting;
   const cacheable = !!key && !autoDecision && isCacheableRequest(payload, isStream, cacheMode);
   const cacheKey = cacheable ? await responseCacheKey(key, slug, payload) : null;
@@ -4837,6 +4861,10 @@ app.put("/admin/shared-pool", async (c) => {
   if (keyId) {
     const key = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE key_id=?").bind(keyId).first();
     if (!key) return c.json({ error: { message: "key not found" } }, 404);
+    // The pool key is communal: its secret gets handed around for /v1 use, so it
+    // must not hold console access. Drop any existing account and live sessions.
+    await c.env.DB.prepare("DELETE FROM console_sessions WHERE key_id=?").bind(keyId).run();
+    await c.env.DB.prepare("DELETE FROM console_accounts WHERE key_id=?").bind(keyId).run();
   }
   await c.env.DB.prepare(
     "INSERT INTO gateway_settings (key, value, updated_at) VALUES ('shared_pool_key', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"

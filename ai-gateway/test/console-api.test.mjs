@@ -188,6 +188,34 @@ test("limits report the key budget and the settings toggle disables the response
   assert.equal(bad.status, 400);
 });
 
+test("the response cache toggle is per key, not gateway-wide", async () => {
+  const { app, db } = await consoleGateway();
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, console_auth, created_at, updated_at) VALUES (?,?,1,?,?,0,?,?)")
+    .bind("sk-second", "second", "usd", 1e9, now, now).run();
+
+  const signIn = async (apiKey) => {
+    const r = await app.fetch(new Request("http://gw/console/auth", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: apiKey })
+    }));
+    return cookieFrom(r);
+  };
+  const cookieA = await signIn("sk-console");
+  const cookieB = await signIn("sk-second");
+
+  // Key A turns its cache off.
+  await app.fetch(new Request("http://gw/console/api/settings", {
+    method: "POST", headers: { "content-type": "application/json", cookie: cookieA }, body: JSON.stringify({ response_cache: "off" })
+  }));
+
+  const aState = await (await app.fetch(new Request("http://gw/console/api/settings", { headers: { cookie: cookieA } }))).json();
+  const bState = await (await app.fetch(new Request("http://gw/console/api/settings", { headers: { cookie: cookieB } }))).json();
+  assert.equal(aState.response_cache.enabled, false, "A's cache is off");
+  assert.equal(bState.response_cache.enabled, true, "B is untouched by A's choice");
+  assert.equal(db.prepare("SELECT response_cache FROM api_keys WHERE key_id='sk-console'").first().response_cache, 0);
+  assert.equal(db.prepare("SELECT response_cache FROM api_keys WHERE key_id='sk-second'").first().response_cache, 1);
+});
+
 test("a key with console auth prompts once, then takes a username and password", async () => {
   const { app, db } = await consoleGateway();
   db.prepare("UPDATE api_keys SET console_auth=1 WHERE key_id='sk-console'").run();
@@ -215,4 +243,39 @@ test("a key with console auth prompts once, then takes a username and password",
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console", username: "observer", password: "longenough" })
   }));
   assert.equal(right.status, 200, "the account password signs in");
+});
+
+test("the shared pool key is locked out of the console and loses any account", async () => {
+  const { app, db } = await consoleGateway();
+  db.prepare("UPDATE api_keys SET console_auth=1 WHERE key_id='sk-console'").run();
+  // The key sets up an account and signs in by username, like any owner.
+  await app.fetch(new Request("http://gw/console/account", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ api_key: "sk-console", username: "poolowner", password: "longenough" })
+  }));
+  const byName = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "poolowner", password: "longenough" })
+  }));
+  assert.equal(byName.status, 200, "username login works before the key is a pool");
+
+  // Operator designates it the shared pool: account and live sessions are dropped.
+  const set = await app.fetch(new Request("http://gw/admin/shared-pool", {
+    method: "PUT", headers: { "content-type": "application/json", authorization: "Bearer admin" },
+    body: JSON.stringify({ key_id: "sk-console" })
+  }));
+  assert.equal(set.status, 200);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM console_accounts WHERE key_id='sk-console'").first().n, 0, "the pool key's account is removed");
+
+  const byKey = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console" })
+  }));
+  assert.equal(byKey.status, 403, "the pool key cannot sign in by key");
+  assert.equal(byKey.headers.get("set-cookie"), null, "no session for the pool key");
+
+  const acct = await app.fetch(new Request("http://gw/console/account", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ api_key: "sk-console", username: "again", password: "longenough" })
+  }));
+  assert.equal(acct.status, 403, "the pool key cannot create a new account");
 });
