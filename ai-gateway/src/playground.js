@@ -4,22 +4,26 @@ var PLAYGROUND_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Gateway Control</title>
+<title>Astrosphere Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet" />
 <style>
   :root{
     color-scheme:dark;
     /* Deeper OLED ground with a cool cast; surfaces read as machined trays
        rather than flat panels, so hierarchy comes from light, not borders. */
-    --bg:#05070b; --surface:#0b0f16; --surface-hi:#111826; --surface-deep:#070a10;
-    --line:rgba(148,178,220,.10); --line-hi:rgba(148,178,220,.22);
-    --text:#e8eefb; --muted:#7d8ba6; --muted-dim:#55637d;
-    --accent:#3fe0c4; --accent-dim:#2bbf9f; --accent-soft:rgba(63,224,196,.10); --ink:#04211c;
-    --good:#4ade9a; --warn:#e8bd62; --bad:#f06a6a;
+    --bg:#070912; --surface:#0e1122; --surface-hi:#1a2039; --surface-deep:#0a0e1c;
+    --line:rgba(148,178,220,.12); --line-hi:rgba(148,178,220,.24);
+    --text:#eef1fb; --muted:#9aa4c6; --muted-dim:#6a749a;
+    --accent:#74a4ff; --accent-dim:#93bbff; --accent-soft:rgba(116,164,255,.12); --ink:#05070f;
+    --good:#57d199; --warn:#f0c065; --bad:#ff7a90;
     --violet:#a78bfa; --violet-soft:rgba(167,139,250,.12);
     --r-lg:14px; --radius:10px; --radius-sm:6px; --r-pill:999px;
     --w-med:500; --w-bold:600;
     --mono:ui-monospace,"SF Mono","JetBrains Mono",Consolas,monospace;
     --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    --display:"Fraunces","Iowan Old Style",Palatino,serif;
     /* Custom spring curves only: no linear, no ease-in-out. */
     --ease:cubic-bezier(.32,.72,0,1);
     --ease-out:cubic-bezier(.16,1,.3,1);
@@ -35,7 +39,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   body::before{
     content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
     background:
-      radial-gradient(900px 520px at 12% -8%, rgba(63,224,196,.09), transparent 62%),
+      radial-gradient(900px 520px at 12% -8%, rgba(116,164,255,.12), transparent 62%),
       radial-gradient(760px 480px at 92% 4%, rgba(167,139,250,.08), transparent 60%);
   }
   body::after{
@@ -56,7 +60,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     cursor:pointer; transition:color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease);}
   .pg-modes .pg-mode:hover{color:var(--text);}
   .pg-modes .pg-mode.is-on{color:var(--ink); background:var(--accent);
-    box-shadow:0 2px 10px -4px rgba(63,224,196,.7);}
+    box-shadow:0 2px 10px -4px rgba(116,164,255,.7);}
   .pg-modes .pg-mode:active{transform:scale(.985);}
   .pg-modes .pg-mode:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
 
@@ -72,7 +76,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     gap:10px; margin:6px 0; font:500 11px/1 var(--mono); color:var(--muted);}
   .pg-dec-bar i{display:block; height:5px; border-radius:var(--r-pill); min-width:2px;
     background:linear-gradient(90deg,var(--accent-dim),var(--accent));
-    box-shadow:0 0 12px -2px rgba(63,224,196,.5);}
+    box-shadow:0 0 12px -2px rgba(116,164,255,.5);}
   .pg-dec-bar b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums;}
   @keyframes pgDecIn{from{opacity:0; transform:translateY(8px) scale(.985);} to{opacity:1; transform:none;}}
 
@@ -84,8 +88,8 @@ var PLAYGROUND_HTML = `<!doctype html>
   body{font:14px/1.45 var(--sans);background:var(--bg);color:var(--text);letter-spacing:.005em;text-rendering:optimizeLegibility;font-feature-settings:"cv01","cv08","cv10","tnum"}
   a{color:var(--accent)} button,input,select,textarea{font:inherit} button{white-space:nowrap}
   header{height:52px;display:flex;align-items:center;gap:20px;padding:0 24px;border-bottom:1px solid var(--line);background:var(--bg);position:sticky;top:0;z-index:30}
-  header .brand{display:flex;align-items:center;gap:8px;font-weight:var(--w-bold);font-size:13px;letter-spacing:-.01em}
-  header .brand .dot{width:22px;height:22px;display:grid;place-items:center;border-radius:4px;background:var(--accent);color:var(--ink);font:600 11px/1 var(--mono)}
+  header .brand{display:flex;align-items:center;gap:9px;font-family:var(--display);font-weight:500;font-size:18px;letter-spacing:-.02em}
+  header .brand .dot{width:24px;height:24px;display:grid;place-items:center;border-radius:50%;background:var(--accent);color:var(--ink);font:600 12px/1 var(--display)}
   header .base{margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:10px/1 var(--mono);letter-spacing:.02em}
   header .clock{padding-left:12px;border-left:1px solid var(--line);color:var(--muted);font:10px/1 var(--mono);font-variant-numeric:tabular-nums}
   nav{position:fixed;z-index:20;top:52px;bottom:0;left:0;width:196px;display:flex;flex-direction:column;align-items:stretch;gap:0;padding:12px 12px 12px 0;background:var(--bg);border-right:1px solid var(--line)}
@@ -159,7 +163,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-signals{display:flex;flex-direction:column;gap:6px}
   @media (max-width:980px){.pg-shell{grid-template-columns:1fr;min-height:0}.pg-messages{min-height:240px}.pg-msg{max-width:100%}.pg-trace{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:0 0 14px}
-  .pagehead h2.sec{font-size:20px;letter-spacing:-.025em;margin:0}
+  .pagehead h2.sec{font-family:var(--display);font-weight:500;font-size:24px;letter-spacing:-.02em;margin:0}
   .pagehead .sub{color:var(--muted);font-size:12px;margin:6px 0 0;max-width:60ch;line-height:1.45}
   .pagehead .actions{display:flex;gap:8px;flex:0 0 auto}
   .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);margin-bottom:12px;overflow:hidden}
@@ -215,7 +219,7 @@ var PLAYGROUND_HTML = `<!doctype html>
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot">G</span><span>Gateway Control</span></div>
+  <div class="brand"><span class="dot">A</span><span>Astrosphere Control</span></div>
   <span class="base" id="base">\u2026</span>
   <span class="clock" id="clock"></span>
 </header>

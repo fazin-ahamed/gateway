@@ -3,25 +3,29 @@ var LOGIN_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Gateway Control</title>
+<title>Astrosphere</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet"/>
 <style>
   :root{color-scheme:dark;
-    --bg:#08090c;--panel:#0f1218;--line:#1c222d;--line-hi:#2d3a4e;
-    --text:#e4eaf2;--muted:#5f6d82;--faint:#4d596a;--accent:#2fd4b5;--accent-dim:#26aa90;
-    --ink:#06211b;--bad:#e45b5b;--radius:10px;
+    --bg:#070912;--panel:#0e1122;--line:#232a46;--line-hi:#4a5384;
+    --text:#eef1fb;--muted:#9aa4c6;--faint:#6a749a;--accent:#74a4ff;--accent-dim:#93bbff;
+    --ink:#05070f;--bad:#ff7a90;--radius:10px;
     --w-med:500;--w-bold:600;
     --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
     --mono:ui-monospace,"SF Mono",Consolas,monospace;
-    --ease:cubic-bezier(.2,0,.13,1);
+    --display:"Fraunces","Iowan Old Style",Palatino,serif;
+    --ease:cubic-bezier(.2,.7,.2,1);
   }
   *{box-sizing:border-box}
   html,body{margin:0;min-height:100%}
   body{min-height:100dvh;display:grid;place-items:center;padding:24px;background:var(--bg);color:var(--text);font:14px/1.5 var(--sans);text-rendering:optimizeLegibility;font-feature-settings:"cv01","cv08","cv10","tnum"}
-  body:before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(600px 400px at 20% -5%,rgba(47,212,181,.06),transparent 60%)}
+  body:before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(700px 460px at 78% -10%,rgba(116,164,255,.16),transparent 60%),radial-gradient(1.3px 1.3px at 40px 60px,rgba(238,241,251,.8),transparent),radial-gradient(1.1px 1.1px at 180px 130px,rgba(200,214,255,.6),transparent),radial-gradient(1.4px 1.4px at 260px 40px,rgba(238,241,251,.7),transparent);background-size:auto,300px 300px,300px 300px,300px 300px}
   .login-card{width:min(380px,100%);padding:28px;border:1px solid var(--line);border-radius:10px;background:var(--panel);position:relative}
   .brand{display:flex;align-items:center;gap:10px;margin-bottom:28px}
-  .brand .dot{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;background:var(--accent);color:var(--ink);font:600 12px/1 var(--mono)}
-  .brand-name{font-size:13px;font-weight:var(--w-bold);letter-spacing:-.01em}
+  .brand .dot{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:var(--accent);color:var(--ink);font:600 13px/1 var(--display)}
+  .brand-name{font-family:var(--display);font-size:20px;font-weight:500;letter-spacing:-.02em}
   .login-head{margin-bottom:22px}
   .login-head h2{margin:0;font-size:18px;line-height:1.2;letter-spacing:-.02em;font-weight:var(--w-bold)}
   .login-head .sub{margin:6px 0 0;color:var(--muted);font-size:12px;line-height:1.45}
@@ -29,7 +33,7 @@ var LOGIN_HTML = `<!doctype html>
   .field>span{display:block;margin:0 0 6px;color:var(--muted);font-size:10px;font-weight:var(--w-med);letter-spacing:.06em;text-transform:uppercase}
   input{width:100%;min-height:42px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--text);padding:10px 12px;font:13px/1.2 var(--sans);transition:border-color 120ms var(--ease),box-shadow 120ms var(--ease)}
   input:hover{border-color:var(--line-hi)}
-  input:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,212,181,.12)}
+  input:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 2px rgba(116,164,255,.18)}
   input::placeholder{color:var(--faint)}
   button{display:flex;align-items:center;justify-content:center;width:100%;min-height:40px;border:1px solid var(--accent);border-radius:4px;background:var(--accent);color:var(--ink);padding:10px 14px;font:600 13px/1 var(--sans);cursor:pointer;transition:background 120ms var(--ease),border-color 120ms var(--ease)}
   button:hover{background:var(--accent-dim);border-color:var(--accent-dim)}
@@ -42,7 +46,7 @@ var LOGIN_HTML = `<!doctype html>
 </head>
 <body>
 <main>
-  <div class="brand"><span class="dot">G</span><span class="brand-name">Gateway Control</span></div>
+  <div class="brand"><span class="dot">A</span><span class="brand-name">Astrosphere</span></div>
   <form class="login-card" id="f">
     <div class="login-head">
       <h2>Sign in</h2>
