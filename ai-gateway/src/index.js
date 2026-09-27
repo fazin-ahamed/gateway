@@ -1251,6 +1251,9 @@ app.get("/console/api/models", async (c) => {
     const entry = capabilityEntryForRoute(r, byId);
     const caps = entryCapabilities(entry);
     const pr = priceBySlug.get(slug);
+    const mdIn = entry && Number.isFinite(entry.prompt_per_1m) ? Number(entry.prompt_per_1m) : null;
+    const mdOut = entry && Number.isFinite(entry.completion_per_1m) ? Number(entry.completion_per_1m) : null;
+    const hasMd = !!(mdIn || mdOut);
     data.push({
       id: slug,
       model_kind: "chat",
@@ -1261,10 +1264,10 @@ app.get("/console/api/models", async (c) => {
       vision: !!caps.vision,
       reasoning: !!(entry && entry.reasoning),
       routing: null,
-      prompt_per_1m: pr ? Number(pr.prompt_per_1m) : (entry && Number.isFinite(entry.prompt_per_1m) ? entry.prompt_per_1m : null),
-      completion_per_1m: pr ? Number(pr.completion_per_1m) : (entry && Number.isFinite(entry.completion_per_1m) ? entry.completion_per_1m : null),
-      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null,
-      price_source: pr ? "gateway" : (entry && (Number(entry.prompt_per_1m) || Number(entry.completion_per_1m)) ? "models.dev" : null),
+      prompt_per_1m: hasMd ? mdIn : (pr ? Number(pr.prompt_per_1m) : null),
+      completion_per_1m: hasMd ? mdOut : (pr ? Number(pr.completion_per_1m) : null),
+      per_request: hasMd ? null : (pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null),
+      price_source: hasMd ? "models.dev" : (pr ? "gateway" : null),
       name: entry && entry.name || null,
       knowledge: entry && (entry.knowledge || entry.release_date) || null
     });
