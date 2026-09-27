@@ -100,6 +100,16 @@ export type Settings = {
   response_cache: { enabled: boolean; entries: number; hits: number; saved_usd: number; saved_tokens: number };
 };
 
+export type Pool = {
+  name: string;
+  mode: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  request_count: number;
+  active: boolean;
+} | null;
+
 export const api = {
   overview: (days: number) => json<Overview>(`/console/api/overview?days=${days}`),
   activity: (hours: number) => json<Activity>(`/console/api/activity?hours=${hours}`),
@@ -112,7 +122,8 @@ export const api = {
       body: JSON.stringify({ response_cache: on ? "on" : "off" })
     }),
   models: () => json<{ data: ConsoleModel[] }>("/console/api/models"),
-  request: (id: string) => json<RequestDetail>(`/console/api/requests/${encodeURIComponent(id)}`)
+  request: (id: string) => json<RequestDetail>(`/console/api/requests/${encodeURIComponent(id)}`),
+  pool: () => json<{ pool: Pool }>("/console/api/pool")
 };
 
 export function fmtInt(n: number | null | undefined): string {

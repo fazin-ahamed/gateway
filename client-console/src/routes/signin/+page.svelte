@@ -2,13 +2,42 @@
   import { session } from "$lib/state/session.svelte";
   import Starfield from "$lib/components/Starfield.svelte";
 
+  let view = $state<"login" | "key">("login");
   let apiKey = $state("");
   let username = $state("");
   let password = $state("");
   let confirm = $state("");
-  let mode = $state<"key" | "create" | "login">("key");
+  let showCreate = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
+
+  async function login(event: SubmitEvent) {
+    event.preventDefault();
+    if (!username.trim() || !password) {
+      error = "Enter your username and password.";
+      return;
+    }
+    busy = true;
+    error = null;
+    try {
+      const res = await fetch("/console/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ username: username.trim(), password })
+      });
+      const body = await res.json().catch(() => null);
+      if (res.ok && body?.ok) {
+        await loadAndGo();
+        return;
+      }
+      error = body?.error?.message ?? "That username or password was not accepted.";
+    } catch {
+      error = "Could not reach the gateway.";
+    } finally {
+      busy = false;
+    }
+  }
 
   async function submitKey(event: SubmitEvent) {
     event.preventDefault();
@@ -27,17 +56,17 @@
       });
       const body = await res.json().catch(() => null);
       if (body?.setup) {
-        mode = "create";
+        showCreate = true;
         error = null;
         return;
       }
       if (body?.account) {
-        mode = "login";
+        view = "login";
         username = body.username || "";
-        error = null;
+        error = "This key already has an account. Sign in with your username and password.";
         return;
       }
-      if (res.ok) {
+      if (res.ok && body?.ok) {
         await loadAndGo();
         return;
       }
@@ -49,37 +78,35 @@
     }
   }
 
-  async function submitAccount(event: SubmitEvent) {
+  async function createAccount(event: SubmitEvent) {
     event.preventDefault();
-    if (mode === "create") {
-      if (username.trim().length < 3) {
-        error = "Username must be at least 3 characters.";
-        return;
-      }
-      if (password.length < 8) {
-        error = "Password must be at least 8 characters.";
-        return;
-      }
-      if (password !== confirm) {
-        error = "The passwords do not match.";
-        return;
-      }
+    if (username.trim().length < 3) {
+      error = "Username must be at least 3 characters.";
+      return;
+    }
+    if (password.length < 8) {
+      error = "Password must be at least 8 characters.";
+      return;
+    }
+    if (password !== confirm) {
+      error = "The passwords do not match.";
+      return;
     }
     busy = true;
     error = null;
     try {
-      const res = await fetch(mode === "create" ? "/console/account" : "/console/auth", {
+      const res = await fetch("/console/account", {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "same-origin",
         body: JSON.stringify({ api_key: apiKey.trim(), username: username.trim(), password })
       });
       const body = await res.json().catch(() => null);
-      if (res.ok && !body?.setup && !body?.account) {
+      if (res.ok && body?.ok) {
         await loadAndGo();
         return;
       }
-      error = body?.error?.message ?? "That was not accepted.";
+      error = body?.error?.message ?? "That account could not be created.";
     } catch {
       error = "Could not reach the gateway.";
     } finally {
@@ -87,11 +114,14 @@
     }
   }
 
-  function backToKey() {
-    mode = "key";
+  function toKey() {
+    view = "key";
     error = null;
-    password = "";
-    confirm = "";
+  }
+
+  function toLogin() {
+    view = "login";
+    error = null;
   }
 
   async function loadAndGo() {
@@ -117,40 +147,49 @@
       </svg>
       <h1>Astrosphere</h1>
     </div>
-    <p class="panel-sub">Your window into the gateway. Sign in with your API key.</p>
-    <form onsubmit={submitKey} class="form">
-      <label for="key">API key</label>
-      <input id="key" class="input" type="password" autocomplete="off" placeholder="sk-…" bind:value={apiKey} disabled={busy || mode !== "key"} />
-      {#if mode === "key" && error}<p class="error" role="alert">{error}</p>{/if}
-      <button class="btn btn-primary" type="submit" disabled={busy || mode !== "key"}>{busy && mode === "key" ? "Checking…" : "Continue"}</button>
-    </form>
+
+    {#if view === "login"}
+      <p class="panel-sub">Sign in with your username and password.</p>
+      <form onsubmit={login} class="form">
+        <label for="user">Username</label>
+        <input id="user" class="input" autocomplete="username" bind:value={username} disabled={busy} />
+        <label for="pass">Password</label>
+        <input id="pass" class="input" type="password" autocomplete="current-password" bind:value={password} disabled={busy} />
+        {#if error}<p class="error" role="alert">{error}</p>{/if}
+        <button class="btn btn-primary" type="submit" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
+      </form>
+      <button class="switch" type="button" onclick={toKey}>First time here? Set up with your API key</button>
+    {:else}
+      <p class="panel-sub">Enter your gateway API key to set up this account. The key is exchanged for a session and never stored in the browser.</p>
+      <form onsubmit={submitKey} class="form">
+        <label for="key">API key</label>
+        <input id="key" class="input" type="password" autocomplete="off" placeholder="sk-…" bind:value={apiKey} disabled={busy} />
+        {#if error}<p class="error" role="alert">{error}</p>{/if}
+        <button class="btn btn-primary" type="submit" disabled={busy}>{busy ? "Checking…" : "Continue"}</button>
+      </form>
+      <button class="switch" type="button" onclick={toLogin}>Already have an account? Sign in</button>
+    {/if}
   </div>
 </main>
 
-{#if mode !== "key"}
+{#if showCreate}
   <div class="scrim"></div>
   <div class="modal-wrap" role="dialog" aria-modal="true" aria-labelledby="acct-title">
     <div class="modal">
       <p class="kicker">{apiKey.slice(0, 7)}…</p>
-      <h2 id="acct-title">{mode === "create" ? "Create your account" : "Welcome back"}</h2>
-      <p class="modal-sub">
-        {mode === "create"
-          ? "This key is new here. Pick a username and password to protect it. The key itself is never stored in the browser."
-          : "This key already has an account. Enter its username and password."}
-      </p>
-      <form onsubmit={submitAccount} class="form">
-        <label for="user">Username</label>
-        <input id="user" class="input" autocomplete="username" bind:value={username} disabled={busy || mode === "login"} placeholder="observatory" />
-        <label for="pass">Password</label>
-        <input id="pass" class="input" type="password" autocomplete={mode === "create" ? "new-password" : "current-password"} bind:value={password} disabled={busy} placeholder={mode === "create" ? "at least 8 characters" : ""} />
-        {#if mode === "create"}
-          <label for="confirm">Confirm password</label>
-          <input id="confirm" class="input" type="password" autocomplete="new-password" bind:value={confirm} disabled={busy} />
-        {/if}
+      <h2 id="acct-title">Create your account</h2>
+      <p class="modal-sub">This key is new here. Pick a username and password. Next time, sign in with those, no key needed.</p>
+      <form onsubmit={createAccount} class="form">
+        <label for="new-user">Username</label>
+        <input id="new-user" class="input" autocomplete="username" bind:value={username} disabled={busy} placeholder="observatory" />
+        <label for="new-pass">Password</label>
+        <input id="new-pass" class="input" type="password" autocomplete="new-password" bind:value={password} disabled={busy} placeholder="at least 8 characters" />
+        <label for="new-confirm">Confirm password</label>
+        <input id="new-confirm" class="input" type="password" autocomplete="new-password" bind:value={confirm} disabled={busy} />
         {#if error}<p class="error" role="alert">{error}</p>{/if}
         <div class="actions">
-          <button class="btn btn-quiet" type="button" onclick={backToKey} disabled={busy}>Back</button>
-          <button class="btn btn-primary" type="submit" disabled={busy}>{busy ? "Working…" : mode === "create" ? "Create account" : "Sign in"}</button>
+          <button class="btn btn-quiet" type="button" onclick={() => (showCreate = false)} disabled={busy}>Back</button>
+          <button class="btn btn-primary" type="submit" disabled={busy}>{busy ? "Working…" : "Create account"}</button>
         </div>
       </form>
     </div>
@@ -227,6 +266,20 @@
     line-height: 17px;
     color: var(--danger);
     margin: 0;
+  }
+
+  .switch {
+    margin-top: 16px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .switch:hover {
+    color: var(--accent);
   }
 
   .scrim {

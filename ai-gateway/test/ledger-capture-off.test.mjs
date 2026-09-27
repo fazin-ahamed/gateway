@@ -14,8 +14,8 @@ test("trajectory capture off has zero effect on the console ledger", async () =>
   db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
   const env = { DB: db, PROVIDER_CRYPTO_KEY: "test-crypto-key-please-change", ADMIN_TOKEN: "admin" };
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, created_at, updated_at) VALUES (?,?,?,?,?,?,?)")
-    .bind("sk-cap", "cap", 1, "usd", 1e9, now, now).run();
+  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, console_auth, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
+    .bind("sk-cap", "cap", 1, "usd", 1e9, 0, now, now).run();
   db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?)")
     .bind(1, "P", "http://up.local/v1", "direct", "openai", 1, 1, "round_robin", now).run();
   db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)")

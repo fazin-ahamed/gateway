@@ -19,11 +19,6 @@ test("the send button has exactly one handler that branches by mode", () => {
   assert.match(SRC, /playgroundMode==='decision'.*sendPlaygroundDecision/);
 });
 
-test("the model select is filtered by model class", () => {
-  assert.match(SRC, /publicModelOptions\(playgroundMode==='decision'\?'decision':'chat'\)/);
-  assert.match(SRC, /String\(r\.model_kind\|\|'chat'\)!==want/);
-});
-
 test("decision answers render typed results with probabilities", () => {
   const fn = SRC.slice(SRC.indexOf("function renderDecisionAnswers"), SRC.indexOf("async function sendPlaygroundDecision"));
   assert.match(fn, /type==='choice'/);

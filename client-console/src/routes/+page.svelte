@@ -229,16 +229,6 @@
     color: var(--text-muted);
     font-size: 14px;
   }
-
-  .limit-line {
-    margin: 12px 0 0;
-    font-size: 13px;
-    color: var(--text-muted);
-  }
-
-  .limit-line a {
-    color: var(--accent);
-  }
 .rings {
   display: flex;
   flex-wrap: wrap;

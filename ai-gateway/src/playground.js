@@ -1086,6 +1086,8 @@ document.addEventListener('click', function(e){
   else if(act==='kedit') editKey(id);
   else if(act==='ktoggle') toggleKey(id, btn.getAttribute('data-active')==='1'?0:1);
   else if(act==='kdel') delKey(id);
+  else if(act==='kpool') setPool(id);
+  else if(act==='kpoolclear') clearPool();
 });
 
 async function publicModelOptions(kind){ const {data}=await api('/admin/routes'); const seen=[]; const out=[]; for(const r of (data&&data.routes||[])){ if(!r.enabled) continue; const rk=String(r.model_kind||'chat'); if(kind&&kind!=='all'&&rk!==kind) continue; if(seen.indexOf(r.slug)>=0) continue; seen.push(r.slug); out.push({value:r.slug,label:kind==='all'&&rk==='decision'?r.slug+' \u00b7 decision':r.slug}); } return out.sort(function(a,b){return a.value.localeCompare(b.value);}); }
@@ -1128,6 +1130,7 @@ async function loadKeys(){
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/keys'); data=res.data; }catch(e){ paintLoadError(el,'Could not load keys: '+e.message,loadKeys); return; }
   try{ await refreshKeyTierSelect(); }catch(e){ toast('Could not refresh tier selects: '+e.message,'err'); }
+  let poolId=''; try{ const pr=await api('/admin/shared-pool'); poolId=(pr.data&&pr.data.key_id)||''; }catch(e){}
   const rows=(data&&data.keys||[]).map(function(k){
     const used=k.budget_mode==='usd'?money(k.used_usd):fmt(k.used_tokens);
     const lim=k.budget_mode==='usd'?money(k.budget_limit):fmt(k.budget_limit);
@@ -1136,12 +1139,17 @@ async function loadKeys(){
     const excludes=k.excluded_models?esc(k.excluded_models):'<span class="pill mut">none</span>';
     const rpm=k.request_limit_per_minute?fmt(k.request_limit_per_minute)+'/min':'<span class="pill mut">unlimited</span>';
     const expiry=expiryLabel(k.expires_at);
+    const isPool=poolId&&k.key_id===poolId;
     const active=(!k.active?'<span class="pill bad">off</span>':(k.expires_at&&new Date(k.expires_at).getTime()<=Date.now()?'<span class="pill bad">expired</span>':'<span class="pill ok">active</span>'));
-    return '<tr><td><b>'+esc(k.name)+'</b><div class="mono small">'+esc(k.key_id)+'</div></td><td>'+used+' / '+lim+'</td><td>'+rpm+'</td><td>'+fmt(k.request_count)+'</td><td>'+tiers+'</td><td>'+am+'</td><td>'+excludes+'</td><td>'+expiry+'</td><td>'+active+'</td>'+
-      '<td><button class="ghost" data-act="copy" data-id="'+esc(k.key_id)+'">copy</button> <button class="ghost" data-act="kedit" data-id="'+esc(k.key_id)+'">edit</button> <button class="ghost" data-act="ktoggle" data-id="'+esc(k.key_id)+'" data-active="'+(k.active?1:0)+'">'+(k.active?'deact':'act')+'</button> <button class="danger" data-act="kdel" data-id="'+esc(k.key_id)+'">del</button></td></tr>';
+    const poolPill=isPool?' <span class="pill ok">shared pool</span>':'';
+    const poolBtn=isPool?'<button class="ghost" data-act="kpoolclear">unset pool</button>':'<button class="ghost" data-act="kpool" data-id="'+esc(k.key_id)+'">set pool</button>';
+    return '<tr><td><b>'+esc(k.name)+'</b>'+poolPill+'<div class="mono small">'+esc(k.key_id)+'</div></td><td>'+used+' / '+lim+'</td><td>'+rpm+'</td><td>'+fmt(k.request_count)+'</td><td>'+tiers+'</td><td>'+am+'</td><td>'+excludes+'</td><td>'+expiry+'</td><td>'+active+'</td>'+
+      '<td><button class="ghost" data-act="copy" data-id="'+esc(k.key_id)+'">copy</button> '+poolBtn+' <button class="ghost" data-act="kedit" data-id="'+esc(k.key_id)+'">edit</button> <button class="ghost" data-act="ktoggle" data-id="'+esc(k.key_id)+'" data-active="'+(k.active?1:0)+'">'+(k.active?'deact':'act')+'</button> <button class="danger" data-act="kdel" data-id="'+esc(k.key_id)+'">del</button></td></tr>';
   }).join('') || '<tr><td colspan="10"><div class="empty">No keys yet.</div></td></tr>';
   el.innerHTML='<table><tr><th>Key</th><th>Budget</th><th>Rate</th><th>Reqs</th><th>Tiers</th><th>Extra allow</th><th>Excludes</th><th>Expiry</th><th>State</th><th></th></tr>'+rows+'</table>';
 }
+async function setPool(id){ const {status,data}=await api('/admin/shared-pool',{method:'PUT',body:JSON.stringify({key_id:id})}); if(status===200){ toast('shared pool set','ok'); loadKeys(); } else toast('could not set pool: '+(data&&data.error&&data.error.message||status),'err'); }
+async function clearPool(){ const {status,data}=await api('/admin/shared-pool',{method:'PUT',body:JSON.stringify({key_id:null})}); if(status===200){ toast('shared pool cleared','ok'); loadKeys(); } else toast('could not clear pool: '+(data&&data.error&&data.error.message||status),'err'); }
 async function toggleKey(id, active){ await api('/admin/keys/'+id+'/'+(active?'activate':'deactivate'),{method:'POST'}); loadKeys(); }
 function copyKey(id){ try{ navigator.clipboard.writeText(id).then(function(){ toast('key copied','ok'); }); }catch(e){ toast('copy failed','err'); } }
 async function editKey(id){

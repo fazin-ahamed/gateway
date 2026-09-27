@@ -42,18 +42,22 @@ cd ~/gateway && nohup sh server/auto-update.sh </dev/null >/tmp/gateway-watch.ou
 
 ## Sign-in: how credentials work
 
-The console signs in with a **gateway API key**, the same `sk-` key used
-against `/v1/*`. There is no separate console account in V1.
+A key's first visit is by **gateway API key**, the same `sk-` key used against
+`/v1/*`. On that first sign-in the key holder sets a **username and password**;
+every later sign-in is by username and password alone, no key.
 
 ```text
-POST /console/auth        { "api_key": "sk-..." }
+POST /console/auth     { "api_key": "sk-..." }        -> { "setup": true } when the key has no account yet
+POST /console/account  { "api_key", "username", "password" }  -> creates the account, sets the session cookie
+POST /console/auth     { "username", "password" }     -> returning sign-in, no key
 -> Set-Cookie: gw_client=<token>; Path=/console; HttpOnly
 ```
 
-The key is exchanged once for an HttpOnly session cookie. The browser never
-stores the `sk-` secret; `localStorage` is not used. The session maps back to
-the owning `api_keys` row, so all console data is scoped to that key and no
-other key's data can appear.
+The username is unique and maps to the owning `api_keys` row. A key created
+with `console_auth=0` skips account setup and signs straight in by key. The
+key is exchanged once for an HttpOnly session cookie; the browser never stores
+the `sk-` secret and `localStorage` is not used. All console data is scoped to
+the owning key.
 
 `POST /console/logout` deletes the session.
 
@@ -87,6 +91,7 @@ GET  /console/api/requests?days=&kind=&status=&model=&request_id=&limit=
 GET  /console/api/requests/:id
 GET  /console/api/usage?days=
 GET  /console/api/models
+GET  /console/api/pool
 POST /console/playground/completions
 POST /console/playground/systemone
 ```
@@ -94,6 +99,23 @@ POST /console/playground/systemone
 The playground routes resolve the session's owning API key server-side and
 run the existing inference paths under it. The browser never calls `/v1/*`
 with a recovered credential.
+
+## Shared pool
+
+One `api_key` can be designated the **shared pool**: a communal key with its
+own budget that every signed-in console user sees as a top-bar event pill with
+the remaining balance. It is set in `/_gw`, Keys tab: **set pool** on a key
+(**unset pool** clears it).
+
+```text
+GET /admin/shared-pool                          -> { key_id, pool } (admin; key_id is the sk- secret)
+PUT /admin/shared-pool  { "key_id": "sk-..." }  -> designate; { "key_id": null } clears
+GET /console/api/pool                           -> { pool: { name, mode, limit, used, remaining, request_count, active } | null }
+```
+
+The designation is stored in `gateway_settings` under `shared_pool_key`. The
+console endpoint never returns the pool's `key_id`; only the admin endpoint,
+which already exposes every `sk-` value, does.
 
 ## The request ledger
 

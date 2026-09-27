@@ -818,10 +818,27 @@ async function requireConsoleSession(c) {
 app.post("/console/auth", async (c) => {
   let b;
   try { b = await c.req.json(); } catch { b = {}; }
-  const offered = String((b && b.api_key) || "");
-  if (!offered.startsWith("sk-"))
-    return c.json({ error: { message: "Enter the API key to sign in.", type: "auth_error" } }, 401);
   await ensureConsoleAuthColumn(c.env.DB);
+  const offered = String((b && b.api_key) || "");
+  const username = String((b && b.username) || "").trim();
+  const password = String((b && b.password) || "");
+
+  // Returning users sign in with the account they set up: username + password,
+  // no key. The username is unique and maps to the owning key_id.
+  if (!offered && username && password) {
+    const account = await c.env.DB.prepare("SELECT key_id, password_hash FROM console_accounts WHERE username=?").bind(username).first();
+    if (!account || await sha256hex(password) !== account.password_hash)
+      return c.json({ error: { message: "That username or password was not accepted.", type: "auth_error" } }, 401);
+    const acctKey = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(account.key_id).first();
+    if (!acctKey || !acctKey.active || isKeyExpired(acctKey))
+      return c.json({ error: { message: "The key behind this account is no longer active.", type: "auth_error" } }, 401);
+    return issueConsoleSession(c, acctKey);
+  }
+
+  // First contact is by key. A key with account auth off signs straight in;
+  // otherwise it either has no account yet (setup) or must present one.
+  if (!offered.startsWith("sk-"))
+    return c.json({ error: { message: "Enter your API key, or sign in with your username and password.", type: "auth_error" } }, 401);
   const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(offered).first();
   if (!key || !key.active || isKeyExpired(key))
     return c.json({ error: { message: "That key was not accepted.", type: "auth_error" } }, 401);
@@ -832,8 +849,6 @@ app.post("/console/auth", async (c) => {
   const account = await c.env.DB.prepare("SELECT username, password_hash FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
   if (!account)
     return c.json({ setup: true });
-  const username = String(b.username || "");
-  const password = String(b.password || "");
   if (!username || !password)
     return c.json({ account: true, username: account.username });
   if (username !== account.username || await sha256hex(password) !== account.password_hash)
@@ -1059,6 +1074,35 @@ app.get("/console/api/limits", async (c) => {
     models: await modelLimitStatus(c)
   });
 });
+
+// The shared pool is a single api_key any operator can designate. Every signed-in
+// console user sees its remaining budget as a banner, but never its secret key_id.
+app.get("/console/api/pool", async (c) => {
+  const { denied } = await requireConsoleSession(c);
+  if (denied) return denied;
+  return c.json({ pool: await sharedPoolStatus(c) });
+});
+
+async function sharedPoolStatus(c) {
+  const keyId = await settingValue(c, "shared_pool_key", "");
+  if (!keyId) return null;
+  const key = await c.env.DB.prepare(
+    "SELECT name, budget_mode, budget_limit, used_tokens, used_usd, request_count, active FROM api_keys WHERE key_id=?"
+  ).bind(keyId).first();
+  if (!key) return null;
+  const mode = String(key.budget_mode || "usd");
+  const used = mode === "usd" ? Number(key.used_usd) || 0 : Number(key.used_tokens) || 0;
+  const limit = Number(key.budget_limit) || 0;
+  return {
+    name: String(key.name || "Shared pool"),
+    mode,
+    limit,
+    used,
+    remaining: Math.max(0, limit - used),
+    request_count: Number(key.request_count) || 0,
+    active: !!key.active
+  };
+}
 
 // Gateway-side response cache, as this key experiences it. The toggle is a
 // gateway setting: turning it off stops serving cached completions for every
@@ -4771,6 +4815,31 @@ app.get("/admin/keys", async (c) => {
      FROM api_keys k ORDER BY k.created_at DESC`
   ).all();
   return c.json({ keys: rows.results || [] });
+});
+app.get("/admin/shared-pool", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const keyId = await settingValue(c, "shared_pool_key", "");
+  if (!keyId) return c.json({ key_id: null, pool: null });
+  const pool = await c.env.DB.prepare(
+    "SELECT key_id, name, budget_mode, budget_limit, used_tokens, used_usd, request_count, active FROM api_keys WHERE key_id=?"
+  ).bind(keyId).first();
+  return c.json({ key_id: pool ? keyId : null, pool: pool || null });
+});
+app.put("/admin/shared-pool", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  let body;
+  try { body = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  const keyId = body && body.key_id ? String(body.key_id) : "";
+  if (keyId) {
+    const key = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE key_id=?").bind(keyId).first();
+    if (!key) return c.json({ error: { message: "key not found" } }, 404);
+  }
+  await c.env.DB.prepare(
+    "INSERT INTO gateway_settings (key, value, updated_at) VALUES ('shared_pool_key', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+  ).bind(keyId, nowIso()).run();
+  return c.json({ key_id: keyId || null });
 });
 app.get("/admin/keys/:id", async (c) => {
   const denied = await requireAdmin(c);
