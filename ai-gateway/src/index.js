@@ -1214,6 +1214,14 @@ app.get("/console/api/models", async (c) => {
   const byId = modelsDevCache.catalog ? flattenModelsDevCatalog(modelsDevCache.catalog) : null;
   const prices = await c.env.DB.prepare("SELECT slug, prompt_per_1m, completion_per_1m, actual_mode, actual_per_request FROM prices").all();
   const priceBySlug = new Map((prices.results || []).map((p) => [p.slug, p]));
+  // Real per-model reliability over the last 7 days, from this key's own
+  // ledger. No invented numbers: a slug with no recent traffic reports null,
+  // and the console renders "no recent requests" rather than a fake 100%.
+  const since = new Date(Date.now() - 7 * 86400000).toISOString();
+  const healthRows = await c.env.DB.prepare(
+    "SELECT public_slug, COUNT(*) n, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY public_slug"
+  ).bind(sess.keyId, since).all();
+  const healthBySlug = new Map((healthRows.results || []).map((r) => [String(r.public_slug), { n: Number(r.n) || 0, ok: Number(r.ok) || 0 }]));
 
   const data = [];
   if (cfg.enabled && live.length) {
@@ -1269,7 +1277,9 @@ app.get("/console/api/models", async (c) => {
       per_request: hasMd ? null : (pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null),
       price_source: hasMd ? "models.dev" : (pr ? "gateway" : null),
       name: entry && entry.name || null,
-      knowledge: entry && (entry.knowledge || entry.release_date) || null
+      knowledge: entry && (entry.knowledge || entry.release_date) || null,
+      uptime: healthBySlug.has(slug) ? healthBySlug.get(slug).ok / healthBySlug.get(slug).n : null,
+      samples: healthBySlug.has(slug) ? healthBySlug.get(slug).n : 0
     });
   }
   for (const [slug, r] of [...decisionSlugs.entries()].sort()) {
@@ -1282,7 +1292,9 @@ app.get("/console/api/models", async (c) => {
       routing: null,
       prompt_per_1m: null,
       completion_per_1m: null,
-      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : (pr ? Number(pr.prompt_per_1m) : null)
+      per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : (pr ? Number(pr.prompt_per_1m) : null),
+      uptime: healthBySlug.has(slug) ? healthBySlug.get(slug).ok / healthBySlug.get(slug).n : null,
+      samples: healthBySlug.has(slug) ? healthBySlug.get(slug).n : 0
     });
   }
   return c.json({ data });

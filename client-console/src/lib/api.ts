@@ -57,6 +57,8 @@ export type ConsoleModel = {
   price_source?: string | null;
   name?: string | null;
   knowledge?: string | null;
+  uptime?: number | null;
+  samples?: number;
 };
 
 export type RequestDetail = {

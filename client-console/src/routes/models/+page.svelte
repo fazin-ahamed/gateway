@@ -53,6 +53,17 @@
     ].join("\n");
   }
 
+  function statusClass(m: ConsoleModel): string {
+    if (!m.samples) return "idle";
+    const up = m.uptime ?? 0;
+    return up >= 0.99 ? "ok" : up >= 0.9 ? "warn" : "bad";
+  }
+
+  function statusText(m: ConsoleModel): string {
+    if (!m.samples) return "Available · no requests in 7d";
+    return `${Math.round((m.uptime ?? 0) * 100)}% uptime · ${m.samples} req (7d)`;
+  }
+
   function price(m: ConsoleModel): string {
     if (m.per_request != null) return `${fmtUsd(m.per_request)} / request`;
     const inR = m.prompt_per_1m;
@@ -94,6 +105,7 @@
         <strong>{m.id}</strong>
         {#if m.name}<span class="name">{m.name}</span>{/if}
         <span class="kind">{m.model_kind === "decision" ? "Decision · /v1/systemone" : "Chat · /v1/chat/completions"}</span>
+        <span class="status"><span class="dot {statusClass(m)}"></span>{statusText(m)}</span>
         {#if m.model_kind !== "decision"}
           <div class="chips">
             {#if m.context_window}<span class="chip">{fmtContext(m.context_window)} ctx</span>{/if}
@@ -241,4 +253,10 @@
   .card .name { color: var(--text); font-size: 13px; }
   .card .chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .card .chip { padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--radius-control); font-size: 11px; color: var(--text-muted); }
+  .card .status { display: inline-flex; align-items: center; gap: 7px; color: var(--text-muted); font-size: 12px; }
+  .card .status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border-strong); }
+  .card .status .dot.ok { background: var(--success); }
+  .card .status .dot.warn { background: var(--warning); }
+  .card .status .dot.bad { background: var(--danger); }
+  .card .status .dot.idle { background: var(--border-strong); }
 </style>
