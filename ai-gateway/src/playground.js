@@ -72,12 +72,13 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-dec-card .k{font:600 11px/1 var(--sans); letter-spacing:.08em; text-transform:uppercase;
     color:var(--muted); display:flex; align-items:center; gap:8px; margin-bottom:8px;}
   .pg-dec-choice{font:600 16px/1.3 var(--sans); color:var(--text); margin-bottom:10px;}
-  .pg-dec-bar{display:grid; grid-template-columns:minmax(72px,auto) 1fr auto; align-items:center;
-    gap:10px; margin:6px 0; font:500 11px/1 var(--mono); color:var(--muted);}
-  .pg-dec-bar i{display:block; height:5px; border-radius:var(--r-pill); min-width:2px;
-    background:linear-gradient(90deg,var(--accent-dim),var(--accent));
-    box-shadow:0 0 12px -2px rgba(116,164,255,.5);}
-  .pg-dec-bar b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums;}
+  .pg-dec-bar{display:grid; grid-template-columns:minmax(72px,110px) 1fr auto; align-items:center;
+    gap:12px; margin:7px 0; font:500 11px/1 var(--mono); color:var(--muted);}
+  .pg-dec-bar .lbl{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .pg-dec-bar .trk{height:6px; border-radius:var(--r-pill); background:var(--surface-deep); overflow:hidden;}
+  .pg-dec-bar .trk i{display:block; height:100%; border-radius:var(--r-pill);
+    background:linear-gradient(90deg,var(--accent-dim),var(--accent)); transition:width var(--dur) var(--ease);}
+  .pg-dec-bar b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; text-align:right; min-width:34px;}
   .pg-dec-track{height:6px; border-radius:var(--r-pill); background:var(--surface-deep); overflow:hidden; margin:2px 0 8px;}
   .pg-dec-track i{display:block; height:100%; background:linear-gradient(90deg,var(--accent-dim),var(--accent)); transition:width var(--dur) var(--ease);}
   @keyframes pgDecIn{from{opacity:0; transform:translateY(8px) scale(.985);} to{opacity:1; transform:none;}}
@@ -1355,7 +1356,7 @@ function renderDecisionAnswers(answers,meta){
       var probs=a.probabilities||{}; var keys=Object.keys(probs);
       for(const k of keys){
         var pct=Math.round((Number(probs[k])||0)*100);
-        head+='<div class="pg-dec-bar"><span>'+esc(k)+'</span><i style="width:'+pct+'%"></i><b>'+pct+'%</b></div>';
+        head+='<div class="pg-dec-bar"><span class="lbl">'+esc(k)+'</span><span class="trk"><i style="width:'+pct+'%"></i></span><b>'+pct+'%</b></div>';
       }
     } else if(a.type==='score'){
       head+='<div class="pg-dec-choice">'+esc(a.label==null?String(a.score):a.label)+'</div>';
