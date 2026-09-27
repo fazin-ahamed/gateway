@@ -1,6 +1,7 @@
 <script lang="ts">
   import Sidebar from "$lib/components/Sidebar.svelte";
   import TopBar from "$lib/components/TopBar.svelte";
+  import Starfield from "$lib/components/Starfield.svelte";
   import { session, signOutLocal, loadSession } from "$lib/state/session.svelte";
 
   let { children } = $props();
@@ -18,11 +19,13 @@
 </script>
 
 {#if session.state.state === "loading"}
+  <Starfield />
   <div class="loading" role="status" aria-label="Loading Astrosphere">
     <span class="ring"></span>
     <strong>Astrosphere</strong>
   </div>
 {:else}
+  <Starfield />
   <div class="shell">
     <Sidebar keyName={session.state.state === "signed-in" ? session.state.keyName : ""} onSignOut={signOut} />
     <div class="main">
@@ -34,9 +37,11 @@
 
 <style>
   .shell {
+    position: relative;
+    z-index: 1;
     display: flex;
     min-height: 100dvh;
-    background: var(--canvas);
+    background: transparent;
   }
 
   .main {
@@ -58,12 +63,14 @@
     }
   }
   .loading {
+    position: relative;
+    z-index: 1;
     min-height: 100dvh;
     display: grid;
     place-items: center;
     align-content: center;
     gap: 16px;
-    background: var(--canvas);
+    background: transparent;
   }
 
   .loading .ring {

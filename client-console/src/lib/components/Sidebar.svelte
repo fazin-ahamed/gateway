@@ -6,14 +6,39 @@
 </script>
 
 <nav class="sidebar" aria-label="Console">
-  <a class="brand" href="/console/">Astrosphere</a>
+  <a class="brand" href="/console/">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
+      <ellipse cx="12" cy="12" rx="10" ry="4.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+      <ellipse cx="12" cy="12" rx="10" ry="4.2" fill="none" stroke="currentColor" stroke-width="1.3" transform="rotate(60 12 12)" />
+    </svg>
+    Astrosphere
+  </a>
   <ul class="nav">
-    <li><a href="/console/" aria-current={current("/console/")}>Activity</a></li>
-    <li><a href="/console/requests/" aria-current={current("/console/requests/")}>Requests</a></li>
-    <li><a href="/console/usage/" aria-current={current("/console/usage/")}>Usage</a></li>
-    <li><a href="/console/models/" aria-current={current("/console/models/")}>Models</a></li>
-    <li><a href="/console/playground/" aria-current={current("/console/playground/")}>Playground</a></li>
-    <li><a href="/console/settings/" aria-current={current("/console/settings/")}>Settings</a></li>
+    <li><a href="/console/" aria-current={current("/console/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" /><circle cx="8" cy="2" r="1.3" fill="currentColor" stroke="none" /></svg>
+      Activity
+    </a></li>
+    <li><a href="/console/requests/" aria-current={current("/console/requests/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M3 8h10M3 12h6" /></svg>
+      Requests
+    </a></li>
+    <li><a href="/console/usage/" aria-current={current("/console/usage/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 13V8M8 13V4M13 13V10" /></svg>
+      Usage
+    </a></li>
+    <li><a href="/console/models/" aria-current={current("/console/models/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3.5" cy="4" r="1.4" fill="currentColor" stroke="none" /><circle cx="12.5" cy="6" r="1.4" fill="currentColor" stroke="none" /><circle cx="6" cy="12.5" r="1.4" fill="currentColor" stroke="none" /><path d="M4.6 4.8 11.4 6M11.9 7.3 6.7 11.4M4.6 5.1 5.6 11.2" /></svg>
+      Models
+    </a></li>
+    <li><a href="/console/playground/" aria-current={current("/console/playground/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2 4 9h3l-1 5 6-8H9l1-4z" fill="currentColor" stroke="none" /></svg>
+      Playground
+    </a></li>
+    <li><a href="/console/settings/" aria-current={current("/console/settings/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h8M2 8h12M2 12h5" /><circle cx="12" cy="4" r="1.6" fill="var(--surface)" /><circle cx="8.5" cy="12" r="1.6" fill="var(--surface)" /></svg>
+      Settings
+    </a></li>
   </ul>
   <div class="foot">
     <div class="who">
@@ -28,7 +53,8 @@
     width: var(--sidebar-width);
     flex-shrink: 0;
     border-right: 1px solid var(--border);
-    background: var(--surface);
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+    backdrop-filter: blur(10px);
     display: flex;
     flex-direction: column;
     position: sticky;
@@ -36,6 +62,9 @@
     height: 100dvh;
   }
   .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     padding: 20px 20px 18px;
     font-family: var(--font-display);
     font-size: 22px;
@@ -44,23 +73,43 @@
     color: var(--text);
   }
 
+  .brand-mark {
+    width: 26px;
+    height: 26px;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
   .nav {
     flex: 1;
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    padding: 0 8px;
+    gap: 2px;
+    padding: 4px 8px;
   }
 
   .nav a {
-    display: block;
-    padding: 6px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
     border-radius: var(--radius-control);
     font-size: 13px;
     line-height: 18px;
     color: var(--text-muted);
     transition: background var(--t-fast), color var(--t-fast);
+  }
+
+  .nav svg {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .nav a:hover {
@@ -69,7 +118,7 @@
   }
 
   .nav a[aria-current="page"] {
-    color: var(--text);
+    color: var(--accent);
     background: var(--accent-soft);
     font-weight: 500;
   }

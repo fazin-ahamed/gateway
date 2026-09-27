@@ -71,12 +71,13 @@
     (activity?.points || []).map((p) => ({ t: p.hour, requests: p.requests, tokens: p.tokens, spend_usd: p.spend_usd }))
   );
 
+  const windowLabel = $derived(hours === 24 ? "Last 24 hours" : hours === 720 ? "Last 30 days" : "Last 7 days");
 </script>
 
 <div class="head">
   <div>
     <h1 class="page-title">Activity</h1>
-    <p class="lede">What this key has sent through Astrosphere.</p>
+    <p class="lede">{windowLabel} through Astrosphere.</p>
   </div>
   <div class="tabs" role="tablist" aria-label="Window">
     <button class="tab" class:on={hours === 24} onclick={() => changeWindow(24)}>24h</button>
@@ -97,7 +98,7 @@
     {/each}
   </div>
 {:else}
-  <div class="metrics">
+  <div class="metrics" class:dim={loading}>
     <div class="metric"><div class="label">Requests</div><div class="value">{fmtInt(activity.totals.requests)}</div></div>
     <div class="metric"><div class="label">Succeeded</div><div class="value">{fmtInt(activity.totals.ok)}</div></div>
     <div class="metric"><div class="label">Failed</div><div class="value">{fmtInt(activity.totals.fail)}</div></div>
@@ -291,6 +292,14 @@
   .metric.budget .value {
     font-size: 18px;
     line-height: 22px;
+  }
+
+  .metrics {
+    transition: opacity var(--t-fast);
+  }
+
+  .metrics.dim {
+    opacity: 0.5;
   }
 
   .block {
