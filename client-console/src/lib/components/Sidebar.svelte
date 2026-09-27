@@ -13,7 +13,6 @@
     <li><a href="/console/usage/" aria-current={current("/console/usage/")}>Usage</a></li>
     <li><a href="/console/models/" aria-current={current("/console/models/")}>Models</a></li>
     <li><a href="/console/playground/" aria-current={current("/console/playground/")}>Playground</a></li>
-    <li><a href="/console/limits/" aria-current={current("/console/limits/")}>Limits</a></li>
     <li><a href="/console/settings/" aria-current={current("/console/settings/")}>Settings</a></li>
   </ul>
   <div class="foot">

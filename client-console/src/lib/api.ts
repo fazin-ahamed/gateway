@@ -76,6 +76,7 @@ export type RequestDetail = {
   cache_state: string | null;
   client_app?: string | null;
   headers?: Record<string, string>;
+  prompt?: string | null;
 };
 export type Activity = {
   window: { hours: number };

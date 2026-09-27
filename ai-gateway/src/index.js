@@ -1291,7 +1291,7 @@ app.get("/console/api/requests/:id", async (c) => {
   if (denied) return denied;
   const id = String(c.req.param("id"));
   const r = await c.env.DB.prepare(
-    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, cost_usd, attempts, cache_state FROM request_summaries WHERE request_id=? AND key_id=?"
+    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, cost_usd, attempts, cache_state, client_app, request_headers FROM request_summaries WHERE request_id=? AND key_id=?"
   ).bind(id, sess.keyId).first();
   if (!r)
     return c.json({ error: { message: "Request not found.", type: "not_found" } }, 404);
@@ -1312,9 +1312,22 @@ app.get("/console/api/requests/:id", async (c) => {
     attempts: Number(r.attempts) || 0,
     cache_state: r.cache_state || null,
     client_app: r.client_app || null,
-    headers: (() => { try { return JSON.parse(r.request_headers || "{}"); } catch { return {}; } })()
+    headers: (() => { try { return JSON.parse(r.request_headers || "{}"); } catch { return {}; } })(),
+    prompt: await cachedPrompt(c, r.request_id, r.cache_state)
   });
 });
+async function cachedPrompt(c, requestId, cacheState) {
+  if (!cacheState) return null;
+  try {
+    const row = await c.env.DB.prepare("SELECT request_json FROM trajectories WHERE id=?").bind(String(requestId)).first();
+    const body = row && row.request_json ? JSON.parse(row.request_json) : null;
+    const message = body && Array.isArray(body.messages) ? body.messages.find((m) => m && m.role === "user") : null;
+    const text = message && typeof message.content === "string" ? message.content : "";
+    return text ? text.slice(0, 4000) : null;
+  } catch {
+    return null;
+  }
+}
 
 // POST /v1/systemone — decision models, reached through the same auth, route
 // ranking, key rotation, circuit breakers and limits as every other model.

@@ -17,6 +17,7 @@ async function consoleGateway() {
   const day = (offset) => new Date(Date.now() - offset * 86400000).toISOString();
   db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, created_at, updated_at) VALUES (?,?,?,?,?,?,?)")
     .bind("sk-console", "console-test", 1, "usd", 1e9, now, now).run();
+  db.prepare("UPDATE api_keys SET console_auth=0 WHERE key_id='sk-console'").run();
   db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?)")
     .bind(1, "P", "http://p.local", "direct", "openai", 1, 1, "round_robin", now).run();
   db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)")
@@ -185,4 +186,33 @@ test("limits report the key budget and the settings toggle disables the response
     method: "POST", headers: { "content-type": "application/json", cookie }, body: JSON.stringify({ response_cache: "maybe" })
   }));
   assert.equal(bad.status, 400);
+});
+
+test("a key with console auth prompts once, then takes a username and password", async () => {
+  const { app, db } = await consoleGateway();
+  db.prepare("UPDATE api_keys SET console_auth=1 WHERE key_id='sk-console'").run();
+  const first = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console" })
+  }));
+  const body = await first.json();
+  assert.equal(body.setup, true, "the first sign-in asks for an account");
+  assert.equal(first.headers.get("set-cookie"), null, "no session before the account exists");
+  const made = await app.fetch(new Request("http://gw/console/account", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console", username: "observer", password: "longenough" })
+  }));
+  assert.equal(made.status, 200, "creating the account signs in");
+  assert.ok(made.headers.get("set-cookie"), "the account signs in with a session");
+  const retry = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console" })
+  }));
+  const again = await retry.json();
+  assert.equal(again.account, true, "later sign-ins ask for the account");
+  const wrong = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console", username: "observer", password: "notthepassword" })
+  }));
+  assert.equal(wrong.status, 401, "a bad password is refused");
+  const right = await app.fetch(new Request("http://gw/console/auth", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-console", username: "observer", password: "longenough" })
+  }));
+  assert.equal(right.status, 200, "the account password signs in");
 });

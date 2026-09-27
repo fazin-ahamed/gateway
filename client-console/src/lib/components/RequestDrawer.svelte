@@ -57,6 +57,12 @@
       <dt>Cost</dt><dd>{fmtUsd(detail.cost_usd)}</dd>
     </dl>
   </section>
+  {#if detail.prompt}
+    <section>
+      <h3>Prompt</h3>
+      <pre class="prompt">{detail.prompt}</pre>
+    </section>
+  {/if}
   {#if detail.headers && Object.keys(detail.headers).length}
     <section>
       <h3>Sent headers</h3>
@@ -151,5 +157,20 @@
   dd {
     margin: 0;
     font-variant-numeric: tabular-nums;
+    word-break: break-word;
+  }
+
+  .prompt {
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 18px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow-y: auto;
   }
 </style>

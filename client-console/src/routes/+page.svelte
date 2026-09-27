@@ -52,7 +52,7 @@
   }
 
   function changeWindow(h: number) {
-    if (hours === h || loading) return;
+    if (hours === h) return;
     hours = h;
     load(h);
   }
@@ -71,10 +71,6 @@
     (activity?.points || []).map((p) => ({ t: p.hour, requests: p.requests, tokens: p.tokens, spend_usd: p.spend_usd }))
   );
 
-  function budgetText(l: Limits) {
-    if (l.budget.mode === "usd") return `${fmtUsd(l.budget.used)} of ${fmtUsd(l.budget.limit)}`;
-    return `${fmtInt(l.budget.used)} of ${fmtInt(l.budget.limit)} tokens`;
-  }
 </script>
 
 <div class="head">
@@ -106,24 +102,26 @@
     <div class="metric"><div class="label">Succeeded</div><div class="value">{fmtInt(activity.totals.ok)}</div></div>
     <div class="metric"><div class="label">Failed</div><div class="value">{fmtInt(activity.totals.fail)}</div></div>
     <div class="metric"><div class="label">Spend</div><div class="value">{fmtUsd(activity.totals.spend_usd)}</div></div>
+    {#if limits}
+      {@const pct = limits.budget.limit > 0 ? Math.max(2, Math.min(100, (limits.budget.used / limits.budget.limit) * 100)) : 0}
+      <div class="metric budget">
+        <svg class="budget-ring" viewBox="0 0 36 36" style="--pct:{pct}" aria-hidden="true">
+          <circle cx="18" cy="18" r="15"></circle>
+          <circle class="arc" cx="18" cy="18" r="15"></circle>
+        </svg>
+        <div>
+          <div class="label">Limit</div>
+          <div class="value">{limits.budget.mode === "usd" ? fmtUsd(limits.budget.remaining) : fmtInt(limits.budget.remaining)}</div>
+          <div class="label">{limits.budget.mode === "usd" ? fmtUsd(limits.budget.used) : fmtInt(limits.budget.used)} used{limits.rate.per_minute ? ` · ${limits.rate.used_this_minute}/${limits.rate.per_minute} min` : ""}</div>
+        </div>
+      </div>
+    {/if}
   </div>
-
-  {#if limits}
-    <p class="limit-line">
-      Budget {budgetText(limits)}.
-      {#if limits.rate.per_minute}
-        Rate {fmtInt(limits.rate.used_this_minute)} of {fmtInt(limits.rate.per_minute)} this minute.
-      {:else}
-        No per-minute cap.
-      {/if}
-      <a href="/console/limits/">Limits</a>
-    </p>
-  {/if}
   {#if limits?.models.length}
     <div class="rings">
       {#each limits.models as cap (`${cap.slug}-${cap.kind}-${cap.period}`)}
         {@const pct = cap.limit > 0 ? Math.max(2, Math.min(100, (cap.used / cap.limit) * 100)) : 0}
-        <a class="ring" href="/console/limits/" style="--pct:{pct}">
+        <div class="ring" style="--pct:{pct}">
           <svg viewBox="0 0 36 36" aria-hidden="true">
             <circle cx="18" cy="18" r="15"></circle>
             <circle class="arc" cx="18" cy="18" r="15"></circle>
@@ -133,7 +131,7 @@
             <em>{cap.kind === "usd" ? fmtUsd(cap.used) : fmtInt(cap.used)} of {cap.kind === "usd" ? fmtUsd(cap.limit) : fmtInt(cap.limit)}</em>
             <small>per {cap.period}</small>
           </span>
-        </a>
+        </div>
       {/each}
     </div>
   {/if}
@@ -268,6 +266,36 @@
 .ring span { display: flex; flex-direction: column; min-width: 0; }
 .ring strong { font-size: 14px; }
 .ring em, .ring small { color: var(--text-muted); font-style: normal; font-size: 12px; }
+
+  .metric.budget {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+
+  .budget-ring {
+    width: 52px;
+    height: 52px;
+    transform: rotate(-90deg);
+    flex-shrink: 0;
+  }
+
+  .budget-ring circle {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 3;
+  }
+
+  .budget-ring .arc {
+    stroke: var(--accent);
+    stroke-dasharray: calc(var(--pct) * 0.942) 94.2;
+    transition: stroke-dasharray 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .metric.budget .value {
+    font-size: 18px;
+    line-height: 22px;
+  }
 
   .block {
     margin-top: 28px;
