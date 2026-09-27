@@ -75,6 +75,7 @@ Browser surface (all session-authenticated):
 
 ```text
 POST /console/auth
+POST /console/account
 POST /console/logout
 GET  /console/api/me
 GET  /console/api/overview?days=7|30|90

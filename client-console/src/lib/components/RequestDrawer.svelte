@@ -60,12 +60,12 @@
   </section>
 
   <section>
-    <h3>Timing</h3>
+    <h3>Latency</h3>
     <dl>
       <dt>Started</dt><dd>{detail.created_at.slice(0, 19).replace("T", " ")} UTC</dd>
-      <dt>Headers</dt><dd>{fmtMs(detail.headers_ms)}</dd>
-      <dt>First token</dt><dd>{fmtMs(detail.ttft_ms)}</dd>
-      <dt>Completed</dt><dd>{fmtMs(detail.latency_ms)}</dd>
+      <dt>Time to headers</dt><dd>{fmtMs(detail.headers_ms)}</dd>
+      <dt>Time to first token</dt><dd>{fmtMs(detail.ttft_ms)}</dd>
+      <dt>Total time</dt><dd>{fmtMs(detail.latency_ms)}</dd>
     </dl>
   </section>
 
