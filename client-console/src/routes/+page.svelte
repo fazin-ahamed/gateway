@@ -105,9 +105,9 @@
     {#if limits}
       {@const pct = limits.budget.limit > 0 ? Math.max(2, Math.min(100, (limits.budget.used / limits.budget.limit) * 100)) : 0}
       <div class="metric budget">
-        <svg class="budget-ring" viewBox="0 0 36 36" style="--pct:{pct}" aria-hidden="true">
+        <svg class="budget-ring" viewBox="0 0 36 36" aria-hidden="true">
           <circle cx="18" cy="18" r="15"></circle>
-          <circle class="arc" cx="18" cy="18" r="15"></circle>
+          <circle class="arc" cx="18" cy="18" r="15" pathLength="100" stroke-dasharray="{pct} 100"></circle>
         </svg>
         <div>
           <div class="label">Limit</div>
@@ -124,7 +124,7 @@
         <div class="ring" style="--pct:{pct}">
           <svg viewBox="0 0 36 36" aria-hidden="true">
             <circle cx="18" cy="18" r="15"></circle>
-            <circle class="arc" cx="18" cy="18" r="15"></circle>
+            <circle class="arc" cx="18" cy="18" r="15" pathLength="100" stroke-dasharray="{pct} 100"></circle>
           </svg>
           <span>
             <strong>{cap.slug}</strong>
@@ -260,8 +260,6 @@
 .ring circle { fill: none; stroke: var(--border); stroke-width: 3; }
 .ring .arc {
   stroke: var(--accent);
-  stroke-dasharray: calc(var(--pct) * 0.942) 94.2;
-  transition: stroke-dasharray 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .ring span { display: flex; flex-direction: column; min-width: 0; }
 .ring strong { font-size: 14px; }
@@ -288,8 +286,6 @@
 
   .budget-ring .arc {
     stroke: var(--accent);
-    stroke-dasharray: calc(var(--pct) * 0.942) 94.2;
-    transition: stroke-dasharray 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   .metric.budget .value {
