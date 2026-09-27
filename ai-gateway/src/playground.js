@@ -1156,6 +1156,7 @@ async function setPool(id){ const {status,data}=await api('/admin/shared-pool',{
 async function clearPool(){ const {status,data}=await api('/admin/shared-pool',{method:'PUT',body:JSON.stringify({key_id:null})}); if(status===200){ toast('shared pool cleared','ok'); loadKeys(); } else toast('could not clear pool: '+(data&&data.error&&data.error.message||status),'err'); }
 async function toggleKey(id, active){ await api('/admin/keys/'+id+'/'+(active?'activate':'deactivate'),{method:'POST'}); loadKeys(); }
 function copyKey(id){ try{ navigator.clipboard.writeText(id).then(function(){ toast('key copied','ok'); }); }catch(e){ toast('copy failed','err'); } }
+function delKey(id){ confirmAction('Delete key','Delete this key? Its budget, console account, sessions, and cached responses are removed. This cannot be undone.','Delete',async function(){ const {status,data}=await api('/admin/keys/'+id,{method:'DELETE'}); if(status===200){ toast('key deleted','ok'); loadKeys(); } else toast('delete failed: '+(data&&data.error&&data.error.message||status),'err'); }); }
 async function editKey(id){
   const {data}=await api('/admin/keys/'+id); const k=data&&data.key; if(!k){ toast('key not found','err'); return; }
   const tierIds=((data&&data.tiers)||[]).map(function(t){return String(t.id);});

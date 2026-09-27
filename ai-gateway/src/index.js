@@ -4988,6 +4988,11 @@ app.delete("/admin/keys/:id", async (c) => {
   await c.env.DB.prepare("DELETE FROM api_keys WHERE key_id=?").bind(id).run();
   await c.env.DB.prepare("DELETE FROM response_cache WHERE key_id=?").bind(id).run();
   await c.env.DB.prepare("DELETE FROM api_key_rate_windows WHERE key_id=?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM console_sessions WHERE key_id=?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM console_accounts WHERE key_id=?").bind(id).run();
+  // If this key was the shared pool, retire the designation too.
+  if (await isSharedPoolKey(c, id))
+    await c.env.DB.prepare("UPDATE gateway_settings SET value='', updated_at=? WHERE key='shared_pool_key'").bind(nowIso()).run();
   return c.json({ deleted: id });
 });
 app.get("/admin/model-tiers", async (c) => {
