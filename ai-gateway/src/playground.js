@@ -78,6 +78,8 @@ var PLAYGROUND_HTML = `<!doctype html>
     background:linear-gradient(90deg,var(--accent-dim),var(--accent));
     box-shadow:0 0 12px -2px rgba(116,164,255,.5);}
   .pg-dec-bar b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums;}
+  .pg-dec-track{height:6px; border-radius:var(--r-pill); background:var(--surface-deep); overflow:hidden; margin:2px 0 8px;}
+  .pg-dec-track i{display:block; height:100%; background:linear-gradient(90deg,var(--accent-dim),var(--accent)); transition:width var(--dur) var(--ease);}
   @keyframes pgDecIn{from{opacity:0; transform:translateY(8px) scale(.985);} to{opacity:1; transform:none;}}
 
   @media (prefers-reduced-motion:reduce){
@@ -316,18 +318,24 @@ var PLAYGROUND_HTML = `<!doctype html>
           <label for="c-model" id="c-model-label">Model slug</label>
           <select id="c-model"><option value="">Loading enabled models...</option></select>
           <div class="pg-decision-only" id="c-decision-config" hidden>
-            <label for="c-dec-state">State (JSON)</label>
+            <p class="hint">A decision model does not chat. You describe a <b>state</b>, then ask typed <b>questions</b> about it: a yes/no probability (noul), a pick from options you list (choice), or a rating on a scale (score). Load an example, then run:</p>
+            <div class="form-actions">
+              <button class="ghost" type="button" data-dec-ex="yesno">Yes / no example</button>
+              <button class="ghost" type="button" data-dec-ex="choice">Choice example</button>
+              <button class="ghost" type="button" data-dec-ex="score">Score example</button>
+            </div>
+            <label for="c-dec-state">State (JSON): what you are deciding about</label>
             <textarea id="c-dec-state" spellcheck="false">{
   "task": "fix the session writer race"
 }</textarea>
-            <label for="c-dec-questions">Questions (JSON)</label>
+            <label for="c-dec-questions">Questions (JSON): what to ask about the state</label>
             <textarea id="c-dec-questions" spellcheck="false">{
   "verify": {
     "type": "noul",
     "instructions": "Does this change require objective verification?"
   }
 }</textarea>
-            <p class="hint">choice, score and noul questions against one shared state. A choice may only return an option you defined here.</p>
+            <p class="hint">noul needs instructions · choice needs a criteria object (option: why) · score needs a criteria array of labels, lowest to highest.</p>
           </div>
           <div class="small" id="c-route-hint" style="margin-top:6px">Pick a slug to see its last integrity verdict.</div>
           <label class="pg-check" for="c-stream"><input type="checkbox" id="c-stream"> Stream responses</label>
@@ -1312,6 +1320,18 @@ document.getElementById('c-verify').onclick=function(){ verifyPlaygroundSlug(); 
 document.getElementById('c-model').addEventListener('change',function(){ refreshPlaygroundIntegrity(); });
 document.getElementById('c-mode-chat').addEventListener('click',function(){ setPlaygroundMode('chat'); });
 document.getElementById('c-mode-decision').addEventListener('click',function(){ setPlaygroundMode('decision'); });
+var DEC_EXAMPLES={
+  yesno:{state:{task:"fix the session writer race"},questions:{verify:{type:"noul",instructions:"Does this change require objective verification before merge?"}}},
+  choice:{state:{task:"route this request",prompt:"summarize a 2-line diff"},questions:{tier:{type:"choice",instructions:"Which model tier fits this task?",criteria:{"fast-small":"cheap, quick, simple asks","balanced":"general work","flagship":"hard reasoning"}}}},
+  score:{state:{answer:"The capital of France is Paris."},questions:{quality:{type:"score",instructions:"Rate the answer's quality.",criteria:["poor","fair","good","excellent"]}}}
+};
+document.addEventListener('click',function(e){
+  var b=e.target.closest&&e.target.closest('[data-dec-ex]'); if(!b) return;
+  var ex=DEC_EXAMPLES[b.getAttribute('data-dec-ex')]; if(!ex) return;
+  document.getElementById('c-dec-state').value=JSON.stringify(ex.state,null,2);
+  document.getElementById('c-dec-questions').value=JSON.stringify(ex.questions,null,2);
+  toast('example loaded','ok');
+});
 let pgLastRun=null;
 let pgBusy=false;
 function pgRateMeta(elapsedMs, totalTokens){
@@ -1331,7 +1351,7 @@ function renderDecisionAnswers(answers,meta){
     var a=answers[name]||{};
     var head='<div class="pg-dec-card"><div class="k">'+esc(name)+' <span class="pill mut">'+esc(a.type)+'</span></div>';
     if(a.type==='choice'){
-      head+='<div class="pg-dec-choice">'+esc(a.choice==null?'—':a.choice)+'</div>';
+      head+='<div class="pg-dec-choice">'+esc(a.choice==null?'n/a':a.choice)+'</div>';
       var probs=a.probabilities||{}; var keys=Object.keys(probs);
       for(const k of keys){
         var pct=Math.round((Number(probs[k])||0)*100);
@@ -1341,9 +1361,9 @@ function renderDecisionAnswers(answers,meta){
       head+='<div class="pg-dec-choice">'+esc(a.label==null?String(a.score):a.label)+'</div>';
     } else {
       var p=Math.round((Number(a.probability)||0)*100);
-      head+='<div class="pg-dec-choice">'+p+'%</div><div class="pg-dec-bar"><i style="width:'+p+'%"></i></div>';
+      head+='<div class="pg-dec-choice">'+p+'%</div><div class="pg-dec-track" role="meter" aria-valuenow="'+p+'"><i style="width:'+p+'%"></i></div>';
     }
-    head+='<div class="small">confidence '+(a.confidence==null?'—':Math.round(a.confidence*100)+'%')+'</div></div>';
+    head+='<div class="small">confidence '+(a.confidence==null?'n/a':Math.round(a.confidence*100)+'%')+'</div></div>';
     html+=head;
   }
   if(meta) html+='<div class="small" style="margin-top:8px">'+esc(meta)+'</div>';
