@@ -15,12 +15,24 @@ export function systemOnePath() {
   return "/v1/systemone";
 }
 
+// Join base + path without doubling a /v1 segment. Operators set base_url the
+// OpenAI way (https://host/v1), and the default decision path is /v1/systemone;
+// naive concatenation yields https://host/v1/v1/systemone, which 404s. If the
+// base already ends in /v1 and the path starts with /v1/, drop the duplicate.
+export function joinDecisionUrl(base, path) {
+  const b = String(base || "").replace(/\/+$/, "");
+  const p = path || systemOnePath();
+  if (/\/v1$/.test(b) && p.startsWith("/v1/"))
+    return b + p.slice(3);
+  return b + p;
+}
+
 export function isSystemOneFormat(fmt) {
   return String(fmt || "").toLowerCase() === "systemone";
 }
 
 export async function callSystemOne({ base, path, model, state, questions, apiKey, headers, fetchImpl, timeoutMs = 20000 }) {
-  const url = String(base || "").replace(/\/+$/, "") + (path || systemOnePath());
+  const url = joinDecisionUrl(base, path);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const doFetch = fetchImpl || fetch;

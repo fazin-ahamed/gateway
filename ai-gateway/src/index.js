@@ -22,7 +22,7 @@ import { contextLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/
 import { contextBucket, deadlineFor, chooseBackup, wouldHedge } from "./router/latency-governor.js";
 import { validateRequest as validateDecisionRequest } from "./decision/types.js";
 import { startRequestSummary, finishRequestSummary } from "./console/request-ledger.js";
-import { callSystemOne, mapSystemOneResponse, isSystemOneFormat, systemOnePath } from "./decision/providers/systemone.js";
+import { callSystemOne, mapSystemOneResponse, isSystemOneFormat, systemOnePath, joinDecisionUrl } from "./decision/providers/systemone.js";
 var app = new Hono();
 var registrySeededDbs = new WeakSet();
 var registrySeedInflight = new WeakMap();
@@ -1422,7 +1422,7 @@ async function runSystemOneDecision(c, key) {
           return fetch(proxy + sep + "url=" + encodeURIComponent(url), { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
         }
       : (url, init) => upstreamFetch(c, url, init);
-    const attemptUrl = providerBaseFor(route, route) + decisionPathFor(route, route);
+    const attemptUrl = joinDecisionUrl(providerBaseFor(route, route), decisionPathFor(route, route));
     blog("REQ id=" + requestId + " decision -> " + attemptUrl + " transport=" + transport);
     for (const k of orderKeys(keys, route.key_strategy || "round_robin", route.provider_id)) {
       const res = await callSystemOne({
