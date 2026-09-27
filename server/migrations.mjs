@@ -237,9 +237,39 @@ export function migrateRequestSummaries(db) {
     )`);
     db.exec("CREATE INDEX IF NOT EXISTS idx_request_summaries_key_time ON request_summaries(key_id, created_at)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_request_summaries_slug_time ON request_summaries(public_slug, created_at)");
+    const r = db.prepare("PRAGMA table_info(request_summaries)").all();
+    const names = new Set(((r && r.results) || []).map((c) => c && c.name));
+    for (const name of ["client_app", "request_headers"]) {
+      if (!names.has(name)) db.exec("ALTER TABLE request_summaries ADD COLUMN " + name + " TEXT");
+    }
     return true;
   } catch (e) {
     console.warn("[gateway] request summaries migration skipped:", e.message);
     return false;
+  }
+}
+
+// Console accounts: the username/password a key holder picks on first
+// sign-in, plus the per-key switch that turns that requirement off. Both are
+// no-ops on a fresh schema and fill in on databases that predate them.
+export function migrateConsoleAccounts(db) {
+  const added = [];
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS console_accounts (
+      key_id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`);
+    const r = db.prepare("PRAGMA table_info(api_keys)").all();
+    const names = new Set(((r && r.results) || []).map((c) => c && c.name));
+    if (!names.has("console_auth")) {
+      db.exec("ALTER TABLE api_keys ADD COLUMN console_auth INTEGER NOT NULL DEFAULT 1");
+      added.push("console_auth");
+    }
+    return added;
+  } catch (e) {
+    console.warn("[gateway] console accounts migration skipped:", e.message);
+    return added;
   }
 }

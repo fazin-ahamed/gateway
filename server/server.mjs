@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
-import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries } from "./migrations.mjs";
+import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries, migrateConsoleAccounts } from "./migrations.mjs";
 import { configureSessionStore } from "../ai-gateway/src/zai-session.js";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -92,6 +92,7 @@ migrateZaiConversations(db);
 migrateModelRouteKinds(db);
 migrateConsoleSessions(db);
 migrateRequestSummaries(db);
+migrateConsoleAccounts(db);
 const env = {
   DB: db,
   ADMIN_TOKEN,
