@@ -205,6 +205,8 @@ var PLAYGROUND_HTML = `<!doctype html>
   .tj-bar-track{height:6px;background:var(--surface-deep);border-radius:3px;overflow:hidden}
   .tj-bar-fill{height:100%;background:var(--accent);border-radius:3px;transition:width var(--dur) var(--ease)}
   .tj-bar-val{text-align:right;font-size:10px;color:var(--muted)}
+  .tj-pager{display:flex;align-items:center;justify-content:center;gap:14px;padding:14px 0 4px;color:var(--muted)}
+  .tj-pager button:disabled{opacity:.35;cursor:default}
   .tj-steps{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0}
   .tj-step{padding:8px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface-deep)}
   .tj-step.ok{border-color:rgba(62,201,140,.3)}
@@ -1088,6 +1090,8 @@ document.addEventListener('click', function(e){
   else if(act==='kdel') delKey(id);
   else if(act==='kpool') setPool(id);
   else if(act==='kpoolclear') clearPool();
+  else if(act==='tjprev'){ tjOffset=Math.max(0,tjOffset-tjLimit); loadTrajectories(); }
+  else if(act==='tjnext'){ tjOffset+=tjLimit; loadTrajectories(); }
 });
 
 async function publicModelOptions(kind){ const {data}=await api('/admin/routes'); const seen=[]; const out=[]; for(const r of (data&&data.routes||[])){ if(!r.enabled) continue; const rk=String(r.model_kind||'chat'); if(kind&&kind!=='all'&&rk!==kind) continue; if(seen.indexOf(r.slug)>=0) continue; seen.push(r.slug); out.push({value:r.slug,label:kind==='all'&&rk==='decision'?r.slug+' \u00b7 decision':r.slug}); } return out.sort(function(a,b){return a.value.localeCompare(b.value);}); }
@@ -1963,13 +1967,14 @@ document.addEventListener('change',function(e){
 });
 
 // ---------- TRAJECTORIES ----------
+let tjOffset=0; const tjLimit=25;
 async function loadTrajectories(){
   const statsEl=document.getElementById('tj-stats'); const listEl=document.getElementById('tj-list'); const chartEl=document.getElementById('tj-chart');
   paintSkeleton(statsEl);
   let settings=null; try{ settings=(await api('/admin/trajectory-settings')).data; }catch(e){}
   const capBox=document.getElementById('tj-capture'); if(capBox) capBox.checked=!settings||settings.capture!=='off';
-  let data; try{ data=(await api('/admin/trajectories?limit=300')).data; }catch(e){ listEl.innerHTML='<div class="empty">Could not load trajectories: '+esc(e.message)+'</div>'; return; }
-  const list=(data&&data.trajectories)||[]; const s=(data&&data.stats)||{};
+  let data; try{ data=(await api('/admin/trajectories?limit='+tjLimit+'&offset='+tjOffset)).data; }catch(e){ listEl.innerHTML='<div class="empty">Could not load trajectories: '+esc(e.message)+'</div>'; return; }
+  const list=(data&&data.trajectories)||[]; const s=(data&&data.stats)||{}; const pg=(data&&data.page)||{limit:tjLimit,offset:tjOffset,matched:list.length,hasMore:false};
   const okRate=s.total?Math.round(100*(s.ok_count||0)/s.total)+'%':'-';
   statsEl.innerHTML=[
     {k:'Requests',v:fmt(s.total||0),c:''},
@@ -1977,16 +1982,13 @@ async function loadTrajectories(){
     {k:'Tokens',v:fmt(s.tokens||0),c:'acc'},
     {k:'Cost',v:money(s.cost||0),c:''}
   ].map(function(x){return '<div class="stat"><div class="k">'+x.k+'</div><div class="v '+x.c+'">'+esc(x.v)+'</div></div>';}).join('');
-  const byModel={};
-  list.forEach(function(t){ if(t.status!=='ok') return; const k=t.slug; (byModel[k]=byModel[k]||[]).push(t.latency_ms||0); });
-  const models=Object.keys(byModel).sort();
-  if(!models.length){ chartEl.innerHTML='<div class="empty">No recorded requests yet.</div>'; }
+  const lat=(data&&data.latency)||[];
+  if(!lat.length){ chartEl.innerHTML='<div class="empty">No recorded requests yet.</div>'; }
   else{
-    chartEl.innerHTML='<div class="tj-chart">'+models.map(function(m){
-      const lat=byModel[m]; const avg=lat.reduce(function(a,b){return a+b;},0)/lat.length;
-      const max=Math.max.apply(null,models.map(function(x){const l=byModel[x];return l.reduce(function(a,b){return a+b;},0)/l.length;}));
-      const pct=max>0?Math.max(6,Math.round(100*avg/max)):6;
-      return '<div class="tj-bar"><div class="tj-bar-label mono">'+esc(m)+'</div><div class="tj-bar-track"><div class="tj-bar-fill" style="width:'+pct+'%"></div></div><div class="tj-bar-val mono">'+Math.round(avg)+'ms</div></div>';
+    const max=Math.max.apply(null,lat.map(function(x){return x.avg_ms;}));
+    chartEl.innerHTML='<div class="tj-chart">'+lat.map(function(x){
+      const pct=max>0?Math.max(6,Math.round(100*x.avg_ms/max)):6;
+      return '<div class="tj-bar"><div class="tj-bar-label mono">'+esc(x.slug)+'</div><div class="tj-bar-track"><div class="tj-bar-fill" style="width:'+pct+'%"></div></div><div class="tj-bar-val mono">'+x.avg_ms+'ms <span class="small">· '+fmt(x.n)+'</span></div></div>';
     }).join('')+'</div>';
   }
   const rows=list.map(function(t){
@@ -1994,7 +1996,13 @@ async function loadTrajectories(){
     const cache=t.cache_state?'<span class="pill mut">'+esc(t.cache_state)+'</span>':'';
     return '<tr><td class="mono small">'+esc((t.created_at||'').slice(5,19).replace('T',' '))+'</td><td>'+esc(t.slug)+'</td><td>'+esc(t.provider||'-')+'</td><td>'+pill+' '+cache+'</td><td class="mono" title="input tokens">'+fmt(t.prompt_tokens||0)+'&nbsp;in</td><td class="mono" title="output tokens">'+fmt(t.completion_tokens||0)+'&nbsp;out</td><td class="mono" title="latency">'+fmt(t.latency_ms||0)+'ms</td><td class="mono" title="cost">'+money(t.cost_usd||0)+'</td><td><button class="ghost" data-act="tjview" data-id="'+esc(t.id)+'">view</button></td></tr>';
   }).join('') || '<tr><td colspan="9"><div class="empty">No trajectories captured yet.</div></td></tr>';
-  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Provider</th><th>Status</th><th>In tok</th><th>Out tok</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>';
+  const from=pg.matched?pg.offset+1:0; const to=pg.offset+list.length;
+  const pager='<div class="tj-pager">'+
+    '<button class="ghost" data-act="tjprev" '+(pg.offset<=0?'disabled':'')+'>&larr; Newer</button>'+
+    '<span class="small">Showing '+fmt(from)+'–'+fmt(to)+' of '+fmt(pg.matched)+'</span>'+
+    '<button class="ghost" data-act="tjnext" '+(pg.hasMore?'':'disabled')+'>Older &rarr;</button>'+
+  '</div>';
+  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Provider</th><th>Status</th><th>In tok</th><th>Out tok</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>'+pager;
 }
 async function viewTrajectory(id){
   const {data}=await api('/admin/trajectories/'+id); const t=data&&data.trajectory; if(!t){ toast('not found','err'); return; }

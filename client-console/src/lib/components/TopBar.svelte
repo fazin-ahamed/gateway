@@ -40,6 +40,21 @@
   const poolLimit = $derived(
     pool ? (pool.mode === "usd" ? fmtUsd(pool.limit) : fmtInt(pool.limit)) : ""
   );
+
+  let copied = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function copyPoolKey() {
+    if (!pool?.key_id) return;
+    try {
+      await navigator.clipboard.writeText(pool.key_id);
+      copied = true;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => (copied = false), 1400);
+    } catch {
+      copied = false;
+    }
+  }
 </script>
 
 <header class="topbar">
@@ -47,17 +62,23 @@
     <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><line x1="6" y1="2.5" x2="6" y2="13.5" /></svg>
   </button>
   {#if pool}
-    <div class="pool {poolState}" title="Shared pool budget available to every key: {poolRemaining} of {poolLimit} left">
+    <button
+      class="pool {poolState}"
+      type="button"
+      title="Click to copy the shared pool key, then use it as sk-… against /v1"
+      aria-label="Shared pool {pool.name}: {poolRemaining} left. Click to copy the key."
+      onclick={copyPoolKey}
+    >
       <svg class="orbit" viewBox="0 0 24 24" aria-hidden="true">
         <circle cx="12" cy="12" r="2.4" />
         <ellipse cx="12" cy="12" rx="9" ry="3.6" fill="none" />
         <ellipse cx="12" cy="12" rx="9" ry="3.6" fill="none" transform="rotate(60 12 12)" />
       </svg>
-      <span class="pool-name">{pool.name}</span>
+      <span class="pool-name">{copied ? "Key copied" : pool.name}</span>
       <span class="pool-sep">·</span>
-      <span class="pool-remaining">{poolRemaining} left</span>
+      <span class="pool-remaining">{copied ? pool.key_id.slice(0, 12) + "…" : poolRemaining + " left"}</span>
       <span class="meter" aria-hidden="true"><span class="fill" style="width:{poolPct}%"></span></span>
-    </div>
+    </button>
   {/if}
   <div class="spacer"></div>
   {#if limits}
@@ -161,6 +182,18 @@
     font-variant-numeric: tabular-nums;
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent);
     animation: pool-pulse 2.8s ease-in-out infinite;
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform var(--t-fast, 140ms) var(--ease, ease), border-color var(--t-fast, 140ms) ease;
+  }
+
+  .pool:hover {
+    transform: translateY(-1px);
+    border-color: color-mix(in srgb, var(--accent) 75%, var(--border));
+  }
+
+  .pool:active {
+    transform: translateY(0);
   }
 
   .pool.warn {

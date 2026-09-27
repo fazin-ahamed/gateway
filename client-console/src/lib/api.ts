@@ -101,6 +101,7 @@ export type Settings = {
 };
 
 export type Pool = {
+  key_id: string;
   name: string;
   mode: string;
   limit: number;

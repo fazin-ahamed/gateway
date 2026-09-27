@@ -104,18 +104,19 @@ with a recovered credential.
 
 One `api_key` can be designated the **shared pool**: a communal key with its
 own budget that every signed-in console user sees as a top-bar event pill with
-the remaining balance. It is set in `/_gw`, Keys tab: **set pool** on a key
-(**unset pool** clears it).
+the remaining balance. Clicking the pill copies the pool's `sk-` key so it can
+be used against `/v1` — the point of a pool is shared use. It is set in `/_gw`,
+Keys tab: **set pool** on a key (**unset pool** clears it).
 
 ```text
-GET /admin/shared-pool                          -> { key_id, pool } (admin; key_id is the sk- secret)
+GET /admin/shared-pool                          -> { key_id, pool } (admin)
 PUT /admin/shared-pool  { "key_id": "sk-..." }  -> designate; { "key_id": null } clears
-GET /console/api/pool                           -> { pool: { name, mode, limit, used, remaining, request_count, active } | null }
+GET /console/api/pool                           -> { pool: { key_id, name, mode, limit, used, remaining, request_count, active } | null }
 ```
 
 The designation is stored in `gateway_settings` under `shared_pool_key`. The
-console endpoint never returns the pool's `key_id`; only the admin endpoint,
-which already exposes every `sk-` value, does.
+console endpoint returns the pool's `key_id` only to an authenticated console
+session, and only because the pill needs to copy it.
 
 ## The request ledger
 

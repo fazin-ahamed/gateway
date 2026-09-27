@@ -1075,8 +1075,9 @@ app.get("/console/api/limits", async (c) => {
   });
 });
 
-// The shared pool is a single api_key any operator can designate. Every signed-in
-// console user sees its remaining budget as a banner, but never its secret key_id.
+// The shared pool is a single api_key any operator designates for communal use.
+// Every signed-in console user sees its remaining budget as a top-bar event pill
+// and can copy its key from there, since the whole point of a pool is shared use.
 app.get("/console/api/pool", async (c) => {
   const { denied } = await requireConsoleSession(c);
   if (denied) return denied;
@@ -1087,13 +1088,14 @@ async function sharedPoolStatus(c) {
   const keyId = await settingValue(c, "shared_pool_key", "");
   if (!keyId) return null;
   const key = await c.env.DB.prepare(
-    "SELECT name, budget_mode, budget_limit, used_tokens, used_usd, request_count, active FROM api_keys WHERE key_id=?"
+    "SELECT key_id, name, budget_mode, budget_limit, used_tokens, used_usd, request_count, active FROM api_keys WHERE key_id=?"
   ).bind(keyId).first();
   if (!key) return null;
   const mode = String(key.budget_mode || "usd");
   const used = mode === "usd" ? Number(key.used_usd) || 0 : Number(key.used_tokens) || 0;
   const limit = Number(key.budget_limit) || 0;
   return {
+    key_id: String(key.key_id),
     name: String(key.name || "Shared pool"),
     mode,
     limit,
@@ -5838,20 +5840,33 @@ app.get("/admin/trajectories", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)
     return denied;
-  const limit = Math.min(500, Math.max(1, Number(c.req.query("limit")) || 100));
+  const limit = Math.min(200, Math.max(1, Number(c.req.query("limit")) || 100));
+  const offset = Math.max(0, Number(c.req.query("offset")) || 0);
   const slug = String(c.req.query("slug") || "").trim();
   const status = String(c.req.query("status") || "").trim();
   let sql = "SELECT id, created_at, key_name, slug, stream, cache_state, status, http_status, provider, rank, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error FROM trajectories";
+  let countSql = "SELECT COUNT(*) AS n FROM trajectories";
   const conds = [];
   const binds = [];
   if (slug) { conds.push("slug=?"); binds.push(slug); }
   if (status === "ok" || status === "fail") { conds.push("status=?"); binds.push(status); }
-  if (conds.length) sql += " WHERE " + conds.join(" AND ");
-  sql += " ORDER BY created_at DESC LIMIT ?";
-  binds.push(limit);
+  if (conds.length) { sql += " WHERE " + conds.join(" AND "); countSql += " WHERE " + conds.join(" AND "); }
+  sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+  binds.push(limit, offset);
   const rows = await c.env.DB.prepare(sql).bind(...binds).all();
+  const matched = await c.env.DB.prepare(countSql).bind(...binds.slice(0, conds.length)).first();
+  const latRows = await c.env.DB.prepare(
+    "SELECT slug, AVG(latency_ms) avg_ms, COUNT(*) n FROM trajectories WHERE status='ok' AND latency_ms IS NOT NULL " +
+    (conds.length ? " AND " + conds.join(" AND ") : "") +
+    " GROUP BY slug ORDER BY avg_ms DESC"
+  ).bind(...binds.slice(0, conds.length)).all();
   const agg = await c.env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok_count, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost FROM trajectories").first();
-  return c.json({ trajectories: rows.results || [], stats: agg || { total: 0, ok_count: 0, tokens: 0, cost: 0 } });
+  return c.json({
+    trajectories: rows.results || [],
+    stats: agg || { total: 0, ok_count: 0, tokens: 0, cost: 0 },
+    latency: (latRows.results || []).map((r) => ({ slug: String(r.slug || ""), avg_ms: Math.round(Number(r.avg_ms) || 0), n: Number(r.n) || 0 })),
+    page: { limit, offset, matched: Number(matched && matched.n) || 0, hasMore: (Number(matched && matched.n) || 0) > offset + limit }
+  });
 });
 app.get("/admin/trajectories-export", async (c) => {
   const denied = await requireAdmin(c);

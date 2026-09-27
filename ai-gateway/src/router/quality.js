@@ -40,6 +40,25 @@ export const TOOL_VALID_WEIGHT_DEDUPED = 0.2;
 
 const clamp01 = (v) => Math.min(1, Math.max(0, Number(v) || 0));
 
+// Host DBs created before the canonical column landed have quality_observations
+// without it. The emit path inserts canonical_model_id on every observation, so
+// a missing column fails the whole insert and quality silently never records.
+// Runs once per process; safe on fresh DBs (schema.sql already has the column).
+export async function ensureQualityColumns(db) {
+  if (!db || ensureQualityColumns.done) return;
+  try {
+    const r = await db.prepare("PRAGMA table_info(quality_observations)").all();
+    const names = new Set((r && (r.results || r) || []).map((x) => x.name));
+    if (!names.has("canonical_model_id")) {
+      await db.prepare("ALTER TABLE quality_observations ADD COLUMN canonical_model_id TEXT").run();
+      console.warn("[gateway] migration: added quality_observations.canonical_model_id");
+    }
+    ensureQualityColumns.done = true;
+  } catch {
+    // A missing table is created by schema.sql on boot; nothing to migrate here.
+  }
+}
+
 // Synchronous fallback identity used when no DB-backed alias resolves (or no DB
 // handle is available): the raw upstream_model VERBATIM under a "raw:" prefix —
 // no punctuation normalization pretending two spellings are one intelligence.
@@ -134,6 +153,7 @@ export function fractionalUpdate(signals) {
 export async function emitQualityObservations(c, attemptId, a) {
   try {
     if (!c || !c.env || !c.env.DB || !attemptId) return [];
+    await ensureQualityColumns(c.env.DB);
     const allSignals = deriveQualityFromAttempt(a);
     if (!allSignals.length) return [];
     const identity = await resolveQualityIdentity(c, a);
