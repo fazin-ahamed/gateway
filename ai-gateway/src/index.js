@@ -1408,6 +1408,22 @@ async function runSystemOneDecision(c, key) {
     } catch {
       extraHeaders = {};
     }
+    // Send through the SAME egress the chat path uses. A raw global fetch here
+    // skips the undici dispatcher (custom CA/keepalive) and the provider's
+    // proxy transport, so on a host where direct egress is blocked the request
+    // silently never leaves — the "it isn't even sending" symptom. Direct/auto
+    // ride upstreamFetch; a proxy provider tunnels through its egress helper.
+    const transport = routeTransport(route, c.env);
+    const decisionFetch = transport === "proxy"
+      ? async (url, init) => {
+          const proxy = route.proxy_url || (await resolveActiveEgress(c) || {}).url;
+          if (!proxy) throw new Error("proxy transport but no egress configured");
+          const sep = proxy.includes("?") ? "&" : "?";
+          return fetch(proxy + sep + "url=" + encodeURIComponent(url), { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
+        }
+      : (url, init) => upstreamFetch(c, url, init);
+    const attemptUrl = providerBaseFor(route, route) + decisionPathFor(route, route);
+    blog("REQ id=" + requestId + " decision -> " + attemptUrl + " transport=" + transport);
     for (const k of orderKeys(keys, route.key_strategy || "round_robin", route.provider_id)) {
       const res = await callSystemOne({
         base: providerBaseFor(route, route),
@@ -1417,7 +1433,7 @@ async function runSystemOneDecision(c, key) {
         questions: body.questions,
         apiKey: k.key,
         headers: extraHeaders,
-        fetchImpl: c.__fetchImpl,
+        fetchImpl: decisionFetch,
         timeoutMs: Number(c.env.DECISION_TIMEOUT_MS) || 20000
       });
       if (res.ok) {
