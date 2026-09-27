@@ -54,7 +54,7 @@ export type ConsoleModel = {
   prompt_per_1m?: number | null;
   completion_per_1m?: number | null;
   per_request?: number | null;
-  description?: string | null;
+  name?: string | null;
   knowledge?: string | null;
 };
 

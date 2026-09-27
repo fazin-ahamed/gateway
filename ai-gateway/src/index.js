@@ -1264,7 +1264,7 @@ app.get("/console/api/models", async (c) => {
       prompt_per_1m: pr ? Number(pr.prompt_per_1m) : null,
       completion_per_1m: pr ? Number(pr.completion_per_1m) : null,
       per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null,
-      description: entry && (entry.description || entry.name) || null,
+      name: entry && entry.name || null,
       knowledge: entry && (entry.knowledge || entry.release_date) || null
     });
   }
@@ -1373,6 +1373,8 @@ async function runSystemOneDecision(c, key) {
   }
 
   let lastReason = "no decision route answered";
+  let lastStatus = 0;
+  let lastProviderMessage = "";
   for (const route of candidates) {
     const circuit = circuitKey(route);
     if (circuitOpen(circuit) || circuitOpen("provider", route.provider_id)) {
@@ -1421,12 +1423,24 @@ async function runSystemOneDecision(c, key) {
         });
       }
       lastReason = res.reason || "decision provider failed";
+      if (res.http) lastStatus = res.http;
+      if (res.providerMessage) lastProviderMessage = res.providerMessage;
       blog("FWD FAIL decision provider=" + route.provider_name + " -> " + lastReason);
     }
   }
-  await recordTrajectory(c, { id: requestId, keyId: key && key.key_id || null, keyName: key && key.name || null, slug, stream: false, requestJson: JSON.stringify({ model: slug, state: body.state, questions: Object.keys(body.questions) }), steps: [], status: "fail", httpStatus: 502, attempts: candidates.length, latencyMs: Date.now() - started, error: lastReason });
-  await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 502, latencyMs: Date.now() - started, attempts: candidates.length });
-  return c.json({ error: { message: "The decision model did not answer. The gateway falls back to its own policy.", type: "decision_unavailable" } }, 502);
+  // Surface what actually happened. An upstream 4xx means the request WAS sent
+  // and the provider rejected it (usually a wrong base_url or endpoint_path),
+  // so return that status and message instead of a blanket "did not answer" —
+  // otherwise a 404 from a misconfigured route looks like the gateway never
+  // tried. 5xx and unreachable stay 502 (a transient provider fault).
+  const clientStatus = lastStatus >= 400 && lastStatus < 500 ? lastStatus : 502;
+  const detail = lastProviderMessage ? " (" + lastProviderMessage + ")" : "";
+  const message = lastStatus
+    ? "The decision model at this route returned HTTP " + lastStatus + detail + ". Check the provider base URL and endpoint path."
+    : "The decision model could not be reached (" + lastReason + "). Check the provider base URL, key, and health.";
+  await recordTrajectory(c, { id: requestId, keyId: key && key.key_id || null, keyName: key && key.name || null, slug, stream: false, requestJson: JSON.stringify({ model: slug, state: body.state, questions: Object.keys(body.questions) }), steps: [], status: "fail", httpStatus: clientStatus, attempts: candidates.length, latencyMs: Date.now() - started, error: lastReason });
+  await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: clientStatus, latencyMs: Date.now() - started, attempts: candidates.length });
+  return c.json({ error: { message, type: "decision_unavailable" } }, clientStatus);
 }
 app.post("/v1/systemone", async (c) => {
   await ensureUpstreamDispatcher();
@@ -3050,7 +3064,11 @@ function flattenModelsDevCatalog(catalog) {
         ...model && "tool_call" in Object(model) ? { toolCall: model.tool_call } : {},
         attachment: !!(model && model.attachment),
         modalities: model && model.modalities || null,
-        limit: model && model.limit || null
+        limit: model && model.limit || null,
+        name: model && model.name ? String(model.name) : null,
+        knowledge: model && model.knowledge ? String(model.knowledge) : null,
+        release_date: model && model.release_date ? String(model.release_date) : null,
+        vision: !!(model && (model.attachment || (model.modalities && Array.isArray(model.modalities.input) && model.modalities.input.includes("image"))))
       };
       if (!byId.has(id) || provider && provider.id && id.startsWith(provider.id + "/"))
         byId.set(id, entry);

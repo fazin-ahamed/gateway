@@ -89,9 +89,17 @@
     {#each shown as m (m.id)}
       <button class="card" type="button" onclick={() => (selected = m)}>
         <strong>{m.id}</strong>
-        <span>{m.model_kind === "decision" ? "Decision" : "Chat"} · {price(m)}</span>
-        <p>{m.description || "No description from models.dev."}</p>
-        <em>{m.knowledge ? `Knowledge ${m.knowledge}` : fmtContext(m.context_window)}</em>
+        {#if m.name}<span class="name">{m.name}</span>{/if}
+        <span class="kind">{m.model_kind === "decision" ? "Decision · /v1/systemone" : "Chat · /v1/chat/completions"}</span>
+        {#if m.model_kind !== "decision"}
+          <div class="chips">
+            {#if m.context_window}<span class="chip">{fmtContext(m.context_window)} ctx</span>{/if}
+            {#if m.tools}<span class="chip">Tools</span>{/if}
+            {#if m.vision}<span class="chip">Vision</span>{/if}
+            {#if m.reasoning}<span class="chip">Reasoning</span>{/if}
+          </div>
+        {/if}
+        <em>{price(m)}{m.knowledge ? ` · knowledge ${m.knowledge}` : ""}</em>
       </button>
     {:else}
       <p class="empty">No models match.</p>
@@ -227,5 +235,7 @@
   .card:hover { border-color: var(--accent); }
   .card strong { font-size: 15px; }
   .card span, .card em { color: var(--text-muted); font-style: normal; font-size: 12px; }
-  .card p { margin: 0; font-size: 13px; line-height: 19px; }
+  .card .name { color: var(--text); font-size: 13px; }
+  .card .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .card .chip { padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--radius-control); font-size: 11px; color: var(--text-muted); }
 </style>
