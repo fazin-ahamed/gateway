@@ -111,9 +111,9 @@
           <circle class="arc" cx="18" cy="18" r="15" pathLength="100" stroke-dasharray="{pct} 100"></circle>
         </svg>
         <div>
-          <div class="label">Limit</div>
-          <div class="value">{limits.budget.mode === "usd" ? fmtUsd(limits.budget.remaining) : fmtInt(limits.budget.remaining)}</div>
-          <div class="label">{limits.budget.mode === "usd" ? fmtUsd(limits.budget.used) : fmtInt(limits.budget.used)} used{limits.rate.per_minute ? ` · ${limits.rate.used_this_minute}/${limits.rate.per_minute} min` : ""}</div>
+          <div class="label">Budget</div>
+          <div class="value">{limits.budget.mode === "usd" ? fmtUsd(limits.budget.used) : fmtInt(limits.budget.used)}</div>
+          <div class="label">of {limits.budget.mode === "usd" ? fmtUsd(limits.budget.limit) : fmtInt(limits.budget.limit)} used{limits.rate.per_minute ? ` · ${limits.rate.used_this_minute}/${limits.rate.per_minute}/min` : ""}</div>
         </div>
       </div>
     {/if}
