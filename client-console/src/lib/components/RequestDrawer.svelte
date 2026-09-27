@@ -6,6 +6,23 @@
   const statusWord = $derived(
     detail.status === "ok" ? "Succeeded" : detail.status === "cancelled" ? "Cancelled" : detail.status === "fail" ? "Failed" : detail.status
   );
+
+  const throughput = $derived(
+    detail.completion_tokens && detail.latency_ms && detail.latency_ms > 0
+      ? Math.round((detail.completion_tokens / detail.latency_ms) * 1000)
+      : null
+  );
+
+  let copied = $state(false);
+  async function copyId() {
+    try {
+      await navigator.clipboard.writeText(detail.id);
+      copied = true;
+      setTimeout(() => (copied = false), 1200);
+    } catch {
+      copied = false;
+    }
+  }
 </script>
 
 <svelte:window
@@ -24,7 +41,10 @@
     <button class="btn" type="button" onclick={onClose}>Close</button>
   </header>
 
-  <p class="id">{detail.id}</p>
+  <button class="id" type="button" onclick={copyId} title="Copy request ID">
+    <span>{detail.id}</span>
+    <em>{copied ? "Copied" : "Copy"}</em>
+  </button>
 
   <section>
     <h3>Route</h3>
@@ -54,6 +74,7 @@
     <dl>
       <dt>Input</dt><dd>{fmtInt(detail.prompt_tokens)}</dd>
       <dt>Output</dt><dd>{fmtInt(detail.completion_tokens)}</dd>
+      {#if throughput}<dt>Throughput</dt><dd>{fmtInt(throughput)} tok/s</dd>{/if}
       <dt>Cost</dt><dd>{fmtUsd(detail.cost_usd)}</dd>
     </dl>
   </section>
@@ -123,11 +144,38 @@
   }
 
   .id {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
     margin: 16px 0 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    background: var(--surface-subtle);
     font-family: var(--font-mono);
     font-size: 12px;
     color: var(--text-muted);
-    word-break: break-all;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .id span {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .id em {
+    flex-shrink: 0;
+    font-style: normal;
+    color: var(--accent);
+  }
+
+  .id:hover {
+    border-color: var(--border-strong);
   }
 
   section {

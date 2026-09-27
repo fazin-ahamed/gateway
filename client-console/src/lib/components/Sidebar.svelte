@@ -1,11 +1,13 @@
 <script lang="ts">
   import { page } from "$app/state";
+  import { ui } from "$lib/state/ui.svelte";
   let { keyName, onSignOut } = $props();
   const here = $derived(page.url.pathname.replace(/\/$/, "") || "/console");
   const current = (href: string) => (here === href.replace(/\/$/, "") ? "page" : undefined);
+  const initial = $derived((keyName || "?").trim().charAt(0).toUpperCase() || "?");
 </script>
 
-<nav class="sidebar" aria-label="Console">
+<nav class="sidebar" class:collapsed={ui.collapsed} aria-label="Console">
   <a class="brand" href="/console/">
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
       <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
@@ -41,10 +43,11 @@
     </a></li>
   </ul>
   <div class="foot">
-    <div class="who">
-      <span class="meta">{keyName}</span>
-    </div>
-    <button class="btn btn-quiet" type="button" onclick={onSignOut}>Sign out</button>
+    <div class="avatar" aria-hidden="true">{initial}</div>
+    <div class="who"><span class="name">{keyName}</span></div>
+    <button class="signout" type="button" onclick={onSignOut} title="Sign out" aria-label="Sign out">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H3v12h3M10 11l3-3-3-3M13 8H6" /></svg>
+    </button>
   </div>
 </nav>
 
@@ -125,19 +128,77 @@
 
   .foot {
     border-top: 1px solid var(--border);
-    padding: 12px 20px;
+    padding: 12px;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    gap: 10px;
+  }
+
+  .avatar {
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 13px;
   }
 
   .who {
+    flex: 1;
     min-width: 0;
+  }
+
+  .who .name {
+    display: block;
+    font-size: 13px;
+    color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  .signout {
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    background: transparent;
+    cursor: pointer;
+    transition: color var(--t-fast), background var(--t-fast);
+  }
+
+  .signout:hover {
+    color: var(--danger);
+    background: var(--surface-subtle);
+  }
+
+  .signout svg {
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  /* Collapsed: icons only. */
+  .sidebar.collapsed {
+    width: 60px;
+  }
+  .sidebar.collapsed .brand { justify-content: center; font-size: 0; gap: 0; padding: 20px 0 18px; }
+  .sidebar.collapsed .nav a { justify-content: center; font-size: 0; gap: 0; padding: 8px 0; }
+  .sidebar.collapsed .nav svg { font-size: 16px; }
+  .sidebar.collapsed .who, .sidebar.collapsed .signout { display: none; }
+  .sidebar.collapsed .foot { justify-content: center; }
 
   /* Narrow screens: the sidebar becomes a drawer later; for now it hides
      so content keeps the full width. */
