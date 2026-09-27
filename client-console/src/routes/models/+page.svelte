@@ -55,8 +55,11 @@
 
   function price(m: ConsoleModel): string {
     if (m.per_request != null) return `${fmtUsd(m.per_request)} / request`;
-    if (m.prompt_per_1m != null) return `$${m.prompt_per_1m.toFixed(2)} / 1M in`;
-    return "—";
+    const inR = m.prompt_per_1m;
+    const outR = m.completion_per_1m;
+    if (inR == null && outR == null) return "Not priced";
+    const one = (v: number | null | undefined) => (v == null ? "—" : `$${v.toFixed(2)}`);
+    return `${one(inR)} in · ${one(outR)} out / 1M`;
   }
 </script>
 
@@ -99,7 +102,7 @@
             {#if m.reasoning}<span class="chip">Reasoning</span>{/if}
           </div>
         {/if}
-        <em>{price(m)}{m.knowledge ? ` · knowledge ${m.knowledge}` : ""}</em>
+        <em>{price(m)}{m.price_source === "models.dev" ? " · via models.dev" : ""}{m.knowledge ? ` · knowledge ${m.knowledge}` : ""}</em>
       </button>
     {:else}
       <p class="empty">No models match.</p>

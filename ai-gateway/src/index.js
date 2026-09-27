@@ -1261,9 +1261,10 @@ app.get("/console/api/models", async (c) => {
       vision: !!caps.vision,
       reasoning: !!(entry && entry.reasoning),
       routing: null,
-      prompt_per_1m: pr ? Number(pr.prompt_per_1m) : null,
-      completion_per_1m: pr ? Number(pr.completion_per_1m) : null,
+      prompt_per_1m: pr ? Number(pr.prompt_per_1m) : (entry && Number.isFinite(entry.prompt_per_1m) ? entry.prompt_per_1m : null),
+      completion_per_1m: pr ? Number(pr.completion_per_1m) : (entry && Number.isFinite(entry.completion_per_1m) ? entry.completion_per_1m : null),
       per_request: pr && String(pr.actual_mode) === "per_request" ? Number(pr.actual_per_request) : null,
+      price_source: pr ? "gateway" : (entry && (Number(entry.prompt_per_1m) || Number(entry.completion_per_1m)) ? "models.dev" : null),
       name: entry && entry.name || null,
       knowledge: entry && (entry.knowledge || entry.release_date) || null
     });
