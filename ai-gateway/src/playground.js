@@ -1079,8 +1079,8 @@ document.addEventListener('click', function(e){
   else if(act==='kdel') delKey(id);
 });
 
-async function publicModelOptions(kind){ const {data}=await api('/admin/routes'); const want=kind||'chat'; const seen=[]; const out=[]; for(const r of (data&&data.routes||[])){ if(!r.enabled) continue; if(String(r.model_kind||'chat')!==want) continue; if(seen.indexOf(r.slug)>=0) continue; seen.push(r.slug); out.push({value:r.slug,label:r.slug}); } return out.sort(function(a,b){return a.value.localeCompare(b.value);}); }
-async function refreshTierSlugSelect(){ const select=document.getElementById('tier-slugs'); if(!select)return; const opts=await publicModelOptions(); select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';}).join('')||'<option disabled>No enabled public models</option>'; }
+async function publicModelOptions(kind){ const {data}=await api('/admin/routes'); const seen=[]; const out=[]; for(const r of (data&&data.routes||[])){ if(!r.enabled) continue; const rk=String(r.model_kind||'chat'); if(kind&&kind!=='all'&&rk!==kind) continue; if(seen.indexOf(r.slug)>=0) continue; seen.push(r.slug); out.push({value:r.slug,label:kind==='all'&&rk==='decision'?r.slug+' \u00b7 decision':r.slug}); } return out.sort(function(a,b){return a.value.localeCompare(b.value);}); }
+async function refreshTierSlugSelect(){ const select=document.getElementById('tier-slugs'); if(!select)return; const opts=await publicModelOptions('all'); select.innerHTML=opts.map(function(o){return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';}).join('')||'<option disabled>No enabled public models</option>'; }
 async function tierOptions(){ const {data}=await api('/admin/model-tiers'); return (data&&data.tiers||[]).map(function(t){return {value:String(t.id),label:t.name+' - '+t.models};}); }
 async function refreshKeyTierSelect(){
   const select=document.getElementById('k-tiers'); if(!select) return;
@@ -1098,7 +1098,7 @@ async function loadTiers(){
 }
 async function editTier(id){
   const {data}=await api('/admin/model-tiers'); const t=(data&&data.tiers||[]).find(function(x){return Number(x.id)===Number(id);}); if(!t)return toast('tier not found','err');
-  const opts=await publicModelOptions();
+  const opts=await publicModelOptions('all');
   openModal('Edit model tier',[{key:'name',label:'Tier name',value:t.name},{key:'models',type:'multiselect',label:'Public model slugs',value:t.models.split(',').map(function(s){return s.trim();}),options:opts}],async function(v){const {status,data:r}=await api('/admin/model-tiers/'+id,{method:'PATCH',body:JSON.stringify(v)});if(status===200){toast('tier updated','ok');closeModal();loadTiers();}else toast('update failed: '+(r&&r.error&&r.error.message||status),'err');});
 }
 async function delTier(id){confirmAction('Delete tier','Delete this tier? It will be removed from assigned keys.','Delete',async function(){const {status}=await api('/admin/model-tiers/'+id,{method:'DELETE'});if(status===200){toast('tier deleted','ok');loadTiers();}else toast('delete failed','err');});return;}
