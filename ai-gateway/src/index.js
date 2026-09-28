@@ -18,7 +18,7 @@ import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
-import { contextLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
+import { contextLimit, outputLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
 import { contextBucket, deadlineFor, chooseBackup, wouldHedge } from "./router/latency-governor.js";
 import { validateRequest as validateDecisionRequest } from "./decision/types.js";
 import { startRequestSummary, finishRequestSummary } from "./console/request-ledger.js";
@@ -1334,7 +1334,7 @@ app.get("/console/api/models", async (c) => {
       model_kind: "chat",
       endpoint: "/v1/chat/completions",
       context_window: contextLimit(caps),
-      max_output_tokens: caps.output || null,
+      max_output_tokens: outputLimit(caps),
       tools: !!caps.tools,
       vision: !!caps.vision,
       reasoning: !!(entry && entry.reasoning),

@@ -11,11 +11,24 @@
 
 export const UNKNOWN_CONTEXT_CEILING = 32000;
 
+// A chat model whose output limit is genuinely unknown still gets a positive
+// number. 0 is not "unknown" — clients read 0 as "this model cannot generate",
+// so an absent limit must never be advertised as zero. The provenance stays
+// honest: callers that need to know it was a fallback read the source.
+export const UNKNOWN_OUTPUT_CEILING = 8192;
+
 export function contextLimit(caps) {
   if (!caps || caps.unknown)
     return UNKNOWN_CONTEXT_CEILING;
   const ctx = Number(caps.context) || 0;
   return ctx > 0 ? ctx : UNKNOWN_CONTEXT_CEILING;
+}
+
+export function outputLimit(caps) {
+  if (!caps || caps.unknown)
+    return UNKNOWN_OUTPUT_CEILING;
+  const out = Number(caps.output) || 0;
+  return out > 0 ? out : UNKNOWN_OUTPUT_CEILING;
 }
 
 // routes: { providerId, context, output, tools, vision, reasoning, circuitOpen }
@@ -43,9 +56,11 @@ export function buildCapabilityEnvelope(routes, { minIndependentProviders = 2 } 
 
   const maxContext = maxOf((r) => contextLimit(r));
   const resilientContext = resilientOf((r) => contextLimit(r));
+  const maxOutput = maxOf((r) => outputLimit(r));
+  const resilientOutput = resilientOf((r) => outputLimit(r));
   return {
     context_window: resilientContext || maxContext,
-    max_output_tokens: maxOf((r) => Number(r.output) || 0),
+    max_output_tokens: resilientOutput || maxOutput,
     capabilities: {
       streaming: live.length > 0,
       tools: any("tools"),
@@ -56,7 +71,8 @@ export function buildCapabilityEnvelope(routes, { minIndependentProviders = 2 } 
       dynamic: true,
       max_context: maxContext,
       resilient_context: resilientContext,
-      max_output: maxOf((r) => Number(r.output) || 0),
+      max_output: maxOutput,
+      resilient_output: resilientOutput,
       eligible_routes: live.length,
       independent_providers: providers.size,
       resilient: {

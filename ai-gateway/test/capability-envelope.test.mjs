@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildCapabilityEnvelope, contextLimit, autoModelEntry, UNKNOWN_CONTEXT_CEILING } from "../src/router/capability-envelope.js";
+import { buildCapabilityEnvelope, contextLimit, outputLimit, autoModelEntry, UNKNOWN_CONTEXT_CEILING, UNKNOWN_OUTPUT_CEILING } from "../src/router/capability-envelope.js";
 
 const route = (providerId, extra) => ({ providerId, context: 0, output: 0, tools: false, vision: false, reasoning: false, ...extra });
 
@@ -76,6 +76,25 @@ test("the auto model entry carries the envelope and nothing else", () => {
   assert.equal(entry.context_window, 8192);
   assert.equal(entry.capabilities.tools, true);
   assert.equal(entry.capabilities.vision, false);
+});
+
+test("output mirrors context: ordinary is resilient, the max stays visible", () => {
+  const env = buildCapabilityEnvelope([
+    route(1, { output: 131072 }),
+    route(2, { output: 65536 }),
+    route(3, { output: 65536 })
+  ]);
+  assert.equal(env.routing.max_output, 131072, "the opportunistic maximum is the biggest route");
+  assert.equal(env.routing.resilient_output, 65536, "resilient is what two providers can both deliver");
+  assert.equal(env.max_output_tokens, 65536, "the ordinary advertised output is the resilient one");
+});
+
+test("a route with no output limit is a positive fallback, never zero", () => {
+  const env = buildCapabilityEnvelope([route(1, { output: 0 }), route(2, { output: 0 })]);
+  assert.equal(env.max_output_tokens, UNKNOWN_OUTPUT_CEILING);
+  assert.ok(env.max_output_tokens > 0, "0 reads as 'cannot generate' to a client");
+  assert.equal(outputLimit({ output: 0 }), UNKNOWN_OUTPUT_CEILING);
+  assert.equal(outputLimit({ unknown: true, output: 999999 }), UNKNOWN_OUTPUT_CEILING);
 });
 
 test("GET /v1/models hides auto when it is off and sizes it from the key's routes", async () => {

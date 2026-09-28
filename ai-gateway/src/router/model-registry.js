@@ -26,7 +26,10 @@ export const SEED_CANONICAL_MODELS = [
     family: "glm",
     display_name: "GLM-5.3",
     reasoning: 1, tools: 1, vision: 0,
-    context_limit: 98304, output_limit: 16384
+    // Native model capability, verified independently of any transport. A route
+    // that cannot deliver this much clamps BELOW it via its own override; the
+    // canonical row never absorbs a transport's measured ceiling.
+    context_limit: 1000000, output_limit: 131072
   },
   {
     id: "glm-5.2",
@@ -188,6 +191,16 @@ export async function seedModelRegistry(c) {
          VALUES (?,?,?,?,?,?,?,?,?,?)`
       ).bind(m.id, m.family, m.display_name, m.reasoning, m.tools, m.vision, m.context_limit, m.output_limit, now, now).run();
       if (r && r.meta && r.meta.changes) mCount++;
+      // A canonical limit that was seeded too low (a transport ceiling mistaken
+      // for the model's own) has to move up. Operator values above the seed are
+      // left alone: this only raises a row that is still below the verified seed.
+      await c.env.DB.prepare(
+        `UPDATE canonical_models
+         SET context_limit = CASE WHEN context_limit IS NULL OR context_limit < ? THEN ? ELSE context_limit END,
+             output_limit  = CASE WHEN output_limit  IS NULL OR output_limit  < ? THEN ? ELSE output_limit  END,
+             updated_at = ?
+         WHERE id = ? AND (context_limit IS NULL OR context_limit < ? OR output_limit IS NULL OR output_limit < ?)`
+      ).bind(m.context_limit, m.context_limit, m.output_limit, m.output_limit, now, m.id, m.context_limit, m.output_limit).run();
     }
     let aCount = 0;
     for (const a of SEED_MODEL_ALIASES) {
