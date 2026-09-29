@@ -135,6 +135,21 @@ CREATE TABLE IF NOT EXISTS console_accounts (
   password_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+-- Single-use tokens for password resets and account creation invites.
+-- purpose 'reset' re-credentials an existing console_accounts row;
+-- 'invite' lets a brand-new key set up its account without the operator
+-- handing over the raw sk- key. One row per issued token: consumed on use,
+-- and the operator can revoke any pending token from the admin console.
+CREATE TABLE IF NOT EXISTS console_account_tokens (
+  token_hash TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL REFERENCES api_keys(key_id) ON DELETE CASCADE,
+  purpose TEXT NOT NULL,  -- 'reset' | 'invite'
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_tokens_key
+  ON console_account_tokens(key_id, purpose);
 
 -- Always-on, body-free per-request ledger. This is the customer-facing
 -- operational truth: Overview, Requests and Usage read it, and it records

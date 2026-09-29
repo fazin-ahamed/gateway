@@ -157,7 +157,7 @@ function consoleFileResponse(path) {
 
 const handler = async (req) => {
   const path = new URL(req.url).pathname;
-  const isConsoleApi = path.startsWith("/console/api/") || path.startsWith("/console/playground/") || path === "/console/auth" || path === "/console/account" || path === "/console/logout";
+  const isConsoleApi = path.startsWith("/console/api/") || path.startsWith("/console/playground/") || path === "/console/auth" || path === "/console/account" || path === "/console/logout" || path === "/console/redeem-api";
   if ((path === "/console" || path === "/console/" || path.startsWith("/console/")) && !isConsoleApi) {
     const served = consoleFileResponse(path);
     if (served) return served;

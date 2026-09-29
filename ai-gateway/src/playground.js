@@ -233,7 +233,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="providers">Providers</button>
   <button type="button" data-tab="routes">Model routes</button>
   <button type="button" data-tab="tiers">Model tiers</button>
-  <button type="button" data-tab="keys">API keys</button>
+  <button type="button" data-tab="accounts">Accounts</button>
   <button type="button" data-tab="chat">Playground</button>
   <button type="button" data-tab="cache">Cache</button>
   <button type="button" data-tab="prices">Prices</button>
@@ -282,6 +282,19 @@ var PLAYGROUND_HTML = `<!doctype html>
       </div>
     </div></div>
     <div class="panel"><div class="panel-b flush" id="tiers-list"></div></div>
+  </section>
+
+  <section class="tab" id="tab-accounts">
+    <div class="pagehead"><div><h2 class="sec">Accounts</h2><p class="sub">Console accounts, password reset links, and invite links for keys without an account yet.</p></div></div>
+    <div class="panel"><div class="panel-b flush" id="accounts-list"></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Account links</h2></div><div class="panel-b">
+      <div class="form-grid">
+        <div><label>Key</label><select id="acct-key"></select><small>Pick a key to reset its account password or send an invite.</small></div>
+        <div class="full"><button class="act" id="acct-reset">Create password reset link</button> <button class="act" id="acct-invite">Create account invite link</button></div>
+        <div class="full hint" id="acct-out"></div>
+      </div>
+    </div></div>
+    <div class="panel"><div class="panel-b flush" id="acct-tokens-list"></div></div>
   </section>
 
   <section class="tab" id="tab-keys">
@@ -575,7 +588,7 @@ async function selectTab(t){
     if(t==='providers') await loadProviders();
     if(t==='routes') await loadRoutes();
     if(t==='tiers') await loadTiers();
-    if(t==='keys') await loadKeys();
+    if(t==='accounts') await loadAccounts();
     if(t==='chat'){ await refreshPlaygroundModels(); await refreshPlaygroundIntegrity(); }
     if(t==='cache') await loadCache();
     if(t==='prices') await loadPrices();
@@ -1089,7 +1102,10 @@ document.addEventListener('click', function(e){
   else if(act==='ktoggle') toggleKey(id, btn.getAttribute('data-active')==='1'?0:1);
   else if(act==='kdel') delKey(id);
   else if(act==='kpool') setPool(id);
-  else if(act==='kpoolclear') clearPool();
+  else if(act==='acctreset') createResetLink(id);
+  else if(act==='acctedit') editAccountLimits(id);
+  else if(act==='tokdel') revokeToken(id);
+  else if(act==='copylink') copyLink(btn.getAttribute('data-link'));
   else if(act==='tjprev'){ tjOffset=Math.max(0,tjOffset-tjLimit); loadTrajectories(); }
   else if(act==='tjnext'){ tjOffset+=tjLimit; loadTrajectories(); }
 });
@@ -1192,6 +1208,106 @@ document.getElementById('k-create').onclick=async function(){
   if(status===201){ document.getElementById('k-out').innerHTML='<b>Key:</b> <span class="mono">'+esc(data.key)+'</span>'; toast('key created','ok'); loadKeys(); }
   else toast('create failed: '+(data&&data.error&&data.error.message||status),'err');
 };
+
+// ---------- ACCOUNTS ----------
+function accountKeyLabel(k){
+  const used=k.budget_mode==='usd'?money(k.used_usd):fmt(k.used_tokens);
+  const lim=k.budget_mode==='usd'?money(k.budget_limit):fmt(k.budget_limit);
+  return esc(k.name)+' — '+used+' / '+lim+' '+(k.budget_mode==='usd'?'USD':'tokens');
+}
+async function loadAccounts(){
+  const el=document.getElementById('accounts-list');
+  paintSkeleton(el);
+  let data; try{ const res=await api('/admin/accounts'); data=res.data; }catch(e){ paintLoadError(el,'Could not load accounts: '+e.message,loadAccounts); return; }
+  const accounts=(data&&data.accounts)||[];
+  const tokens=(data&&data.tokens)||[];
+  const rows=accounts.map(function(a){
+    const used=a.budget_mode==='usd'?money(a.used_usd):fmt(a.used_tokens);
+    const lim=a.budget_mode==='usd'?money(a.budget_limit):fmt(a.budget_limit);
+    const tiers=a.tier_names?esc(a.tier_names):'<span class="pill mut">none</span>';
+    const state=a.active===1?'<span class="pill ok">active</span>':'<span class="pill warn">deactivated</span>';
+    return '<tr><td><b>'+esc(a.username)+'</b><br><span class="mono small">'+esc(a.key_id)+'</span></td><td>'+esc(a.name)+'</td><td>'+used+' / '+lim+' '+(a.budget_mode==='usd'?'USD':'tok')+'</td><td>'+tiers+'</td><td>'+state+'</td><td><button class="ghost" data-act="acctreset" data-id="'+esc(a.key_id)+'">reset link</button> <button class="ghost" data-act="acctedit" data-id="'+esc(a.key_id)+'">limits</button></td></tr>';
+  }).join('')||'<tr><td colspan="6"><div class="empty">No accounts yet. Invite a key below.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Account</th><th>Key</th><th>Budget used</th><th>Tiers</th><th>State</th><th></th></tr>'+rows+'</table>';
+  const keySel=document.getElementById('acct-key');
+  if(keySel){
+    const withAccount=new Set(accounts.map(function(a){return a.key_id;}));
+    let keys=[]; try{ const kr=await api('/admin/keys'); keys=(kr.data&&kr.data.keys)||[]; }catch(e){}
+    keySel.innerHTML=keys.map(function(k){return '<option value="'+esc(k.key_id)+'">'+accountKeyLabel(k)+(withAccount.has(k.key_id)?' (has account)':'')+'</option>';}).join('');
+  }
+  const tl=document.getElementById('acct-tokens-list');
+  if(tl){
+    const now=Date.now();
+    const trows=tokens.map(function(t){
+      const expired=new Date(t.expires_at).getTime()<now;
+      let badge;
+      if(t.used_at) badge='<span class="pill mut">used</span>';
+      else if(expired) badge='<span class="pill warn">expired</span>';
+      else badge='<span class="pill ok">pending</span>';
+      return '<tr><td class="mono small">'+esc(t.purpose)+'</td><td class="mono small">'+esc(t.key_id)+'</td><td>'+badge+'</td><td class="small">'+esc(t.expires_at)+'</td><td>'+(t.used_at||expired?'':'<button class="danger" data-act="tokdel" data-id="'+esc(t.token_hash)+'">revoke</button>')+'</td></tr>';
+    }).join('')||'<tr><td colspan="5"><div class="empty">No links issued yet.</div></td></tr>';
+    tl.innerHTML='<table><tr><th>Purpose</th><th>Key</th><th>State</th><th>Expires</th><th></th></tr>'+trows+'</table>';
+  }
+}
+function paintAcctLink(kind,out){
+  return function(status,r){
+    if(status===201&&r&&r.url){
+      out.innerHTML='<b>'+(kind==='reset'?'Reset link':'Invite link')+':</b> <span class="mono small selectable">'+esc(r.url)+'</span> <button class="ghost" data-act="copylink" data-link="'+esc(r.url)+'">copy</button>';
+      toast((kind==='reset'?'reset':'invite')+' link created, expires in 24h','ok');
+      loadAccounts();
+    } else {
+      toast('could not create link: '+(r&&r.error&&r.error.message||status),'err');
+    }
+  };
+}
+document.getElementById('acct-reset').onclick=async function(){
+  const id=document.getElementById('acct-key').value;
+  if(!id){ toast('select a key first','err'); return; }
+  const {status,data}=await api('/admin/accounts/'+id+'/reset-link',{method:'POST'});
+  paintAcctLink('reset',document.getElementById('acct-out'))(status,data);
+};
+document.getElementById('acct-invite').onclick=async function(){
+  const id=document.getElementById('acct-key').value;
+  if(!id){ toast('select a key first','err'); return; }
+  const {status,data}=await api('/admin/accounts/'+id+'/invite-link',{method:'POST'});
+  paintAcctLink('invite',document.getElementById('acct-out'))(status,data);
+};
+async function editAccountLimits(id){
+  const {data}=await api('/admin/keys/'+id); const k=data&&data.key; if(!k){ toast('key not found','err'); return; }
+  const tierIds=((data&&data.tiers)||[]).map(function(t){return String(t.id);});
+  let opts=[];
+  try{ const tr=await api('/admin/model-tiers'); opts=((tr.data&&tr.data.tiers)||[]).map(function(t){return {value:String(t.id),label:t.name};}); }catch(e){}
+  openModal('Account limits: '+k.name,[
+    {key:'budget_mode',label:'Budget mode',type:'select',value:k.budget_mode,options:[{value:'usd',label:'USD ($)'},{value:'tokens',label:'Tokens'}]},
+    {key:'budget_limit',label:'Budget limit',type:'number',value:k.budget_limit},
+    {key:'request_limit_per_minute',label:'Request limit / minute (0 = unlimited)',type:'number',value:k.request_limit_per_minute||0},
+    {key:'expires_at',label:'Expires at (UAE / GST, blank = never)',value:localExpiryValue(k.expires_at),hint:'UAE time (UTC+4). Clear to make the key never expire.'},
+    {key:'tier_ids',label:'Model tiers',type:'multiselect',value:tierIds,options:opts},
+    {key:'active',label:'State',type:'select',value:k.active?'1':'0',options:[{value:'1',label:'active'},{value:'0',label:'deactivated'}]}
+  ],async function(v){
+    let expires_at=null;
+    if(v.expires_at){ try { expires_at=uaeLocalInputToIso(v.expires_at); } catch(e) { return toast('invalid UAE expiry','err'); } }
+    const body={budget_mode:v.budget_mode,budget_limit:Number(v.budget_limit),request_limit_per_minute:Number(v.request_limit_per_minute)||0,expires_at,tier_ids:v.tier_ids.map(Number),active:v.active==='1'};
+    const {status,data:r}=await api('/admin/keys/'+id,{method:'PATCH',body:JSON.stringify(body)});
+    if(status===200){ toast('account limits updated','ok'); closeModal(); loadAccounts(); }
+    else toast('update failed: '+(r&&r.error&&r.error.message||status),'err');
+  });
+}
+async function createResetLink(id){
+  const {status,data}=await api('/admin/accounts/'+id+'/reset-link',{method:'POST'});
+  paintAcctLink('reset',document.getElementById('acct-out'))(status,data);
+}
+async function revokeToken(hash){
+  confirmAction('Revoke link','Revoke this account link? It will stop working immediately.','Revoke',async function(){
+    const {status,data}=await api('/admin/account-tokens/'+hash,{method:'DELETE'});
+    if(status===200){ toast('link revoked','ok'); loadAccounts(); }
+    else toast('revoke failed: '+(data&&data.error&&data.error.message||status),'err');
+  });
+}
+function copyLink(link){
+  try{ navigator.clipboard.writeText(link).then(function(){ toast('link copied','ok'); }); }catch(e){ toast('copy failed','err'); }
+}
+
 
 // ---------- CHAT ----------
 let pgMessages=[];

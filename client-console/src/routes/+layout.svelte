@@ -9,7 +9,7 @@
 
   let { children } = $props();
 
-  const isSignIn = $derived(page.url.pathname === "/console/signin");
+  const isSignIn = $derived(page.url.pathname === "/console/signin" || page.url.pathname === "/console/redeem");
 </script>
 
 {#if isSignIn}

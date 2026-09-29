@@ -911,6 +911,98 @@ app.post("/console/account", async (c) => {
   }
   return issueConsoleSession(c, key);
 });
+// console_account_tokens is new; existing host databases add it lazily. Same
+// idempotent shape as the other console migrations, keyed per DB handle.
+var accountTokensMigrated = new WeakSet();
+async function ensureAccountTokensTable(db) {
+  if (!db || accountTokensMigrated.has(db)) return;
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS console_account_tokens (token_hash TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES api_keys(key_id) ON DELETE CASCADE, purpose TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)"
+  ).run();
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_account_tokens_key ON console_account_tokens(key_id, purpose)").run();
+  accountTokensMigrated.add(db);
+}
+
+// A reset or invite token authorizes one credential change. The plaintext is
+// returned exactly once, at creation, so the operator can copy it to the user;
+// only its hash is stored. Redemption marks the row used, which makes a copied
+// link die after one use and lets the operator see whether it was taken.
+const RESET_TOKEN_HOURS = 24;
+async function issueAccountToken(c, keyId, purpose) {
+  const raw = "rst_" + uuid() + uuid().replace(/-/g, "");
+  const expiresAt = new Date(Date.now() + RESET_TOKEN_HOURS * 3600000).toISOString();
+  await c.env.DB.prepare(
+    "INSERT INTO console_account_tokens (token_hash, key_id, purpose, created_at, expires_at) VALUES (?,?,?,?,?)"
+  ).bind(await sha256hex(raw), keyId, purpose, nowIso(), expiresAt).run();
+  return { token: raw, expires_at: expiresAt };
+}
+
+// Redeem a token: it must exist, be unused, and not be expired. A used or
+// expired token is reported the same way as an unknown one so a stale link
+// reveals nothing about which state it is in. Returns the owning key.
+async function redeemAccountToken(c, raw) {
+  if (typeof raw !== "string" || !raw.startsWith("rst_")) return null;
+  const row = await c.env.DB.prepare(
+    "SELECT key_id, purpose, used_at, expires_at FROM console_account_tokens WHERE token_hash=?"
+  ).bind(await sha256hex(raw)).first();
+  if (!row || row.used_at || new Date(row.expires_at).getTime() < Date.now()) return null;
+  return row;
+}
+
+// Public: set or reset credentials from a link. A reset link belongs to a key
+// that already has an account and replaces its password; an invite link
+// creates the account. Both issue a console session, so the user lands inside
+// the console without a second sign-in.
+app.post("/console/redeem-api", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  let b;
+  try { b = await c.req.json(); } catch { b = {}; }
+  const raw = String((b && b.token) || "");
+  const username = String((b && b.username) || "").trim();
+  const password = String((b && b.password) || "");
+  const info = await redeemAccountToken(c, raw);
+  if (!info)
+    return c.json({ error: { message: "This link is not valid or has expired.", type: "auth_error" } }, 401);
+  if (username.length < 3 || password.length < 8)
+    return c.json({ error: { message: "Choose a username of 3 or more characters and a password of 8 or more.", type: "invalid_request_error" } }, 400);
+  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(info.key_id).first();
+  if (!key || !key.active || isKeyExpired(key))
+    return c.json({ error: { message: "The key behind this account is no longer active.", type: "auth_error" } }, 401);
+  if (await isSharedPoolKey(c, key.key_id))
+    return c.json({ error: { message: "The shared pool key cannot have a console account.", type: "invalid_request_error" } }, 403);
+  if (info.purpose === "reset") {
+    await c.env.DB.prepare(
+      "UPDATE console_accounts SET password_hash=? WHERE key_id=?"
+    ).bind(await sha256hex(password), key.key_id).run();
+  } else {
+    const existing = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
+    if (existing)
+      return c.json({ error: { message: "This key already has an account.", type: "invalid_request_error" } }, 409);
+    try {
+      await c.env.DB.prepare(
+        "INSERT INTO console_accounts (key_id, username, password_hash, created_at) VALUES (?,?,?,?)"
+      ).bind(key.key_id, username, await sha256hex(password), nowIso()).run();
+    } catch {
+      return c.json({ error: { message: "That username is already taken.", type: "invalid_request_error" } }, 409);
+    }
+  }
+  await c.env.DB.prepare("UPDATE console_account_tokens SET used_at=? WHERE token_hash=?").bind(nowIso(), await sha256hex(raw)).run();
+  await c.env.DB.prepare("DELETE FROM console_sessions WHERE key_id=?").bind(key.key_id).run();
+  return issueConsoleSession(c, key);
+});
+
+// Public probe: tells the sign-in page what a link is for (existing account to
+// reset, or a fresh invite) so it renders the right form. Nothing about the
+// key beyond that is exposed.
+app.get("/console/redeem-api", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const raw = String(c.req.query("token") || "");
+  const info = await redeemAccountToken(c, raw);
+  if (!info)
+    return c.json({ valid: false });
+  const account = await c.env.DB.prepare("SELECT username FROM console_accounts WHERE key_id=?").bind(info.key_id).first();
+  return c.json({ valid: true, purpose: info.purpose, has_account: !!account, username: account ? account.username : "" });
+});
 
 async function issueConsoleSession(c, key) {
   const session = "v1." + uuid() + uuid().replace(/-/g, "");
@@ -5117,7 +5209,7 @@ app.delete("/admin/keys/:id", async (c) => {
   if (denied)
     return denied;
   const id = c.req.param("id");
-  await c.env.DB.prepare("DELETE FROM api_key_model_tiers WHERE key_id=?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM console_account_tokens WHERE key_id=?").bind(id).run();
   await c.env.DB.prepare("DELETE FROM api_keys WHERE key_id=?").bind(id).run();
   await c.env.DB.prepare("DELETE FROM response_cache WHERE key_id=?").bind(id).run();
   await c.env.DB.prepare("DELETE FROM api_key_rate_windows WHERE key_id=?").bind(id).run();
@@ -5128,6 +5220,81 @@ app.delete("/admin/keys/:id", async (c) => {
     await c.env.DB.prepare("UPDATE gateway_settings SET value='', updated_at=? WHERE key='shared_pool_key'").bind(nowIso()).run();
   return c.json({ deleted: id });
 });
+// The account roster: one row per console_accounts join api_keys, with the
+// key's limits and tier assignment in the same payload so the operator can
+// manage credentials and access from one place instead of joining tabs.
+app.get("/admin/accounts", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const rows = await c.env.DB.prepare(
+    `SELECT ca.key_id, ca.username, ca.created_at AS account_created,
+       k.name, k.budget_mode, k.budget_limit, k.used_usd, k.used_tokens,
+       k.request_count, k.request_limit_per_minute, k.expires_at, k.active,
+       COALESCE((SELECT GROUP_CONCAT(mt.name, ' \xB7 ') FROM api_key_model_tiers akmt JOIN model_tiers mt ON mt.id=akmt.tier_id WHERE akmt.key_id=ca.key_id), '') AS tier_names
+     FROM console_accounts ca JOIN api_keys k ON k.key_id=ca.key_id
+     ORDER BY ca.username`
+  ).all();
+  const tokens = await c.env.DB.prepare(
+    "SELECT token_hash, key_id, purpose, created_at, expires_at, used_at FROM console_account_tokens ORDER BY created_at DESC"
+  ).all();
+  return c.json({ accounts: rows.results || [], tokens: tokens.results || [] });
+});
+
+// Issue a reset link for an existing account. The plaintext token comes back
+// exactly once; the operator copies it to the user. Any prior pending reset
+// for the same key is revoked first so only the newest link is live.
+app.post("/admin/accounts/:id/reset-link", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const id = c.req.param("id");
+  const account = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(id).first();
+  if (!account) return c.json({ error: { message: "This key has no account to reset." } }, 404);
+  await c.env.DB.prepare(
+    "DELETE FROM console_account_tokens WHERE key_id=? AND purpose='reset' AND used_at IS NULL"
+  ).bind(id).run();
+  const issued = await issueAccountToken(c, id, "reset");
+  return c.json({ url: redeemUrl(c, issued.token), token: issued.token, expires_at: issued.expires_at }, 201);
+});
+
+// Issue an account-creation link for a key that has no account yet. The
+// recipient sets up their own username and password without the operator
+// ever seeing or handing out the raw API key.
+app.post("/admin/accounts/:id/invite-link", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const id = c.req.param("id");
+  const key = await c.env.DB.prepare("SELECT key_id, name FROM api_keys WHERE key_id=?").bind(id).first();
+  if (!key) return c.json({ error: { message: "key not found" } }, 404);
+  const existing = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(id).first();
+  if (existing) return c.json({ error: { message: "This key already has an account." } }, 409);
+  await c.env.DB.prepare(
+    "DELETE FROM console_account_tokens WHERE key_id=? AND purpose='invite' AND used_at IS NULL"
+  ).bind(id).run();
+  const issued = await issueAccountToken(c, id, "invite");
+  return c.json({ url: redeemUrl(c, issued.token), token: issued.token, expires_at: issued.expires_at }, 201);
+});
+
+// Revoke a pending token. Only unused, unexpired tokens matter, but revoking
+// any row is safe and keeps the list honest.
+app.delete("/admin/account-tokens/:hash", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  // The admin UI lists hashes, but a caller may hold the raw token; hash a
+  // plaintext rst_ value so both spellings delete the same row.
+  const param = c.req.param("hash");
+  const hash = param.startsWith("rst_") ? await sha256hex(param) : param;
+  await c.env.DB.prepare("DELETE FROM console_account_tokens WHERE token_hash=?").bind(hash).run();
+  return c.json({ deleted: hash });
+});
+
+function redeemUrl(c, token) {
+  const origin = new URL(c.req.url).origin;
+  return origin + "/console/redeem?token=" + encodeURIComponent(token);
+}
 app.get("/admin/model-tiers", async (c) => {
   const denied = await requireAdmin(c);
   if (denied)

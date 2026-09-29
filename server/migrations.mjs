@@ -261,6 +261,15 @@ export function migrateConsoleAccounts(db) {
       password_hash TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS console_account_tokens (
+      token_hash TEXT PRIMARY KEY,
+      key_id TEXT NOT NULL REFERENCES api_keys(key_id) ON DELETE CASCADE,
+      purpose TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_account_tokens_key ON console_account_tokens(key_id, purpose)");
     const r = db.prepare("PRAGMA table_info(api_keys)").all();
     const names = new Set(((r && r.results) || []).map((c) => c && c.name));
     if (!names.has("console_auth")) {
