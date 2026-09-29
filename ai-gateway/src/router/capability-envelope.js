@@ -31,6 +31,53 @@ export function outputLimit(caps) {
   return out > 0 ? out : UNKNOWN_OUTPUT_CEILING;
 }
 
+// What a route can actually deliver. The canonical model sets the ceiling;
+// the route may only clamp below it. A missing override inherits. A zero or
+// negative override is not a limit and is ignored, because 0 means "cannot
+// generate" to a client and must never be advertised.
+//
+// `canonical` carries the model's own limits. `route` carries this
+// transport's clamps. `extra` is the kind-specific overlay (image sizes,
+// video durations) and passes through untouched — this resolver only decides
+// context and output, so later model kinds extend it without rewriting it.
+export function resolveRouteCapabilities({ canonical = null, route = null, extra = null } = {}) {
+  const nativeContext = positiveLimit(canonical && canonical.context_limit);
+  const nativeOutput = positiveLimit(canonical && canonical.output_limit);
+  const routeContext = positiveLimit(route && route.context_limit_override);
+  const routeOutput = positiveLimit(route && route.output_limit_override);
+  return {
+    context: clampToNative(routeContext, nativeContext),
+    output: clampToNative(routeOutput, nativeOutput),
+    sources: {
+      context: limitSource(routeContext, nativeContext),
+      output: limitSource(routeOutput, nativeOutput)
+    },
+    native: { context: nativeContext, output: nativeOutput },
+    extra: extra || null
+  };
+}
+
+function positiveLimit(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// A route clamp wins only when it is below the model's own limit. Above it,
+// the model wins: a transport cannot advertise more than the model can do.
+function clampToNative(routeLimit, nativeLimit) {
+  if (routeLimit != null && nativeLimit != null)
+    return Math.min(routeLimit, nativeLimit);
+  return routeLimit != null ? routeLimit : nativeLimit;
+}
+
+function limitSource(routeLimit, nativeLimit) {
+  if (routeLimit != null && (nativeLimit == null || routeLimit < nativeLimit))
+    return "route_override";
+  if (nativeLimit != null)
+    return "canonical";
+  return "unknown";
+}
+
 // routes: { providerId, context, output, tools, vision, reasoning, circuitOpen }
 // A route with its circuit open is unusable and never counted.
 export function buildCapabilityEnvelope(routes, { minIndependentProviders = 2 } = {}) {

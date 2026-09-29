@@ -40,7 +40,16 @@ CREATE TABLE IF NOT EXISTS model_routes (
   -- so one provider can host several model kinds.
   model_kind TEXT NOT NULL DEFAULT 'chat',
   wire_format TEXT,
-  endpoint_path TEXT
+  endpoint_path TEXT,
+  -- A route may deliver less than the canonical model can. NULL inherits the
+  -- canonical limit; a positive number clamps this transport below it. Zero is
+  -- not a limit and is rejected on write. A route can never claim more than
+  -- the model itself supports.
+  context_limit_override INTEGER,
+  output_limit_override INTEGER,
+  -- Kind-specific overlays (image sizes, video durations) live here as JSON so
+  -- media kinds don't each grow their own columns. Empty means inherit.
+  capability_overrides_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_model_routes_slug_rank
   ON model_routes(slug, rank);

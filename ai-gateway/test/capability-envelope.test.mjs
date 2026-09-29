@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildCapabilityEnvelope, contextLimit, outputLimit, autoModelEntry, UNKNOWN_CONTEXT_CEILING, UNKNOWN_OUTPUT_CEILING } from "../src/router/capability-envelope.js";
+import { buildCapabilityEnvelope, contextLimit, outputLimit, autoModelEntry, resolveRouteCapabilities, UNKNOWN_CONTEXT_CEILING, UNKNOWN_OUTPUT_CEILING } from "../src/router/capability-envelope.js";
 
 const route = (providerId, extra) => ({ providerId, context: 0, output: 0, tools: false, vision: false, reasoning: false, ...extra });
 
@@ -95,6 +95,72 @@ test("a route with no output limit is a positive fallback, never zero", () => {
   assert.ok(env.max_output_tokens > 0, "0 reads as 'cannot generate' to a client");
   assert.equal(outputLimit({ output: 0 }), UNKNOWN_OUTPUT_CEILING);
   assert.equal(outputLimit({ unknown: true, output: 999999 }), UNKNOWN_OUTPUT_CEILING);
+});
+
+test("a route clamp lowers the canonical limit and never raises it", () => {
+  const clamped = resolveRouteCapabilities({
+    canonical: { context_limit: 1000000, output_limit: 131072 },
+    route: { context_limit_override: 98304, output_limit_override: 16384 }
+  });
+  assert.equal(clamped.context, 98304, "the transport ceiling wins when it is lower");
+  assert.equal(clamped.output, 16384);
+  assert.equal(clamped.sources.context, "route_override");
+  assert.equal(clamped.native.context, 1000000, "the model's own limit stays visible");
+
+  const overclaimed = resolveRouteCapabilities({
+    canonical: { context_limit: 1000000, output_limit: 131072 },
+    route: { context_limit_override: 2000000, output_limit_override: 999999 }
+  });
+  assert.equal(overclaimed.context, 1000000, "a route cannot advertise more than the model");
+  assert.equal(overclaimed.output, 131072);
+  assert.equal(overclaimed.sources.context, "canonical");
+});
+
+test("a missing or zero route override inherits the canonical limit", () => {
+  const inherited = resolveRouteCapabilities({
+    canonical: { context_limit: 1000000, output_limit: 131072 },
+    route: { context_limit_override: null, output_limit_override: 0 }
+  });
+  assert.equal(inherited.context, 1000000);
+  assert.equal(inherited.output, 131072, "zero is not a limit, so the canonical output stands");
+  assert.equal(inherited.sources.output, "canonical");
+
+  const unknown = resolveRouteCapabilities({ canonical: null, route: { context_limit_override: 4096 } });
+  assert.equal(unknown.context, 4096, "a route clamp survives even with no canonical row");
+  assert.equal(unknown.sources.context, "route_override");
+});
+
+test("a clamped route advertises the transport ceiling, not the canonical model", async () => {
+  const { createApp, __test: t } = await import("../src/index.js");
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").bind("sk-env", "t", 1, "usd", 1e9, now, now).run();
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(1, "P", "http://p.local/v1", "direct", "openai", 1, 1, "round_robin", now).run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled, context_limit_override, output_limit_override) VALUES (?,?,?,0,1,?,?)").bind("glm-5.3", 1, "g", 98304, 16384).run();
+  db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('auto_enabled','off',?)").bind(now).run();
+  t.__setModelsDevCache({
+    p1: { models: { "glm-5.3": { cost: { input: 1, output: 2 }, limit: { context: 1000000, output: 131072 }, modalities: { input: ["text"] }, tool_call: true, reasoning: true } } }
+  });
+  const app = createApp({ DB: db, ADMIN_TOKEN: "admin" });
+  // Sign in with a console_auth=0 key, then read the console model list, which
+  // is where per-model limits are advertised.
+  db.prepare("UPDATE api_keys SET console_auth=0 WHERE key_id='sk-env'").run();
+  const cookie = "gw_client=" + (await (async () => {
+    const r = await app.fetch(new Request("http://gw/console/auth", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: "sk-env" })
+    }));
+    return r.headers.get("set-cookie").match(/gw_client=([^;]+)/)[1];
+  })());
+  const res = await app.fetch(new Request("http://gw/console/api/models", { headers: { cookie } }));
+  const body = await res.json();
+  const model = body.data.find((m) => m.id === "glm-5.3");
+  assert.ok(model, "the model is listed");
+  assert.equal(model.context_window, 98304, "the advertised context is the transport clamp");
+  assert.equal(model.max_output_tokens, 16384, "the advertised output is the transport clamp");
+  t.__setModelsDevCache(null);
 });
 
 test("GET /v1/models hides auto when it is off and sizes it from the key's routes", async () => {

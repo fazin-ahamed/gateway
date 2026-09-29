@@ -18,7 +18,7 @@ import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
-import { contextLimit, outputLimit, buildCapabilityEnvelope, autoModelEntry } from "./router/capability-envelope.js";
+import { contextLimit, outputLimit, buildCapabilityEnvelope, autoModelEntry, resolveRouteCapabilities } from "./router/capability-envelope.js";
 import { contextBucket, deadlineFor, chooseBackup, wouldHedge } from "./router/latency-governor.js";
 import { validateRequest as validateDecisionRequest } from "./decision/types.js";
 import { startRequestSummary, finishRequestSummary } from "./console/request-ledger.js";
@@ -661,7 +661,7 @@ app.get("/v1/models", async (c) => {
   // providers are all disabled or all marked down would 503 on use, which is
   // exactly the "client picked a model that fails" trap.
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, mr.context_limit_override, mr.output_limit_override, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
   ).bind(...allowed).all();
   const live = [];
   const liveSlugs = new Set();
@@ -904,6 +904,37 @@ async function ensureConsoleAuthColumn(db) {
       await db.prepare("ALTER TABLE api_keys ADD COLUMN response_cache INTEGER NOT NULL DEFAULT 1").run();
     ensureConsoleAuthColumn.done = true;
   } catch {}
+}
+
+// Routes created before per-route clamps existed have no override columns.
+// NULL is the meaningful default — it means "inherit the canonical limit" — so
+// the columns are added without a value rather than a zero, which would read
+// as "this transport can produce nothing".
+async function ensureRouteCapabilityColumns(db) {
+  if (!db || ensureRouteCapabilityColumns.done) return;
+  try {
+    const cols = await db.prepare("PRAGMA table_info(model_routes)").all();
+    const names = new Set((cols.results || []).map((r) => r.name));
+    if (!names.has("context_limit_override"))
+      await db.prepare("ALTER TABLE model_routes ADD COLUMN context_limit_override INTEGER").run();
+    if (!names.has("output_limit_override"))
+      await db.prepare("ALTER TABLE model_routes ADD COLUMN output_limit_override INTEGER").run();
+    if (!names.has("capability_overrides_json"))
+      await db.prepare("ALTER TABLE model_routes ADD COLUMN capability_overrides_json TEXT NOT NULL DEFAULT '{}'").run();
+    ensureRouteCapabilityColumns.done = true;
+  } catch {}
+}
+
+// null inherits the canonical limit. A positive number clamps this route.
+// false rejects the write: zero and negatives are not limits, and a non-number
+// is a client error rather than a silent inherit.
+function routeLimitOverride(value) {
+  if (value == null || value === "")
+    return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0)
+    return false;
+  return Math.floor(n);
 }
 
 app.post("/console/logout", async (c) => {
@@ -1261,7 +1292,7 @@ app.get("/console/api/models", async (c) => {
   if (!allowed.length)
     return c.json({ data: [] });
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
+    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, mr.context_limit_override, mr.output_limit_override, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
   ).bind(...allowed).all();
   const live = [];
   const decisionSlugs = new Map();
@@ -3670,12 +3701,34 @@ function hasImageContent(payload) {
 // route is absent from models.dev, so its local catalog entry wins; everything
 // else resolves through the public catalog. Both callers must see the same row.
 function capabilityEntryForRoute(route, catalogById) {
-  if (route && isZaiWebFormat(route.fmt)) {
-    const local = modelCatalogEntry(route.upstream_model, route.fmt);
-    if (local)
-      return local;
-  }
-  return catalogById && route ? matchModelsDevPrice(catalogById, route.slug) : null;
+  let entry = null;
+  if (route && isZaiWebFormat(route.fmt))
+    entry = modelCatalogEntry(route.upstream_model, route.fmt) || null;
+  if (!entry)
+    entry = catalogById && route ? matchModelsDevPrice(catalogById, route.slug) : null;
+  return applyRouteCapability(entry, route);
+}
+
+// The catalog describes the model. The route may deliver less. A route clamp
+// replaces the catalog limit only when it is lower; a route claiming more than
+// the model is ignored. A route with no catalog row still carries its clamp,
+// so a transport ceiling is never lost just because models.dev has no entry.
+function applyRouteCapability(entry, route) {
+  const caps = resolveRouteCapabilities({
+    canonical: entry && entry.limit ? { context_limit: entry.limit.context, output_limit: entry.limit.output } : null,
+    route
+  });
+  if (caps.sources.context !== "route_override" && caps.sources.output !== "route_override")
+    return entry;
+  const base = entry || { limit: {} };
+  return {
+    ...base,
+    limit: {
+      ...(base.limit || {}),
+      context: caps.context != null ? caps.context : (base.limit && base.limit.context),
+      output: caps.output != null ? caps.output : (base.limit && base.limit.output)
+    }
+  };
 }
 
 // Capability gate from the models.dev catalog entry. Unknown models are
@@ -5730,9 +5783,14 @@ app.post("/admin/routes", async (c) => {
   const kind = String(b.model_kind || "chat").toLowerCase() === "decision" ? "decision" : "chat";
   const wire = b.wire_format ? String(b.wire_format) : null;
   const endpoint = b.endpoint_path ? String(b.endpoint_path) : null;
+  const contextOverride = routeLimitOverride(b.context_limit_override);
+  const outputOverride = routeLimitOverride(b.output_limit_override);
+  if (contextOverride === false || outputOverride === false)
+    return c.json({ error: { message: "a route limit override must be a positive number or empty" } }, 400);
   const existing = await c.env.DB.prepare("SELECT COALESCE(MAX(rank),-1)+1 AS next FROM model_routes WHERE slug=?").bind(b.slug).first();
   const rank = b.rank != null ? Number(b.rank) : existing.next;
-  await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled, model_kind, wire_format, endpoint_path) VALUES (?,?,?,?,?,?,?,?)").bind(b.slug, Number(b.provider_id), b.upstream_model, rank, b.enabled === false ? 0 : 1, kind, wire, endpoint).run();
+  await ensureRouteCapabilityColumns(c.env.DB);
+  await c.env.DB.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled, model_kind, wire_format, endpoint_path, context_limit_override, output_limit_override) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(b.slug, Number(b.provider_id), b.upstream_model, rank, b.enabled === false ? 0 : 1, kind, wire, endpoint, contextOverride, outputOverride).run();
   return c.json({ ok: true, slug: b.slug, rank, model_kind: kind, wire_format: wire, endpoint_path: endpoint }, 201);
 });
 app.get("/admin/routes", async (c) => {
@@ -5742,6 +5800,7 @@ app.get("/admin/routes", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT mr.id, mr.slug, mr.provider_id, mr.upstream_model, mr.rank, mr.enabled,
             COALESCE(mr.model_kind,'chat') AS model_kind, mr.wire_format, mr.endpoint_path,
+            mr.context_limit_override, mr.output_limit_override,
             p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled,
             pr.verdict AS probe_verdict, pr.measured_family AS probe_measured_family, pr.created_at AS probe_at
      FROM model_routes mr
@@ -5786,10 +5845,18 @@ app.patch("/admin/routes/:id", async (c) => {
   }
   const sets = [];
   const binds = [];
-  for (const f of ["slug", "provider_id", "upstream_model", "rank", "model_kind", "wire_format", "endpoint_path"]) {
+  for (const f of ["slug", "provider_id", "upstream_model", "rank", "model_kind", "wire_format", "endpoint_path", "context_limit_override", "output_limit_override"]) {
     if (b[f] !== void 0) {
       if (f === "model_kind" && !["chat", "decision"].includes(String(b[f])))
         return c.json({ error: { message: "model_kind must be chat or decision" } }, 400);
+      if (f === "context_limit_override" || f === "output_limit_override") {
+        const override = routeLimitOverride(b[f]);
+        if (override === false)
+          return c.json({ error: { message: "a route limit override must be a positive number or empty" } }, 400);
+        sets.push(f + "=?");
+        binds.push(override);
+        continue;
+      }
       sets.push(f + "=?");
       binds.push(f === "rank" || f === "provider_id" ? Number(b[f]) : b[f]);
     }
