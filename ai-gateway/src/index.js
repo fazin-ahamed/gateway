@@ -38,9 +38,10 @@ async function ensureRegistrySeed(c) {
   let inflight = registrySeedInflight.get(db);
   if (!inflight) {
     inflight = seedModelRegistry(c)
+      .catch((e) => { blog("registry seed failed: " + String(e && e.message || e)); })
       .then(() => ensureRouteCapabilityColumns(db))
       .then(() => { registrySeededDbs.add(db); })
-      .catch((e) => { blog("registry seed failed: " + String(e && e.message || e)); })
+      .catch((e) => { blog("route capability migration failed: " + String(e && e.message || e)); })
       .finally(() => { registrySeedInflight.delete(db); });
     registrySeedInflight.set(db, inflight);
   }
@@ -681,13 +682,16 @@ app.get("/v1/models", async (c) => {
     liveSlugs.add(r.slug);
   }
   const data = [];
+  // Computed for every chat slug, not only when Auto is on: clients discover
+  // models here, and a slug with no advertised output ceiling reads as
+  // "output limit 0" to them.
+  if (!modelsDevCache.catalog)
+    await fetchModelsDevCatalog().catch(() => {});
+  const catalog = modelsDevCache.catalog;
+  const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
+  const canonicalByRoute = await canonicalLimitsForRoutes(c, live);
   const cfg = await autoSettings(c);
   if (cfg.enabled && live.length) {
-    if (!modelsDevCache.catalog)
-      await fetchModelsDevCatalog().catch(() => {});
-    const catalog = modelsDevCache.catalog;
-    const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
-    const canonicalByRoute = await canonicalLimitsForRoutes(c, live);
     const envelope = buildCapabilityEnvelope(live.map((r) => {
       const entry = capabilityEntryForRoute(r, byId, canonicalByRoute.get(r.route_id));
       const caps = entryCapabilities(entry);
@@ -702,8 +706,30 @@ app.get("/v1/models", async (c) => {
     }));
     data.push(autoModelEntry(envelope));
   }
-  for (const slug of [...liveSlugs].sort())
-    data.push({ id: slug, object: "model", created: 0, owned_by: "gateway", model_kind: "chat" });
+  const chatBySlug = new Map();
+  for (const route of live)
+    if (!chatBySlug.has(route.slug))
+      chatBySlug.set(route.slug, route);
+  for (const [slug, route] of [...chatBySlug.entries()].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)) {
+    const entry = capabilityEntryForRoute(route, byId, canonicalByRoute.get(route.route_id));
+    const caps = entryCapabilities(entry);
+    data.push({
+      id: slug,
+      object: "model",
+      created: 0,
+      owned_by: "gateway",
+      model_kind: "chat",
+      endpoint: "/v1/chat/completions",
+      context_window: contextLimit(caps),
+      max_output_tokens: outputLimit(caps),
+      capabilities: {
+        streaming: true,
+        tools: !!caps.tools,
+        vision: !!caps.vision,
+        reasoning: !!(entry && entry.reasoning)
+      }
+    });
+  }
   for (const [slug, info] of [...decisionSlugs.entries()].sort())
     data.push({
       id: slug,
@@ -915,17 +941,18 @@ async function ensureConsoleAuthColumn(db) {
 var routeCapabilityMigrated = new WeakSet();
 async function ensureRouteCapabilityColumns(db) {
   if (!db || routeCapabilityMigrated.has(db)) return;
-  try {
-    const cols = await db.prepare("PRAGMA table_info(model_routes)").all();
-    const names = new Set((cols.results || []).map((r) => r.name));
-    if (!names.has("context_limit_override"))
-      await db.prepare("ALTER TABLE model_routes ADD COLUMN context_limit_override INTEGER").run();
-    if (!names.has("output_limit_override"))
-      await db.prepare("ALTER TABLE model_routes ADD COLUMN output_limit_override INTEGER").run();
-    if (!names.has("capability_overrides_json"))
-      await db.prepare("ALTER TABLE model_routes ADD COLUMN capability_overrides_json TEXT NOT NULL DEFAULT '{}'").run();
-    routeCapabilityMigrated.add(db);
-  } catch {}
+  // No try/catch: a failure must propagate so the caller does not record this
+  // database as migrated. Swallowing it would make every later request skip
+  // the retry and keep selecting columns that were never added.
+  const cols = await db.prepare("PRAGMA table_info(model_routes)").all();
+  const names = new Set((cols.results || []).map((r) => r.name));
+  if (!names.has("context_limit_override"))
+    await db.prepare("ALTER TABLE model_routes ADD COLUMN context_limit_override INTEGER").run();
+  if (!names.has("output_limit_override"))
+    await db.prepare("ALTER TABLE model_routes ADD COLUMN output_limit_override INTEGER").run();
+  if (!names.has("capability_overrides_json"))
+    await db.prepare("ALTER TABLE model_routes ADD COLUMN capability_overrides_json TEXT NOT NULL DEFAULT '{}'").run();
+  routeCapabilityMigrated.add(db);
 }
 
 // null inherits the canonical limit. A positive number clamps this route.

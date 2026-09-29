@@ -192,6 +192,44 @@ test("a reseller slug with no catalog row inherits the canonical model's limits"
   t.__setModelsDevCache(null);
 });
 
+test("GET /v1/models advertises canonical limits, route clamps, and never zero", async () => {
+  const { createApp, __test: t } = await import("../src/index.js");
+  const { createDb } = await import("../../server/db.mjs");
+  const { readFileSync } = await import("node:fs");
+  const { seedModelRegistry } = await import("../src/router/model-registry.js");
+  const db = createDb(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const now = new Date().toISOString();
+  await seedModelRegistry({ env: { DB: db } });
+  db.prepare("INSERT INTO model_aliases (alias, canonical_model_id, alias_type, provider_id, confidence, source, created_at) VALUES ('mygateway/glm-5.3','glm-5.3','public_slug',NULL,1,'test',?)").bind(now).run();
+  db.prepare("INSERT INTO api_keys (key_id, name, active, budget_mode, budget_limit, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").bind("sk-env", "t", 1, "usd", 1e9, now, now).run();
+  db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(1, "P", "http://p.local/v1", "direct", "openai", 1, 1, "round_robin", now).run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,0,1)").bind("mygateway/glm-5.3", 1, "glm-5.3").run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled, context_limit_override, output_limit_override) VALUES (?,?,?,0,1,?,?)").bind("z-ai/glm-5.3", 1, "glm-5.3", 98304, 16384).run();
+  db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,0,1)").bind("mystery-model", 1, "mystery").run();
+  db.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('auto_enabled','off',?)").bind(now).run();
+  t.__setModelsDevCache({ p1: { models: {} } });
+  const app = createApp({ DB: db, ADMIN_TOKEN: "admin" });
+  const res = await app.fetch(new Request("http://gw/v1/models", { headers: { authorization: "Bearer sk-env" } }));
+  if (res.status !== 200) throw new Error("status " + res.status + ": " + (await res.text()).slice(0, 400));
+  const body = await res.json();
+  const byId = (id) => body.data.find((m) => m.id === id);
+
+  const reseller = byId("mygateway/glm-5.3");
+  assert.equal(reseller.context_window, 1000000, "the public list carries the canonical context");
+  assert.equal(reseller.max_output_tokens, 131072, "the public list carries the canonical output");
+
+  const clamped = byId("z-ai/glm-5.3");
+  assert.equal(clamped.context_window, 98304, "a route clamp reaches the public list");
+  assert.equal(clamped.max_output_tokens, 16384);
+
+  const unknown = byId("mystery-model");
+  assert.equal(unknown.context_window, UNKNOWN_CONTEXT_CEILING);
+  assert.equal(unknown.max_output_tokens, UNKNOWN_OUTPUT_CEILING, "an unknown output is a positive fallback, never 0");
+  assert.ok(unknown.max_output_tokens > 0);
+  t.__setModelsDevCache(null);
+});
+
 test("GET /v1/models hides auto when it is off and sizes it from the key's routes", async () => {
   const { createApp, __test: t } = await import("../src/index.js");
   const { createDb } = await import("../../server/db.mjs");
