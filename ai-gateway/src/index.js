@@ -38,6 +38,7 @@ async function ensureRegistrySeed(c) {
   let inflight = registrySeedInflight.get(db);
   if (!inflight) {
     inflight = seedModelRegistry(c)
+      .then(() => ensureRouteCapabilityColumns(db))
       .then(() => { registrySeededDbs.add(db); })
       .catch((e) => { blog("registry seed failed: " + String(e && e.message || e)); })
       .finally(() => { registrySeedInflight.delete(db); });
@@ -686,8 +687,9 @@ app.get("/v1/models", async (c) => {
       await fetchModelsDevCatalog().catch(() => {});
     const catalog = modelsDevCache.catalog;
     const byId = catalog ? flattenModelsDevCatalog(catalog) : null;
+    const canonicalByRoute = await canonicalLimitsForRoutes(c, live);
     const envelope = buildCapabilityEnvelope(live.map((r) => {
-      const entry = capabilityEntryForRoute(r, byId);
+      const entry = capabilityEntryForRoute(r, byId, canonicalByRoute.get(r.route_id));
       const caps = entryCapabilities(entry);
       return {
         providerId: r.provider_id,
@@ -910,8 +912,9 @@ async function ensureConsoleAuthColumn(db) {
 // NULL is the meaningful default — it means "inherit the canonical limit" — so
 // the columns are added without a value rather than a zero, which would read
 // as "this transport can produce nothing".
+var routeCapabilityMigrated = new WeakSet();
 async function ensureRouteCapabilityColumns(db) {
-  if (!db || ensureRouteCapabilityColumns.done) return;
+  if (!db || routeCapabilityMigrated.has(db)) return;
   try {
     const cols = await db.prepare("PRAGMA table_info(model_routes)").all();
     const names = new Set((cols.results || []).map((r) => r.name));
@@ -921,7 +924,7 @@ async function ensureRouteCapabilityColumns(db) {
       await db.prepare("ALTER TABLE model_routes ADD COLUMN output_limit_override INTEGER").run();
     if (!names.has("capability_overrides_json"))
       await db.prepare("ALTER TABLE model_routes ADD COLUMN capability_overrides_json TEXT NOT NULL DEFAULT '{}'").run();
-    ensureRouteCapabilityColumns.done = true;
+    routeCapabilityMigrated.add(db);
   } catch {}
 }
 
@@ -1322,9 +1325,10 @@ app.get("/console/api/models", async (c) => {
   const healthBySlug = new Map((healthRows.results || []).map((r) => [String(r.public_slug), { n: Number(r.n) || 0, ok: Number(r.ok) || 0 }]));
 
   const data = [];
+  const canonicalByRoute = await canonicalLimitsForRoutes(c, live);
   if (cfg.enabled && live.length) {
     const envelope = buildCapabilityEnvelope(live.map((r) => {
-      const entry = capabilityEntryForRoute(r, byId);
+      const entry = capabilityEntryForRoute(r, byId, canonicalByRoute.get(r.route_id));
       const caps = entryCapabilities(entry);
       return {
         providerId: r.provider_id,
@@ -1354,7 +1358,7 @@ app.get("/console/api/models", async (c) => {
   const chatSlugs = new Set(live.map((r) => r.slug));
   for (const slug of [...chatSlugs].sort()) {
     const r = live.find((x) => x.slug === slug);
-    const entry = capabilityEntryForRoute(r, byId);
+    const entry = capabilityEntryForRoute(r, byId, canonicalByRoute.get(r.route_id));
     const caps = entryCapabilities(entry);
     const pr = priceBySlug.get(slug);
     const mdIn = entry && Number.isFinite(entry.prompt_per_1m) ? Number(entry.prompt_per_1m) : null;
@@ -3697,28 +3701,34 @@ function hasImageContent(payload) {
   return false;
 }
 
-// One capability lookup for the router and the model list. A Z.AI consumer
-// route is absent from models.dev, so its local catalog entry wins; everything
-// else resolves through the public catalog. Both callers must see the same row.
-function capabilityEntryForRoute(route, catalogById) {
+// One capability lookup for the router and the model list. Identity and the
+// native ceilings come from the canonical registry: a reseller slug that
+// models.dev has never heard of still inherits its model's real limits.
+// The catalog only fills what the registry doesn't record — vision, tools,
+// modalities — and a Z.AI consumer route uses its local table for those,
+// since it has no models.dev row at all.
+function capabilityEntryForRoute(route, catalogById, canonical) {
   let entry = null;
   if (route && isZaiWebFormat(route.fmt))
     entry = modelCatalogEntry(route.upstream_model, route.fmt) || null;
   if (!entry)
     entry = catalogById && route ? matchModelsDevPrice(catalogById, route.slug) : null;
-  return applyRouteCapability(entry, route);
+  return applyRouteCapability(entry, route, canonical);
 }
 
-// The catalog describes the model. The route may deliver less. A route clamp
-// replaces the catalog limit only when it is lower; a route claiming more than
-// the model is ignored. A route with no catalog row still carries its clamp,
-// so a transport ceiling is never lost just because models.dev has no entry.
-function applyRouteCapability(entry, route) {
+// The canonical model sets the ceiling. The catalog is supplemental and only
+// fills a limit the registry doesn't have. The route may deliver less than
+// either, never more. A route with no catalog row and no canonical row still
+// carries its own clamp, so a measured transport ceiling is never lost.
+function applyRouteCapability(entry, route, canonical) {
   const caps = resolveRouteCapabilities({
-    canonical: entry && entry.limit ? { context_limit: entry.limit.context, output_limit: entry.limit.output } : null,
+    canonical: {
+      context_limit: positiveOrNull(canonical && canonical.context_limit) ?? (entry && entry.limit && entry.limit.context),
+      output_limit: positiveOrNull(canonical && canonical.output_limit) ?? (entry && entry.limit && entry.limit.output)
+    },
     route
   });
-  if (caps.sources.context !== "route_override" && caps.sources.output !== "route_override")
+  if (caps.context == null && caps.output == null)
     return entry;
   const base = entry || { limit: {} };
   return {
@@ -3729,6 +3739,49 @@ function applyRouteCapability(entry, route) {
       output: caps.output != null ? caps.output : (base.limit && base.limit.output)
     }
   };
+}
+
+function positiveOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// Native ceilings for a batch of routes, keyed by route id. A route whose
+// slug or upstream model resolves to a canonical model inherits that model's
+// limits even when no catalog has ever heard of the public slug. A miss is
+// simply absent from the map, and the catalog remains the fallback.
+async function canonicalLimitsForRoutes(c, routes) {
+  const out = new Map();
+  const list = routes || [];
+  if (!list.length || !c || !c.env || !c.env.DB)
+    return out;
+  try {
+    const index = await loadAliasIndex(c);
+    const wanted = new Set();
+    const resolved = [];
+    for (const r of list) {
+      const hit = resolveCanonicalModel(index, {
+        providerId: r.provider_id, publicSlug: r.slug, upstreamModel: r.upstream_model
+      });
+      if (hit && hit.canonicalModelId) {
+        resolved.push([r.route_id, hit.canonicalModelId]);
+        wanted.add(hit.canonicalModelId);
+      }
+    }
+    if (!wanted.size)
+      return out;
+    const ids = [...wanted];
+    const rows = await c.env.DB.prepare(
+      "SELECT id, context_limit, output_limit FROM canonical_models WHERE id IN (" + ids.map(() => "?").join(",") + ")"
+    ).bind(...ids).all();
+    const byId = new Map((rows.results || []).map((row) => [row.id, row]));
+    for (const [routeId, canonicalId] of resolved) {
+      const row = byId.get(canonicalId);
+      if (row)
+        out.set(routeId, { context_limit: row.context_limit, output_limit: row.output_limit });
+    }
+  } catch {}
+  return out;
 }
 
 // Capability gate from the models.dev catalog entry. Unknown models are
