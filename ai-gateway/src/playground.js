@@ -511,6 +511,16 @@ var PLAYGROUND_HTML = `<!doctype html>
       <p class="hint">Bodies are capped at 128KB per side and secrets are stripped. Turn off to record nothing.</p>
     </div></div>
     <div class="hero-stats" id="tj-stats"></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Filter</h2></div><div class="panel-b">
+      <div class="form-grid">
+        <div><label>Account</label><select id="tj-f-account"><option value="">All accounts</option></select></div>
+        <div><label>Key</label><select id="tj-f-key"><option value="">All keys</option></select></div>
+        <div><label>Model</label><select id="tj-f-model"><option value="">All models</option></select></div>
+        <div><label>Status</label><select id="tj-f-status"><option value="">Any</option><option value="ok">Succeeded</option><option value="fail">Failed</option></select></div>
+        <div class="full"><button class="ghost" id="tj-f-clear">Clear filters</button></div>
+      </div>
+      <p class="hint">Totals and the latency chart follow the filter. Picking an account narrows to the keys it owns.</p>
+    </div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Latency by model</h2></div><div class="panel-b" id="tj-chart"></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Recent requests</h2></div><div class="panel-b flush" id="tj-list"></div></div>
   </section>
@@ -2121,12 +2131,61 @@ document.addEventListener('change',function(e){
 
 // ---------- TRAJECTORIES ----------
 let tjOffset=0; const tjLimit=25;
+let tjFilters={account_id:'',key_id:'',slug:'',status:''};
+let tjFilterOptionsLoaded=false;
+function tjQuery(){
+  const p=['limit='+tjLimit,'offset='+tjOffset];
+  if(tjFilters.account_id) p.push('account_id='+encodeURIComponent(tjFilters.account_id));
+  if(tjFilters.key_id) p.push('key_id='+encodeURIComponent(tjFilters.key_id));
+  if(tjFilters.slug) p.push('slug='+encodeURIComponent(tjFilters.slug));
+  if(tjFilters.status) p.push('status='+encodeURIComponent(tjFilters.status));
+  return p.join('&');
+}
+async function loadTjFilterOptions(){
+  try{
+    const acc=(await api('/admin/accounts')).data||{};
+    const keys=(await api('/admin/keys')).data||{};
+    // Which keys belong to which account (new style), plus the legacy 1:1
+    // shape where the account's own id is the key id. A key with no account
+    // stays listed under "all keys" only.
+    const ownerOf={}; ((keys.keys)||[]).forEach(function(k){ if(k.account_id) ownerOf[k.key_id]=k.account_id; });
+    const acctSel=document.getElementById('tj-f-account');
+    if(acctSel){
+      const cur=acctSel.value;
+      acctSel.innerHTML='<option value="">All accounts</option>'+((acc.accounts)||[]).map(function(a){
+        return '<option value="'+esc(a.key_id)+'">'+esc(a.username)+' ('+esc(a.key_id)+')</option>';
+      }).join('');
+      acctSel.value=cur||'';
+    }
+    const keySel=document.getElementById('tj-f-key');
+    if(keySel){
+      const cur=keySel.value;
+      const list=(keys.keys)||[];
+      keySel.innerHTML='<option value="">All keys</option>'+list.map(function(k){
+        const own=ownerOf[k.key_id]?' · '+esc(ownerOf[k.key_id]):' · no account';
+        return '<option value="'+esc(k.key_id)+'">'+esc(k.name)+' — '+esc(k.key_id.slice(0,12))+'…'+own+'</option>';
+      }).join('');
+      keySel.value=cur||'';
+    }
+    const modelSel=document.getElementById('tj-f-model');
+    if(modelSel){
+      const cur=modelSel.value;
+      let opts=[]; try{ opts=await publicModelOptions('all'); }catch(e){ opts=[]; }
+      modelSel.innerHTML='<option value="">All models</option>'+opts.map(function(o){
+        return '<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>';
+      }).join('');
+      modelSel.value=cur||'';
+    }
+    tjFilterOptionsLoaded=true;
+  }catch(e){ /* the filters stay empty rather than blocking the list */ }
+}
 async function loadTrajectories(){
   const statsEl=document.getElementById('tj-stats'); const listEl=document.getElementById('tj-list'); const chartEl=document.getElementById('tj-chart');
   paintSkeleton(statsEl);
+  if(!tjFilterOptionsLoaded) await loadTjFilterOptions();
   let settings=null; try{ settings=(await api('/admin/trajectory-settings')).data; }catch(e){}
   const capBox=document.getElementById('tj-capture'); if(capBox) capBox.checked=!settings||settings.capture!=='off';
-  let data; try{ data=(await api('/admin/trajectories?limit='+tjLimit+'&offset='+tjOffset)).data; }catch(e){ listEl.innerHTML='<div class="empty">Could not load trajectories: '+esc(e.message)+'</div>'; return; }
+  let data; try{ data=(await api('/admin/trajectories?'+tjQuery())).data; }catch(e){ listEl.innerHTML='<div class="empty">Could not load trajectories: '+esc(e.message)+'</div>'; return; }
   const list=(data&&data.trajectories)||[]; const s=(data&&data.stats)||{}; const pg=(data&&data.page)||{limit:tjLimit,offset:tjOffset,matched:list.length,hasMore:false};
   const okRate=s.total?Math.round(100*(s.ok_count||0)/s.total)+'%':'-';
   statsEl.innerHTML=[
@@ -2147,15 +2206,15 @@ async function loadTrajectories(){
   const rows=list.map(function(t){
     const pill=t.status==='ok'?'<span class="pill ok">ok</span>':'<span class="pill bad">fail</span>';
     const cache=t.cache_state?'<span class="pill mut">'+esc(t.cache_state)+'</span>':'';
-    return '<tr><td class="mono small">'+esc((t.created_at||'').slice(5,19).replace('T',' '))+'</td><td>'+esc(t.slug)+'</td><td>'+esc(t.provider||'-')+'</td><td>'+pill+' '+cache+'</td><td class="mono" title="input tokens">'+fmt(t.prompt_tokens||0)+'&nbsp;in</td><td class="mono" title="output tokens">'+fmt(t.completion_tokens||0)+'&nbsp;out</td><td class="mono" title="latency">'+fmt(t.latency_ms||0)+'ms</td><td class="mono" title="cost">'+money(t.cost_usd||0)+'</td><td><button class="ghost" data-act="tjview" data-id="'+esc(t.id)+'">view</button></td></tr>';
-  }).join('') || '<tr><td colspan="9"><div class="empty">No trajectories captured yet.</div></td></tr>';
+    return '<tr><td class="mono small">'+esc((t.created_at||'').slice(5,19).replace('T',' '))+'</td><td>'+esc(t.slug)+'</td><td class="small">'+esc(t.key_name||'-')+'<br><span class="mono small" title="'+esc(t.key_id||'')+'">'+esc(String(t.key_id||'').slice(0,10))+(t.key_id?'…':'')+'</span></td><td>'+esc(t.provider||'-')+'</td><td>'+pill+' '+cache+'</td><td class="mono" title="input tokens">'+fmt(t.prompt_tokens||0)+'&nbsp;in</td><td class="mono" title="output tokens">'+fmt(t.completion_tokens||0)+'&nbsp;out</td><td class="mono" title="latency">'+fmt(t.latency_ms||0)+'ms</td><td class="mono" title="cost">'+money(t.cost_usd||0)+'</td><td><button class="ghost" data-act="tjview" data-id="'+esc(t.id)+'">view</button></td></tr>';
+  }).join('') || '<tr><td colspan="10"><div class="empty">No trajectories captured yet.</div></td></tr>';
   const from=pg.matched?pg.offset+1:0; const to=pg.offset+list.length;
   const pager='<div class="tj-pager">'+
     '<button class="ghost" data-act="tjprev" '+(pg.offset<=0?'disabled':'')+'>&larr; Newer</button>'+
     '<span class="small">Showing '+fmt(from)+'–'+fmt(to)+' of '+fmt(pg.matched)+'</span>'+
     '<button class="ghost" data-act="tjnext" '+(pg.hasMore?'':'disabled')+'>Older &rarr;</button>'+
   '</div>';
-  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Provider</th><th>Status</th><th>In tok</th><th>Out tok</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>'+pager;
+  listEl.innerHTML='<table><tr><th>Time</th><th>Model</th><th>Key</th><th>Provider</th><th>Status</th><th>In tok</th><th>Out tok</th><th>Latency</th><th>Cost</th><th></th></tr>'+rows+'</table>'+pager;
 }
 async function viewTrajectory(id){
   const {data}=await api('/admin/trajectories/'+id); const t=data&&data.trajectory; if(!t){ toast('not found','err'); return; }
@@ -2302,6 +2361,29 @@ document.getElementById('ar-run').onclick=async function(){
     '<table style="margin-top:10px"><tr><th>Model</th><th>Status</th><th>Quality</th><th>Cost</th><th>Health</th></tr>'+rows+'</table>';
 };
 document.getElementById('tj-refresh').onclick=function(){ loadTrajectories(); };
+// Any filter change restarts from the first page: page 3 of the old filter is
+// meaningless under a new one.
+function applyTjFilter(patch){
+  tjFilters=Object.assign({},tjFilters,patch);
+  tjOffset=0;
+  loadTrajectories();
+}
+['account','key','model','status'].forEach(function(name){
+  const el=document.getElementById('tj-f-'+name);
+  if(!el) return;
+  el.addEventListener('change',function(){
+    const value=el.value;
+    if(name==='account') applyTjFilter({account_id:value});
+    else if(name==='key') applyTjFilter({key_id:value});
+    else if(name==='model') applyTjFilter({slug:value});
+    else applyTjFilter({status:value});
+  });
+});
+const tjClear=document.getElementById('tj-f-clear');
+if(tjClear) tjClear.onclick=function(){
+  ['account','key','model','status'].forEach(function(name){ const el=document.getElementById('tj-f-'+name); if(el) el.value=''; });
+  applyTjFilter({account_id:'',key_id:'',slug:'',status:''});
+};
 document.getElementById('tj-purge').onclick=function(){ confirmAction('Purge trajectories','Delete every captured trajectory? This cannot be undone.','Purge',async function(){ await api('/admin/trajectories/purge',{method:'POST'}); loadTrajectories(); }); };
 document.getElementById('tj-capture').addEventListener('change',async function(e){
   await api('/admin/trajectory-settings',{method:'POST',body:JSON.stringify({capture:e.target.checked?'on':'off'})});

@@ -5274,7 +5274,7 @@ app.get("/admin/keys", async (c) => {
   if (denied)
     return denied;
   const rows = await c.env.DB.prepare(
-    `SELECT k.key_id, k.name, k.budget_mode, k.budget_limit, k.used_tokens, k.used_usd, k.request_count, k.request_limit_per_minute, k.expires_at, k.active, k.allowed_models, k.excluded_models, k.created_at, k.updated_at,
+    `SELECT k.key_id, k.name, k.budget_mode, k.budget_limit, k.used_tokens, k.used_usd, k.request_count, k.request_limit_per_minute, k.expires_at, k.active, k.allowed_models, k.excluded_models, k.account_id, k.created_at, k.updated_at,
       COALESCE((SELECT GROUP_CONCAT(akmt.tier_id, ',') FROM api_key_model_tiers akmt WHERE akmt.key_id=k.key_id), '') AS tier_ids,
       COALESCE((SELECT GROUP_CONCAT(mt.name, ' \xB7 ') FROM api_key_model_tiers akmt JOIN model_tiers mt ON mt.id=akmt.tier_id WHERE akmt.key_id=k.key_id), '') AS tier_names
      FROM api_keys k ORDER BY k.created_at DESC`
@@ -6455,23 +6455,36 @@ app.get("/admin/trajectories", async (c) => {
   const offset = Math.max(0, Number(c.req.query("offset")) || 0);
   const slug = String(c.req.query("slug") || "").trim();
   const status = String(c.req.query("status") || "").trim();
-  let sql = "SELECT id, created_at, key_name, slug, stream, cache_state, status, http_status, provider, rank, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error FROM trajectories";
-  let countSql = "SELECT COUNT(*) AS n FROM trajectories";
+  const keyId = String(c.req.query("key_id") || "").trim();
+  const accountId = String(c.req.query("account_id") || "").trim();
   const conds = [];
-  const binds = [];
-  if (slug) { conds.push("slug=?"); binds.push(slug); }
-  if (status === "ok" || status === "fail") { conds.push("status=?"); binds.push(status); }
-  if (conds.length) { sql += " WHERE " + conds.join(" AND "); countSql += " WHERE " + conds.join(" AND "); }
-  sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
-  binds.push(limit, offset);
-  const rows = await c.env.DB.prepare(sql).bind(...binds).all();
-  const matched = await c.env.DB.prepare(countSql).bind(...binds.slice(0, conds.length)).first();
+  const condBinds = [];
+  if (slug) { conds.push("slug=?"); condBinds.push(slug); }
+  if (status === "ok" || status === "fail") { conds.push("status=?"); condBinds.push(status); }
+  if (keyId) { conds.push("key_id=?"); condBinds.push(keyId); }
+  // An account filter reaches every key it owns plus, for the legacy 1:1
+  // shape, the account's own key. No matching keys means no rows, not all rows.
+  if (accountId) {
+    const owned = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE account_id=?").bind(accountId).all();
+    const ids = (owned.results || []).map((r) => r.key_id);
+    const legacy = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(accountId).first();
+    if (legacy && legacy.key_id && ids.indexOf(legacy.key_id) < 0) ids.push(legacy.key_id);
+    if (!ids.length)
+      conds.push("1=0");
+    else { conds.push("key_id IN (" + ids.map(() => "?").join(",") + ")"); condBinds.push(...ids); }
+  }
+  const where = conds.length ? " WHERE " + conds.join(" AND ") : "";
+  const sql = "SELECT id, created_at, key_id, key_name, slug, stream, cache_state, status, http_status, provider, rank, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error FROM trajectories" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+  const rows = await c.env.DB.prepare(sql).bind(...condBinds, limit, offset).all();
+  const matched = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM trajectories" + where).bind(...condBinds).first();
+  // Latency and totals follow the same filter, so a filtered view never
+  // reports gateway-wide numbers next to a narrowed list.
   const latRows = await c.env.DB.prepare(
-    "SELECT slug, AVG(latency_ms) avg_ms, COUNT(*) n FROM trajectories WHERE status='ok' AND latency_ms IS NOT NULL " +
+    "SELECT slug, AVG(latency_ms) avg_ms, COUNT(*) n FROM trajectories WHERE status='ok' AND latency_ms IS NOT NULL" +
     (conds.length ? " AND " + conds.join(" AND ") : "") +
     " GROUP BY slug ORDER BY avg_ms DESC"
-  ).bind(...binds.slice(0, conds.length)).all();
-  const agg = await c.env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok_count, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost FROM trajectories").first();
+  ).bind(...condBinds).all();
+  const agg = await c.env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok_count, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost FROM trajectories" + where).bind(...condBinds).first();
   return c.json({
     trajectories: rows.results || [],
     stats: agg || { total: 0, ok_count: 0, tokens: 0, cost: 0 },
