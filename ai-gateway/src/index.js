@@ -6447,21 +6447,22 @@ app.get("/admin/logs", async (c) => {
     return denied;
   return c.json({ logs: logBuffer });
 });
-app.get("/admin/trajectories", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied)
-    return denied;
-  const limit = Math.min(200, Math.max(1, Number(c.req.query("limit")) || 100));
-  const offset = Math.max(0, Number(c.req.query("offset")) || 0);
+// One definition of "which trajectories does this view cover", shared by the
+// list and the exports so a filter can never mean one thing in the table and
+// another in the file. Returns SQL conditions, their binds, and the resolved
+// key ids (null when the filter is not key-scoped, [] when it matched none).
+async function trajectoryScope(c, options) {
+  const opts = options || {};
   const slug = String(c.req.query("slug") || "").trim();
-  const status = String(c.req.query("status") || "").trim();
   const keyId = String(c.req.query("key_id") || "").trim();
   const accountId = String(c.req.query("account_id") || "").trim();
+  const status = String(c.req.query("status") || "").trim();
   const conds = [];
-  const condBinds = [];
-  if (slug) { conds.push("slug=?"); condBinds.push(slug); }
-  if (status === "ok" || status === "fail") { conds.push("status=?"); condBinds.push(status); }
-  if (keyId) { conds.push("key_id=?"); condBinds.push(keyId); }
+  const binds = [];
+  let keyIds = null;
+  if (slug) { conds.push("slug=?"); binds.push(slug); }
+  if (opts.includeStatus && (status === "ok" || status === "fail")) { conds.push("status=?"); binds.push(status); }
+  if (keyId) { conds.push("key_id=?"); binds.push(keyId); keyIds = [keyId]; }
   // An account filter reaches every key it owns plus, for the legacy 1:1
   // shape, the account's own key. No matching keys means no rows, not all rows.
   if (accountId) {
@@ -6469,10 +6470,26 @@ app.get("/admin/trajectories", async (c) => {
     const ids = (owned.results || []).map((r) => r.key_id);
     const legacy = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(accountId).first();
     if (legacy && legacy.key_id && ids.indexOf(legacy.key_id) < 0) ids.push(legacy.key_id);
+    // Both filters together mean the intersection: the key must belong to the
+    // account. The SQL conditions already AND that way; this keeps the key id
+    // list handed to the streaming export honest about the same scope.
+    keyIds = keyIds ? ids.filter((id) => keyIds.indexOf(id) >= 0) : ids;
     if (!ids.length)
       conds.push("1=0");
-    else { conds.push("key_id IN (" + ids.map(() => "?").join(",") + ")"); condBinds.push(...ids); }
+    else { conds.push("key_id IN (" + ids.map(() => "?").join(",") + ")"); binds.push(...ids); }
   }
+  return { conds, binds, keyIds };
+}
+
+app.get("/admin/trajectories", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied)
+    return denied;
+  const limit = Math.min(200, Math.max(1, Number(c.req.query("limit")) || 100));
+  const offset = Math.max(0, Number(c.req.query("offset")) || 0);
+  const scope = await trajectoryScope(c, { includeStatus: true });
+  const conds = scope.conds;
+  const condBinds = scope.binds;
   const where = conds.length ? " WHERE " + conds.join(" AND ") : "";
   const sql = "SELECT id, created_at, key_id, key_name, slug, stream, cache_state, status, http_status, provider, rank, attempts, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, error FROM trajectories" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?";
   const rows = await c.env.DB.prepare(sql).bind(...condBinds, limit, offset).all();
@@ -6497,26 +6514,29 @@ app.get("/admin/trajectories-export", async (c) => {
   if (denied)
     return denied;
   const format = String(c.req.query("format") || "openai");
+  // The scope is resolved before the format branch so every export, Vey
+  // included, covers exactly what the Trajectories table is showing.
+  const scope = await trajectoryScope(c, { includeStatus: false });
   if (format === "vey" || format === "world") {
     // Vey exports the whole episode — including failed attempts — so it must
     // NOT run through the successful-completion query below. The Response it
     // builds has to be returned: dropping it sends the browser an empty body
     // (NS_ERROR_NET_EMPTY_RESPONSE).
     // See exportVeyDataset in src/export/vey-serve.js.
-    const vey = await exportVeyDataset(c, format);
+    const vey = await exportVeyDataset(c, format, { keyIds: scope.keyIds });
     if (vey)
       return vey;
     return c.json({ error: { message: "vey export produced no response" } }, 500);
   }
   if (!["openai", "sharegpt", "trl", "rl"].includes(format))
     return c.json({ error: { message: "format must be one of openai, sharegpt, trl, rl, vey" } }, 400);
-  const slugFilter = String(c.req.query("slug") || "").trim();
+  // Exports are training data: they need a complete request/response pair, so
+  // the successful-completion requirement stays. The status filter is therefore
+  // not part of an export scope, and the UI says so.
   let sql = "SELECT slug, stream, status, provider, attempts, steps_json, request_json, response_json, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at FROM trajectories WHERE status='ok' AND request_json IS NOT NULL AND response_json IS NOT NULL";
   const binds = [];
-  if (slugFilter) {
-    sql += " AND slug=?";
-    binds.push(slugFilter);
-  }
+  for (const cond of scope.conds) sql += " AND " + cond;
+  binds.push(...scope.binds);
   sql += " ORDER BY created_at";
   const rows = await c.env.DB.prepare(sql).bind(...binds).all();
   const lines = [];

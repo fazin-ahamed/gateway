@@ -124,3 +124,104 @@ test("rows carry the key so a filtered list is attributable", async () => {
   assert.equal(k.trajectories[0].key_name, "a-server");
   db.close?.();
 });
+
+// --- exports: the file must cover exactly what the table shows ---
+
+// Exportable rows need a complete request/response pair, so these seeds carry
+// bodies; the row-level helpers above deliberately do not.
+async function gatewayWithBodies() {
+  const { app, db } = await gateway();
+  const now = new Date().toISOString();
+  const req = JSON.stringify({ messages: [{ role: "user", content: "hi" }] });
+  const res = JSON.stringify({ choices: [{ message: { role: "assistant", content: "hello" } }] });
+  db.prepare("UPDATE trajectories SET request_json=?, response_json=?").bind(req, res).run();
+  return { app, db, now };
+}
+
+async function exportCount(app, query) {
+  const res = await app.fetch(new Request("http://gw/admin/trajectories-export?" + query, { headers: ADMIN }));
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  const lines = body ? body.trim().split("\n") : [];
+  return { header: res.headers.get("x-trajectory-count"), lines };
+}
+
+test("the export follows the account filter", async () => {
+  const { app, db } = await gatewayWithBodies();
+  // Five rows, but one is a failed run: a training export needs a completed
+  // request/response pair, so that row is not exportable in these formats.
+  const all = await exportCount(app, "format=openai");
+  assert.equal(Number(all.header), 4);
+  assert.equal(all.lines.length, 4);
+
+  const a = await exportCount(app, "format=openai&account_id=acct_a");
+  assert.equal(Number(a.header), 2, "only account A's completed runs are exported");
+  assert.equal(a.lines.length, 2);
+  db.close?.();
+});
+
+test("the export follows a key filter", async () => {
+  const { app, db } = await gatewayWithBodies();
+  const one = await exportCount(app, "format=openai&key_id=sk-k1b");
+  assert.equal(Number(one.header), 1);
+  assert.equal(one.lines.length, 1);
+  db.close?.();
+});
+
+test("the export follows the model filter", async () => {
+  const { app, db } = await gatewayWithBodies();
+  const m = await exportCount(app, "format=openai&slug=glm-5.3");
+  assert.equal(Number(m.header), 4, "four completed glm-5.3 runs");
+  // The only glm-5.2 row failed, so nothing is exportable for it.
+  const failedOnly = await exportCount(app, "format=openai&slug=glm-5.2");
+  assert.equal(Number(failedOnly.header), 0);
+  db.close?.();
+});
+
+test("a failed run is absent from a training export but present in vey", async () => {
+  const { app, db } = await gatewayWithBodies();
+  const training = await exportCount(app, "format=openai&key_id=sk-k1");
+  assert.equal(Number(training.header), 1, "only the completed run exports");
+  const vey = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey&key_id=sk-k1", { headers: ADMIN }));
+  const veyText = await vey.text();
+  assert.equal(veyText.trim().split("\n").length, 2, "vey keeps the failed attempt too");
+  db.close?.();
+});
+
+test("a key and account together export only their intersection", async () => {
+  const { app, db } = await gatewayWithBodies();
+  // sk-op is not owned by acct_a, so the intersection is empty.
+  const none = await exportCount(app, "format=openai&account_id=acct_a&key_id=sk-op");
+  assert.equal(Number(none.header), 0);
+  assert.equal(none.lines.length, 0);
+  // sk-k1b is owned by acct_a, so it survives.
+  const one = await exportCount(app, "format=openai&account_id=acct_a&key_id=sk-k1b");
+  assert.equal(Number(one.header), 1);
+  db.close?.();
+});
+
+test("an export filter that matches nothing produces an empty file", async () => {
+  const { app, db } = await gatewayWithBodies();
+  const none = await exportCount(app, "format=openai&account_id=acct_missing");
+  assert.equal(Number(none.header), 0);
+  assert.equal(none.lines.length, 0);
+  db.close?.();
+});
+
+test("the vey export follows the same key and account scope", async () => {
+  const { app, db } = await gatewayWithBodies();
+  const countLines = async (q) => {
+    const res = await app.fetch(new Request("http://gw/admin/trajectories-export?format=vey&" + q, { headers: ADMIN }));
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    return text ? text.trim().split("\n").length : 0;
+  };
+  assert.equal(await countLines(""), 5, "unfiltered vey exports everything");
+  assert.equal(await countLines("account_id=acct_a"), 3);
+  assert.equal(await countLines("key_id=sk-k1b"), 1, "a pure key filter reaches the stream");
+  assert.equal(await countLines("key_id=sk-op"), 1);
+  assert.equal(await countLines("slug=glm-5.2"), 1);
+  assert.equal(await countLines("account_id=acct_missing"), 0);
+  assert.equal(await countLines("account_id=acct_a&key_id=sk-op"), 0, "intersection, not union");
+  db.close?.();
+});

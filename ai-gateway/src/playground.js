@@ -519,7 +519,7 @@ var PLAYGROUND_HTML = `<!doctype html>
         <div><label>Status</label><select id="tj-f-status"><option value="">Any</option><option value="ok">Succeeded</option><option value="fail">Failed</option></select></div>
         <div class="full"><button class="ghost" id="tj-f-clear">Clear filters</button></div>
       </div>
-      <p class="hint">Totals and the latency chart follow the filter. Picking an account narrows to the keys it owns.</p>
+      <p class="hint">Totals and the latency chart follow the filter. Picking an account narrows to the keys it owns. Exports above follow the account, key, and model you pick; the status filter does not apply to them, because a training export needs a completed run.</p>
     </div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Latency by model</h2></div><div class="panel-b" id="tj-chart"></div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Recent requests</h2></div><div class="panel-b flush" id="tj-list"></div></div>
@@ -2389,7 +2389,32 @@ document.getElementById('tj-capture').addEventListener('change',async function(e
   await api('/admin/trajectory-settings',{method:'POST',body:JSON.stringify({capture:e.target.checked?'on':'off'})});
   toast(e.target.checked?'capture on':'capture off','ok');
 });
-function downloadTraj(fmt){ const a=document.createElement('a'); a.href=API+'/admin/trajectories-export?format='+fmt; a.download='trajectories-'+fmt+'.jsonl'; document.body.appendChild(a); a.click(); a.remove(); }
+// Exports honour the active filter, so the file matches the table. Status is
+// left out on purpose: an export needs a complete request/response pair, which
+// only a successful run has.
+function tjExportQuery(){
+  const p=['format='];
+  if(tjFilters.account_id) p.push('account_id='+encodeURIComponent(tjFilters.account_id));
+  if(tjFilters.key_id) p.push('key_id='+encodeURIComponent(tjFilters.key_id));
+  if(tjFilters.slug) p.push('slug='+encodeURIComponent(tjFilters.slug));
+  return p;
+}
+function tjScopeLabel(){
+  const bits=[];
+  if(tjFilters.account_id) bits.push('account '+tjFilters.account_id);
+  if(tjFilters.key_id) bits.push('key '+tjFilters.key_id.slice(0,12)+'…');
+  if(tjFilters.slug) bits.push('model '+tjFilters.slug);
+  return bits.length?bits.join(', '):'all trajectories';
+}
+function downloadTraj(fmt){
+  const parts=tjExportQuery();
+  parts[0]='format='+encodeURIComponent(fmt);
+  const a=document.createElement('a');
+  a.href=API+'/admin/trajectories-export?'+parts.join('&');
+  a.download='trajectories-'+fmt+'.jsonl';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('exporting '+tjScopeLabel(),'ok');
+}
 document.getElementById('tj-export-openai').onclick=function(){ downloadTraj('openai'); };
 document.getElementById('tj-export-sharegpt').onclick=function(){ downloadTraj('sharegpt'); };
 document.getElementById('tj-export-trl').onclick=function(){ downloadTraj('trl'); };

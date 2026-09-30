@@ -47,7 +47,7 @@ export async function exportVeyEpisodeFull(db, requestId) {
 // these running together is how the heap death repeated.
 let exportInFlight = false;
 
-export async function exportVeyDataset(c, format) {
+export async function exportVeyDataset(c, format, options) {
   if (exportInFlight)
     return c.json({ error: { message: "a vey export is already running" } }, 409);
   exportInFlight = true;
@@ -56,6 +56,9 @@ export async function exportVeyDataset(c, format) {
   const since = bound(c.req.query("since"));
   const until = bound(c.req.query("until"));
   const limit = clampLimit(c.req.query("limit"));
+  // null means the caller did not scope by key; an array (even empty) means it
+  // did, and an empty one is a filter that matched nothing.
+  const keyIds = options && Array.isArray(options.keyIds) ? options.keyIds : null;
   const name = format === "world" ? "vey" : format;
   const encoder = new TextEncoder();
 
@@ -85,7 +88,7 @@ export async function exportVeyDataset(c, format) {
         if (limit != null && emitted >= limit)
           return finish();
         while (!pending.length && !exhausted) {
-          const page = await loadIdPage(c.env.DB, { slugFilter, since, until, cursor });
+          const page = await loadIdPage(c.env.DB, { slugFilter, since, until, cursor, keyIds });
           if (!page.length) {
             exhausted = true;
             break;
@@ -144,12 +147,20 @@ function clampLimit(value) {
   return Math.min(100000, Math.floor(n));
 }
 
-async function loadIdPage(db, { slugFilter, since, until, cursor }) {
+async function loadIdPage(db, { slugFilter, since, until, cursor, keyIds }) {
+  // A key scope that matched no keys yields no page, which ends the stream
+  // rather than exporting the whole table under a filter that matched nothing.
+  if (Array.isArray(keyIds) && !keyIds.length)
+    return [];
   let sql = "SELECT id, created_at FROM trajectories WHERE request_json IS NOT NULL";
   const binds = [];
   if (slugFilter) {
     sql += " AND slug=?";
     binds.push(slugFilter);
+  }
+  if (Array.isArray(keyIds) && keyIds.length) {
+    sql += " AND key_id IN (" + keyIds.map(() => "?").join(",") + ")";
+    binds.push(...keyIds);
   }
   if (since) {
     sql += " AND created_at>=?";
