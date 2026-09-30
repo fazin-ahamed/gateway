@@ -233,6 +233,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="providers">Providers</button>
   <button type="button" data-tab="routes">Model routes</button>
   <button type="button" data-tab="tiers">Model tiers</button>
+  <button type="button" data-tab="keys">API keys</button>
   <button type="button" data-tab="accounts">Accounts</button>
   <button type="button" data-tab="chat">Playground</button>
   <button type="button" data-tab="cache">Cache</button>
@@ -296,6 +297,13 @@ var PLAYGROUND_HTML = `<!doctype html>
       </div>
     </div></div>
     <div class="panel"><div class="panel-b flush" id="accounts-list"></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Key invite (legacy)</h2></div><div class="panel-b">
+      <div class="form-grid">
+        <div><label>Key</label><select id="acct-legacy-key"></select><small>Attach an existing key to a new account. It stays in the API keys tab and keeps its limits.</small></div>
+        <div class="full"><button class="act" id="acct-invite">Create key invite link</button></div>
+        <div class="full hint" id="acct-invite-out"></div>
+      </div>
+    </div></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Existing account links</h2></div><div class="panel-b">
       <div class="form-grid">
         <div><label>Account</label><select id="acct-key"></select><small>Pick an account to reset its password.</small></div>
@@ -597,6 +605,7 @@ async function selectTab(t){
     if(t==='providers') await loadProviders();
     if(t==='routes') await loadRoutes();
     if(t==='tiers') await loadTiers();
+    if(t==='keys') await loadKeys();
     if(t==='accounts') await loadAccounts();
     if(t==='chat'){ await refreshPlaygroundModels(); await refreshPlaygroundIntegrity(); }
     if(t==='cache') await loadCache();
@@ -1248,6 +1257,14 @@ async function loadAccounts(){
   const acctSel=document.getElementById('acct-key');
   if(acctSel)
     acctSel.innerHTML=accounts.map(function(a){return '<option value="'+esc(a.key_id)+'">'+esc(a.username)+' ('+esc(a.key_id)+')</option>';}).join('');
+  // Legacy key invite: keys with no account yet, straight from the keys tab.
+  const legacySel=document.getElementById('acct-legacy-key');
+  if(legacySel){
+    let keys=[]; try{ const kr=await api('/admin/keys'); keys=(kr.data&&kr.data.keys)||[]; }catch(e){ keys=[]; }
+    const claimed=new Set(accounts.map(function(a){return a.key_id;}));
+    const free=keys.filter(function(k){ return !claimed.has(k.key_id); });
+    legacySel.innerHTML=free.map(function(k){return '<option value="'+esc(k.key_id)+'">'+esc(k.name)+' — '+esc(k.key_id)+'</option>';}).join('')||'<option value="">(no free keys)</option>';
+  }
   const tl=document.getElementById('acct-tokens-list');
   if(tl){
     const now=Date.now();
@@ -1279,6 +1296,12 @@ document.getElementById('acct-new-create').onclick=async function(){
   const body={budget_mode:document.getElementById('acct-new-mode').value, budget_limit:rawLimit===''?null:Number(rawLimit), tier_ids};
   const {status,data}=await api('/admin/accounts',{method:'POST',body:JSON.stringify(body)});
   paintAcctLink('invite',document.getElementById('acct-new-out'))(status,data);
+};
+document.getElementById('acct-invite').onclick=async function(){
+  const id=document.getElementById('acct-legacy-key').value;
+  if(!id||!id.startsWith('sk-')){ toast('no free key selected','err'); return; }
+  const {status,data}=await api('/admin/accounts/'+id+'/invite-link',{method:'POST'});
+  paintAcctLink('invite',document.getElementById('acct-invite-out'))(status,data);
 };
 document.getElementById('acct-reset').onclick=async function(){
   const id=document.getElementById('acct-key').value;
