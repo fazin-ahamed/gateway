@@ -89,7 +89,7 @@
   const sub = $derived(
     purpose === "reset"
       ? "Pick a new password for your account. You stay signed in after this."
-      : "This invite links straight to your key. Pick a username and password; the key itself is never shown."
+      : "Pick a username and password for your account. You create your own API keys after signing in."
   );
 </script>
 

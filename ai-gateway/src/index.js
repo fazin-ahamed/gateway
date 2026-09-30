@@ -828,8 +828,13 @@ async function consoleSessionFromCookie(c) {
       "SELECT s.key_id, s.expires_at FROM console_sessions s WHERE s.token_hash=? AND s.expires_at>?"
     ).bind(h, nowIso()).first();
     if (!row) return null;
-    const key = await c.env.DB.prepare("SELECT key_id, name FROM api_keys WHERE key_id=? AND active=1").bind(row.key_id).first();
-    return key ? { keyId: key.key_id, name: key.name } : null;
+    const key = await c.env.DB.prepare("SELECT key_id, name, account_id FROM api_keys WHERE key_id=? AND active=1").bind(row.key_id).first();
+    if (key)
+      return { keyId: key.key_id, name: key.name, accountId: key.account_id || null };
+    const account = await c.env.DB.prepare("SELECT key_id, username FROM console_accounts WHERE key_id=?").bind(row.key_id).first();
+    if (account)
+      return { keyId: null, name: account.username, accountId: account.key_id };
+    return null;
   } catch (e) {
     console.warn("[gateway] console session read failed: " + String(e && e.message || e));
     return null;
@@ -852,17 +857,21 @@ app.post("/console/auth", async (c) => {
   const password = String((b && b.password) || "");
 
   // Returning users sign in with the account they set up: username + password,
-  // no key. The username is unique and maps to the owning key_id.
+  // no key. An invite-created account has no backing key yet; the session
+  // still belongs to the account, and keys come later from the console.
   if (!offered && username && password) {
-    const account = await c.env.DB.prepare("SELECT key_id, password_hash FROM console_accounts WHERE username=?").bind(username).first();
+    const account = await c.env.DB.prepare("SELECT key_id, username, password_hash FROM console_accounts WHERE username=?").bind(username).first();
     if (!account || await sha256hex(password) !== account.password_hash)
       return c.json({ error: { message: "That username or password was not accepted.", type: "auth_error" } }, 401);
-    if (await isSharedPoolKey(c, account.key_id))
-      return c.json({ error: { message: "The shared pool key cannot sign in to the console.", type: "auth_error" } }, 403);
     const acctKey = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(account.key_id).first();
-    if (!acctKey || !acctKey.active || isKeyExpired(acctKey))
-      return c.json({ error: { message: "The key behind this account is no longer active.", type: "auth_error" } }, 401);
-    return issueConsoleSession(c, acctKey);
+    if (acctKey) {
+      if (await isSharedPoolKey(c, account.key_id))
+        return c.json({ error: { message: "The shared pool key cannot sign in to the console.", type: "auth_error" } }, 403);
+      if (!acctKey.active || isKeyExpired(acctKey))
+        return c.json({ error: { message: "The key behind this account is no longer active.", type: "auth_error" } }, 401);
+      return issueConsoleSession(c, acctKey);
+    }
+    return issueAccountSession(c, account);
   }
 
   // First contact is by key. A key with account auth off signs straight in;
@@ -917,9 +926,34 @@ var accountTokensMigrated = new WeakSet();
 async function ensureAccountTokensTable(db) {
   if (!db || accountTokensMigrated.has(db)) return;
   await db.prepare(
-    "CREATE TABLE IF NOT EXISTS console_account_tokens (token_hash TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES api_keys(key_id) ON DELETE CASCADE, purpose TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)"
+    "CREATE TABLE IF NOT EXISTS console_account_tokens (token_hash TEXT PRIMARY KEY, key_id TEXT NOT NULL, purpose TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, budget_mode TEXT, budget_limit REAL, tier_ids TEXT)"
   ).run();
+  const tokenCols = await db.prepare("PRAGMA table_info(console_account_tokens)").all();
+  const tokenNames = new Set((tokenCols.results || []).map((r) => r.name));
+  if (!tokenNames.has("budget_mode"))
+    await db.prepare("ALTER TABLE console_account_tokens ADD COLUMN budget_mode TEXT").run();
+  if (!tokenNames.has("budget_limit"))
+    await db.prepare("ALTER TABLE console_account_tokens ADD COLUMN budget_limit REAL").run();
+  if (!tokenNames.has("tier_ids"))
+    await db.prepare("ALTER TABLE console_account_tokens ADD COLUMN tier_ids TEXT").run();
   await db.prepare("CREATE INDEX IF NOT EXISTS idx_account_tokens_key ON console_account_tokens(key_id, purpose)").run();
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS console_account_tiers (key_id TEXT NOT NULL REFERENCES console_accounts(key_id) ON DELETE CASCADE, tier_id INTEGER NOT NULL REFERENCES model_tiers(id) ON DELETE CASCADE, PRIMARY KEY (key_id, tier_id))"
+  ).run();
+  const cols = await db.prepare("PRAGMA table_info(console_accounts)").all();
+  const names = new Set((cols.results || []).map((r) => r.name));
+  if (!names.has("budget_mode"))
+    await db.prepare("ALTER TABLE console_accounts ADD COLUMN budget_mode TEXT NOT NULL DEFAULT 'usd'").run();
+  if (!names.has("budget_limit"))
+    await db.prepare("ALTER TABLE console_accounts ADD COLUMN budget_limit REAL").run();
+  if (!names.has("used_usd"))
+    await db.prepare("ALTER TABLE console_accounts ADD COLUMN used_usd REAL NOT NULL DEFAULT 0").run();
+  if (!names.has("used_tokens"))
+    await db.prepare("ALTER TABLE console_accounts ADD COLUMN used_tokens INTEGER NOT NULL DEFAULT 0").run();
+  const keyCols = await db.prepare("PRAGMA table_info(api_keys)").all();
+  const keyNames = new Set((keyCols.results || []).map((r) => r.name));
+  if (!keyNames.has("account_id"))
+    await db.prepare("ALTER TABLE api_keys ADD COLUMN account_id TEXT REFERENCES console_accounts(key_id) ON DELETE CASCADE").run();
   accountTokensMigrated.add(db);
 }
 
@@ -928,12 +962,13 @@ async function ensureAccountTokensTable(db) {
 // only its hash is stored. Redemption marks the row used, which makes a copied
 // link die after one use and lets the operator see whether it was taken.
 const RESET_TOKEN_HOURS = 24;
-async function issueAccountToken(c, keyId, purpose) {
+async function issueAccountToken(c, keyId, purpose, extra) {
   const raw = "rst_" + uuid() + uuid().replace(/-/g, "");
   const expiresAt = new Date(Date.now() + RESET_TOKEN_HOURS * 3600000).toISOString();
+  const payload = extra || {};
   await c.env.DB.prepare(
-    "INSERT INTO console_account_tokens (token_hash, key_id, purpose, created_at, expires_at) VALUES (?,?,?,?,?)"
-  ).bind(await sha256hex(raw), keyId, purpose, nowIso(), expiresAt).run();
+    "INSERT INTO console_account_tokens (token_hash, key_id, purpose, created_at, expires_at, budget_mode, budget_limit, tier_ids) VALUES (?,?,?,?,?,?,?,?)"
+  ).bind(await sha256hex(raw), keyId, purpose, nowIso(), expiresAt, payload.budget_mode || null, payload.budget_limit == null ? null : payload.budget_limit, payload.tier_ids || null).run();
   return { token: raw, expires_at: expiresAt };
 }
 
@@ -943,7 +978,7 @@ async function issueAccountToken(c, keyId, purpose) {
 async function redeemAccountToken(c, raw) {
   if (typeof raw !== "string" || !raw.startsWith("rst_")) return null;
   const row = await c.env.DB.prepare(
-    "SELECT key_id, purpose, used_at, expires_at FROM console_account_tokens WHERE token_hash=?"
+    "SELECT key_id, purpose, used_at, expires_at, budget_mode, budget_limit, tier_ids FROM console_account_tokens WHERE token_hash=?"
   ).bind(await sha256hex(raw)).first();
   if (!row || row.used_at || new Date(row.expires_at).getTime() < Date.now()) return null;
   return row;
@@ -965,6 +1000,22 @@ app.post("/console/redeem-api", async (c) => {
     return c.json({ error: { message: "This link is not valid or has expired.", type: "auth_error" } }, 401);
   if (username.length < 3 || password.length < 8)
     return c.json({ error: { message: "Choose a username of 3 or more characters and a password of 8 or more.", type: "invalid_request_error" } }, 400);
+  if (info.purpose === "invite" && String(info.key_id).startsWith("acct_")) {
+    const existing = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(info.key_id).first();
+    if (existing)
+      return c.json({ error: { message: "This invite was already used.", type: "invalid_request_error" } }, 409);
+    try {
+      await c.env.DB.prepare(
+        "INSERT INTO console_accounts (key_id, username, password_hash, created_at, budget_mode, budget_limit) VALUES (?,?,?,?,?,?)"
+      ).bind(info.key_id, username, await sha256hex(password), nowIso(), info.budget_mode || "usd", info.budget_limit).run();
+    } catch {
+      return c.json({ error: { message: "That username is already taken.", type: "invalid_request_error" } }, 409);
+    }
+    for (const tierId of String(info.tier_ids || "").split(",").filter(Boolean))
+      await c.env.DB.prepare("INSERT OR IGNORE INTO console_account_tiers (key_id, tier_id) VALUES (?,?)").bind(info.key_id, Number(tierId)).run();
+    await c.env.DB.prepare("UPDATE console_account_tokens SET used_at=? WHERE token_hash=?").bind(nowIso(), await sha256hex(raw)).run();
+    return issueAccountSession(c, { key_id: info.key_id });
+  }
   const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(info.key_id).first();
   if (!key || !key.active || isKeyExpired(key))
     return c.json({ error: { message: "The key behind this account is no longer active.", type: "auth_error" } }, 401);
@@ -1005,10 +1056,21 @@ app.get("/console/redeem-api", async (c) => {
 });
 
 async function issueConsoleSession(c, key) {
+  return issueSessionCookie(c, key.key_id);
+}
+
+// An invite-created account has no api_keys row. The session stores the
+// account id in console_sessions.key_id; the cookie reader tells the two
+// apart by looking the row up in console_accounts when no key exists.
+async function issueAccountSession(c, account) {
+  return issueSessionCookie(c, account.key_id);
+}
+
+async function issueSessionCookie(c, ownerId) {
   const session = "v1." + uuid() + uuid().replace(/-/g, "");
   const expiresAt = new Date(Date.now() + CONSOLE_SESSION_HOURS * 3600000).toISOString();
   await c.env.DB.prepare("DELETE FROM console_sessions WHERE expires_at <= ?").bind(nowIso()).run();
-  await c.env.DB.prepare("INSERT INTO console_sessions (token_hash, key_id, expires_at, created_at) VALUES (?,?,?,?)").bind(await sha256hex(session), key.key_id, expiresAt, nowIso()).run();
+  await c.env.DB.prepare("INSERT INTO console_sessions (token_hash, key_id, expires_at, created_at) VALUES (?,?,?,?)").bind(await sha256hex(session), ownerId, expiresAt, nowIso()).run();
   c.header("Set-Cookie", CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=Lax; HttpOnly");
   return c.json({ ok: true });
 }
@@ -1096,6 +1158,106 @@ app.get("/console/api/me", async (c) => {
   if (denied) return denied;
   return c.json({ key: { key_id: sess.keyId, name: sess.name } });
 });
+app.get("/console/api/keys", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  if (!sess.accountId) return c.json({ keys: [], account: null });
+  const account = await c.env.DB.prepare(
+    "SELECT username, budget_mode, budget_limit, used_usd, used_tokens FROM console_accounts WHERE key_id=?"
+  ).bind(sess.accountId).first();
+  const tiers = await c.env.DB.prepare(
+    "SELECT mt.id, mt.name FROM console_account_tiers cat JOIN model_tiers mt ON mt.id=cat.tier_id WHERE cat.key_id=? ORDER BY mt.name"
+  ).bind(sess.accountId).all();
+  const keys = await c.env.DB.prepare(
+    "SELECT key_id, name, active, used_usd, used_tokens, request_count, created_at FROM api_keys WHERE account_id=? ORDER BY created_at DESC"
+  ).bind(sess.accountId).all();
+  return c.json({
+    account: account ? {
+      username: account.username,
+      budget_mode: account.budget_mode,
+      budget_limit: account.budget_limit == null ? null : Number(account.budget_limit),
+      used_usd: Number(account.used_usd) || 0,
+      used_tokens: Number(account.used_tokens) || 0,
+      tiers: (tiers.results || []).map((t) => ({ id: t.id, name: t.name }))
+    } : null,
+    keys: (keys.results || []).map((k) => ({
+      key_id: k.key_id, name: k.name, active: !!k.active,
+      used_usd: Number(k.used_usd) || 0, used_tokens: Number(k.used_tokens) || 0,
+      request_count: Number(k.request_count) || 0, created_at: k.created_at
+    }))
+  });
+});
+
+app.post("/console/api/keys", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  if (!sess.accountId)
+    return c.json({ error: { message: "This session has no account to add keys to.", type: "invalid_request_error" } }, 403);
+  let body;
+  try { body = await c.req.json(); } catch { body = {}; }
+  const name = String((body && body.name) || "").trim().slice(0, 120);
+  if (!name) return c.json({ error: { message: "Give the key a name." } }, 400);
+  const account = await c.env.DB.prepare("SELECT budget_mode FROM console_accounts WHERE key_id=?").bind(sess.accountId).first();
+  if (!account) return c.json({ error: { message: "account not found" } }, 404);
+  const count = await c.env.DB.prepare("SELECT COUNT(*) n FROM api_keys WHERE account_id=?").bind(sess.accountId).first();
+  if (Number(count && count.n) >= 25)
+    return c.json({ error: { message: "This account already has 25 keys." } }, 409);
+  const keyId = genKey();
+  const now = nowIso();
+  await c.env.DB.prepare(
+    "INSERT INTO api_keys (key_id, name, budget_mode, budget_limit, account_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)"
+  ).bind(keyId, name, account.budget_mode || "usd", 1e12, sess.accountId, now, now).run();
+  const tiers = await c.env.DB.prepare("SELECT tier_id FROM console_account_tiers WHERE key_id=?").bind(sess.accountId).all();
+  for (const row of tiers.results || [])
+    await c.env.DB.prepare("INSERT INTO api_key_model_tiers (key_id, tier_id) VALUES (?,?)").bind(keyId, row.tier_id).run();
+  return c.json({ key_id: keyId, key: keyId, name }, 201);
+});
+
+app.post("/console/api/keys/:id/active", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const owned = await ownedAccountKey(c, sess, c.req.param("id"));
+  if (!owned) return c.json({ error: { message: "key not found" } }, 404);
+  let body;
+  try { body = await c.req.json(); } catch { body = {}; }
+  await c.env.DB.prepare("UPDATE api_keys SET active=?, updated_at=? WHERE key_id=?").bind(body.active ? 1 : 0, nowIso(), owned.key_id).run();
+  return c.json({ key_id: owned.key_id, active: !!body.active });
+});
+
+app.delete("/console/api/keys/:id", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const owned = await ownedAccountKey(c, sess, c.req.param("id"));
+  if (!owned) return c.json({ error: { message: "key not found" } }, 404);
+  await c.env.DB.prepare("DELETE FROM api_key_model_tiers WHERE key_id=?").bind(owned.key_id).run();
+  await c.env.DB.prepare("DELETE FROM api_keys WHERE key_id=?").bind(owned.key_id).run();
+  return c.json({ deleted: owned.key_id });
+});
+
+async function ownedAccountKey(c, sess, keyId) {
+  if (!sess.accountId) return null;
+  return c.env.DB.prepare("SELECT key_id FROM api_keys WHERE key_id=? AND account_id=?").bind(keyId, sess.accountId).first();
+}
+// The keys a console session may read usage for. An account sees every key it
+// owns, narrowed by ?key_id when the user filters to one. A plain key session
+// sees only itself.
+async function sessionKeyScope(c, sess) {
+  const wanted = String(c.req.query("key_id") || "");
+  if (sess.accountId) {
+    const rows = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE account_id=?").bind(sess.accountId).all();
+    const owned = (rows.results || []).map((r) => r.key_id);
+    if (wanted) return owned.includes(wanted) ? [wanted] : [];
+    return owned;
+  }
+  return sess.keyId ? [sess.keyId] : [];
+}
+
+function keyScopeClause(ids) {
+  if (!ids.length) return { sql: " AND 1=0", binds: [] };
+  return { sql: " AND key_id IN (" + ids.map(() => "?").join(",") + ")", binds: ids };
+}
+
+
 
 // One overview of real usage for the signed-in key. No fake savings, no
 // invented percentiles: p95 TTFT is computed from rows that carry a ttft.
@@ -1108,22 +1270,23 @@ app.get("/console/api/overview", async (c) => {
 
   // The ledger is the customer truth: one row per request, chat and decision
   // alike, written whether or not trajectory capture is enabled.
+  const scopeIds = await sessionKeyScope(c, sess);
   const totals = await c.env.DB.prepare(
-    "SELECT COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok_requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=?"
-  ).bind(sess.keyId, since).first();
+    "SELECT COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok_requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE created_at>=?" + keyScopeClause(scopeIds).sql
+  ).bind(since, ...keyScopeClause(scopeIds).binds).first();
   const prior = await c.env.DB.prepare(
-    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=? AND created_at<?"
-  ).bind(sess.keyId, priorSince, since).first();
+    "SELECT COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE created_at>=? AND created_at<?" + keyScopeClause(scopeIds).sql
+  ).bind(priorSince, since, ...keyScopeClause(scopeIds).binds).first();
 
   const ttftRows = await c.env.DB.prepare(
-    "SELECT ttft_ms FROM request_summaries WHERE key_id=? AND created_at>=? AND ttft_ms IS NOT NULL"
-  ).bind(sess.keyId, since).all();
+    "SELECT ttft_ms FROM request_summaries WHERE created_at>=? AND ttft_ms IS NOT NULL" + keyScopeClause(scopeIds).sql
+  ).bind(since, ...keyScopeClause(scopeIds).binds).all();
   const ttfts = (ttftRows.results || []).map((r) => Number(r.ttft_ms)).filter((n) => Number.isFinite(n) && n >= 0).sort((a, b) => a - b);
   const p95 = ttfts.length ? ttfts[Math.min(ttfts.length - 1, Math.ceil(ttfts.length * 0.95) - 1)] : null;
 
   const seriesRows = await c.env.DB.prepare(
-    "SELECT substr(created_at,1,10) day, COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day"
-  ).bind(sess.keyId, since).all();
+    "SELECT substr(created_at,1,10) day, COUNT(*) requests, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE created_at>=?" + keyScopeClause(scopeIds).sql + " GROUP BY substr(created_at,1,10) ORDER BY day"
+  ).bind(since, ...keyScopeClause(scopeIds).binds).all();
   const byDay = new Map((seriesRows.results || []).map((r) => [r.day, r]));
   const series = [];
   for (let i = days - 1; i >= 0; i--) {
@@ -1139,8 +1302,8 @@ app.get("/console/api/overview", async (c) => {
   }
 
   const recentRows = await c.env.DB.prepare(
-    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, ttft_ms, latency_ms, total_tokens, cost_usd FROM request_summaries WHERE key_id=? ORDER BY created_at DESC LIMIT 25"
-  ).bind(sess.keyId).all();
+    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, ttft_ms, latency_ms, total_tokens, cost_usd FROM request_summaries WHERE 1=1" + keyScopeClause(scopeIds).sql + " ORDER BY created_at DESC LIMIT 25"
+  ).bind(...keyScopeClause(scopeIds).binds).all();
   const recent = (recentRows.results || []).map((r) => ({
     id: String(r.request_id),
     created_at: String(r.created_at),
@@ -1181,9 +1344,11 @@ app.get("/console/api/activity", async (c) => {
   if (denied) return denied;
   const hours = Math.min(24 * 30, Math.max(1, Number(c.req.query("hours")) || 24 * 7));
   const since = new Date(Date.now() - hours * 3600000).toISOString();
+  const scopeIds = await sessionKeyScope(c, sess);
+  const scope = keyScopeClause(scopeIds);
   const rows = await c.env.DB.prepare(
-    "SELECT substr(created_at,1,13) bucket, COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok, SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) fail, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY substr(created_at,1,13) ORDER BY bucket"
-  ).bind(sess.keyId, since).all();
+    "SELECT substr(created_at,1,13) bucket, COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok, SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) fail, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend_usd FROM request_summaries WHERE created_at>=?" + scope.sql + " GROUP BY substr(created_at,1,13) ORDER BY bucket"
+  ).bind(since, ...scope.binds).all();
   const points = (rows.results || []).map((r) => ({
     hour: String(r.bucket) + ":00:00Z",
     requests: Number(r.requests) || 0,
@@ -1202,11 +1367,38 @@ app.get("/console/api/activity", async (c) => {
   return c.json({ window: { hours }, totals, points });
 });
 
-// The signed-in key's own budget and rate limit. These are operator-set;
-// the console shows them and never writes them.
+// The signed-in account's budget and rate limit. An account session reports
+// the account cap; a plain key session reports that key's own limits.
 app.get("/console/api/limits", async (c) => {
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
+  if (sess.accountId) {
+    const account = await c.env.DB.prepare(
+      "SELECT username, budget_mode, budget_limit, used_usd, used_tokens FROM console_accounts WHERE key_id=?"
+    ).bind(sess.accountId).first();
+    if (!account)
+      return c.json({ error: { message: "This account no longer exists.", type: "auth_error" } }, 401);
+    const mode = String(account.budget_mode || "usd");
+    const used = mode === "usd" ? Number(account.used_usd) || 0 : Number(account.used_tokens) || 0;
+    const limit = account.budget_limit == null ? null : Number(account.budget_limit);
+    const keys = await c.env.DB.prepare("SELECT COUNT(*) n FROM api_keys WHERE account_id=?").bind(sess.accountId).first();
+    return c.json({
+      name: String(account.username || ""),
+      active: true,
+      expires_at: null,
+      budget: {
+        mode,
+        limit: limit == null ? 0 : limit,
+        uncapped: limit == null,
+        used,
+        remaining: limit == null ? null : Math.max(0, limit - used),
+        request_count: 0
+      },
+      rate: { per_minute: 0, used_this_minute: 0 },
+      keys: Number(keys && keys.n) || 0,
+      models: await modelLimitStatus(c)
+    });
+  }
   const key = await c.env.DB.prepare(
     "SELECT name, budget_mode, budget_limit, used_tokens, used_usd, request_count, request_limit_per_minute, expires_at, active FROM api_keys WHERE key_id=?"
   ).bind(sess.keyId).first();
@@ -1332,8 +1524,10 @@ app.get("/console/api/requests", async (c) => {
   const limit = Math.min(100, Math.max(1, Number(q.limit) || 50));
   const since = new Date(Date.now() - days * 86400000).toISOString();
 
-  let sql = "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, ttft_ms, latency_ms, prompt_tokens, completion_tokens, total_tokens, cost_usd, attempts, cache_state FROM request_summaries WHERE key_id=? AND created_at>=?";
-  const binds = [sess.keyId, since];
+  const scopeIds = await sessionKeyScope(c, sess);
+  const scope = keyScopeClause(scopeIds);
+  let sql = "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, ttft_ms, latency_ms, prompt_tokens, completion_tokens, total_tokens, cost_usd, attempts, cache_state FROM request_summaries WHERE created_at>=?" + scope.sql;
+  const binds = [since, ...scope.binds];
   if (kind) { sql += " AND model_kind=?"; binds.push(kind); }
   if (status) { sql += " AND status=?"; binds.push(status); }
   if (slug) { sql += " AND public_slug=?"; binds.push(slug); }
@@ -1370,13 +1564,15 @@ app.get("/console/api/usage", async (c) => {
   const days = Math.min(90, Math.max(1, Number(c.req.query("days")) || 7));
   const since = new Date(Date.now() - days * 86400000).toISOString();
 
+  const scopeIds = await sessionKeyScope(c, sess);
+  const scope = keyScopeClause(scopeIds);
   const byModel = await c.env.DB.prepare(
-    "SELECT public_slug, model_kind, COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY public_slug, model_kind ORDER BY requests DESC"
-  ).bind(sess.keyId, since).all();
+    "SELECT public_slug, model_kind, COUNT(*) requests, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok, COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) spend FROM request_summaries WHERE created_at>=?" + scope.sql + " GROUP BY public_slug, model_kind ORDER BY requests DESC"
+  ).bind(since, ...scope.binds).all();
 
   const lat = await c.env.DB.prepare(
-    "SELECT public_slug, model_kind, ttft_ms FROM request_summaries WHERE key_id=? AND created_at>=? AND ttft_ms IS NOT NULL"
-  ).bind(sess.keyId, since).all();
+    "SELECT public_slug, model_kind, ttft_ms FROM request_summaries WHERE created_at>=? AND ttft_ms IS NOT NULL" + scope.sql
+  ).bind(since, ...scope.binds).all();
   const latBy = new Map();
   for (const r of lat.results || []) {
     const k = r.public_slug + "|" + r.model_kind;
@@ -1407,7 +1603,9 @@ app.get("/console/api/usage", async (c) => {
 app.get("/console/api/models", async (c) => {
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
-  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(sess.keyId).first();
+  let key = sess.keyId ? await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=?").bind(sess.keyId).first() : null;
+  if (!key && sess.accountId)
+    key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE account_id=? AND active=1 ORDER BY created_at LIMIT 1").bind(sess.accountId).first();
   if (!key)
     return c.json({ data: [] });
   const allowed = await allowedSlugs(c, key);
@@ -1438,9 +1636,11 @@ app.get("/console/api/models", async (c) => {
   // ledger. No invented numbers: a slug with no recent traffic reports null,
   // and the console renders "no recent requests" rather than a fake 100%.
   const since = new Date(Date.now() - 7 * 86400000).toISOString();
+  const scopeIds = await sessionKeyScope(c, sess);
+  const scope = keyScopeClause(scopeIds);
   const healthRows = await c.env.DB.prepare(
-    "SELECT public_slug, COUNT(*) n, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok FROM request_summaries WHERE key_id=? AND created_at>=? GROUP BY public_slug"
-  ).bind(sess.keyId, since).all();
+    "SELECT public_slug, COUNT(*) n, SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) ok FROM request_summaries WHERE created_at>=?" + scope.sql + " GROUP BY public_slug"
+  ).bind(since, ...scope.binds).all();
   const healthBySlug = new Map((healthRows.results || []).map((r) => [String(r.public_slug), { n: Number(r.n) || 0, ok: Number(r.ok) || 0 }]));
 
   const data = [];
@@ -1527,9 +1727,11 @@ app.get("/console/api/requests/:id", async (c) => {
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
   const id = String(c.req.param("id"));
+  const scopeIds = await sessionKeyScope(c, sess);
+  const scope = keyScopeClause(scopeIds);
   const r = await c.env.DB.prepare(
-    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, cost_usd, attempts, cache_state, client_app, request_headers FROM request_summaries WHERE request_id=? AND key_id=?"
-  ).bind(id, sess.keyId).first();
+    "SELECT request_id, created_at, public_slug, model_kind, status, http_status, stream, headers_ms, ttft_ms, latency_ms, prompt_tokens, completion_tokens, cost_usd, attempts, cache_state, client_app, request_headers FROM request_summaries WHERE request_id=?" + scope.sql
+  ).bind(id, ...scope.binds).first();
   if (!r)
     return c.json({ error: { message: "Request not found.", type: "not_found" } }, 404);
   return c.json({
@@ -4416,6 +4618,10 @@ async function recordUsage(c, key, usage) {
   await c.env.DB.prepare(
     "UPDATE api_keys SET used_tokens=used_tokens+?, used_usd=used_usd+?, request_count=request_count+1, updated_at=? WHERE key_id=?"
   ).bind(usage.total_tokens, usage.cost_usd || 0, nowIso(), key.key_id).run();
+  if (key.account_id)
+    await c.env.DB.prepare(
+      "UPDATE console_accounts SET used_tokens=used_tokens+?, used_usd=used_usd+? WHERE key_id=?"
+    ).bind(usage.total_tokens, usage.cost_usd || 0, key.account_id).run();
 }
 
 // ---- Trajectory capture (RL / SFT) ----
@@ -4951,6 +5157,14 @@ async function authClient(c) {
       error: { message: `Key budget exceeded (${unit}). Used ${fmt(key.budget_mode === "usd" ? key.used_usd : key.used_tokens)} / ${fmt(key.budget_limit)} ${unit}.`, type: "budget_exceeded" }
     }, 429);
   }
+  if (key.account_id) {
+    const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit, used_usd, used_tokens FROM console_accounts WHERE key_id=?").bind(key.account_id).first();
+    if (account && account.budget_limit != null) {
+      const spent = account.budget_mode === "tokens" ? Number(account.used_tokens) || 0 : Number(account.used_usd) || 0;
+      if (spent >= Number(account.budget_limit))
+        return c.json({ error: { message: "Account spend limit reached.", type: "budget_exceeded" } }, 429);
+    }
+  }
   const rateDenied = await enforceRequestLimit(c, key);
   if (rateDenied)
     return rateDenied;
@@ -5229,10 +5443,10 @@ app.get("/admin/accounts", async (c) => {
   if (denied) return denied;
   const rows = await c.env.DB.prepare(
     `SELECT ca.key_id, ca.username, ca.created_at AS account_created,
-       k.name, k.budget_mode, k.budget_limit, k.used_usd, k.used_tokens,
-       k.request_count, k.request_limit_per_minute, k.expires_at, k.active,
-       COALESCE((SELECT GROUP_CONCAT(mt.name, ' \xB7 ') FROM api_key_model_tiers akmt JOIN model_tiers mt ON mt.id=akmt.tier_id WHERE akmt.key_id=ca.key_id), '') AS tier_names
-     FROM console_accounts ca JOIN api_keys k ON k.key_id=ca.key_id
+       ca.budget_mode, ca.budget_limit, ca.used_usd, ca.used_tokens,
+       (SELECT COUNT(*) FROM api_keys ak WHERE ak.account_id=ca.key_id) AS key_count,
+       COALESCE((SELECT GROUP_CONCAT(mt.name, ' \xB7 ') FROM console_account_tiers cat JOIN model_tiers mt ON mt.id=cat.tier_id WHERE cat.key_id=ca.key_id), '') AS tier_names
+     FROM console_accounts ca
      ORDER BY ca.username`
   ).all();
   const tokens = await c.env.DB.prepare(
@@ -5240,6 +5454,26 @@ app.get("/admin/accounts", async (c) => {
   ).all();
   return c.json({ accounts: rows.results || [], tokens: tokens.results || [] });
 });
+// Create the customer and hand back one link. Registered before the
+// /admin/accounts/:id routes so Hono does not treat "accounts" as an id.
+app.post("/admin/accounts", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  let body;
+  try { body = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  const budget_mode = body.budget_mode === "tokens" ? "tokens" : "usd";
+  const budget_limit = body.budget_limit == null || body.budget_limit === "" ? null : Number(body.budget_limit);
+  if (budget_limit != null && (!Number.isFinite(budget_limit) || budget_limit <= 0))
+    return c.json({ error: { message: "budget_limit must be positive, or blank for no cap" } }, 400);
+  let tierIds;
+  try { tierIds = normalizeTierIds(body.tier_ids); await validateTierIds(c, tierIds); }
+  catch (e) { return c.json({ error: { message: e.message } }, 400); }
+  const id = "acct_" + uuid().replace(/-/g, "");
+  const issued = await issueAccountToken(c, id, "invite", { budget_mode, budget_limit, tier_ids: tierIds.join(",") });
+  return c.json({ account_id: id, url: redeemUrl(c, issued.token), token: issued.token, expires_at: issued.expires_at, budget_mode, budget_limit, tier_ids: tierIds }, 201);
+});
+
 
 // Issue a reset link for an existing account. The plaintext token comes back
 // exactly once; the operator copies it to the user. Any prior pending reset
@@ -5256,6 +5490,36 @@ app.post("/admin/accounts/:id/reset-link", async (c) => {
   ).bind(id).run();
   const issued = await issueAccountToken(c, id, "reset");
   return c.json({ url: redeemUrl(c, issued.token), token: issued.token, expires_at: issued.expires_at }, 201);
+});
+
+
+
+// Change the cap or the model tiers an account's keys inherit.
+app.patch("/admin/accounts/:id", async (c) => {
+  await ensureAccountTokensTable(c.env.DB);
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const id = c.req.param("id");
+  const account = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(id).first();
+  if (!account) return c.json({ error: { message: "account not found" } }, 404);
+  let body;
+  try { body = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  if (body.budget_mode !== void 0 || body.budget_limit !== void 0) {
+    const mode = body.budget_mode === "tokens" ? "tokens" : "usd";
+    const limit = body.budget_limit == null || body.budget_limit === "" ? null : Number(body.budget_limit);
+    if (limit != null && (!Number.isFinite(limit) || limit <= 0))
+      return c.json({ error: { message: "budget_limit must be positive, or blank for no cap" } }, 400);
+    await c.env.DB.prepare("UPDATE console_accounts SET budget_mode=?, budget_limit=? WHERE key_id=?").bind(mode, limit, id).run();
+  }
+  if (body.tier_ids !== void 0) {
+    let tierIds;
+    try { tierIds = normalizeTierIds(body.tier_ids); await validateTierIds(c, tierIds); }
+    catch (e) { return c.json({ error: { message: e.message } }, 400); }
+    await c.env.DB.prepare("DELETE FROM console_account_tiers WHERE key_id=?").bind(id).run();
+    for (const tierId of tierIds)
+      await c.env.DB.prepare("INSERT INTO console_account_tiers (key_id, tier_id) VALUES (?,?)").bind(id, tierId).run();
+  }
+  return c.json({ key_id: id });
 });
 
 // Issue an account-creation link for a key that has no account yet. The

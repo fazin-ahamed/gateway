@@ -111,10 +111,45 @@ export type Pool = {
   active: boolean;
 } | null;
 
+export type AccountKey = {
+  key_id: string;
+  name: string;
+  active: boolean;
+  used_usd: number;
+  used_tokens: number;
+  request_count: number;
+  created_at: string;
+};
+export type Account = {
+  username: string;
+  budget_mode: string;
+  budget_limit: number | null;
+  used_usd: number;
+  used_tokens: number;
+  tiers: Array<{ id: number; name: string }>;
+};
+export type KeysResponse = { keys: AccountKey[]; account: Account | null };
+
 export const api = {
-  overview: (days: number) => json<Overview>(`/console/api/overview?days=${days}`),
+  overview: (days: number, keyId?: string) =>
+    json<Overview>(`/console/api/overview?days=${days}${keyId ? `&key_id=${encodeURIComponent(keyId)}` : ""}`),
   activity: (hours: number) => json<Activity>(`/console/api/activity?hours=${hours}`),
   limits: () => json<Limits>("/console/api/limits"),
+  keys: () => json<KeysResponse>("/console/api/keys"),
+  createKey: (name: string) =>
+    json<{ key_id: string; key: string; name: string }>("/console/api/keys", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name })
+    }),
+  setKeyActive: (id: string, active: boolean) =>
+    json<{ key_id: string; active: boolean }>(`/console/api/keys/${encodeURIComponent(id)}/active`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ active })
+    }),
+  deleteKey: (id: string) =>
+    json<{ deleted: string }>(`/console/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
   settings: () => json<Settings>("/console/api/settings"),
   setCache: (on: boolean) =>
     json<{ response_cache: { enabled: boolean } }>("/console/api/settings", {

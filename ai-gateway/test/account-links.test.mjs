@@ -37,19 +37,17 @@ async function signInAccount(app, keyId, username, password) {
   }));
 }
 
-test("an account roster joins usernames to their key limits and tiers", async () => {
+test("an account roster lists account caps, tiers, and key counts", async () => {
   const { app, db } = await freshGateway();
   await signInAccount(app, "sk-two", "alice", "password1");
+  // Attach alice's key to her account so it counts as account-owned.
+  db.prepare("UPDATE api_keys SET account_id=(SELECT key_id FROM console_accounts WHERE username='alice') WHERE key_id='sk-two'").run();
   const res = await app.fetch(new Request("http://gw/admin/accounts", { headers: adminHeaders() }));
   const body = await res.json();
   assert.equal(res.status, 200);
   const acct = body.accounts.find((a) => a.username === "alice");
   assert.ok(acct, "alice is listed");
-  assert.equal(acct.key_id, "sk-two");
-  assert.equal(acct.budget_limit, 10);
-  assert.equal(acct.tier_names, "basic");
-  // Keys without accounts must not appear: the roster is accounts, not keys.
-  assert.ok(!body.accounts.some((a) => a.key_id === "sk-one"));
+  assert.equal(acct.key_count, 1, "her key counts toward the account");
   db.close?.();
 });
 

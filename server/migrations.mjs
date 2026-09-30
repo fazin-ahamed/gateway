@@ -263,15 +263,45 @@ export function migrateConsoleAccounts(db) {
     )`);
     db.exec(`CREATE TABLE IF NOT EXISTS console_account_tokens (
       token_hash TEXT PRIMARY KEY,
-      key_id TEXT NOT NULL REFERENCES api_keys(key_id) ON DELETE CASCADE,
+      key_id TEXT NOT NULL,
       purpose TEXT NOT NULL,
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       used_at TEXT
     )`);
     db.exec("CREATE INDEX IF NOT EXISTS idx_account_tokens_key ON console_account_tokens(key_id, purpose)");
+    const tokenCols = new Set(((db.prepare("PRAGMA table_info(console_account_tokens)").all().results) || []).map((c) => c && c.name));
+    if (!tokenCols.has("budget_mode")) db.exec("ALTER TABLE console_account_tokens ADD COLUMN budget_mode TEXT");
+    if (!tokenCols.has("budget_limit")) db.exec("ALTER TABLE console_account_tokens ADD COLUMN budget_limit REAL");
+    if (!tokenCols.has("tier_ids")) db.exec("ALTER TABLE console_account_tokens ADD COLUMN tier_ids TEXT");
     const r = db.prepare("PRAGMA table_info(api_keys)").all();
     const names = new Set(((r && r.results) || []).map((c) => c && c.name));
+    const acctCols = new Set(((db.prepare("PRAGMA table_info(console_accounts)").all().results) || []).map((c) => c && c.name));
+    if (!acctCols.has("budget_mode")) {
+      db.exec("ALTER TABLE console_accounts ADD COLUMN budget_mode TEXT NOT NULL DEFAULT 'usd'");
+      added.push("account.budget_mode");
+    }
+    if (!acctCols.has("budget_limit")) {
+      db.exec("ALTER TABLE console_accounts ADD COLUMN budget_limit REAL");
+      added.push("account.budget_limit");
+    }
+    if (!acctCols.has("used_usd")) {
+      db.exec("ALTER TABLE console_accounts ADD COLUMN used_usd REAL NOT NULL DEFAULT 0");
+      added.push("account.used_usd");
+    }
+    if (!acctCols.has("used_tokens")) {
+      db.exec("ALTER TABLE console_accounts ADD COLUMN used_tokens INTEGER NOT NULL DEFAULT 0");
+      added.push("account.used_tokens");
+    }
+    db.exec(`CREATE TABLE IF NOT EXISTS console_account_tiers (
+      key_id TEXT NOT NULL REFERENCES console_accounts(key_id) ON DELETE CASCADE,
+      tier_id INTEGER NOT NULL REFERENCES model_tiers(id) ON DELETE CASCADE,
+      PRIMARY KEY (key_id, tier_id)
+    )`);
+    if (!names.has("account_id")) {
+      db.exec("ALTER TABLE api_keys ADD COLUMN account_id TEXT REFERENCES console_accounts(key_id) ON DELETE CASCADE");
+      added.push("api_keys.account_id");
+    }
     if (!names.has("console_auth")) {
       db.exec("ALTER TABLE api_keys ADD COLUMN console_auth INTEGER NOT NULL DEFAULT 1");
       added.push("console_auth");

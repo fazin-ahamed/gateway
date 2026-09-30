@@ -23,13 +23,15 @@
   let search = $state("");
   let days = $state(7);
   let detail = $state<RequestDetail | null>(null);
+  let ownedKeys = $state<Array<{ key_id: string; name: string }> | null>(null);
+  let keyFilter = $state("all");
 
   async function load() {
     failed = false;
     rows = null;
     const params = new URLSearchParams({ days: String(days), limit: "50" });
     if (kind !== "all") params.set("kind", kind);
-    if (status !== "all") params.set("status", status);
+    if (keyFilter !== "all") params.set("key_id", keyFilter);
     if (search.trim()) params.set("request_id", search.trim());
     try {
       const res = await fetch(`/console/api/requests?${params}`, { credentials: "same-origin" });
@@ -41,9 +43,17 @@
     }
   }
 
-  onMount(load);
+  onMount(async () => {
+    load();
+    try {
+      const body = await api.keys();
+      ownedKeys = body.account ? body.keys.map((k) => ({ key_id: k.key_id, name: k.name })) : [];
+    } catch {
+      ownedKeys = [];
+    }
+  });
   $effect(() => {
-    void kind; void status; void days;
+    void kind; void status; void days; void keyFilter;
     load();
   });
 
@@ -76,6 +86,14 @@
     value={search}
     oninput={(e) => onSearch(e.currentTarget.value)}
   />
+  {#if ownedKeys && ownedKeys.length > 1}
+    <select class="input" aria-label="Filter by key" bind:value={keyFilter}>
+      <option value="all">All keys</option>
+      {#each ownedKeys as k (k.key_id)}
+        <option value={k.key_id}>{k.name}</option>
+      {/each}
+    </select>
+  {/if}
   <div class="tabs" role="tablist" aria-label="Type">
     <button class="tab" class:on={kind === "all"} onclick={() => (kind = "all")}>All</button>
     <button class="tab" class:on={kind === "chat"} onclick={() => (kind = "chat")}>Chat</button>

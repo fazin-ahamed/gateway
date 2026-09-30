@@ -29,6 +29,10 @@
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 13V8M8 13V4M13 13V10" /></svg>
       Usage
     </a></li>
+    <li><a href="/console/keys/" aria-current={current("/console/keys/")}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2a3.5 3.5 0 1 0 1.2 6.8L14 11v1h1v2h-2v1h-2l-1.3-2.3A3.5 3.5 0 0 1 10.5 2Z" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
+      Keys
+    </a></li>
     <li><a href="/console/models/" aria-current={current("/console/models/")}>
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3.5" cy="4" r="1.4" fill="currentColor" stroke="none" /><circle cx="12.5" cy="6" r="1.4" fill="currentColor" stroke="none" /><circle cx="6" cy="12.5" r="1.4" fill="currentColor" stroke="none" /><path d="M4.6 4.8 11.4 6M11.9 7.3 6.7 11.4M4.6 5.1 5.6 11.2" /></svg>
       Models

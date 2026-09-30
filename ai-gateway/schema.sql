@@ -78,7 +78,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
   console_auth INTEGER NOT NULL DEFAULT 1,
   response_cache INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- The console account that minted this key. NULL for operator-created keys,
+  -- which have no account and no shared spend cap.
+  account_id TEXT REFERENCES console_accounts(key_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS api_key_model_tiers (
@@ -133,20 +136,35 @@ CREATE TABLE IF NOT EXISTS console_accounts (
   key_id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- The account is the customer. Spend across every key it owns is capped
+  -- here; individual keys only track their own usage. NULL means no cap.
+  budget_mode TEXT NOT NULL DEFAULT 'usd',
+  budget_limit REAL,
+  used_usd REAL NOT NULL DEFAULT 0,
+  used_tokens INTEGER NOT NULL DEFAULT 0
+);
+-- Model tiers granted to the whole account. Keys the account creates inherit
+-- these and cannot widen them.
+CREATE TABLE IF NOT EXISTS console_account_tiers (
+  key_id TEXT NOT NULL REFERENCES console_accounts(key_id) ON DELETE CASCADE,
+  tier_id INTEGER NOT NULL REFERENCES model_tiers(id) ON DELETE CASCADE,
+  PRIMARY KEY (key_id, tier_id)
 );
 -- Single-use tokens for password resets and account creation invites.
 -- purpose 'reset' re-credentials an existing console_accounts row;
--- 'invite' lets a brand-new key set up its account without the operator
--- handing over the raw sk- key. One row per issued token: consumed on use,
--- and the operator can revoke any pending token from the admin console.
+-- 'invite' lets a new person set up their account without a key being handed
+-- over. One row per issued token: consumed on use, revocable while pending.
 CREATE TABLE IF NOT EXISTS console_account_tokens (
   token_hash TEXT PRIMARY KEY,
-  key_id TEXT NOT NULL REFERENCES api_keys(key_id) ON DELETE CASCADE,
+  key_id TEXT NOT NULL,
   purpose TEXT NOT NULL,  -- 'reset' | 'invite'
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  used_at TEXT
+  used_at TEXT,
+  budget_mode TEXT,
+  budget_limit REAL,
+  tier_ids TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_account_tokens_key
   ON console_account_tokens(key_id, purpose);

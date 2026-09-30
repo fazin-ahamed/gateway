@@ -25,6 +25,8 @@
   let detail = $state<RequestDetail | null>(null);
   let metric = $state<"requests" | "tokens" | "spend_usd">("requests");
   let hours = $state(168);
+  let keyFilter = $state("all");
+  let ownedKeys = $state<Array<{ key_id: string; name: string }> | null>(null);
 
   let request = 0;
   async function load(h: number) {
@@ -36,8 +38,8 @@
       const [act, lim, used, list] = await Promise.all([
         api.activity(h),
         api.limits(),
-        fetch(`/console/api/usage?days=${days}`, { credentials: "same-origin" }).then((r) => r.json()),
-        fetch(`/console/api/requests?days=${days}&limit=25`, { credentials: "same-origin" }).then((r) => r.json())
+        fetch(`/console/api/usage?days=${days}${keyFilter !== "all" ? `&key_id=${encodeURIComponent(keyFilter)}` : ""}`, { credentials: "same-origin" }).then((r) => r.json()),
+        fetch(`/console/api/requests?days=${days}&limit=25${keyFilter !== "all" ? `&key_id=${encodeURIComponent(keyFilter)}` : ""}`, { credentials: "same-origin" }).then((r) => r.json())
       ]);
       if (mine !== request) return;
       activity = act;
@@ -57,7 +59,10 @@
     load(h);
   }
 
-  onMount(() => load(hours));
+  onMount(() => {
+    load(hours);
+    api.keys().then((b) => { ownedKeys = b.account ? b.keys.map((k) => ({ key_id: k.key_id, name: k.name })) : []; }).catch(() => { ownedKeys = []; });
+  });
 
   async function openRequest(id: string) {
     try {
@@ -84,6 +89,14 @@
     <button class="tab" class:on={hours === 168} onclick={() => changeWindow(168)}>7d</button>
     <button class="tab" class:on={hours === 720} onclick={() => changeWindow(720)}>30d</button>
   </div>
+  {#if ownedKeys && ownedKeys.length > 1}
+    <select class="input" aria-label="Filter by key" bind:value={keyFilter} onchange={() => load(hours)}>
+      <option value="all">All keys</option>
+      {#each ownedKeys as k (k.key_id)}
+        <option value={k.key_id}>{k.name}</option>
+      {/each}
+    </select>
+  {/if}
 </div>
 
 {#if failed}

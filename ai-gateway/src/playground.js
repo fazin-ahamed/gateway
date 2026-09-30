@@ -285,12 +285,21 @@ var PLAYGROUND_HTML = `<!doctype html>
   </section>
 
   <section class="tab" id="tab-accounts">
-    <div class="pagehead"><div><h2 class="sec">Accounts</h2><p class="sub">Console accounts, password reset links, and invite links for keys without an account yet.</p></div></div>
-    <div class="panel"><div class="panel-b flush" id="accounts-list"></div></div>
-    <div class="panel"><div class="panel-h"><h2 class="sec">Account links</h2></div><div class="panel-b">
+    <div class="pagehead"><div><h2 class="sec">Accounts</h2><p class="sub">Create a customer, set their spend cap and model tiers, and hand over one link. They set up credentials and mint their own keys.</p></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Create account</h2></div><div class="panel-b">
       <div class="form-grid">
-        <div><label>Key</label><select id="acct-key"></select><small>Pick a key to reset its account password or send an invite.</small></div>
-        <div class="full"><button class="act" id="acct-reset">Create password reset link</button> <button class="act" id="acct-invite">Create account invite link</button></div>
+        <div><label>Spend cap mode</label><select id="acct-new-mode"><option value="usd">USD ($)</option><option value="tokens">Tokens</option></select></div>
+        <div><label>Spend cap (blank = no cap)</label><input id="acct-new-limit" type="number" step="any" placeholder="10.00"></div>
+        <div><label>Model tiers</label><select id="acct-new-tiers" multiple size="3"></select><small>The account's keys inherit these tiers.</small></div>
+        <div class="full"><button class="act" id="acct-new-create">Create account link</button></div>
+        <div class="full hint" id="acct-new-out"></div>
+      </div>
+    </div></div>
+    <div class="panel"><div class="panel-b flush" id="accounts-list"></div></div>
+    <div class="panel"><div class="panel-h"><h2 class="sec">Existing account links</h2></div><div class="panel-b">
+      <div class="form-grid">
+        <div><label>Account</label><select id="acct-key"></select><small>Pick an account to reset its password.</small></div>
+        <div class="full"><button class="act" id="acct-reset">Create password reset link</button></div>
         <div class="full hint" id="acct-out"></div>
       </div>
     </div></div>
@@ -1212,8 +1221,15 @@ document.getElementById('k-create').onclick=async function(){
 // ---------- ACCOUNTS ----------
 function accountKeyLabel(k){
   const used=k.budget_mode==='usd'?money(k.used_usd):fmt(k.used_tokens);
-  const lim=k.budget_mode==='usd'?money(k.budget_limit):fmt(k.budget_limit);
+  const lim=k.budget_limit==null?'no cap':(k.budget_mode==='usd'?money(k.budget_limit):fmt(k.budget_limit));
   return esc(k.name)+' — '+used+' / '+lim+' '+(k.budget_mode==='usd'?'USD':'tokens');
+}
+async function refreshAccountTierSelect(){
+  const sel=document.getElementById('acct-new-tiers');
+  if(!sel) return;
+  let tiers=[];
+  try{ const tr=await api('/admin/model-tiers'); tiers=(tr.data&&tr.data.tiers)||[]; }catch(e){ return; }
+  sel.innerHTML=tiers.map(function(t){return '<option value="'+esc(String(t.id))+'">'+esc(t.name)+'</option>';}).join('')||'<option value="">(no tiers defined)</option>';
 }
 async function loadAccounts(){
   const el=document.getElementById('accounts-list');
@@ -1223,18 +1239,15 @@ async function loadAccounts(){
   const tokens=(data&&data.tokens)||[];
   const rows=accounts.map(function(a){
     const used=a.budget_mode==='usd'?money(a.used_usd):fmt(a.used_tokens);
-    const lim=a.budget_mode==='usd'?money(a.budget_limit):fmt(a.budget_limit);
+    const lim=a.budget_limit==null?'<span class="pill mut">no cap</span>':(a.budget_mode==='usd'?money(a.budget_limit):fmt(a.budget_limit));
     const tiers=a.tier_names?esc(a.tier_names):'<span class="pill mut">none</span>';
-    const state=a.active===1?'<span class="pill ok">active</span>':'<span class="pill warn">deactivated</span>';
-    return '<tr><td><b>'+esc(a.username)+'</b><br><span class="mono small">'+esc(a.key_id)+'</span></td><td>'+esc(a.name)+'</td><td>'+used+' / '+lim+' '+(a.budget_mode==='usd'?'USD':'tok')+'</td><td>'+tiers+'</td><td>'+state+'</td><td><button class="ghost" data-act="acctreset" data-id="'+esc(a.key_id)+'">reset link</button> <button class="ghost" data-act="acctedit" data-id="'+esc(a.key_id)+'">limits</button></td></tr>';
-  }).join('')||'<tr><td colspan="6"><div class="empty">No accounts yet. Invite a key below.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Account</th><th>Key</th><th>Budget used</th><th>Tiers</th><th>State</th><th></th></tr>'+rows+'</table>';
-  const keySel=document.getElementById('acct-key');
-  if(keySel){
-    const withAccount=new Set(accounts.map(function(a){return a.key_id;}));
-    let keys=[]; try{ const kr=await api('/admin/keys'); keys=(kr.data&&kr.data.keys)||[]; }catch(e){}
-    keySel.innerHTML=keys.map(function(k){return '<option value="'+esc(k.key_id)+'">'+accountKeyLabel(k)+(withAccount.has(k.key_id)?' (has account)':'')+'</option>';}).join('');
-  }
+    return '<tr><td><b>'+esc(a.username)+'</b><br><span class="mono small">'+esc(a.key_id)+'</span></td><td>'+used+' / '+lim+' '+(a.budget_mode==='usd'?'USD':'tok')+'</td><td>'+fmt(a.key_count)+' keys</td><td>'+tiers+'</td><td><button class="ghost" data-act="acctreset" data-id="'+esc(a.key_id)+'">reset link</button> <button class="ghost" data-act="acctedit" data-id="'+esc(a.key_id)+'">cap + tiers</button></td></tr>';
+  }).join('')||'<tr><td colspan="5"><div class="empty">No accounts yet. Create one above.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Account</th><th>Spend</th><th>Keys</th><th>Tiers</th><th></th></tr>'+rows+'</table>';
+  await refreshAccountTierSelect();
+  const acctSel=document.getElementById('acct-key');
+  if(acctSel)
+    acctSel.innerHTML=accounts.map(function(a){return '<option value="'+esc(a.key_id)+'">'+esc(a.username)+' ('+esc(a.key_id)+')</option>';}).join('');
   const tl=document.getElementById('acct-tokens-list');
   if(tl){
     const now=Date.now();
@@ -1246,50 +1259,50 @@ async function loadAccounts(){
       else badge='<span class="pill ok">pending</span>';
       return '<tr><td class="mono small">'+esc(t.purpose)+'</td><td class="mono small">'+esc(t.key_id)+'</td><td>'+badge+'</td><td class="small">'+esc(t.expires_at)+'</td><td>'+(t.used_at||expired?'':'<button class="danger" data-act="tokdel" data-id="'+esc(t.token_hash)+'">revoke</button>')+'</td></tr>';
     }).join('')||'<tr><td colspan="5"><div class="empty">No links issued yet.</div></td></tr>';
-    tl.innerHTML='<table><tr><th>Purpose</th><th>Key</th><th>State</th><th>Expires</th><th></th></tr>'+trows+'</table>';
+    tl.innerHTML='<table><tr><th>Purpose</th><th>Account</th><th>State</th><th>Expires</th><th></th></tr>'+trows+'</table>';
   }
 }
 function paintAcctLink(kind,out){
   return function(status,r){
     if(status===201&&r&&r.url){
-      out.innerHTML='<b>'+(kind==='reset'?'Reset link':'Invite link')+':</b> <span class="mono small selectable">'+esc(r.url)+'</span> <button class="ghost" data-act="copylink" data-link="'+esc(r.url)+'">copy</button>';
-      toast((kind==='reset'?'reset':'invite')+' link created, expires in 24h','ok');
+      out.innerHTML='<b>'+(kind==='reset'?'Reset link':'Account creation link')+':</b> <span class="mono small selectable">'+esc(r.url)+'</span> <button class="ghost" data-act="copylink" data-link="'+esc(r.url)+'">copy</button>';
+      toast((kind==='reset'?'reset':'account')+' link created, expires in 24h','ok');
       loadAccounts();
     } else {
       toast('could not create link: '+(r&&r.error&&r.error.message||status),'err');
     }
   };
 }
+document.getElementById('acct-new-create').onclick=async function(){
+  const tier_ids=Array.from(document.getElementById('acct-new-tiers').selectedOptions).map(function(o){return Number(o.value);}).filter(function(n){return Number.isFinite(n);});
+  const rawLimit=document.getElementById('acct-new-limit').value;
+  const body={budget_mode:document.getElementById('acct-new-mode').value, budget_limit:rawLimit===''?null:Number(rawLimit), tier_ids};
+  const {status,data}=await api('/admin/accounts',{method:'POST',body:JSON.stringify(body)});
+  paintAcctLink('invite',document.getElementById('acct-new-out'))(status,data);
+};
 document.getElementById('acct-reset').onclick=async function(){
   const id=document.getElementById('acct-key').value;
-  if(!id){ toast('select a key first','err'); return; }
+  if(!id){ toast('no account selected','err'); return; }
   const {status,data}=await api('/admin/accounts/'+id+'/reset-link',{method:'POST'});
   paintAcctLink('reset',document.getElementById('acct-out'))(status,data);
 };
-document.getElementById('acct-invite').onclick=async function(){
-  const id=document.getElementById('acct-key').value;
-  if(!id){ toast('select a key first','err'); return; }
-  const {status,data}=await api('/admin/accounts/'+id+'/invite-link',{method:'POST'});
-  paintAcctLink('invite',document.getElementById('acct-out'))(status,data);
-};
+async function createResetLink(id){
+  const {status,data}=await api('/admin/accounts/'+id+'/reset-link',{method:'POST'});
+  paintAcctLink('reset',document.getElementById('acct-out'))(status,data);
+}
 async function editAccountLimits(id){
-  const {data}=await api('/admin/keys/'+id); const k=data&&data.key; if(!k){ toast('key not found','err'); return; }
-  const tierIds=((data&&data.tiers)||[]).map(function(t){return String(t.id);});
+  const {data}=await api('/admin/accounts'); const a=((data&&data.accounts)||[]).find(function(x){return x.key_id===id;});
+  if(!a){ toast('account not found','err'); return; }
   let opts=[];
   try{ const tr=await api('/admin/model-tiers'); opts=((tr.data&&tr.data.tiers)||[]).map(function(t){return {value:String(t.id),label:t.name};}); }catch(e){}
-  openModal('Account limits: '+k.name,[
-    {key:'budget_mode',label:'Budget mode',type:'select',value:k.budget_mode,options:[{value:'usd',label:'USD ($)'},{value:'tokens',label:'Tokens'}]},
-    {key:'budget_limit',label:'Budget limit',type:'number',value:k.budget_limit},
-    {key:'request_limit_per_minute',label:'Request limit / minute (0 = unlimited)',type:'number',value:k.request_limit_per_minute||0},
-    {key:'expires_at',label:'Expires at (UAE / GST, blank = never)',value:localExpiryValue(k.expires_at),hint:'UAE time (UTC+4). Clear to make the key never expire.'},
-    {key:'tier_ids',label:'Model tiers',type:'multiselect',value:tierIds,options:opts},
-    {key:'active',label:'State',type:'select',value:k.active?'1':'0',options:[{value:'1',label:'active'},{value:'0',label:'deactivated'}]}
+  openModal('Account: '+(a.username||a.key_id),[
+    {key:'budget_mode',label:'Spend cap mode',type:'select',value:a.budget_mode,options:[{value:'usd',label:'USD ($)'},{value:'tokens',label:'Tokens'}]},
+    {key:'budget_limit',label:'Spend cap (blank = no cap)',type:'text',value:a.budget_limit==null?'':String(a.budget_limit)},
+    {key:'tier_ids',label:'Model tiers (keys inherit these)',type:'multiselect',value:(a.tier_names||'').split(' \u00B7 ').filter(Boolean).map(function(n){return String((opts.find(function(o){return o.label===n;})||{}).value||'');}),options:opts}
   ],async function(v){
-    let expires_at=null;
-    if(v.expires_at){ try { expires_at=uaeLocalInputToIso(v.expires_at); } catch(e) { return toast('invalid UAE expiry','err'); } }
-    const body={budget_mode:v.budget_mode,budget_limit:Number(v.budget_limit),request_limit_per_minute:Number(v.request_limit_per_minute)||0,expires_at,tier_ids:v.tier_ids.map(Number),active:v.active==='1'};
-    const {status,data:r}=await api('/admin/keys/'+id,{method:'PATCH',body:JSON.stringify(body)});
-    if(status===200){ toast('account limits updated','ok'); closeModal(); loadAccounts(); }
+    const body={budget_mode:v.budget_mode, budget_limit:v.budget_limit===''?null:Number(v.budget_limit), tier_ids:v.tier_ids.map(Number)};
+    const {status,data:r}=await api('/admin/accounts/'+id,{method:'PATCH',body:JSON.stringify(body)});
+    if(status===200){ toast('account updated','ok'); closeModal(); loadAccounts(); }
     else toast('update failed: '+(r&&r.error&&r.error.message||status),'err');
   });
 }
