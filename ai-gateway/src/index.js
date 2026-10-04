@@ -1849,7 +1849,7 @@ async function cachedPrompt(c, requestId, cacheState) {
 // A decision model is never a chat model: the two endpoints refuse each other.
 // The decision inference path, shared by the API-key surface and the console
 // playground. `key` is null for the admin playground, exactly like chat.
-async function runSystemOneDecision(c, key) {
+async function runSystemOneDecision(c, key, options) {
   let body;
   try {
     body = await c.req.json();
@@ -1945,13 +1945,28 @@ async function runSystemOneDecision(c, key) {
         const decCost = decPrice && String(decPrice.actual_mode) === "per_request" ? Number(decPrice.actual_per_request) || 0 : 0;
         await finishRequestSummary(c.env.DB, requestId, { status: "ok", httpStatus: res.http, ttftMs: Date.now() - started, latencyMs: Date.now() - started, costUsd: decCost, attempts: 1 });
         blog("TRACE id=" + requestId + " decision provider=" + route.provider_name + " model=" + route.upstream_model + " ms=" + (Date.now() - started));
-        return c.json({
+        const decisionBody = {
           model: slug,
           upstream_model: route.upstream_model,
           answers,
           source: "remote",
           latency_ms: Date.now() - started
-        });
+        };
+        // The chat-endpoint bridge asks for an OpenAI envelope so a chat-SDK
+        // client parses the reply; the answers ride inside choices[0].message
+        // as JSON, identical data, plus the native fields for direct callers.
+        if ((options && options.envelope) === "openai") {
+          return c.json({
+            id: "chatcmpl-decision-" + requestId,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: slug,
+            choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(decisionBody) }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            ...decisionBody
+          });
+        }
+        return c.json(decisionBody);
       }
       lastReason = res.reason || "decision provider failed";
       if (res.http) lastStatus = res.http;
@@ -2046,15 +2061,22 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started });
     return c.json({ error: { message: "model is required" } }, 400);
   }
-  // A decision model answers /v1/systemone, never this endpoint. Refuse before
-  // any upstream call so it can never be picked to generate an assistant reply.
+  // A decision model answers /v1/systemone, never a chat completion. BUT many
+  // clients speak only the chat endpoint, so a SystemOne-shaped body — {state,
+  // questions}, no messages — is bridged through the real decision pipeline and
+  // answered in an OpenAI envelope instead of being refused. A body that is
+  // actually chat (messages present) is still refused before any upstream call:
+  // a decision model must never be asked to generate assistant prose.
   if (String(slug).toLowerCase() !== AUTO_SLUG) {
     const kindRow = await c.env.DB.prepare(
       "SELECT model_kind FROM model_routes WHERE slug=? AND enabled=1 AND COALESCE(model_kind,'chat')<>'chat' LIMIT 1"
     ).bind(slug).first();
     if (kindRow) {
+      if (payload && !Array.isArray(payload.messages) && payload.state && payload.questions && typeof payload.questions === "object") {
+        return runSystemOneDecision(c, key, { envelope: "openai" });
+      }
       await recordTrajectory(c, { ...traj, status: "fail", httpStatus: 400, attempts: 0, latencyMs: Date.now() - started, error: "model_endpoint_mismatch" });
-      return c.json({ error: { message: "This model uses the decision inference API at /v1/systemone and cannot answer chat completions.", type: "model_endpoint_mismatch" } }, 400);
+      return c.json({ error: { message: "This model uses the decision inference API at /v1/systemone and cannot answer chat completions. Post {model, state, questions} to this endpoint to use it from a chat client.", type: "model_endpoint_mismatch" } }, 400);
     }
   }
   await startRequestSummary(c.env.DB, { requestId, keyId: key && key.key_id || null, modelKind: "chat", publicSlug: slug, stream: isStream });

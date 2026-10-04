@@ -141,7 +141,7 @@ test("/v1/systemone reaches a decision route and returns typed answers", async (
   }
 });
 
-test("a decision model is refused by /v1/chat/completions before any upstream call", async () => {
+test("a decision model refuses PROSE chat (messages) on the chat endpoint, before any upstream call", async () => {
   const { app } = await seededDecisionGateway();
   const orig = globalThis.fetch;
   let called = 0;
@@ -156,6 +156,53 @@ test("a decision model is refused by /v1/chat/completions before any upstream ca
     const body = await res.json();
     assert.equal(body.error.type, "model_endpoint_mismatch");
     assert.equal(called, 0, "no upstream call may be made for a decision model on the chat endpoint");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("a decision model BRIDGES a SystemOne-shaped chat request and answers in an OpenAI envelope", async () => {
+  const { app } = await seededDecisionGateway();
+  const orig = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, init) => {
+    seen = { url: String(url) };
+    return new Response(JSON.stringify({ answers: { verify: { probability: 0.9 } } }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const res = await app.fetch(new Request("http://gw/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer sk-dec", "content-type": "application/json" },
+      body: JSON.stringify({ model: "jev", state: { task: "fix auth race" }, questions: { verify: { type: "noul", instructions: "Does this need verification?" } } })
+    }));
+    assert.equal(res.status, 200, "the bridge answers, not a 400 mismatch");
+    const body = await res.json();
+    assert.equal(body.object, "chat.completion", "a chat-SDK client sees a chat completion");
+    assert.ok(Array.isArray(body.choices) && body.choices.length === 1);
+    assert.equal(body.choices[0].message.role, "assistant");
+    const inner = JSON.parse(body.choices[0].message.content);
+    assert.equal(inner.answers.verify.probability, 0.9, "the decision answers ride inside the envelope");
+    assert.equal(inner.model, "jev");
+    assert.equal(body.answers.verify.probability, 0.9, "the native fields sit alongside the envelope too");
+    assert.ok(seen.url.endsWith("/v1/systemone"), "the upstream decision call goes to the systemone path");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("the direct /v1/systemone endpoint keeps its native response shape", async () => {
+  const { app } = await seededDecisionGateway();
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ answers: { verify: { probability: 0.4 } } }), { status: 200, headers: { "content-type": "application/json" } });
+  try {
+    const res = await app.fetch(new Request("http://gw/v1/systemone", {
+      method: "POST",
+      headers: { authorization: "Bearer sk-dec", "content-type": "application/json" },
+      body: JSON.stringify({ model: "jev", ...question })
+    }));
+    const body = await res.json();
+    assert.equal(body.object, undefined, "no chat envelope on the native endpoint");
+    assert.equal(body.answers.verify.probability, 0.4);
   } finally {
     globalThis.fetch = orig;
   }
