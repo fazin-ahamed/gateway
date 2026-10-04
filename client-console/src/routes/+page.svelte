@@ -117,7 +117,8 @@
     <div class="metric"><div class="label">Failed</div><div class="value">{fmtInt(activity.totals.fail)}</div></div>
     <div class="metric"><div class="label">Spend</div><div class="value">{fmtUsd(activity.totals.spend_usd)}</div></div>
     {#if limits}
-      {@const pct = limits.budget.limit > 0 ? Math.max(2, Math.min(100, (limits.budget.used / limits.budget.limit) * 100)) : 0}
+      {@const uncapped = !!(limits.budget.uncapped || limits.budget.limit <= 0)}
+      {@const pct = uncapped ? 0 : Math.max(2, Math.min(100, (limits.budget.used / limits.budget.limit) * 100))}
       <div class="metric budget">
         <svg class="budget-ring" viewBox="0 0 36 36" aria-hidden="true">
           <circle cx="18" cy="18" r="15"></circle>
@@ -126,7 +127,13 @@
         <div>
           <div class="label">Budget</div>
           <div class="value">{limits.budget.mode === "usd" ? fmtUsd(limits.budget.used) : fmtInt(limits.budget.used)}</div>
-          <div class="label">of {limits.budget.mode === "usd" ? fmtUsd(limits.budget.limit) : fmtInt(limits.budget.limit)} used{limits.rate.per_minute ? ` · ${limits.rate.used_this_minute}/${limits.rate.per_minute}/min` : ""}</div>
+          {#if uncapped}
+            <div class="label">no spend cap{limits.keys ? ` · ${limits.keys} ${limits.keys === 1 ? "key" : "keys"}` : ""}</div>
+          {:else}
+            <div class="label">
+              of {limits.budget.mode === "usd" ? fmtUsd(limits.budget.limit) : fmtInt(limits.budget.limit)} used{limits.budget_scope === "key" ? " (per key)" : ""}{limits.keys ? ` · ${limits.keys} ${limits.keys === 1 ? "key" : "keys"}` : ""}{limits.rate.per_minute ? ` · ${limits.rate.used_this_minute}/${limits.rate.per_minute}/min` : ""}
+            </div>
+          {/if}
         </div>
       </div>
     {/if}

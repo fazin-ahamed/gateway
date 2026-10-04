@@ -27,6 +27,28 @@ export const ROUTER_V2_MODE = () => {
   return "shadow";
 };
 
+// How often to build the V2 world for telemetry. The world costs several
+// queries per Auto request, and in shadow mode that work is thrown away, so an
+// operator can dial the sample down without leaving the measurement window.
+// Live mode ignores the rate: there the world IS the decision.
+export const ROUTER_V2_SHADOW_SAMPLE = () => {
+  const raw = process.env.ROUTER_V2_SHADOW_SAMPLE;
+  if (raw == null || raw === "") return 1;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(0, Math.min(1, n));
+};
+
+export function shouldShadow(rand = Math.random) {
+  const mode = ROUTER_V2_MODE();
+  if (mode === "off") return false;
+  if (mode === "live") return true;
+  const rate = ROUTER_V2_SHADOW_SAMPLE();
+  if (rate >= 1) return true;
+  if (rate <= 0) return false;
+  return rand() < rate;
+}
+
 function posteriorFromCandidate(cand) {
   const n = Number(cand && cand.samples) || 0;
   const ok = Number(cand && cand.okRate);

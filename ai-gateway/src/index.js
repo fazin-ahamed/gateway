@@ -8,7 +8,7 @@ import { zaiSessionPoolStatus } from "./zai-session-pool.js";
 import { peekDeviceTokens, appendDeviceTokens } from "./zai-tokens.js";
 import { zaiCaptchaCacheStatus } from "./zai-captcha-cache.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
-import { shadowFromV1, shadowV2, loadV2World } from "./router/index.js";
+import { shadowFromV1, shadowV2, loadV2World, ROUTER_V2_MODE, shouldShadow } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
 import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
 import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShadow, rebuildQualityStats } from "./router/quality.js";
@@ -829,8 +829,17 @@ async function consoleSessionFromCookie(c) {
     ).bind(h, nowIso()).first();
     if (!row) return null;
     const key = await c.env.DB.prepare("SELECT key_id, name, account_id FROM api_keys WHERE key_id=? AND active=1").bind(row.key_id).first();
-    if (key)
-      return { keyId: key.key_id, name: key.name, accountId: key.account_id || null };
+    if (key) {
+      // Which account this key belongs to: it is either owned by one (the key
+      // carries account_id) or it IS the account's own key in the legacy 1:1
+      // shape, where console_accounts.key_id is the key itself.
+      let accountId = key.account_id || null;
+      if (!accountId) {
+        const own = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
+        if (own) accountId = key.key_id;
+      }
+      return { keyId: key.key_id, name: key.name, accountId };
+    }
     const account = await c.env.DB.prepare("SELECT key_id, username FROM console_accounts WHERE key_id=?").bind(row.key_id).first();
     if (account)
       return { keyId: null, name: account.username, accountId: account.key_id };
@@ -887,6 +896,20 @@ app.post("/console/auth", async (c) => {
     return c.json({ error: { message: "The shared pool key cannot sign in to the console.", type: "auth_error" } }, 403);
   if (isOverBudget(key))
     return c.json({ error: { message: "Key budget exceeded.", type: "budget_exceeded" } }, 429);
+  // A key minted by an account belongs to that account, so presenting it must
+  // not hand over a console session on its own: a service key would then expose
+  // every other key the account holds. It resolves to the account and asks for
+  // that account's credentials, the same shape a legacy key already has.
+  if (key.account_id) {
+    const owner = await c.env.DB.prepare("SELECT key_id, username, password_hash FROM console_accounts WHERE key_id=?").bind(key.account_id).first();
+    if (owner) {
+      if (!username || !password)
+        return c.json({ account: true, username: owner.username });
+      if (username !== owner.username || await sha256hex(password) !== owner.password_hash)
+        return c.json({ error: { message: "That username or password was not accepted.", type: "auth_error" } }, 401);
+      return issueAccountSession(c, owner);
+    }
+  }
   if (Number(key.console_auth) === 0)
     return issueConsoleSession(c, key);
   const account = await c.env.DB.prepare("SELECT username, password_hash FROM console_accounts WHERE key_id=?").bind(key.key_id).first();
@@ -1169,19 +1192,38 @@ app.get("/console/api/keys", async (c) => {
     "SELECT mt.id, mt.name FROM console_account_tiers cat JOIN model_tiers mt ON mt.id=cat.tier_id WHERE cat.key_id=? ORDER BY mt.name"
   ).bind(sess.accountId).all();
   const keys = await c.env.DB.prepare(
-    "SELECT key_id, name, active, used_usd, used_tokens, request_count, created_at FROM api_keys WHERE account_id=? ORDER BY created_at DESC"
-  ).bind(sess.accountId).all();
+    "SELECT key_id, name, active, used_usd, used_tokens, request_count, created_at FROM api_keys WHERE account_id=? OR key_id=? ORDER BY created_at DESC"
+  ).bind(sess.accountId, sess.accountId).all();
+  const keyRows = keys.results || [];
+  // The cap that actually binds, matching /console/api/limits: an account cap
+  // when one is set, otherwise the account's own key's cap in the legacy shape.
+  let capMode = account ? String(account.budget_mode || "usd") : "usd";
+  let capLimit = account && account.budget_limit != null ? Number(account.budget_limit) : null;
+  let capScope = "account";
+  if (capLimit == null) {
+    const own = await c.env.DB.prepare("SELECT budget_mode, budget_limit FROM api_keys WHERE key_id=?").bind(sess.accountId).first();
+    if (own && own.budget_limit != null && Number(own.budget_limit) > 0) {
+      capMode = String(own.budget_mode || capMode);
+      capLimit = Number(own.budget_limit);
+      capScope = "key";
+    }
+  }
   return c.json({
     account: account ? {
       username: account.username,
-      budget_mode: account.budget_mode,
-      budget_limit: account.budget_limit == null ? null : Number(account.budget_limit),
+      budget_mode: capMode,
+      budget_limit: capLimit,
+      budget_scope: capScope,
       used_usd: Number(account.used_usd) || 0,
       used_tokens: Number(account.used_tokens) || 0,
       tiers: (tiers.results || []).map((t) => ({ id: t.id, name: t.name }))
     } : null,
-    keys: (keys.results || []).map((k) => ({
+    keys: keyRows.map((k) => ({
       key_id: k.key_id, name: k.name, active: !!k.active,
+      // The account's own key in the legacy 1:1 shape: it predates account
+      // ownership, cannot be recreated if deleted, and is flagged so the page
+      // can say so.
+      own: k.key_id === sess.accountId,
       used_usd: Number(k.used_usd) || 0, used_tokens: Number(k.used_tokens) || 0,
       request_count: Number(k.request_count) || 0, created_at: k.created_at
     }))
@@ -1197,8 +1239,20 @@ app.post("/console/api/keys", async (c) => {
   try { body = await c.req.json(); } catch { body = {}; }
   const name = String((body && body.name) || "").trim().slice(0, 120);
   if (!name) return c.json({ error: { message: "Give the key a name." } }, 400);
-  const account = await c.env.DB.prepare("SELECT budget_mode FROM console_accounts WHERE key_id=?").bind(sess.accountId).first();
+  const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit FROM console_accounts WHERE key_id=?").bind(sess.accountId).first();
   if (!account) return c.json({ error: { message: "account not found" } }, 404);
+  // This key's own spending cap, if the account holder wants one below the
+  // account's. The account cap still applies on top, so a higher per-key value
+  // is harmless; it just never binds.
+  let keyLimit;
+  if (body && body.budget_limit != null && body.budget_limit !== "") {
+    const n = Number(body.budget_limit);
+    if (!Number.isFinite(n) || n <= 0)
+      return c.json({ error: { message: "budget_limit must be positive, or blank for no per-key cap" } }, 400);
+    keyLimit = n;
+  } else {
+    keyLimit = Number(account.budget_limit) > 0 ? Number(account.budget_limit) : 1e12;
+  }
   const count = await c.env.DB.prepare("SELECT COUNT(*) n FROM api_keys WHERE account_id=?").bind(sess.accountId).first();
   if (Number(count && count.n) >= 25)
     return c.json({ error: { message: "This account already has 25 keys." } }, 409);
@@ -1206,11 +1260,11 @@ app.post("/console/api/keys", async (c) => {
   const now = nowIso();
   await c.env.DB.prepare(
     "INSERT INTO api_keys (key_id, name, budget_mode, budget_limit, account_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)"
-  ).bind(keyId, name, account.budget_mode || "usd", 1e12, sess.accountId, now, now).run();
+  ).bind(keyId, name, account.budget_mode || "usd", keyLimit, sess.accountId, now, now).run();
   const tiers = await c.env.DB.prepare("SELECT tier_id FROM console_account_tiers WHERE key_id=?").bind(sess.accountId).all();
   for (const row of tiers.results || [])
-    await c.env.DB.prepare("INSERT INTO api_key_model_tiers (key_id, tier_id) VALUES (?,?)").bind(keyId, row.tier_id).run();
-  return c.json({ key_id: keyId, key: keyId, name }, 201);
+    await c.env.DB.prepare("INSERT OR IGNORE INTO api_key_model_tiers (key_id, tier_id) VALUES (?,?)").bind(keyId, row.tier_id).run();
+  return c.json({ key_id: keyId, key: keyId, name, budget_mode: account.budget_mode || "usd", budget_limit: keyLimit }, 201);
 });
 
 app.post("/console/api/keys/:id/active", async (c) => {
@@ -1229,22 +1283,28 @@ app.delete("/console/api/keys/:id", async (c) => {
   if (denied) return denied;
   const owned = await ownedAccountKey(c, sess, c.req.param("id"));
   if (!owned) return c.json({ error: { message: "key not found" } }, 404);
+  // The legacy own key is the account's identity for sign-in by key. Deleting
+  // it is allowed but the account keeps working by username, so it is not
+  // blocked: the page warns before it gets here.
   await c.env.DB.prepare("DELETE FROM api_key_model_tiers WHERE key_id=?").bind(owned.key_id).run();
   await c.env.DB.prepare("DELETE FROM api_keys WHERE key_id=?").bind(owned.key_id).run();
   return c.json({ deleted: owned.key_id });
 });
 
+// A key the session may manage: owned by the account, or the account's own key
+// in the legacy 1:1 shape.
 async function ownedAccountKey(c, sess, keyId) {
   if (!sess.accountId) return null;
-  return c.env.DB.prepare("SELECT key_id FROM api_keys WHERE key_id=? AND account_id=?").bind(keyId, sess.accountId).first();
+  return c.env.DB.prepare("SELECT key_id FROM api_keys WHERE key_id=? AND (account_id=? OR key_id=?)")
+    .bind(keyId, sess.accountId, sess.accountId).first();
 }
 // The keys a console session may read usage for. An account sees every key it
-// owns, narrowed by ?key_id when the user filters to one. A plain key session
-// sees only itself.
+// owns plus its own legacy key, narrowed by ?key_id when the user filters to
+// one. A plain key session sees only itself.
 async function sessionKeyScope(c, sess) {
   const wanted = String(c.req.query("key_id") || "");
   if (sess.accountId) {
-    const rows = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE account_id=?").bind(sess.accountId).all();
+    const rows = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE account_id=? OR key_id=?").bind(sess.accountId, sess.accountId).all();
     const owned = (rows.results || []).map((r) => r.key_id);
     if (wanted) return owned.includes(wanted) ? [wanted] : [];
     return owned;
@@ -1378,10 +1438,25 @@ app.get("/console/api/limits", async (c) => {
     ).bind(sess.accountId).first();
     if (!account)
       return c.json({ error: { message: "This account no longer exists.", type: "auth_error" } }, 401);
-    const mode = String(account.budget_mode || "usd");
+    const owned = await c.env.DB.prepare("SELECT key_id FROM api_keys WHERE account_id=? OR key_id=?").bind(sess.accountId, sess.accountId).all();
+    const ownedIds = (owned.results || []).map((r) => r.key_id);
+    // The effective cap. A legacy account (the 1:1 shape) carries no cap of
+    // its own; the limit that actually binds is its key's, so report that
+    // rather than claiming the account is uncapped.
+    let mode = String(account.budget_mode || "usd");
+    let limit = account.budget_limit == null ? null : Number(account.budget_limit);
+    let scopeNote = "account";
+    if (limit == null && ownedIds.length) {
+      const own = await c.env.DB.prepare(
+        "SELECT budget_mode, budget_limit FROM api_keys WHERE key_id=?"
+      ).bind(ownedIds.includes(sess.accountId) ? sess.accountId : ownedIds[0]).first();
+      if (own && own.budget_limit != null && Number(own.budget_limit) > 0) {
+        mode = String(own.budget_mode || mode);
+        limit = Number(own.budget_limit);
+        scopeNote = "key";
+      }
+    }
     const used = mode === "usd" ? Number(account.used_usd) || 0 : Number(account.used_tokens) || 0;
-    const limit = account.budget_limit == null ? null : Number(account.budget_limit);
-    const keys = await c.env.DB.prepare("SELECT COUNT(*) n FROM api_keys WHERE account_id=?").bind(sess.accountId).first();
     return c.json({
       name: String(account.username || ""),
       active: true,
@@ -1395,7 +1470,8 @@ app.get("/console/api/limits", async (c) => {
         request_count: 0
       },
       rate: { per_minute: 0, used_this_minute: 0 },
-      keys: Number(keys && keys.n) || 0,
+      keys: ownedIds.length,
+      budget_scope: scopeNote,
       models: await modelLimitStatus(c)
     });
   }
@@ -4335,47 +4411,78 @@ async function pickAutoModel(c, payload, key) {
   const slug = horizonOk ? horizonSlug : picked.slug;
   const chosen = candidates.find((x) => x.slug === slug && x.eligible) || picked;
   let v2 = null;
-  try {
-    const allowed = key ? await allowedSlugs(c, key) : null;
-    const priceResolver = await buildPriceResolver(c);
-    const world = await loadV2World(c, {
-      payload,
-      allowed,
-      excluded: cfg.excluded,
-      catalogById: byId,
-      overlay,
-      circuitOpen,
-      keyCircuitOpen: (keyId) => circuitOpen("key", keyId),
-      priceResolver
-    });
-    v2 = shadowV2({ payload, routes: world.routes, preference: cfg.preference });
-    // Shadow-only answer-quality block, attached AFTER selection math so it can
-    // never influence candidatePolicies ordering. Primary route is resolved by
-    // primaryRoute.routeId (or routeKey), NEVER by public slug — two providers
-    // can expose the same public slug with different upstreams/identities.
-    // Quality identity prefers the canonical model id from the registry,
-    // falling back to "raw:<upstream>" when unresolved.
-    if (v2 && v2.explain && world && Array.isArray(world.routes)) {
-      const _pr = v2.explain.primaryRoute || null;
-      const _qRoute = (_pr && _pr.routeId != null && world.routes.find((r) => r.routeId === _pr.routeId))
-        || (_pr && _pr.routeKey && world.routes.find((r) => r.key === _pr.routeKey))
-        || world.routes.find((r) => r.slug === v2.explain.primary)
-        || world.routes.find((r) => r.slug === v2.primary)
-        || null;
-      const _qIdentity = _qRoute
-        ? (_qRoute.canonicalModelId || ("raw:" + (_qRoute.upstream_model || _qRoute.slug)))
-        : null;
-      if (_qIdentity) {
-        const _qTask = v2.taskIR ? String(v2.taskIR.task || "") : "";
-        v2.explain.quality = {
-          identity: _qIdentity,
-          task: _qTask,
-          stats: await loadQualityShadow(c, _qIdentity, _qTask)
-        };
+  // In shadow mode this block is pure telemetry, so ROUTER_V2_SHADOW_SAMPLE can
+  // dial it down (and ROUTER_V2=off skips it entirely). In live mode the world
+  // is the decision, so it always runs.
+  const v2mode = ROUTER_V2_MODE();
+  const useV2 = shouldShadow();
+  if (useV2) {
+    try {
+      const allowed = key ? await allowedSlugs(c, key) : null;
+      const priceResolver = await buildPriceResolver(c);
+      const world = await loadV2World(c, {
+        payload,
+        allowed,
+        excluded: cfg.excluded,
+        catalogById: byId,
+        overlay,
+        circuitOpen,
+        keyCircuitOpen: (keyId) => circuitOpen("key", keyId),
+        priceResolver
+      });
+      v2 = shadowV2({ payload, routes: world.routes, preference: cfg.preference });
+      // Shadow-only answer-quality block, attached AFTER selection math so it can
+      // never influence candidatePolicies ordering. Primary route is resolved by
+      // primaryRoute.routeId (or routeKey), NEVER by public slug — two providers
+      // can expose the same public slug with different upstreams/identities.
+      // Quality identity prefers the canonical model id from the registry,
+      // falling back to "raw:<upstream>" when unresolved.
+      if (v2 && v2.explain && world && Array.isArray(world.routes)) {
+        const _pr = v2.explain.primaryRoute || null;
+        const _qRoute = (_pr && _pr.routeId != null && world.routes.find((r) => r.routeId === _pr.routeId))
+          || (_pr && _pr.routeKey && world.routes.find((r) => r.key === _pr.routeKey))
+          || world.routes.find((r) => r.slug === v2.explain.primary)
+          || world.routes.find((r) => r.slug === v2.primary)
+          || null;
+        const _qIdentity = _qRoute
+          ? (_qRoute.canonicalModelId || ("raw:" + (_qRoute.upstream_model || _qRoute.slug)))
+          : null;
+        if (_qIdentity) {
+          const _qTask = v2.taskIR ? String(v2.taskIR.task || "") : "";
+          v2.explain.quality = {
+            identity: _qIdentity,
+            task: _qTask,
+            stats: await loadQualityShadow(c, _qIdentity, _qTask)
+          };
+        }
       }
+    } catch (e) {
+      blog("AUTO v2 shadow failed: " + String(e && e.message || e).slice(0, 200));
     }
-  } catch (e) {
-    blog("AUTO v2 shadow failed: " + String(e && e.message || e).slice(0, 200));
+  }
+  // Router V2 live selection. The V2 world names its pick by route id, never by
+  // public slug: two providers can expose the same slug with different
+  // upstreams, so a slug match could serve the route V2 did not choose. The
+  // constraint-first pick is preferred (it gates on reliability and quality);
+  // the operational pick is the fallback, and V1's pick stands if neither
+  // resolves to a candidate that is actually eligible here.
+  let v2Chosen = null;
+  if (v2mode === "live" && v2) {
+    const qaId = v2.shadow && v2.shadow.quality_aware_pick ? v2.shadow.quality_aware_pick.routeId : null;
+    const opId = v2.picked && v2.picked.primaryRef ? v2.picked.primaryRef.routeId : null;
+    for (const wantId of [qaId, opId]) {
+      if (wantId == null)
+        continue;
+      const hit = candidates.find((c) => c.eligible && (c.routeIds || []).includes(Number(wantId)));
+      if (hit) { v2Chosen = hit; break; }
+    }
+  }
+  if (v2Chosen) {
+    const v2slug = v2Chosen.slug;
+    const v2HorizonOk = horizonSlug && candidates.some((c) => c.slug === horizonSlug && c.eligible);
+    // Horizon still plans the queue, but it may not override the V2 pick onto a
+    // route V2 rejected; it only refines when it lands on another eligible one.
+    return { ...v2Chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: v2Chosen.context || 0, output: v2Chosen.output || 0, horizon, queue: (horizon && horizon.queue) || [], v2, v2_served: true, served_slug: v2slug, served_route_id: (v2Chosen.routeIds || [])[0] || null, v2_horizon_eligible: !!v2HorizonOk };
   }
   return { ...chosen, candidates, need, complexity: score, preference: cfg.preference, estInputTokens: reqTokens, images: reqImages, context: chosen.context || picked.context || 0, output: chosen.output || picked.output || 0, horizon, queue: (horizon && horizon.queue) || [], v2 };
 }
@@ -4795,7 +4902,11 @@ function shadowAttemptFields(autoDecision) {
     v2_quality_state: String(sh.quality_state || (qaPick ? "cold" : "none")),
     v2_quality_reason: String(sh.quality_reason || "no shadow decision"),
     v2_reliability_floor: floors.reliability != null ? Number(floors.reliability) : null,
-    v2_quality_floor: floors.quality != null ? Number(floors.quality) : null
+    v2_quality_floor: floors.quality != null ? Number(floors.quality) : null,
+    // 1 when V2 actually chose this request, so a live rollout can be measured
+    // against the shadow-only baseline without reading the served route back
+    // out of the attempt chain.
+    v2_served: autoDecision && autoDecision.v2_served ? 1 : 0
   };
 }
 // One row per real upstream attempt. Body-free. Returns the row id (for a
@@ -4857,9 +4968,13 @@ function decisionSnapshot(decision) {
   // chose. route_ids stays on the candidate so the episode can still show
   // which routes existed; the attempts carry the ones that were tried.
   const task = decision.v2 && decision.v2.taskIR && decision.v2.taskIR.task;
+  // Name the policy that actually chose, not the one that usually chooses: a
+  // V2-served request recorded as router-v1 would make the export lie about
+  // which policy produced the episode.
+  const servedV2 = !!decision.v2_served;
   return {
-    policyName: "router-v1",
-    policyVersion: "router-v1@live",
+    policyName: servedV2 ? "router-v2" : "router-v1",
+    policyVersion: servedV2 ? "router-v2@live" : "router-v1@live",
     taskType: task || null,
     taskIrVersion: task ? "taskir-v1" : null,
     context: {

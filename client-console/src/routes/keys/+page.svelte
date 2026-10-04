@@ -6,6 +6,7 @@
   let account = $state<Account | null>(null);
   let failed = $state(false);
   let newName = $state("");
+  let newCap = $state("");
   let minted = $state<string | null>(null);
   let busy = $state(false);
   let confirmDelete = $state<string | null>(null);
@@ -30,9 +31,15 @@
     if (!newName.trim() || busy) return;
     busy = true;
     try {
-      const made = await api.createKey(newName.trim());
+      const cap = newCap.trim() === "" ? null : Number(newCap);
+      if (cap != null && (!Number.isFinite(cap) || cap <= 0)) {
+        minted = null;
+        return;
+      }
+      const made = await api.createKey(newName.trim(), cap);
       minted = made.key;
       newName = "";
+      newCap = "";
       await load();
     } catch {
       minted = null;
@@ -75,13 +82,16 @@
         : `${fmtInt(account.used_tokens)}${account.budget_limit != null ? ` / ${fmtInt(account.budget_limit)} tokens` : " tokens (no cap)"}`
       : ""
   );
+  // In the legacy shape the binding cap lives on the account's own key, so say
+  // which limit is being shown rather than implying one number covers all keys.
+  const capNote = $derived(account && account.budget_scope === "key" ? " (its original key's cap)" : "");
 </script>
 
 <h1 class="page-title">Keys</h1>
 
 {#if account}
   <p class="lede">
-    Keys under <strong>{account.username}</strong>. Spend across all of them: {spendLabel}.
+    Keys under <strong>{account.username}</strong>. Spend across all of them: {spendLabel}{capNote}.
     {#if account.tiers.length}
       Model access: {account.tiers.map((t) => t.name).join(", ")}.
     {:else}
@@ -105,10 +115,22 @@
         bind:value={newName}
         disabled={busy}
       />
+      <input
+        class="input cap"
+        type="number"
+        min="0"
+        step="any"
+        placeholder="cap (optional)"
+        aria-label="Per-key spend cap"
+        title="Optional. Limits this key on its own, under the account cap."
+        bind:value={newCap}
+        disabled={busy}
+      />
       <button class="btn btn-primary" type="submit" disabled={busy || !newName.trim()}>
         {busy ? "Creating…" : "Create key"}
       </button>
     </form>
+    <p class="hint">The cap is optional and only limits this one key. The account cap still applies to everything together.</p>
     {#if minted}
       <div class="minted" role="status">
         <p>Copy this key now. It is not shown again.</p>
@@ -143,7 +165,12 @@
           <tbody>
             {#each keys as key (key.key_id)}
               <tr class:off={!key.active}>
-                <td>{key.name}</td>
+                <td>
+                  {key.name}
+                  {#if key.own}
+                    <span class="tag" title="This key created the account. It cannot be recreated if deleted.">original</span>
+                  {/if}
+                </td>
                 <td><code class="key-id">{key.key_id.slice(0, 8)}…</code></td>
                 <td>
                   {#if key.active}
@@ -203,6 +230,30 @@
 
   .create .input {
     flex: 1;
+  }
+
+  .create .cap {
+    flex: 0 0 150px;
+  }
+
+  .hint {
+    margin: 8px 0 0;
+    font-size: 12px;
+    line-height: 17px;
+    color: var(--text-muted);
+  }
+
+  .tag {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    vertical-align: 1px;
   }
 
   .minted {

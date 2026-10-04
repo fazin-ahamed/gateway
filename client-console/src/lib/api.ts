@@ -91,8 +91,12 @@ export type Limits = {
   name: string;
   active: boolean;
   expires_at: string | null;
-  budget: { mode: string; limit: number; used: number; remaining: number; request_count: number };
+  budget: { mode: string; limit: number; used: number; remaining: number | null; request_count: number; uncapped?: boolean };
   rate: { per_minute: number; used_this_minute: number };
+  keys?: number;
+  // "account" when the cap is the account's; "key" for the legacy 1:1 shape,
+  // where the binding limit lives on the account's own key.
+  budget_scope?: "account" | "key";
   models: Array<{ slug: string; kind: string; period: string; limit: number; used: number; remaining: number }>;
 };
 
@@ -115,6 +119,9 @@ export type AccountKey = {
   key_id: string;
   name: string;
   active: boolean;
+  // True for the account's own key in the legacy 1:1 shape: it predates the
+  // account and cannot be recreated if deleted.
+  own?: boolean;
   used_usd: number;
   used_tokens: number;
   request_count: number;
@@ -124,6 +131,8 @@ export type Account = {
   username: string;
   budget_mode: string;
   budget_limit: number | null;
+  // "key" when the binding cap is the original key's, in the legacy shape.
+  budget_scope?: "account" | "key";
   used_usd: number;
   used_tokens: number;
   tiers: Array<{ id: number; name: string }>;
@@ -136,11 +145,11 @@ export const api = {
   activity: (hours: number) => json<Activity>(`/console/api/activity?hours=${hours}`),
   limits: () => json<Limits>("/console/api/limits"),
   keys: () => json<KeysResponse>("/console/api/keys"),
-  createKey: (name: string) =>
+  createKey: (name: string, budgetLimit?: number | null) =>
     json<{ key_id: string; key: string; name: string }>("/console/api/keys", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name })
+      body: JSON.stringify(budgetLimit == null ? { name } : { name, budget_limit: budgetLimit })
     }),
   setKeyActive: (id: string, active: boolean) =>
     json<{ key_id: string; active: boolean }>(`/console/api/keys/${encodeURIComponent(id)}/active`, {
