@@ -6263,10 +6263,13 @@ app.post("/admin/providers/:id/test", async (c) => {
 // Live upstream balance for a provider that has one. Charm Hyper answers
 // GET <base>/credits with the team's remaining Hypercredits ({"balance":N});
 // teams that turned hypercredit display off get {"balance_usd":X} instead and
-// NO shard figure at all. The unit resets on Hyper's own schedule, so the
-// gateway always reports exactly what the upstream says, never a cached or
-// invented remainder. Any other provider shape surfaces whatever the upstream
-// returned without guessing at its meaning.
+// NO shard figure at all. Every key of the provider is read and the team
+// balances are SUMMED: an operator pooling several Hyper keys wants the total
+// across all of them, not whichever key happens to lead rotation. Each key's
+// own figure is also returned so the total is auditable key by key. A key that
+// fails (bad credential, upstream error) is reported per key and never
+// contributes a phantom number to the total; ok is true when at least one key
+// reported a figure.
 app.get("/admin/providers/:id/credits", async (c) => {
   const denied = await requireAdmin(c);
   if (denied) return denied;
@@ -6278,37 +6281,55 @@ app.get("/admin/providers/:id/credits", async (c) => {
   const route = await c.env.DB.prepare("SELECT * FROM model_routes WHERE provider_id=? ORDER BY rank LIMIT 1").bind(id).first();
   const base = providerBaseFor(provider, route);
   if (!base) return c.json({ ok: false, error: "provider has no base_url", key_label: keys[0].label }, 200);
-  try {
-    // probeEgress(c, provider, route, key, url, method, headers, body, timeoutMs):
-    // a GET must carry no body, so the timeout goes in its own slot.
-    const res = await probeEgress(c, provider, route, keys[0].key, base + "/credits", "GET",
-      { Authorization: "Bearer " + keys[0].key }, null, 10000);
-    const status = res.response.status;
-    if (status !== 200) {
-      return c.json({
-        ok: false, status,
-        error: String(await res.response.text().catch(() => "")).slice(0, 200),
-        key_label: keys[0].label
-      }, 200);
+  const fetched_at = nowIso();
+  const perKey = [];
+  let balance = null;
+  let balance_usd = null;
+  for (const k of keys) {
+    const entry = { key_label: k.label };
+    perKey.push(entry);
+    try {
+      // probeEgress(c, provider, route, key, url, method, headers, body, timeoutMs):
+      // a GET must carry no body, so the timeout goes in its own slot.
+      const res = await probeEgress(c, provider, route, k.key, base + "/credits", "GET",
+        { Authorization: "Bearer " + k.key }, null, 10000);
+      const status = res.response.status;
+      if (status !== 200) {
+        entry.ok = false;
+        entry.status = status;
+        entry.error = String(await res.response.text().catch(() => "")).slice(0, 200);
+        continue;
+      }
+      const body = await res.response.json().catch(() => null);
+      const b = body && Number.isFinite(Number(body.balance)) ? Number(body.balance) : null;
+      const bu = body && Number.isFinite(Number(body.balance_usd)) ? Number(body.balance_usd) : null;
+      entry.ok = true;
+      entry.status = status;
+      entry.balance = b;
+      entry.balance_usd = bu;
+      entry.unit = b != null ? "hypercredits" : bu != null ? "usd" : null;
+      if (b != null) balance = (balance || 0) + b;
+      if (bu != null) balance_usd = (balance_usd || 0) + bu;
+    } catch (e) {
+      entry.ok = false;
+      entry.status = 0;
+      entry.error = String(e && e.message || e).slice(0, 200);
     }
-    const body = await res.response.json().catch(() => null);
-    const balance = body && Number.isFinite(Number(body.balance)) ? Number(body.balance) : null;
-    const balance_usd = body && Number.isFinite(Number(body.balance_usd)) ? Number(body.balance_usd) : null;
-    return c.json({
-      ok: true, status,
-      provider: { id: provider.id, name: provider.name },
-      base_url: base,
-      // Hypercredits when the team displays them; null means the upstream
-      // reports money instead (balance_usd) or returned no figure at all.
-      balance,
-      balance_usd,
-      unit: balance != null ? "hypercredits" : balance_usd != null ? "usd" : null,
-      key_label: keys[0].label,
-      fetched_at: nowIso()
-    }, 200);
-  } catch (e) {
-    return c.json({ ok: false, status: 0, error: String(e && e.message || e).slice(0, 200), key_label: keys[0].label }, 200);
   }
+  const anyOk = perKey.some((e) => e.ok);
+  return c.json({
+    ok: anyOk, status: anyOk ? 200 : 0,
+    provider: { id: provider.id, name: provider.name },
+    base_url: base,
+    // Sum across every key that reported a figure. null means no key reported
+    // one, not zero: an all-failed read must not look like an empty balance.
+    balance,
+    balance_usd,
+    unit: balance != null ? "hypercredits" : balance_usd != null ? "usd" : null,
+    keys: perKey,
+    key_label: keys.length === 1 ? keys[0].label : keys.length + " keys",
+    fetched_at
+  }, 200);
 });
 // ---------------------------------------------------------------------------
 // Model-integrity probes (ported from modelprobe): does this provider actually

@@ -1007,8 +1007,16 @@ async function showProviderCredits(id){
     if(pill){ pill.textContent='—'; pill.className='pill mut'; }
     html+='<div class="empty">The upstream reported no balance field.</div>';
   }
-  html+='<div class="small mono" style="margin:10px 0">GET '+esc(data.base_url||'')+'/credits · key '+esc(data.key_label||'')+(data.fetched_at?' · read '+esc(String(data.fetched_at).replace('T',' ').slice(0,19)):'')+'</div>';
-  html+='<p class="hint" style="margin:0">The balance resets on the upstream account schedule, not on this gateway. Hyper grants a fresh allowance each period and this figure is always a live read, never a cached one.</p>';
+  if(data.keys&&data.keys.length>1){
+    html+='<h3 class="sec" style="margin:14px 0 8px;font-size:12px">Per key</h3>';
+    html+=data.keys.map(function(k){
+      const own=k.balance!=null?(fmt(k.balance)+' shards'):(k.balance_usd!=null?money(k.balance_usd):(k.ok?'no figure':'failed'));
+      const pill=k.ok?(k.balance!=null||k.balance_usd!=null?'ok':'warn'):'bad';
+      return '<div class="kvrow"><span class="pill '+pill+'">'+esc(k.key_label)+'</span><span class="grow small">'+(k.error?('HTTP '+k.status+' · '+esc(String(k.error).slice(0,80))):esc(own))+'</span><span class="right mono small">'+(k.status?('HTTP '+k.status):'')+'</span></div>';
+    }).join('');
+  }
+  html+='<div class="small mono" style="margin:10px 0">GET '+esc(data.base_url||'')+'/credits · '+esc(data.key_label||'')+(data.fetched_at?' · read '+esc(String(data.fetched_at).replace('T',' ').slice(0,19)):'')+'</div>';
+  html+='<p class="hint" style="margin:0">The balance resets on the upstream account schedule, not on this gateway. The total sums every key that reported a figure; a key that failed contributes nothing, so the total is a floor, never an inflated guess.</p>';
   body.innerHTML=html;
 }
 async function manageProviderKeys(id){

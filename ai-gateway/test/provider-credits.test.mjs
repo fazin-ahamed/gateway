@@ -15,7 +15,7 @@ import { __test as gw } from "../src/index.js";
 const SCHEMA = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
 const AUTH = { authorization: "Bearer admin" };
 
-async function providerGateway() {
+async function providerGateway(keyCount = 1) {
   const { createApp } = await import("../src/index.js");
   const db = createDb(":memory:");
   db.exec(SCHEMA);
@@ -23,8 +23,10 @@ async function providerGateway() {
   const now = new Date().toISOString();
   db.prepare("INSERT INTO providers (id, name, base_url, transport, fmt, healthy, enabled, key_strategy, created_at) VALUES (?,?,?,?,?,1,1,?,?)")
     .bind(1, "Charm Hyper", "https://hyper.charm.land/v1", "direct", "openai", "round_robin", now).run();
-  db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)")
-    .bind(1, await gw.sealProviderKey(env, "sk-hyper-test"), "primary", now).run();
+  for (let i = 0; i < keyCount; i++) {
+    db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)")
+      .bind(1, await gw.sealProviderKey(env, "sk-hyper-test-" + i), "key-" + i, now).run();
+  }
   db.prepare("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES (?,?,?,0,1)")
     .bind("hyper/glm-5.3", 1, "glm-5.3").run();
   return { db, app: createApp(env) };
@@ -60,8 +62,7 @@ test("a Hyper balance answer returns the upstream's shards with unit hypercredit
   assert.equal(b.balance_usd, null);
   assert.ok(b.fetched_at, "the read is timestamped");
   assert.ok(seen.url.endsWith("/credits"), "the probe hits the credits path, got " + seen.url);
-  assert.equal(seen.headers.Authorization, "Bearer sk-hyper-test", "the provider's own key authenticates");
-  db.close?.();
+  assert.equal(seen.headers.Authorization, "Bearer sk-hyper-test-0", "the provider's own key authenticates");
 });
 
 test("a team with hypercredit display off gets balance_usd and NO shard figure", async () => {
@@ -85,10 +86,11 @@ test("a non-200 from the upstream is reported, not guessed", async () => {
     () => app.fetch(new Request("http://gw/admin/providers/1/credits", { headers: AUTH }))
   );
   const b = await result.json();
-  assert.equal(b.ok, false);
-  assert.equal(b.status, 401);
-  assert.match(b.error, /invalid api key/);
-  assert.equal(b.balance, undefined, "no balance field on failure");
+  assert.equal(b.ok, false, "every key failed, so the read is not ok");
+  assert.equal(b.balance, null, "an all-failed read must not look like zero balance");
+  assert.equal(b.keys.length, 1);
+  assert.equal(b.keys[0].status, 401);
+  assert.match(b.keys[0].error, /invalid api key/);
   db.close?.();
 });
 
@@ -126,6 +128,66 @@ test("the credits probe is a GET with no body, so undici never rejects it", asyn
   } finally {
     globalThis.fetch = orig;
   }
+  db.close?.();
+});
+
+test("multiple keys are summed into one balance with a per-key breakdown", async () => {
+  const { db, app } = await providerGateway(3);
+  let call = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => {
+    call++;
+    return jsonRes({ balance: 20 + call }); // 21, 22, 23 -> sum 66
+  };
+  try {
+    const res = await app.fetch(new Request("http://gw/admin/providers/1/credits", { headers: AUTH }));
+    const b = await res.json();
+    assert.equal(call, 3, "every key is read, not just the first");
+    assert.equal(b.ok, true);
+    assert.equal(b.balance, 66, "the total is the sum across all keys");
+    assert.equal(b.unit, "hypercredits");
+    assert.equal(b.keys.length, 3);
+    assert.deepEqual(b.keys.map((k) => k.balance).sort(), [21, 22, 23], "each key's own figure is auditable");
+    assert.equal(b.key_label, "3 keys");
+  } finally {
+    globalThis.fetch = orig;
+  }
+  db.close?.();
+});
+
+test("a failed key is reported per key and contributes nothing to the total", async () => {
+  const { db, app } = await providerGateway(2);
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(init.headers.Authorization).endsWith("test-0"))
+      return jsonRes({ error: { message: "revoked" } }, 401);
+    return jsonRes({ balance: 40 });
+  };
+  try {
+    const res = await app.fetch(new Request("http://gw/admin/providers/1/credits", { headers: AUTH }));
+    const b = await res.json();
+    assert.equal(b.ok, true, "one key reported, so the read is ok");
+    assert.equal(b.balance, 40, "only the working key's figure is summed, no phantom from the dead one");
+    assert.equal(b.keys.length, 2);
+    const failed = b.keys.find((k) => !k.ok);
+    assert.equal(failed.status, 401);
+    assert.match(failed.error, /revoked/);
+  } finally {
+    globalThis.fetch = orig;
+  }
+  db.close?.();
+});
+
+test("all keys failing reads as no balance, never zero", async () => {
+  const { db, app } = await providerGateway(2);
+  const { result } = await withStubFetch(
+    () => jsonRes({ error: { message: "down" } }, 503),
+    () => app.fetch(new Request("http://gw/admin/providers/1/credits", { headers: AUTH }))
+  );
+  const b = await result.json();
+  assert.equal(b.ok, false);
+  assert.equal(b.balance, null, "an all-failed pool must not read as an empty balance");
+  assert.ok(b.keys.every((k) => k.status === 503));
   db.close?.();
 });
 
