@@ -1,5 +1,8 @@
-// Router V2 shadow path. Never selects live traffic unless ROUTER_V2=live.
-// Default is shadow: compute the policy, attach it, leave V1 in control.
+// Router V2 selection. Live is the default since the measurement window
+// closed: the shadow-only era existed to compare V2 against V1 under real
+// traffic, and that comparison is done. ROUTER_V2=shadow restores the old
+// behavior exactly (V1 serves, V2 observes), and ROUTER_V2=off drops the V2
+// work entirely.
 //
 // The candidate universe is independent of V1. shadowFromV1 still exists as
 // a compatibility wrapper for tests that pass a V1-shaped list, but live
@@ -21,10 +24,11 @@ import {
 import { buildV2Universe, loadV2World, shadowFromUniverse, shapeV2Route } from "./candidates.js";
 
 export const ROUTER_V2_MODE = () => {
-  const raw = String(process.env.ROUTER_V2 || "shadow").toLowerCase();
+  const raw = String(process.env.ROUTER_V2 || "live").toLowerCase();
   if (raw === "off" || raw === "0" || raw === "false") return "off";
   if (raw === "live" || raw === "1" || raw === "true") return "live";
-  return "shadow";
+  if (raw === "shadow") return "shadow";
+  return "live";
 };
 
 // How often to build the V2 world for telemetry. The world costs several

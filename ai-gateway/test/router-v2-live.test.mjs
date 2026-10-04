@@ -53,10 +53,11 @@ test("shouldShadow honours mode and sample rate", async () => {
 
 test("ROUTER_V2_MODE reads off, shadow, and live", async () => {
   const { ROUTER_V2_MODE } = await import("../src/router/index.js");
-  await withEnv({ ROUTER_V2: undefined }, () => assert.equal(ROUTER_V2_MODE(), "shadow"));
+  await withEnv({ ROUTER_V2: undefined }, () => assert.equal(ROUTER_V2_MODE(), "live", "live is the default since the measurement window closed"));
   await withEnv({ ROUTER_V2: "off" }, () => assert.equal(ROUTER_V2_MODE(), "off"));
   await withEnv({ ROUTER_V2: "live" }, () => assert.equal(ROUTER_V2_MODE(), "live"));
-  await withEnv({ ROUTER_V2: "true" }, () => assert.equal(ROUTER_V2_MODE(), "live"));
+  await withEnv({ ROUTER_V2: "shadow" }, () => assert.equal(ROUTER_V2_MODE(), "shadow"));
+  await withEnv({ ROUTER_V2: "nonsense" }, () => assert.equal(ROUTER_V2_MODE(), "live", "an unrecognized value lands on live, the default"));
 });
 
 // --- the serving path, on a real database ---
@@ -156,6 +157,17 @@ test("a V2 pick that no eligible candidate carries falls back to V1", async () =
     const matched = decision.candidates.filter((c) => c.eligible).flatMap((c) => c.routeIds).includes(9999);
     assert.equal(matched, false, "route 9999 is not among the candidates");
     assert.ok(stale, "and the decision still carries a V1 result to fall back on");
+  });
+  db.close?.();
+});
+
+test("with no env set, auto serves from V2", async () => {
+  const { db, __test } = await autoGateway();
+  await withEnv({ ROUTER_V2: undefined, ROUTER_V2_SHADOW_SAMPLE: undefined }, async () => {
+    const decision = await __test.pickAutoModel({ env: { DB: db } }, { messages: [{ role: "user", content: "hi" }] }, null);
+    assert.ok(decision, "auto still decides");
+    assert.equal(decision.v2_served, true, "the host default is V2 live");
+    assert.equal(__test.decisionSnapshot(decision).policyName, "router-v2");
   });
   db.close?.();
 });
