@@ -5591,6 +5591,62 @@ app.get("/admin/accounts", async (c) => {
   ).all();
   return c.json({ accounts: rows.results || [], tokens: tokens.results || [] });
 });
+
+// Operator credit book: how much remains for every allocation the gateway
+// enforces, in one read. Accounts (the customers) and standalone keys each get
+// their own row; the grand totals add the remaining amounts so an operator can
+// answer "how much is left in total" without a spreadsheet. Uncapped rows
+// contribute usage to the used totals but never to the remaining totals,
+// because an infinite cap has no meaningful remainder to add.
+app.get("/admin/credits", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const accounts = await c.env.DB.prepare(
+    "SELECT ca.key_id, ca.username, ca.budget_mode, ca.budget_limit, ca.used_usd, ca.used_tokens FROM console_accounts ca ORDER BY ca.username"
+  ).all();
+  const keys = await c.env.DB.prepare(
+    "SELECT k.key_id, k.name, k.budget_mode, k.budget_limit, k.used_usd, k.used_tokens, k.active, k.account_id FROM api_keys k ORDER BY k.name"
+  ).all();
+  const quotaOf = (budget) => {
+    const mode = String(budget.budget_mode || "usd");
+    const used = mode === "usd" ? Number(budget.used_usd) || 0 : Number(budget.used_tokens) || 0;
+    const raw = budget.budget_limit == null ? null : Number(budget.budget_limit);
+    // api_keys.budget_limit is NOT NULL with 0 as the legacy no-cap marker;
+    // console_accounts uses real NULL. Either shape normalizes to total null,
+    // and available must derive from the SAME normalized total so an uncapped
+    // row reads total/available null, never a fake zero-remaining.
+    const total = Number.isFinite(raw) && raw > 0 ? raw : null;
+    return {
+      kind: mode === "tokens" ? "tokens" : "usd",
+      total,
+      used,
+      available: total == null ? null : Math.max(0, total - used)
+    };
+  };
+  const rows = [];
+  for (const a of accounts.results || []) {
+    const q = quotaOf(a);
+    rows.push({ kind: "account", id: a.key_id, name: a.username, quota: q });
+  }
+  for (const k of keys.results || []) {
+    const q = quotaOf(k);
+    rows.push({
+      kind: "key",
+      id: k.key_id,
+      name: k.name,
+      active: k.active === 1,
+      owned_by_account: k.account_id ? String(k.account_id) : null,
+      quota: q
+    });
+  }
+  const total = { usd: { used: 0, available: 0 }, tokens: { used: 0, available: 0 } };
+  for (const r of rows) {
+    const bucket = r.quota.kind === "tokens" ? total.tokens : total.usd;
+    bucket.used += r.quota.used;
+    bucket.available += r.quota.available || 0;
+  }
+  return c.json({ rows, total });
+});
 // Create the customer and hand back one link. Registered before the
 // /admin/accounts/:id routes so Hono does not treat "accounts" as an id.
 app.post("/admin/accounts", async (c) => {
@@ -5952,6 +6008,24 @@ var PROVIDER_PRESETS = [
     routes: [
       { slug: "z-ai/glm-4.6", upstream_model: "glm-4.6" },
       { slug: "z-ai/glm-4.5", upstream_model: "glm-4.5" }
+    ]
+  },
+  {
+    id: "charm-hyper",
+    label: "Charm Hyper — OpenAI-compatible (hyper.charm.land/v1)",
+    summary: "Coding-focused inference from Charm. OpenAI-compatible chat completions; key from hyper.charm.land. Seeds GLM, DeepSeek, Kimi, and Qwen picks.",
+    fmt: "openai",
+    name: "Charm Hyper",
+    base_url: "https://hyper.charm.land/v1",
+    transport: "auto",
+    credential_hint: "Paste the API key from your hyper.charm.land account.",
+    credential_format: "api_key",
+    routes: [
+      { slug: "hyper/glm-5.3", upstream_model: "glm-5.3" },
+      { slug: "hyper/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
+      { slug: "hyper/deepseek-v4.1-flash", upstream_model: "deepseek-v4.1-flash" },
+      { slug: "hyper/kimi-k3", upstream_model: "kimi-k3" },
+      { slug: "hyper/qwen3.8-max", upstream_model: "qwen3.8-max" }
     ]
   }
 ];

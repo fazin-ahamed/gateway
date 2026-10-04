@@ -8,6 +8,7 @@ var PLAYGROUND_HTML = `<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5.0.46/dist/full.min.css" rel="stylesheet" type="text/css" />
 <style>
   :root{
     color-scheme:dark;
@@ -243,6 +244,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="auto">Auto</button>
   <button type="button" data-tab="proxies">Proxies</button>
   <button type="button" data-tab="tokens">Device tokens</button>
+  <button type="button" data-tab="credits">Credits</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -564,6 +566,16 @@ var PLAYGROUND_HTML = `<!doctype html>
     </div></div>
   </section>
 
+  <section class="tab" id="tab-credits">
+    <div class="pagehead"><div><h2 class="sec">Credits</h2><p class="sub">Remaining allocation across every account and key this gateway enforces. Totals add the remainders of capped rows; uncapped rows contribute usage only, because an infinite cap has no remainder.</p></div></div>
+    <div id="credits-root" data-theme="dark">
+      <div class="hero-stats" id="credits-total" style="margin-bottom:12px"></div>
+      <div class="panel" style="background:transparent;border:0;box-shadow:none;padding:0">
+        <div class="panel-b flush" id="credits-list"></div>
+      </div>
+    </div>
+  </section>
+
 
   <section class="tab" id="tab-logs">
     <div class="pagehead"><div><h2 class="sec">Logs</h2><p class="sub">Live request and provider events from this process. In memory only; the ring holds the last 500 lines and resets on restart.</p></div><div class="actions"><label class="pg-check" style="margin:0"><input type="checkbox" id="lg-auto"> Auto</label><button class="ghost" id="lg-refresh">Refresh</button><button class="ghost" id="lg-copy">Copy</button></div></div>
@@ -625,6 +637,7 @@ async function selectTab(t){
     if(t==='trajectories') await loadTrajectories();
     if(t==='proxies') await loadProxies();
     if(t==='tokens') await loadZaiTokens();
+    if(t==='credits') await loadCredits();
     if(t==='logs') await loadLogs();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
@@ -2457,6 +2470,44 @@ document.addEventListener('click',function(e){
     loadLimits();
   });
 });
+
+// ---------- CREDITS ----------
+// Admin-only credit book (/admin/credits): grand totals plus one row per
+// account and key. USD and tokens are separate buckets; each bucket's
+// "remaining" adds only capped rows, while usage counts everything.
+function creditQuotaLabel(q){
+  if(q.kind==='tokens'){
+    const total=q.total==null?'uncapped':fmt(q.total);
+    const left=q.available==null?fmt(q.used)+' used':fmt(q.available)+' left of '+total;
+    return left;
+  }
+  const total=q.total==null?'uncapped':money(q.total);
+  return q.available==null?money(q.used)+' used':money(q.available)+' left of '+total;
+}
+async function loadCredits(){
+  const totalEl=document.getElementById('credits-total');
+  const listEl=document.getElementById('credits-list');
+  paintSkeleton(totalEl,'stats');
+  paintSkeleton(listEl);
+  let data; try{ const res=await api('/admin/credits'); data=res.data; }catch(e){ paintLoadError(totalEl,'Could not load credits: '+e.message,loadCredits); paintLoadError(listEl,'Could not load credits: '+e.message,loadCredits); return; }
+  const usd=data&&data.total&&data.total.usd||{used:0,available:0};
+  const tok=data&&data.total&&data.total.tokens||{used:0,available:0};
+  totalEl.innerHTML=
+    '<div class="stat"><div class="k">USD remaining (grand total)</div><div class="v acc">'+money(usd.available)+'</div><div class="sub2">'+money(usd.used)+' spent across all rows</div></div>'
+    +'<div class="stat"><div class="k">Tokens remaining (grand total)</div><div class="v acc">'+fmt(tok.available)+'</div><div class="sub2">'+fmt(tok.used)+' spent across all rows</div></div>'
+    +'<div class="stat"><div class="k">Accounts</div><div class="v">'+((data&&data.rows||[]).filter(function(r){return r.kind==='account';}).length)+'</div><div class="sub2">customers with their own cap</div></div>'
+    +'<div class="stat"><div class="k">Keys</div><div class="v">'+((data&&data.rows||[]).filter(function(r){return r.kind==='key';}).length)+'</div><div class="sub2">including shared-pool and operator keys</div></div>';
+  const rows=(data&&data.rows||[]).map(function(r){
+    const who=r.kind==='account'?'account':'key';
+    const pill=r.kind==='account'?'<span class="pill acc">account</span>':'<span class="pill mut">key</span>';
+    const owner=r.kind==='key'&&r.owned_by_account?'<span class="pill mut">'+esc(r.owned_by_account)+'</span>':'';
+    const active=r.kind==='key'?(r.active?'<span class="pill ok">active</span>':'<span class="pill bad">off</span>'):'';
+    const pct=r.quota&&r.quota.total&&r.quota.total>0?Math.max(0,Math.min(100,Math.round(r.quota.available/r.quota.total*100))):null;
+    const meter=pct==null?'':'<progress class="progress w-24" value="'+pct+'" max="100"></progress>';
+    return '<tr><td>'+pill+'</td><td class="mono">'+esc(r.id)+'</td><td>'+esc(r.name||'')+'</td><td style="display:flex;gap:6px;flex-wrap:wrap">'+owner+active+'</td><td class="mono">'+esc(creditQuotaLabel(r.quota))+'</td><td>'+meter+'</td></tr>';
+  }).join('') || '<tr><td colspan="6"><div class="empty">No accounts or keys yet. Create one in Accounts or API keys.</div></td></tr>';
+  listEl.innerHTML='<table><tr><th>Kind</th><th>Id</th><th>Name</th><th>Scope</th><th>Remaining</th><th>Used</th></tr>'+rows+'</table>';
+}
 
 // init
 loadOverview();
