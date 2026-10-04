@@ -6260,6 +6260,56 @@ app.post("/admin/providers/:id/test", async (c) => {
     return c.json({ ok: false, status: 0, error: String(e && e.message || e).slice(0, 200), key_label: keys[0].label, fmt: provider.fmt }, 200);
   }
 });
+// Live upstream balance for a provider that has one. Charm Hyper answers
+// GET <base>/credits with the team's remaining Hypercredits ({"balance":N});
+// teams that turned hypercredit display off get {"balance_usd":X} instead and
+// NO shard figure at all. The unit resets on Hyper's own schedule, so the
+// gateway always reports exactly what the upstream says, never a cached or
+// invented remainder. Any other provider shape surfaces whatever the upstream
+// returned without guessing at its meaning.
+app.get("/admin/providers/:id/credits", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const id = Number(c.req.param("id"));
+  const provider = await c.env.DB.prepare("SELECT id, name, fmt, base_url FROM providers WHERE id=?").bind(id).first();
+  if (!provider) return c.json({ error: { message: "provider not found" } }, 404);
+  const keys = await providerKeys(c, id);
+  if (!keys.length) return c.json({ ok: false, error: "provider has no usable key", key_label: null }, 200);
+  const route = await c.env.DB.prepare("SELECT * FROM model_routes WHERE provider_id=? ORDER BY rank LIMIT 1").bind(id).first();
+  const base = providerBaseFor(provider, route);
+  if (!base) return c.json({ ok: false, error: "provider has no base_url", key_label: keys[0].label }, 200);
+  try {
+    // probeEgress(c, provider, route, key, url, method, headers, body, timeoutMs):
+    // a GET must carry no body, so the timeout goes in its own slot.
+    const res = await probeEgress(c, provider, route, keys[0].key, base + "/credits", "GET",
+      { Authorization: "Bearer " + keys[0].key }, null, 10000);
+    const status = res.response.status;
+    if (status !== 200) {
+      return c.json({
+        ok: false, status,
+        error: String(await res.response.text().catch(() => "")).slice(0, 200),
+        key_label: keys[0].label
+      }, 200);
+    }
+    const body = await res.response.json().catch(() => null);
+    const balance = body && Number.isFinite(Number(body.balance)) ? Number(body.balance) : null;
+    const balance_usd = body && Number.isFinite(Number(body.balance_usd)) ? Number(body.balance_usd) : null;
+    return c.json({
+      ok: true, status,
+      provider: { id: provider.id, name: provider.name },
+      base_url: base,
+      // Hypercredits when the team displays them; null means the upstream
+      // reports money instead (balance_usd) or returned no figure at all.
+      balance,
+      balance_usd,
+      unit: balance != null ? "hypercredits" : balance_usd != null ? "usd" : null,
+      key_label: keys[0].label,
+      fetched_at: nowIso()
+    }, 200);
+  } catch (e) {
+    return c.json({ ok: false, status: 0, error: String(e && e.message || e).slice(0, 200), key_label: keys[0].label }, 200);
+  }
+});
 // ---------------------------------------------------------------------------
 // Model-integrity probes (ported from modelprobe): does this provider actually
 // serve the model a route claims, or is it a reseller answering with something
@@ -6273,9 +6323,11 @@ function providerBaseFor(provider, route) {
 // The body must be forwarded: a probe with a dropped body looks like a request
 // for no model at all, which many gateways answer with 200 for anything.
 async function probeEgress(c, provider, route, key, url, method, headers, body, timeoutMs) {
-  const transport = routeTransport(route, c.env);
+  // route is null for a provider with no model route yet; a balance or health
+  // read must still work off the provider's own base_url.
+  const transport = routeTransport(route || { transport: "direct" }, c.env);
   const merged = withExtraHeaders(headers, route);
-  if (transport === "oci" && route.proxy_url)
+  if (transport === "oci" && route && route.proxy_url)
     return fetchViaProxy(c, route.proxy_url, url, method, merged, body);
   if (transport === "koyeb") {
     const providerName = String((route && route.provider_name) || (provider && provider.name) || "").toLowerCase();

@@ -973,10 +973,43 @@ async function loadProviders(){
     // stays listed and probed), "disable" takes it out of rotation entirely.
     const healthBtn=on?('<button class="ghost" data-act="ptoggle" data-id="'+p.id+'" data-h="'+(p.healthy?'1':'0')+'">'+(p.healthy?'mark down':'mark up')+'</button>'):'';
     const switchBtn=on?('<button class="danger" data-act="pdisable" data-id="'+p.id+'" title="Take this provider out of rotation: its slugs stop being advertised and routed">disable</button>'):('<button class="ghost" data-act="penable" data-id="'+p.id+'" title="Put this provider back into rotation">enable</button>');
-    return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td>'+keys+'</td><td>'+esc(p.key_strategy||'round_robin')+'</td><td><span class="pill '+cls+'">'+state+'</span></td>'+
-      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="pverify" data-id="'+p.id+'" title="Probe what this provider really serves: tokenizer fingerprint, relay routing, identity, limits">verify</button> '+healthBtn+' '+switchBtn+' <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
-  }).join('')||'<tr><td colspan="7"><div class="empty">No providers yet.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>Keys</th><th>Strategy</th><th>State</th><th></th></tr>'+rows+'</table>';
+    // Live upstream balance pill (Charm Hyper shards). Empty until fetched:
+    // the figure is a live upstream read, not a stored field.
+    return '<tr><td><b>'+esc(p.name)+'</b><div class="small mono">'+esc(p.base_url||'')+'</div></td><td>'+esc(p.fmt||'')+'</td><td>'+esc(p.transport||'auto')+'</td><td>'+keys+'</td><td>'+esc(p.key_strategy||'round_robin')+'</td><td><span class="pill mut" data-credits-for="'+p.id+'">—</span></td><td><span class="pill '+cls+'">'+state+'</span></td>'+
+      '<td class="rowact"><button class="ghost" data-act="pkeys" data-id="'+p.id+'">keys</button> <button class="ghost" data-act="pedit" data-id="'+p.id+'">edit</button> <button class="ghost" data-act="pverify" data-id="'+p.id+'" title="Probe what this provider really serves: tokenizer fingerprint, relay routing, identity, limits">verify</button> <button class="ghost" data-act="pcredits" data-id="'+p.id+'" title="Fetch the live balance this provider reports upstream, e.g. remaining Charm Hyper shards">credits</button> '+healthBtn+' '+switchBtn+' <button class="danger" data-act="pdel" data-id="'+p.id+'">delete</button></td></tr>';
+  }).join('')||'<tr><td colspan="8"><div class="empty">No providers yet.</div></td></tr>';
+  el.innerHTML='<table><tr><th>Provider</th><th>Format</th><th>Transport</th><th>Keys</th><th>Strategy</th><th>Balance</th><th>State</th><th></th></tr>'+rows+'</table>';
+}
+// Live upstream balance: reads what the provider itself reports (Charm Hyper
+// answers GET <base>/credits with the team's remaining Hypercredits). The unit
+// is the upstream's own; no figure is invented and no reset date is fabricated
+// because the API returns none. The row pill mirrors the modal so the table
+// carries the number without opening anything.
+async function showProviderCredits(id){
+  const pill=document.querySelector('[data-credits-for="'+id+'"]');
+  if(pill){ pill.textContent='…'; pill.className='pill mut'; }
+  let data; try{ const res=await api('/admin/providers/'+id+'/credits'); data=res.data; }catch(e){ if(pill){ pill.textContent='err'; pill.className='pill bad'; } toast('credits failed: '+e.message,'err'); return; }
+  const body=document.getElementById('modal-body');
+  document.querySelector('.modal').classList.remove('wide');
+  document.getElementById('modal-title').textContent='Balance: '+((data&&data.provider&&data.provider.name)||id);
+  document.getElementById('modal-title').style.color='';
+  const save=document.getElementById('modal-save'); save.style.display='none';
+  document.getElementById('overlay').classList.add('show');
+  if(!data||!data.ok){ body.innerHTML='<div class="empty">Upstream did not report a balance'+(data&&data.status?' (HTTP '+data.status+')':'')+'. '+(data&&data.error?esc(data.error):'The provider may not expose a credits endpoint.')+'</div>'; save.style.display=''; if(pill){ pill.textContent='—'; pill.className='pill mut'; } return; }
+  let html='';
+  if(data.balance!=null){
+    if(pill){ pill.textContent=fmt(data.balance)+' shards'; pill.className='pill acc'; }
+    html+='<div class="kvrow"><span class="pill acc">'+fmt(data.balance)+'</span><span class="grow small">shards (Hypercredits) remaining</span></div>';
+  } else if(data.balance_usd!=null){
+    if(pill){ pill.textContent=money(data.balance_usd); pill.className='pill acc'; }
+    html+='<div class="kvrow"><span class="pill acc">'+money(data.balance_usd)+'</span><span class="grow small">remaining (this account reports dollars, not shards)</span></div>';
+  } else {
+    if(pill){ pill.textContent='—'; pill.className='pill mut'; }
+    html+='<div class="empty">The upstream reported no balance field.</div>';
+  }
+  html+='<div class="small mono" style="margin:10px 0">GET '+esc(data.base_url||'')+'/credits · key '+esc(data.key_label||'')+(data.fetched_at?' · read '+esc(String(data.fetched_at).replace('T',' ').slice(0,19)):'')+'</div>';
+  html+='<p class="hint" style="margin:0">The balance resets on the upstream account schedule, not on this gateway. Hyper grants a fresh allowance each period and this figure is always a live read, never a cached one.</p>';
+  body.innerHTML=html;
 }
 async function manageProviderKeys(id){
   const provs=(await api('/admin/providers')).data.providers||[];
@@ -1130,6 +1163,7 @@ document.addEventListener('click', function(e){
   else if(act==='pdisable') switchProvider(id, false);
   else if(act==='penable') switchProvider(id, true);
   else if(act==='pverify') verifyProvider(id);
+  else if(act==='pcredits') showProviderCredits(id);
   else if(act==='pdel') delProvider(id);
   else if(act==='redit') editRoute(id);
   else if(act==='rverify') verifyProvider(id, btn.getAttribute('data-slug'));
