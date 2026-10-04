@@ -4719,16 +4719,32 @@ async function storeResponseCache(c, entry) {
     blog("RESPONSE_CACHE store unavailable");
   }
 }
+// Which account a request's spend belongs to. An account-owned key carries
+// account_id; in the legacy 1:1 shape the account's own key IS the account
+// row's key_id and api_keys.account_id is NULL, so both spellings must reach
+// the same debit or that account's spend stays frozen at zero while its key
+// counter grows — exactly the "key says I spent, usage says nothing" gap.
+function spendAccountId(key) {
+  return (key && (key.account_id || key.key_id)) || null;
+}
 async function recordUsage(c, key, usage) {
   if (!key || !key.key_id)
     return;
   await c.env.DB.prepare(
     "UPDATE api_keys SET used_tokens=used_tokens+?, used_usd=used_usd+?, request_count=request_count+1, updated_at=? WHERE key_id=?"
   ).bind(usage.total_tokens, usage.cost_usd || 0, nowIso(), key.key_id).run();
-  if (key.account_id)
-    await c.env.DB.prepare(
-      "UPDATE console_accounts SET used_tokens=used_tokens+?, used_usd=used_usd+? WHERE key_id=?"
-    ).bind(usage.total_tokens, usage.cost_usd || 0, key.account_id).run();
+  // Debit the account only when this key actually belongs to one. spendAccountId
+  // falls back to the key's own id in the legacy shape; the console_accounts
+  // row is the authority on whether that id names an account.
+  const acctId = spendAccountId(key);
+
+  if (acctId) {
+    const owner = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(acctId).first();
+    if (owner)
+      await c.env.DB.prepare(
+        "UPDATE console_accounts SET used_tokens=used_tokens+?, used_usd=used_usd+? WHERE key_id=?"
+      ).bind(usage.total_tokens, usage.cost_usd || 0, acctId).run();
+  }
 }
 
 // ---- Trajectory capture (RL / SFT) ----
@@ -5272,14 +5288,20 @@ async function authClient(c) {
       error: { message: `Key budget exceeded (${unit}). Used ${fmt(key.budget_mode === "usd" ? key.used_usd : key.used_tokens)} / ${fmt(key.budget_limit)} ${unit}.`, type: "budget_exceeded" }
     }, 429);
   }
-  if (key.account_id) {
-    const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit, used_usd, used_tokens FROM console_accounts WHERE key_id=?").bind(key.account_id).first();
+  // The account cap, resolved by real ownership: account_id when the key is
+  // owned, the key's own id when it IS the account's key in the legacy shape.
+  // The console_accounts row is the authority; without one, no cap applies.
+  const capAccountId = spendAccountId(key);
+  if (capAccountId) {
+    const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit, used_usd, used_tokens FROM console_accounts WHERE key_id=?").bind(capAccountId).first();
     if (account && account.budget_limit != null) {
       const spent = account.budget_mode === "tokens" ? Number(account.used_tokens) || 0 : Number(account.used_usd) || 0;
       if (spent >= Number(account.budget_limit))
         return c.json({ error: { message: "Account spend limit reached.", type: "budget_exceeded" } }, 429);
     }
   }
+
+
   const rateDenied = await enforceRequestLimit(c, key);
   if (rateDenied)
     return rateDenied;
@@ -8113,7 +8135,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { recordUsage, __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

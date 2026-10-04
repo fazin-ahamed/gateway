@@ -306,7 +306,33 @@ export function migrateConsoleAccounts(db) {
       db.exec("ALTER TABLE api_keys ADD COLUMN console_auth INTEGER NOT NULL DEFAULT 1");
       added.push("console_auth");
     }
+    // One-time reconciliation: before the dual-shape debit fix, spend by a
+    // legacy account's own key never reached the account counters, so every
+    // console surface understated that account. Sum the owned keys' counters
+    // onto the account once; the per-request debit keeps it true afterwards.
+    // The zero-guard makes it idempotent per account and harmless for accounts
+    // that already carried spend under the fixed debit.
+    try {
+      const stamped = db.prepare("SELECT value FROM gateway_settings WHERE key='account_spend_backfilled'").first();
+      if (!stamped) {
+        db.exec(`UPDATE console_accounts SET
+          used_usd = used_usd + COALESCE((
+            SELECT SUM(k.used_usd) FROM api_keys k
+            WHERE k.account_id = console_accounts.key_id OR k.key_id = console_accounts.key_id
+          ), 0),
+          used_tokens = used_tokens + COALESCE((
+            SELECT SUM(k.used_tokens) FROM api_keys k
+            WHERE k.account_id = console_accounts.key_id OR k.key_id = console_accounts.key_id
+          ), 0)
+          WHERE used_usd = 0 AND used_tokens = 0`);
+        db.exec("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('account_spend_backfilled','1','backfill')");
+        added.push("account.spend_backfill");
+      }
+    } catch (e) {
+      console.warn("[gateway] account spend backfill skipped:", e.message);
+    }
     return added;
+
   } catch (e) {
     console.warn("[gateway] console accounts migration skipped:", e.message);
     return added;
