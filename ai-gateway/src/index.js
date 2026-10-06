@@ -3700,9 +3700,21 @@ function circuitOpen(kindOrKey, id) {
     return true;
   if (s.openUntil && now >= s.openUntil) {
     // OPEN → HALF_OPEN: exactly one in-flight probe may try the provider.
-    if (s.probeUsed)
-      return true;
+    if (s.probeUsed) {
+      // A probe that failed into a class the audit gate FILTERS (relay 400s,
+      // caller-side 4xx) never reaches recordFailOn, so nothing would ever
+      // re-open or release the probe lock. Without a bound, probeUsed stays
+      // true forever and the breaker is deadlocked open by a single filtered
+      // probe failure. Release the lock after one base cooldown so the next
+      // request probes again: the probe window is bounded even when its
+      // outcome was classified as not-provider-health.
+      if (s.probeAt && now - s.probeAt < CIRCUIT_BASE_COOLDOWN_MS)
+        return true;
+      s.probeUsed = false;
+      s.halfOpen = false;
+    }
     s.probeUsed = true;
+    s.probeAt = now;
     s.halfOpen = true;
     return false;
   }
@@ -3763,6 +3775,27 @@ function circuitRecordOk(kind, id) {
 function recordFailOn(key, { expiresHintMs } = {}) {
   const now = Date.now();
   const s = circuitState.get(key) || { fails: 0, firstFail: 0, openUntil: 0, consecutiveOpens: 0, probeUsed: false, halfOpen: false };
+  // A HALF_OPEN probe that fails re-opens immediately with an escalated
+  // cooldown. Without this, the probe's single failure sat below the 3-strike
+  // threshold while probeUsed stayed true, deadlocking the breaker OPEN
+  // forever: no further probe was ever allowed, and only a success (which
+  // needed a probe) could clear it.
+  if (s.halfOpen && s.probeUsed) {
+    const n = Math.max(1, s.consecutiveOpens || 1);
+    const expo = Math.min(CIRCUIT_MAX_COOLDOWN_MS, CIRCUIT_BASE_COOLDOWN_MS * Math.pow(2, n));
+    const jitter = Math.floor(Math.random() * Math.floor(expo * 0.2));
+    const cooldown = expiresHintMs ? Math.max(1000, Math.min(CIRCUIT_MAX_COOLDOWN_MS, expiresHintMs * 1000)) : expo + jitter;
+    s.openUntil = now + cooldown;
+    s.openedAt = now;
+    s.cooldownMs = cooldown;
+    s.probeUsed = false;
+    s.halfOpen = false;
+    s.fails = 0;
+    s.firstFail = 0;
+    s.consecutiveOpens = n + 1;
+    circuitState.set(key, s);
+    return;
+  }
   // Rolling window: failures older than the window do not accumulate.
   if (!s.firstFail || now - s.firstFail > CIRCUIT_WINDOW_MS) {
     s.firstFail = now;
@@ -6250,7 +6283,7 @@ app.post("/admin/providers/:id/test", async (c) => {
   if (denied)
     return denied;
   const id = Number(c.req.param("id"));
-  const provider = await c.env.DB.prepare("SELECT id, name, fmt FROM providers WHERE id=?").bind(id).first();
+  const provider = await c.env.DB.prepare("SELECT id, name, fmt, base_url FROM providers WHERE id=?").bind(id).first();
   if (!provider)
     return c.json({ error: { message: "provider not found" } }, 404);
   const keys = await providerKeys(c, id);
@@ -6270,8 +6303,19 @@ app.post("/admin/providers/:id/test", async (c) => {
     const res = await probeEgress(c, provider, route, keys[0].key, probeBase + "/chat/completions", "POST",
       { "Content-Type": "application/json", Authorization: "Bearer " + keys[0].key }, 12000);
     const status = res.response.status;
+    const ok = status >= 200 && status < 400;
+    // A successful test button probe is live evidence the upstream serves this
+    // route with this key. Release the provider, route, and key breakers so
+    // serving picks the route up again instead of hiding behind stale
+    // in-process state - the operator just watched a real request succeed.
+    if (ok) {
+      circuitRecordOk("provider", id);
+      if (route && route.id != null)
+        circuitRecordOk("route", route.id);
+      circuitRecordOk("key", keys[0].keyId);
+    }
     return c.json({
-      ok: status >= 200 && status < 400,
+      ok,
       status,
       error: status >= 400 ? String(await res.response.text().catch(() => "")).slice(0, 200) : null,
       key_label: keys[0].label,
@@ -6559,6 +6603,11 @@ app.post("/admin/providers/:id/toggle", async (c) => {
   const id = Number(c.req.param("id"));
   await c.env.DB.prepare("UPDATE providers SET healthy = CASE WHEN healthy=1 THEN 0 ELSE 1 END WHERE id=?").bind(id).run();
   const p = await c.env.DB.prepare("SELECT id, healthy FROM providers WHERE id=?").bind(id).first();
+  // Marking a provider up is operator evidence the upstream is fine; the
+  // in-process breaker must never override that judgment with stale state.
+  // The toggle flips health, so a mark-UP clears the provider breaker.
+  if (p && p.healthy)
+    circuitRecordOk("provider", id);
   return c.json({ id: p.id, healthy: !!p.healthy });
 });
 // Explicit off-switch endpoints. Separate from /toggle (health): disable takes
