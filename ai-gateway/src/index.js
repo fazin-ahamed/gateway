@@ -1849,6 +1849,56 @@ async function cachedPrompt(c, requestId, cacheState) {
 // A decision model is never a chat model: the two endpoints refuse each other.
 // The decision inference path, shared by the API-key surface and the console
 // playground. `key` is null for the admin playground, exactly like chat.
+// ---- Per-slug route selection mode ---------------------------------------
+// A slug's routes walk in rank order by default. An operator can flip a slug
+// to "fastest": serving then reorders its candidate routes by measured
+// latency EMA (router_stats, scope 'route') before the usual walk, so the
+// lowest-latency route serves first. Routes without latency data keep their
+// rank order AFTER the measured ones, so a brand-new route never outranks a
+// proven-fast one and an unmeasured pool degrades to today's behavior.
+// Health, circuit state, key rotation and fallback-on-failure are unchanged:
+// the reorder happens before the walk, and a failed first pick still falls
+// through to the next candidate exactly like a rank failure does.
+const SLUG_SELECTION_MODES = ["rank", "fastest"];
+
+async function slugSelectionMode(c, slug) {
+  const raw = await settingValue(c, "slug_selection:" + String(slug || ""), "");
+  try {
+    const parsed = raw ? JSON.parse(raw) : null;
+    const mode = parsed && SLUG_SELECTION_MODES.includes(parsed.mode) ? parsed.mode : "rank";
+    return mode;
+  } catch {
+    return "rank";
+  }
+}
+
+async function reorderRoutesByMode(c, slug, routes) {
+  if (!Array.isArray(routes) || routes.length < 2)
+    return routes;
+  const mode = await slugSelectionMode(c, slug);
+  if (mode !== "fastest")
+    return routes;
+  const rows = await c.env.DB.prepare(
+    "SELECT scope_id, latency_ema FROM router_stats WHERE scope='route' AND task_type=''"
+  ).all();
+  const ema = new Map();
+  for (const r of rows.results || []) {
+    const v = Number(r.latency_ema);
+    if (Number.isFinite(v) && v > 0)
+      ema.set(String(r.scope_id), v);
+  }
+  // Stable sort: measured routes by latency ascending, unmeasured after them
+  // in their existing (rank) order.
+  return routes.slice().sort((a, b) => {
+    const ea = ema.get(String(a.id));
+    const eb = ema.get(String(b.id));
+    if (ea != null && eb != null) return ea - eb;
+    if (ea != null) return -1;
+    if (eb != null) return 1;
+    return 0;
+  });
+}
+
 async function runSystemOneDecision(c, key, options) {
   let body;
   try {
@@ -1873,7 +1923,7 @@ async function runSystemOneDecision(c, key, options) {
   const routes = await c.env.DB.prepare(
     "SELECT mr.*, p.name AS provider_name, p.healthy, p.enabled AS provider_enabled, p.fmt, p.base_url, p.transport, p.proxy_url, p.extra_headers, p.key_strategy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
   ).bind(slug).all();
-  const candidates = (routes.results || []).filter((r) => effectiveModelKind(r) === "decision");
+  const candidates = await reorderRoutesByMode(c, slug, (routes.results || []).filter((r) => effectiveModelKind(r) === "decision"));
   if (!candidates.length) {
     const chatOnly = (routes.results || []).length > 0;
     await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: chatOnly ? 400 : 503, attempts: 0 });
@@ -2097,7 +2147,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     const rows = await c.env.DB.prepare(
       "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat')='chat' ORDER BY mr.rank"
     ).bind(s).all();
-    for (const r of rows.results || [])
+    for (const r of await reorderRoutesByMode(c, s, rows.results || []))
       combined.push({ ...r, public_slug: s });
   }
   const routes = { results: combined };
@@ -6668,16 +6718,25 @@ app.get("/admin/routes", async (c) => {
             COALESCE(mr.model_kind,'chat') AS model_kind, mr.wire_format, mr.endpoint_path,
             mr.context_limit_override, mr.output_limit_override,
             p.name AS provider_name, p.healthy AS provider_healthy, p.enabled AS provider_enabled,
-            pr.verdict AS probe_verdict, pr.measured_family AS probe_measured_family, pr.created_at AS probe_at
+            pr.verdict AS probe_verdict, pr.measured_family AS probe_measured_family, pr.created_at AS probe_at,
+            rs.latency_ema AS latency_ema
      FROM model_routes mr
      JOIN providers p ON p.id=mr.provider_id
      LEFT JOIN provider_probe_runs pr ON pr.id = (
        SELECT MAX(id) FROM provider_probe_runs
        WHERE slug = mr.slug AND provider_id = mr.provider_id
      )
+     LEFT JOIN router_stats rs ON rs.scope='route' AND rs.scope_id=mr.id AND rs.task_type=''
      ORDER BY mr.slug, mr.rank`
   ).all();
-  return c.json({ routes: rows.results || [] });
+  // One selection mode per slug; the UI shows it once per slug card.
+  const modes = {};
+  for (const r of rows.results || []) {
+    const slug = String(r.slug);
+    if (!(slug in modes))
+      modes[slug] = await slugSelectionMode(c, slug);
+  }
+  return c.json({ routes: rows.results || [], selection_modes: modes });
 });
 app.post("/admin/routes/:id/toggle", async (c) => {
   const denied = await requireAdmin(c);
@@ -6687,6 +6746,31 @@ app.post("/admin/routes/:id/toggle", async (c) => {
   await c.env.DB.prepare("UPDATE model_routes SET enabled = CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?").bind(id).run();
   const r = await c.env.DB.prepare("SELECT id, enabled FROM model_routes WHERE id=?").bind(id).first();
   return c.json({ id: r.id, enabled: !!r.enabled });
+});
+
+// Per-slug route selection mode: "rank" (default, tried in order) or "fastest"
+// (reordered by measured latency EMA before the walk). One endpoint reads it
+// and one writes it, scoped to a single slug.
+app.get("/admin/routes/selection-mode/:slug", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const slug = String(c.req.param("slug") || "");
+  return c.json({ slug, mode: await slugSelectionMode(c, slug) });
+});
+app.put("/admin/routes/selection-mode/:slug", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const slug = String(c.req.param("slug") || "").trim();
+  let b;
+  try { b = await c.req.json(); } catch { return c.json({ error: { message: "Invalid JSON" } }, 400); }
+  const mode = String((b && b.mode) || "");
+  if (!SLUG_SELECTION_MODES.includes(mode))
+    return c.json({ error: { message: "mode must be one of " + SLUG_SELECTION_MODES.join(", ") } }, 400);
+  await c.env.DB.prepare(
+    "INSERT INTO gateway_settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+  ).bind("slug_selection:" + slug, JSON.stringify({ mode }), nowIso()).run();
+  blog("ROUTES slug=" + slug + " selection_mode=" + mode);
+  return c.json({ slug, mode });
 });
 app.get("/admin/routes/:id", async (c) => {
   const denied = await requireAdmin(c);
@@ -8353,7 +8437,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { recordUsage, __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { recordUsage, __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, slugSelectionMode, reorderRoutesByMode, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

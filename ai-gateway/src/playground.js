@@ -187,6 +187,12 @@ var PLAYGROUND_HTML = `<!doctype html>
   .kvrow:last-child{border-bottom:0}
   .kvrow .grow{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:12px}
   .kvrow .right{margin-left:auto;flex:0 0 auto}
+  /* Model-routes cards: one per public slug. The chain reads as a vertical
+     list inside the card, so a slug never repeats as a table column. */
+  .routegroup{padding:10px 14px;border:1px solid var(--line);border-radius:var(--radius);margin-bottom:10px;background:var(--surface-deep)}
+  .routegroup>.kvrow{border-bottom:1px solid var(--line-hi)}
+  .muted2{color:var(--muted-dim)}
+  .strong{font-weight:600;color:var(--text)}
   .empty{padding:24px 20px;text-align:center;color:var(--muted);font-size:11px;border:1px dashed var(--line-hi);border-radius:var(--radius-sm)}
   .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
   .form-grid .full{grid-column:1/-1}
@@ -1077,21 +1083,46 @@ async function loadRoutes(){
   const el=document.getElementById('routes-list');
   paintSkeleton(el);
   let data; try{ const res=await api('/admin/routes'); data=res.data; }catch(e){ paintLoadError(el,'Could not load routes: '+e.message,loadRoutes); return; }
-  const rows=(data.routes||[]).map(function(r){
-    // A route can be on while its provider is off: say so, otherwise a slug
-    // going dark looks like a routing bug.
-    const providerOff=r.provider_enabled===undefined?false:!r.provider_enabled;
-    const cls=(r.enabled&&r.provider_healthy&&!providerOff)?'ok':'bad';
-    const label=r.enabled?(providerOff?'<span class="pill bad">provider disabled</span>':(r.provider_healthy?'on':'<span class="pill bad">provider down</span>')):'off';
-    const role=r.rank===0?'<span class="pill acc">primary</span>':'<span class="pill mut">fallback '+esc(String(r.rank))+'</span>';
-    const verdict=r.probe_verdict
-      ? '<span class="pill '+verdictClass(r.probe_verdict)+'" title="'+(r.probe_measured_family?('measured '+r.probe_measured_family):'')+'">'+esc(r.probe_verdict)+'</span>'
-      : '<span class="pill mut">unverified</span>';
-    const kindPill=String(r.model_kind||'chat')==='decision'?' <span class="pill warn" title="Answers /v1/systemone, never /v1/chat/completions">decision</span>':'';
-    return '<tr><td class="mono">'+esc(r.slug)+kindPill+'</td><td>'+role+' <span class="mono small">rank '+esc(String(r.rank))+'</span></td><td>'+esc(r.provider_name||'')+'</td><td class="mono small">'+esc(r.upstream_model)+'</td><td><span class="pill '+cls+'">'+label+'</span></td><td>'+verdict+'</td>'+
-      '<td class="rowact"><button class="ghost" data-act="rverify" data-id="'+esc(String(r.provider_id))+'" data-slug="'+esc(r.slug)+'" title="Probe this slug only: tokenizer fingerprint, relay routing, identity, limits">verify</button> <button class="ghost" data-act="raddfb" data-slug="'+esc(r.slug)+'" data-provider="'+esc(String(r.provider_id))+'" data-model="'+esc(r.upstream_model)+'" data-rank="'+esc(String(r.rank))+' data-kind="'+esc(String(r.model_kind||"chat"))+'" data-wire="'+esc(String(r.wire_format||""))+'"">add fallback</button> <button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> <button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> <button class="danger" data-act="rdel" data-id="'+r.id+'">delete</button></td></tr>';
-  }).join('') || '<tr><td colspan="7"><div class="empty">No model routes yet.</div></td></tr>';
-  el.innerHTML='<table><tr><th>Slug</th><th>Role</th><th>Provider</th><th>Upstream model</th><th>Route</th><th>Integrity</th><th></th></tr>'+rows+'</table>';
+  const routes=data.routes||[];
+  const modes=data.selection_modes||{};
+  // Group by slug so each public model is ONE card: the slug, its selection
+  // mode, and the ordered candidate chain read top to bottom. No repeated
+  // slug column, no repeated add-fallback button per row.
+  const groups=new Map();
+  for(const r of routes){
+    if(!groups.has(r.slug)) groups.set(r.slug, []);
+    groups.get(r.slug).push(r);
+  }
+  if(!groups.size){ el.innerHTML='<div class="empty">No model routes yet. Add one.</div>'; return; }
+  el.innerHTML=[...groups.entries()].map(function(entry){
+    const slug=entry[0], rs=entry[1];
+    const mode=modes[slug]||'rank';
+    const modePill=mode==='fastest'?'<span class="pill acc" title="Serving tries the lowest-latency candidate first, from measured route latency">fastest</span>':'<span class="pill mut" title="Serving tries candidates in rank order">in order</span>';
+    const toggle='<button class="ghost" data-act="rmode" data-slug="'+esc(slug)+'" data-mode="'+esc(mode)+'">'+(mode==='fastest'?'use rank order':'use fastest')+'</button>';
+    const chat=rs.filter(function(r){return String(r.model_kind||'chat')!=='decision';});
+    const kindNote=chat.length&&chat.length<rs.length?' <span class="pill warn">decision route inside</span>':'';
+    const rows=rs.map(function(r,ix){
+      const providerOff=r.provider_enabled===undefined?false:!r.provider_enabled;
+      const cls=(r.enabled&&r.provider_healthy&&!providerOff)?'ok':'bad';
+      const label=r.enabled?(providerOff?'provider disabled':(r.provider_healthy?'on':'provider down')):'off';
+      const ema=r.latency_ema!=null?('~'+Math.round(Number(r.latency_ema))+'ms'):'no data';
+      const emaCls=r.latency_ema!=null?'pill acc':'pill mut';
+      const verdict=r.probe_verdict?('<span class="pill '+verdictClass(r.probe_verdict)+'" title="'+esc(r.probe_measured_family||'')+'">'+esc(r.probe_verdict)+'</span>'):'';
+      const kindPill=String(r.model_kind||'chat')==='decision'?'<span class="pill warn">decision</span>':'';
+      return '<div class="kvrow"><span class="pill mut">'+(ix+1)+'</span>'
+        +'<span class="grow"><span class="mono">'+esc(r.provider_name||'')+'</span> <span class="mono small muted2">'+esc(r.upstream_model)+'</span></span>'
+        +'<span class="'+emaCls+'" title="Rolling latency EMA from real serving attempts">'+esc(ema)+'</span>'
+        +'<span class="pill '+cls+'">'+esc(label)+'</span>'+verdict+kindPill
+        +'<span class="right"><button class="ghost" data-act="rverify" data-id="'+esc(String(r.provider_id))+'" data-slug="'+esc(slug)+'" title="Probe this route: tokenizer fingerprint, relay routing, identity">verify</button> '
+        +'<button class="ghost" data-act="redit" data-id="'+r.id+'">edit</button> '
+        +'<button class="ghost" data-act="rtoggle" data-id="'+r.id+'" data-e="'+r.enabled+'">'+(r.enabled?'disable':'enable')+'</button> '
+        +'<button class="danger" data-act="rdel" data-id="'+r.id+'">del</button></span></div>';
+    }).join('');
+    return '<div class="routegroup"><div class="kvrow"><span class="mono strong">'+esc(slug)+'</span>'
+      +'<span class="grow"></span>'+modePill+kindNote
+      +'<span class="right">'+toggle+' <button class="ghost" data-act="raddfb" data-slug="'+esc(slug)+'" data-kind="chat" data-wire="">add route</button></span></div>'
+      +rows+'</div>';
+  }).join('');
 }
 async function providerOptions(){
   const {data}=await api('/admin/providers'); return (data.providers||[]).map(function(p){return {value:String(p.id),label:esc(p.name)};});
@@ -1147,19 +1178,27 @@ async function addFallbackRoute(btn){
   if(!slug){ toast('route slug missing','err'); return; }
   const opts=await providerOptions();
   if(!opts.length){ toast('create a provider first','err'); return; }
-  const nextRank=Number(btn.getAttribute('data-rank')||'0')+1;
-  openModal('Add fallback for '+slug,[
-    {key:'provider_id',label:'Fallback provider',type:'select',value:btn.getAttribute('data-provider')||'',options:opts},
-    {key:'upstream_model',label:'Fallback upstream model id',value:btn.getAttribute('data-model')||''},
-    {key:'rank',label:'Rank (higher than '+esc(String(nextRank-1))+')',type:'number',value:String(nextRank)},
-    {key:'model_kind',label:'Model type',type:'select',value:String(btn.getAttribute('data-kind')||'chat'),options:[{value:'chat',label:'Chat'},{value:'decision',label:'Decision / System-One'}]},
+  openModal('Add route for '+slug,[
+    {key:'provider_id',label:'Provider',type:'select',options:opts},
+    {key:'upstream_model',label:'Upstream model id',placeholder:'model-id'},
+    {key:'model_kind',label:'Model type',type:'select',value:'chat',options:[{value:'chat',label:'Chat'},{value:'decision',label:'Decision / System-One'}]},
     {key:'enabled',label:'State',type:'select',value:'1',options:[{value:'1',label:'enabled'},{value:'0',label:'disabled'}]}
   ], async function(v){
-    v.provider_id=Number(v.provider_id); v.rank=Number(v.rank)||nextRank; v.enabled=v.enabled==='1';
-    const {status,data}=await api('/admin/routes',{method:'POST',body:JSON.stringify({slug:slug,provider_id:v.provider_id,upstream_model:v.upstream_model,rank:v.rank,model_kind:v.model_kind,wire_format:v.model_kind==='decision'?(btn.getAttribute('data-wire')||null):null,enabled:v.enabled})});
-    if(status===201){ toast('fallback added at rank '+v.rank,'ok'); closeModal(); loadRoutes(); }
+    v.provider_id=Number(v.provider_id); v.enabled=v.enabled==='1';
+    // Rank lands at the END of the chain automatically; the card shows the
+    // order, so the operator never types a rank number by hand.
+    const {data:rd}=await api('/admin/routes');
+    const siblings=(rd.routes||[]).filter(function(r){return r.slug===slug;});
+    const nextRank=siblings.length?Math.max.apply(null,siblings.map(function(r){return Number(r.rank)||0;}))+1:0;
+    const {status,data}=await api('/admin/routes',{method:'POST',body:JSON.stringify({slug:slug,provider_id:v.provider_id,upstream_model:v.upstream_model,rank:nextRank,model_kind:v.model_kind,enabled:v.enabled})});
+    if(status===201){ toast('route added at rank '+nextRank,'ok'); closeModal(); loadRoutes(); }
     else toast('add failed: '+(data&&data.error&&data.error.message||status),'err');
   });
+}
+async function setSlugMode(slug, mode){
+  const {status,data}=await api('/admin/routes/selection-mode/'+encodeURIComponent(slug),{method:'PUT',body:JSON.stringify({mode})});
+  if(status===200){ toast(slug+' now serves '+(mode==='fastest'?'the fastest route first':'routes in order'),'ok'); loadRoutes(); }
+  else toast('mode change failed: '+(data&&data.error&&data.error.message||status),'err');
 }
 
 // delegated clicks
@@ -1176,6 +1215,7 @@ document.addEventListener('click', function(e){
   else if(act==='redit') editRoute(id);
   else if(act==='rverify') verifyProvider(id, btn.getAttribute('data-slug'));
   else if(act==='raddfb') addFallbackRoute(btn);
+  else if(act==='rmode') setSlugMode(btn.getAttribute('data-slug'), btn.getAttribute('data-mode')==='fastest'?'rank':'fastest');
   else if(act==='rtoggle') toggleRoute(id, btn.getAttribute('data-e')==='1'?0:1);
   else if(act==='rdel') delRoute(id);
   else if(act==='tieredit') editTier(id);
