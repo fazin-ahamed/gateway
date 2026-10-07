@@ -77,6 +77,17 @@ Migration: `providers.enabled` is in `schema.sql` (fresh installs) and is added
 by an idempotent `ALTER TABLE` on Node boot, so an existing `data/gateway.db`
 picks it up on the next start with no manual step.
 
+## Account invite migrations
+
+New-account invites reserve an account ID before registration. Their token
+rows therefore cannot require an existing API key or account. On Node startup,
+the account migration rebuilds legacy token tables that still enforce that
+foreign key, preserving pending and consumed links in a transaction.
+Foreign-key enforcement remains enabled for the database.
+
+Deploy and restart the Node server to apply this migration before creating
+account links. Repeated starts leave the migrated token table unchanged.
+
 ## Provider formats
 
 The admin UI exposes normal API providers plus three Z.AI consumer transports.

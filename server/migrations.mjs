@@ -274,6 +274,31 @@ export function migrateConsoleAccounts(db) {
     if (!tokenCols.has("budget_mode")) db.exec("ALTER TABLE console_account_tokens ADD COLUMN budget_mode TEXT");
     if (!tokenCols.has("budget_limit")) db.exec("ALTER TABLE console_account_tokens ADD COLUMN budget_limit REAL");
     if (!tokenCols.has("tier_ids")) db.exec("ALTER TABLE console_account_tokens ADD COLUMN tier_ids TEXT");
+    const tokenRefs = db.prepare("PRAGMA foreign_key_list(console_account_tokens)").all().results || [];
+    if (tokenRefs.some((ref) => ref.from === "key_id")) {
+      db.exec("SAVEPOINT account_token_references");
+      try {
+        db.exec(`
+          CREATE TABLE console_account_tokens_rebuilt (
+            token_hash TEXT PRIMARY KEY, key_id TEXT NOT NULL, purpose TEXT NOT NULL,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT,
+            budget_mode TEXT, budget_limit REAL, tier_ids TEXT
+          );
+          INSERT INTO console_account_tokens_rebuilt
+            (token_hash, key_id, purpose, created_at, expires_at, used_at, budget_mode, budget_limit, tier_ids)
+          SELECT token_hash, key_id, purpose, created_at, expires_at, used_at, budget_mode, budget_limit, tier_ids
+          FROM console_account_tokens;
+          DROP TABLE console_account_tokens;
+          ALTER TABLE console_account_tokens_rebuilt RENAME TO console_account_tokens;
+          CREATE INDEX idx_account_tokens_key ON console_account_tokens(key_id, purpose);
+          RELEASE account_token_references;
+        `);
+        added.push("account_tokens.key_reference");
+      } catch (e) {
+        db.exec("ROLLBACK TO account_token_references; RELEASE account_token_references;");
+        throw e;
+      }
+    }
     const r = db.prepare("PRAGMA table_info(api_keys)").all();
     const names = new Set(((r && r.results) || []).map((c) => c && c.name));
     const acctCols = new Set(((db.prepare("PRAGMA table_info(console_accounts)").all().results) || []).map((c) => c && c.name));
