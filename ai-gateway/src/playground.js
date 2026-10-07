@@ -8,7 +8,6 @@ var PLAYGROUND_HTML = `<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet" />
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5.0.46/dist/full.min.css" rel="stylesheet" type="text/css" />
 <style>
   :root{
     color-scheme:dark;
@@ -194,6 +193,11 @@ var PLAYGROUND_HTML = `<!doctype html>
   .muted2{color:var(--muted-dim)}
   .strong{font-weight:600;color:var(--text)}
   .empty{padding:24px 20px;text-align:center;color:var(--muted);font-size:11px;border:1px dashed var(--line-hi);border-radius:var(--radius-sm)}
+  /* Credit meter: same track+fill language as the decision bars, so the
+     Credits tab needs no external stylesheet (the admin CSP allows inline
+     styles only - no third-party code). */
+  .usagebar{display:inline-block;width:96px;height:6px;border-radius:var(--r-pill);background:var(--surface-deep);border:1px solid var(--line);overflow:hidden;vertical-align:middle}
+  .usagebar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent-dim),var(--accent));transition:width var(--dur) var(--ease)}
   .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
   .form-grid .full{grid-column:1/-1}
   .modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
@@ -574,7 +578,7 @@ var PLAYGROUND_HTML = `<!doctype html>
 
   <section class="tab" id="tab-credits">
     <div class="pagehead"><div><h2 class="sec">Credits</h2><p class="sub">Remaining allocation across every account and key this gateway enforces. Totals add the remainders of capped rows; uncapped rows contribute usage only, because an infinite cap has no remainder.</p></div></div>
-    <div id="credits-root" data-theme="dark">
+    <div id="credits-root">
       <div class="hero-stats" id="credits-total" style="margin-bottom:12px"></div>
       <div class="panel" style="background:transparent;border:0;box-shadow:none;padding:0">
         <div class="panel-b flush" id="credits-list"></div>
@@ -2585,10 +2589,10 @@ async function loadCredits(){
     const owner=r.kind==='key'&&r.owned_by_account?'<span class="pill mut">'+esc(r.owned_by_account)+'</span>':'';
     const active=r.kind==='key'?(r.active?'<span class="pill ok">active</span>':'<span class="pill bad">off</span>'):'';
     const pct=r.quota&&r.quota.total&&r.quota.total>0?Math.max(0,Math.min(100,Math.round(r.quota.available/r.quota.total*100))):null;
-    const meter=pct==null?'':'<progress class="progress w-24" value="'+pct+'" max="100"></progress>';
+    const meter=pct==null?'':'<span class="usagebar" title="'+pct+'% remaining"><i style="width:'+pct+'%"></i></span>';
     return '<tr><td>'+pill+'</td><td class="mono">'+esc(r.id)+'</td><td>'+esc(r.name||'')+'</td><td style="display:flex;gap:6px;flex-wrap:wrap">'+owner+active+'</td><td class="mono">'+esc(creditQuotaLabel(r.quota))+'</td><td>'+meter+'</td></tr>';
   }).join('') || '<tr><td colspan="6"><div class="empty">No accounts or keys yet. Create one in Accounts or API keys.</div></td></tr>';
-  listEl.innerHTML='<table><tr><th>Kind</th><th>Id</th><th>Name</th><th>Scope</th><th>Remaining</th><th>Used</th></tr>'+rows+'</table>';
+  listEl.innerHTML='<table><tr><th>Kind</th><th>Id</th><th>Name</th><th>Scope</th><th>Remaining</th><th>Left</th></tr>'+rows+'</table>';
 }
 
 // init
