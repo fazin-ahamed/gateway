@@ -975,6 +975,13 @@ async function ensureAccountTokensTable(db) {
     await db.prepare("ALTER TABLE console_accounts ADD COLUMN used_tokens INTEGER NOT NULL DEFAULT 0").run();
   const keyCols = await db.prepare("PRAGMA table_info(api_keys)").all();
   const keyNames = new Set((keyCols.results || []).map((r) => r.name));
+  // An old host database may predate api_keys entirely (schema auto-apply
+  // happens at boot, but this lazy migration must not assume it succeeded).
+  // ALTER on a missing table would throw and 500 every account operation.
+  if (!keyCols.results || !keyCols.results.length) {
+    accountTokensMigrated.add(db);
+    return;
+  }
   if (!keyNames.has("account_id"))
     await db.prepare("ALTER TABLE api_keys ADD COLUMN account_id TEXT REFERENCES console_accounts(key_id) ON DELETE CASCADE").run();
   accountTokensMigrated.add(db);
@@ -5755,7 +5762,14 @@ app.get("/admin/credits", async (c) => {
 // Create the customer and hand back one link. Registered before the
 // /admin/accounts/:id routes so Hono does not treat "accounts" as an id.
 app.post("/admin/accounts", async (c) => {
-  await ensureAccountTokensTable(c.env.DB);
+  try {
+    await ensureAccountTokensTable(c.env.DB);
+  } catch (e) {
+    // A migration failure on an old host database must surface as a readable
+    // error, never a bare 500 with no reason.
+    blog("ACCOUNTS migration failed: " + String(e.message || e));
+    return c.json({ error: { message: "The account tables could not be prepared on this database: " + String(e.message || e) } }, 500);
+  }
   const denied = await requireAdmin(c);
   if (denied) return denied;
   let body;
@@ -5768,7 +5782,13 @@ app.post("/admin/accounts", async (c) => {
   try { tierIds = normalizeTierIds(body.tier_ids); await validateTierIds(c, tierIds); }
   catch (e) { return c.json({ error: { message: e.message } }, 400); }
   const id = "acct_" + uuid().replace(/-/g, "");
-  const issued = await issueAccountToken(c, id, "invite", { budget_mode, budget_limit, tier_ids: tierIds.join(",") });
+  let issued;
+  try {
+    issued = await issueAccountToken(c, id, "invite", { budget_mode, budget_limit, tier_ids: tierIds.join(",") });
+  } catch (e) {
+    blog("ACCOUNTS invite insert failed: " + String(e.message || e));
+    return c.json({ error: { message: "The account link could not be stored: " + String(e.message || e) } }, 500);
+  }
   return c.json({ account_id: id, url: redeemUrl(c, issued.token), token: issued.token, expires_at: issued.expires_at, budget_mode, budget_limit, tier_ids: tierIds }, 201);
 });
 
