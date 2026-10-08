@@ -662,9 +662,14 @@ app.get("/v1/models", async (c) => {
   // Only advertise slugs that can actually be served right now: a slug whose
   // providers are all disabled or all marked down would 503 on use, which is
   // exactly the "client picked a model that fails" trap.
+  // Runtime-dependent exclusion: on the edge build HORIZON_EXCLUDED_FORMATS
+  // lists the consumer-web formats, so their routes are never advertised
+  // anywhere; on Node it is empty and every format stays visible.
+  const excludedFormats = (globalThis.HORIZON_EXCLUDED_FORMATS || []);
+  const excludeSql = excludedFormats.length ? " AND p.fmt NOT IN (" + excludedFormats.map(() => "?").join(",") + ")" : "";
   const routes = await c.env.DB.prepare(
-    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, mr.context_limit_override, mr.output_limit_override, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
-  ).bind(...allowed).all();
+    "SELECT mr.id AS route_id, mr.slug, mr.provider_id, mr.upstream_model, mr.model_kind, mr.wire_format, mr.context_limit_override, mr.output_limit_override, p.fmt FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1" + excludeSql + " AND mr.slug IN (" + allowed.map(() => "?").join(",") + ") ORDER BY mr.slug, mr.rank"
+  ).bind(...excludedFormats, ...allowed).all();
   const live = [];
   const liveSlugs = new Set();
   const decisionSlugs = new Map();
@@ -1927,9 +1932,11 @@ async function runSystemOneDecision(c, key, options) {
     return c.json({ error: { message: "Model \"" + slug + "\" is not enabled for this key", type: "model_not_allowed" } }, 403);
   }
 
+  const excludedFormats = (globalThis.HORIZON_EXCLUDED_FORMATS || []);
+  const decisionExcludeSql = excludedFormats.length ? " AND p.fmt NOT IN (" + excludedFormats.map(() => "?").join(",") + ")" : "";
   const routes = await c.env.DB.prepare(
-    "SELECT mr.*, p.name AS provider_name, p.healthy, p.enabled AS provider_enabled, p.fmt, p.base_url, p.transport, p.proxy_url, p.extra_headers, p.key_strategy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 ORDER BY mr.rank"
-  ).bind(slug).all();
+    "SELECT mr.*, p.name AS provider_name, p.healthy, p.enabled AS provider_enabled, p.fmt, p.base_url, p.transport, p.proxy_url, p.extra_headers, p.key_strategy FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1" + decisionExcludeSql + " ORDER BY mr.rank"
+  ).bind(slug, ...excludedFormats).all();
   const candidates = await reorderRoutesByMode(c, slug, (routes.results || []).filter((r) => effectiveModelKind(r) === "decision"));
   if (!candidates.length) {
     const chatOnly = (routes.results || []).length > 0;
@@ -2151,9 +2158,11 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   }
   const combined = [];
   for (const s of slugQueue) {
+    const excludedFormats = (globalThis.HORIZON_EXCLUDED_FORMATS || []);
+    const chatExcludeSql = excludedFormats.length ? " AND p.fmt NOT IN (" + excludedFormats.map(() => "?").join(",") + ")" : "";
     const rows = await c.env.DB.prepare(
-      "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat')='chat' ORDER BY mr.rank"
-    ).bind(s).all();
+      "SELECT mr.*, p.base_url, p.name AS provider_name, p.healthy, p.enabled, p.fmt, p.proxy_url, p.transport, p.extra_headers FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE mr.slug=? AND mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat')='chat'" + chatExcludeSql + " ORDER BY mr.rank"
+    ).bind(s, ...excludedFormats).all();
     for (const r of await reorderRoutesByMode(c, s, rows.results || []))
       combined.push({ ...r, public_slug: s });
   }
@@ -2702,7 +2711,11 @@ function koyebCfg(env) {
     secret: String(env && env.KOYEB_RELAY_SECRET || "")
   };
 }
-var PROVIDER_FORMATS = ["openai", "anthropic", "zaiweb", "zaiwebbrowser", "zaiminted"];
+// Runtime-dependent: the Node host serves consumer-web formats through the
+// bridge; the edge build rewrites this to the formats its transports support
+// (see runtime/zai-stubs.js). Validation, listing, and dispatch all consult
+// it, so an excluded format can never be created, advertised, or dialed there.
+var PROVIDER_FORMATS = (globalThis.HORIZON_SUPPORTED_FORMATS || ["openai", "anthropic", "zaiweb", "zaiwebbrowser", "zaiminted"]);
 function normalizeProviderFormat(value, fallback) {
   const fmt2 = String(value == null ? "" : value).trim().toLowerCase();
   if (!fmt2)

@@ -236,12 +236,14 @@ export async function loadV2World(c, {
   priceResolver = () => null
 } = {}) {
   const taskIR = compileTaskIR(payload || {});
+  const excludedFormats = (globalThis.HORIZON_EXCLUDED_FORMATS || []);
+  const excludeSql = excludedFormats.length ? " AND p.fmt NOT IN (" + excludedFormats.map(() => "?").join(",") + ")" : "";
   const rows = await c.env.DB.prepare(
     `SELECT mr.id, mr.slug, mr.upstream_model, mr.rank, mr.provider_id, p.fmt, p.transport
      FROM model_routes mr
      JOIN providers p ON p.id=mr.provider_id
-     WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat') = 'chat'`
-  ).all();
+     WHERE mr.enabled=1 AND p.enabled=1 AND p.healthy=1 AND COALESCE(mr.model_kind, 'chat') = 'chat'` + excludeSql
+  ).bind(...excludedFormats).all();
   // One query for keys, one for stats — no per-route round-trips.
   const keyRows = await c.env.DB.prepare(
     "SELECT id, provider_id FROM provider_keys WHERE enabled=1"

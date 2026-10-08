@@ -22,6 +22,25 @@ jobs:
       - run: npm run check
       - run: npm test
 
+  edge:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ai-gateway/package-lock.json
+      - run: npm ci
+      - name: Build edge bundle (consumer-web bridge excluded)
+        run: npm run build:edge
+      - name: Static bundle scan
+        run: node scripts/verify-edge-bundle.mjs --scan-only
+      - name: Workerd + local D1 integration tests
+        run: npm run test:edge
 
   tmem:
     runs-on: ubuntu-latest

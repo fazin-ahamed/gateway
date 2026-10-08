@@ -1,37 +1,39 @@
 {
-  "name": "ai-gateway",
-  "main": "src/index.js",
+  // Cloudflare Worker entrypoint for HORIZON. Built by `npm run build:edge`
+  // (scripts/build-edge.mjs) from src/ with the consumer-web GLM bridge
+  // excluded from the bundle; the Node rollback runtime (server/server.mjs +
+  // src/index.js) is untouched by this config.
+  "name": "horizon-edge",
+  "main": ".edge-build/index.js",
   "workers_dev": true,
   "preview_urls": true,
-  "compatibility_date": "2024-11-01",
+  "compatibility_date": "2025-09-01",
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1,
-    "redact_query_string": false,
+    // Free tier: minimal structured logs. 100% head sampling was the Node
+    // host's setting; it inflates log volume for no benefit on Workers and
+    // risks quota. Raise during an incident, not by default.
+    "head_sampling_rate": 0.01,
     "logs": {
       "enabled": true,
-      "head_sampling_rate": 1,
       "persist": true,
       "invocation_logs": true
     },
     "traces": {
-      "enabled": false,
-      "persist": true,
-      "head_sampling_rate": 1
+      "enabled": false
     }
   },
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "ai-gateway",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+      "database_name": "horizon-edge",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
     }
   ],
   "vars": {
     "UPSTREAM_APP_TITLE": "AI Gateway",
     "UPSTREAM_HTTP_REFERER": "https://example.com",
-    "UPSTREAM_TIMEOUT_MS": "600000",
-    "RELAY_BACKEND": "koyeb",
-    "KOYEB_RELAY_URL": ""
+    "UPSTREAM_TIMEOUT_MS": "600000"
   }
 }

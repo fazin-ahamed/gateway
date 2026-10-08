@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --input-type=module --check < src/index.js"
+    "check": "node --input-type=module --check < src/index.js",
+    "build:edge": "node scripts/build-edge.mjs",
+    "verify:edge": "node scripts/verify-edge-bundle.mjs",
+    "test:edge": "node --test test/edge/edge.test.mjs"
   },
   "dependencies": {
     "hono": "^4.6.0"
