@@ -23,23 +23,56 @@ const args = process.argv.slice(2);
 const dbPath = args[0];
 const writeOut = args.includes("--write") ? args[args.indexOf("--write") + 1] : null;
 const includeSealed = args.includes("--include-sealed");
+const includeKeyIds = args.includes("--include-key-ids");
+const operational = args.includes("--operational");
+const excludeArg = args.includes("--exclude") ? args[args.indexOf("--exclude") + 1] : null;
+const excludeTables = new Set((excludeArg || "").split(",").map((s) => s.trim()).filter(Boolean));
 const cryptoKey = process.env.PROVIDER_CRYPTO_KEY || "";
 
 if (!dbPath || !existsSync(dbPath)) {
-  console.error("usage: node scripts/d1-import.mjs /path/to/gateway.db [--write out.sql] [--include-sealed]");
+  console.error("usage: node scripts/d1-import.mjs /path/to/gateway.db [--write out.sql] [--include-sealed] [--include-key-ids] [--operational] [--exclude t1,t2] [--exclude t1,t2]");
+  console.error("  --operational  import only what the serving truth needs (config, keys, accounts,");
+  console.error("                 pricing, tiers, sessions); telemetry/history stays on the Node host.");
   process.exit(1);
 }
 
 const db = new DatabaseSync(resolve(dbPath), { readOnly: true });
 const sizeBytes = statSync(dbPath).size;
-const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((r) => r.name);
+// Parents must be written before children or D1 rejects the FK. The schema's
+// reference graph is small and explicit, so the topological tiers are listed
+// here rather than parsed at runtime.
+const FK_PARENTS_FIRST = [
+  "providers", "canonical_models", "console_accounts", "model_tiers",
+  "api_keys", "model_routes", "provider_keys", "api_key_model_tiers",
+  "console_account_tiers", "model_aliases", "provider_probe_runs", "proxy_pool",
+];
 
+const rawTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((r) => r.name);
+// Parents before children (FK graph), everything else alphabetically after.
+const tables = [
+  ...FK_PARENTS_FIRST.filter((t) => rawTables.includes(t)),
+  ...rawTables.filter((t) => !FK_PARENTS_FIRST.includes(t)),
+];
 console.log("source:", resolve(dbPath));
 console.log("size:", (sizeBytes / 1024 / 1024).toFixed(2), "MB,", tables.length, "tables");
 
 const SKIP_ON_EDGE = new Set([
   // Agent-side / Node-only state, never part of the gateway's serving truth.
   "zai_device_tokens", "zai_sessions", "proxy_pool",
+]);
+
+// Telemetry (route_attempts, quality_observations, router_stats, reflex_*,
+// agent_loop_events, latency_*) and bulk history (trajectories,
+// request_summaries) are deliberately left behind: they are rebuildable
+// observations, and trajectories alone measured 9.1 GB on the Node host -
+// 18x the entire 500 MB D1 per-database limit. Customers, keys, accounts,
+// config, pricing, tiers, and live sessions all migrate.
+const OPERATIONAL = new Set([
+  "providers", "provider_keys", "model_routes", "model_aliases", "canonical_models",
+  "api_keys", "api_key_model_tiers", "model_tiers", "model_limits", "model_usage",
+  "console_accounts", "console_account_tiers", "console_account_tokens", "console_sessions",
+  "gateway_settings", "prices", "admin_sessions", "admin_login_attempts",
+  "response_cache_locks", "provider_probe_runs",
 ]);
 
 const lines = [];
@@ -81,12 +114,22 @@ if (writeOut) {
   for (const t of tables) {
     if (counts[t] <= 0) continue;
     if (SKIP_ON_EDGE.has(t)) { console.log("skip (Node-only):", t); continue; }
+    if (excludeTables.has(t)) { console.log("skip (--exclude):", t); continue; }
+    if (operational && !OPERATIONAL.has(t)) { console.log("skip (--operational, telemetry/history):", t, "(" + counts[t] + " rows)"); continue; }
     const rows = db.prepare(`SELECT * FROM "${t}"`).all();
     for (const row of rows) {
       const cols = Object.keys(row);
       const vals = cols.map((c) => {
         let v = row[c];
+        // api_keys.key_id IS the live credential (auth is a direct key_id
+        // lookup), and console_accounts / console_account_tiers /
+        // console_account_tokens / api_key_model_tiers carry the same value
+        // as the owning key. A default dump must never contain it;
+        // --include-key-ids is the explicit, cutover-only opt-in.
+        if (String(v).startsWith("sk-") && !includeKeyIds)
+          return "'REDACTED-KEY-ID-run-with---include-key-ids'";
         if (c === "api_key" && !includeSealed) return "NULL /* redacted: re-enter on edge */";
+        if (t === "api_keys" && c === "key_id" && !includeKeyIds) return "'REDACTED-KEY-ID-run-with---include-key-ids'";
         if (v == null) return "NULL";
         if (typeof v === "number" || typeof v === "bigint") return String(v);
         return "'" + String(v).replace(/'/g, "''") + "'";

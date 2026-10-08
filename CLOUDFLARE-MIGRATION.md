@@ -67,9 +67,15 @@ Auth mechanisms: `authClient` (API key, 86 admin routes use `requireAdmin`), con
 
 `client-console` is SvelteKit + `adapter-static` with SPA fallback `index.html` (svelte.config.js:1,11). Build output `client-console/build` already exists. Serving it is M6; nothing in `src/index.js` references it (Node serves it from `server/server.mjs`), so the Worker needs an explicit assets binding — good isolation.
 
-### Data migration reality check
+### Data migration reality check (measured against the real previous-server archive)
 
-`server/data/gateway.db` in this checkout is a 4 KB empty SQLite shell (0 tables; `PRAGMA integrity_check` ok). The production DB lives on the host VM only. Therefore the D1 import utility (`scripts/d1-import.mjs`) accepts an arbitrary source DB path and was tested against synthetic seeded DBs. The operator runs it against the host copy per §"Run on the old server".
+The operator provided the previous server's archive (`Previous Server Gateway.tar.gz`, 4.3 GB). Its `server/data/gateway.db` is **9.6 GB**, but the size is one table: `trajectories` holds 25,766 rows averaging 360 KB of request JSON (9.1 GB of the total). Every other table is small - the operationally required set is 478 rows across 20 tables (~97 KB of SQL).
+
+Per the brief, bulk history does not auto-migrate. `scripts/d1-import.mjs --operational` imports only the serving truth: providers, provider keys, routes, aliases, canonical models, API keys, tiers, limits, usage counters, console accounts/tokens/sessions, gateway settings, prices, admin sessions, response-cache locks, probe runs. Telemetry (route_attempts, quality_observations, router_stats, reflex_posteriors, agent_loop_events, latency_shadow_decisions, proxy_test_runs) and bulk history (trajectories, request_summaries) stay on the Node host.
+
+Measured import result against a fresh migrated D1: 478 statements, 0 FK failures (tables are written parents-first), and a real workerd boot verified two production API keys authenticating (200, 13 models listed), the consumer-web bridge route (`z-ai/glm-5.3-flash`, fmt zaiminted) correctly absent from advertising, and unknown keys rejected 401.
+
+Secret handling: `api_keys.key_id` IS the live credential (auth is a direct key_id lookup), and the same value appears in `console_accounts`, `console_account_tiers`, `console_account_tokens`, `api_key_model_tiers`. The default dump redacts every `sk-` value (0 live keys in a default dump); `--include-key-ids` is the cutover-only opt-in. Provider keys are AES-GCM sealed (`enc:v1:` ciphertext) and copy verbatim only with `--include-sealed`; they decrypt only when the Worker secret `PROVIDER_CRYPTO_KEY` equals the Node host's key from its `.env`. The generated dump lives outside git in `.prev-server-data/` (0600).
 
 ## Milestone 1 — Worker-native boot
 
