@@ -1110,17 +1110,18 @@ async function issueAccountSession(c, account) {
   return issueSessionCookie(c, account.key_id);
 }
 
+function consoleCookieAttributes(c) {
+  const secure = new URL(c.req.url).protocol === "https:";
+  const crossSite = secure && c.req.header("origin") && c.req.header("sec-fetch-site") === "cross-site";
+  return "; Path=/console; SameSite=" + (crossSite ? "None" : "Lax") + (secure ? "; Secure" : "") + "; HttpOnly";
+}
+
 async function issueSessionCookie(c, ownerId) {
   const session = "v1." + uuid() + uuid().replace(/-/g, "");
   const expiresAt = new Date(Date.now() + CONSOLE_SESSION_HOURS * 3600000).toISOString();
   await c.env.DB.prepare("DELETE FROM console_sessions WHERE expires_at <= ?").bind(nowIso()).run();
   await c.env.DB.prepare("INSERT INTO console_sessions (token_hash, key_id, expires_at, created_at) VALUES (?,?,?,?)").bind(await sha256hex(session), ownerId, expiresAt, nowIso()).run();
-  // The Pages-hosted console calls this Worker cross-origin with credentials,
-  // so the session cookie must be SameSite=None (which requires Secure).
-  // Same-origin deployments (the Worker serving /console itself) keep Lax.
-  const crossOrigin = String(c.req.header("origin") || "") && String(c.req.header("sec-fetch-site") || "") === "cross-site";
-  const cookieSameSite = crossOrigin ? "None" : "Lax";
-  c.header("Set-Cookie", CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=" + cookieSameSite + "; Secure; HttpOnly");
+  c.header("Set-Cookie", CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + consoleCookieAttributes(c));
   return c.json({ ok: true });
 }
 
@@ -1178,7 +1179,7 @@ app.post("/console/logout", async (c) => {
       await c.env.DB.prepare("DELETE FROM console_sessions WHERE token_hash=?").bind(await sha256hex(decodeURIComponent(m[1]))).run();
     } catch {}
   }
-  const cookie = CONSOLE_COOKIE + "=; Path=/console; Max-Age=0; SameSite=Lax; HttpOnly";
+  const cookie = CONSOLE_COOKIE + "=; Max-Age=0" + consoleCookieAttributes(c);
   c.header("Set-Cookie", cookie);
   return c.json({ ok: true });
 });

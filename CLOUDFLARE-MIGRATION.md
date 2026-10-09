@@ -67,6 +67,12 @@ Auth mechanisms: `authClient` (API key, 86 admin routes use `requireAdmin`), con
 
 `client-console` is SvelteKit + `adapter-static` with SPA fallback `index.html` (svelte.config.js:1,11). Build output `client-console/build` already exists. Serving it is M6; nothing in `src/index.js` references it (Node serves it from `server/server.mjs`), so the Worker needs an explicit assets binding — good isolation.
 
+Console session cookies use the request URL's scheme. HTTPS sets `Secure`;
+cross-site HTTPS requests use `SameSite=None`, while same-origin requests use
+`SameSite=Lax`. Plain HTTP keeps `SameSite=Lax` without `Secure` for existing Node
+hosts. Login and logout use the same attributes. HTTP compatibility does not
+encrypt credentials or sessions: use HTTPS or an SSH tunnel for sign-in.
+
 ### Data migration reality check (measured against the real previous-server archive)
 
 The operator provided the previous server's archive (`Previous Server Gateway.tar.gz`, 4.3 GB). Its `server/data/gateway.db` is **9.6 GB**, but the size is one table: `trajectories` holds 25,766 rows averaging 360 KB of request JSON (9.1 GB of the total). Every other table is small - the operationally required set is 478 rows across 20 tables (~97 KB of SQL).

@@ -63,6 +63,43 @@ test("an API key signs in once and every console call rides the session cookie",
   assert.equal(meBody.key.name, "console-test");
 });
 
+for (const { name, origin, headers, secure, sameSite } of [
+  { name: "HTTP same-origin", origin: "http://gw", headers: {}, secure: false, sameSite: "Lax" },
+  { name: "HTTPS same-origin", origin: "https://gw", headers: {}, secure: true, sameSite: "Lax" },
+  {
+    name: "HTTPS cross-site", origin: "https://gw", secure: true, sameSite: "None",
+    headers: { origin: "https://fazin-gateway.pages.dev", "sec-fetch-site": "cross-site" }
+  }
+]) {
+  test(`${name} login and logout use transport-compatible session cookies`, async () => {
+    const { app } = await consoleGateway();
+    const auth = await app.fetch(new Request(origin + "/console/auth", {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ api_key: "sk-console" })
+    }));
+    assert.equal(auth.status, 200);
+    const cookie = cookieFrom(auth);
+    const issued = auth.headers.get("set-cookie");
+    assert.equal(/;\s*Secure(?:;|$)/i.test(issued), secure);
+    assert.match(issued, new RegExp(`;\\s*SameSite=${sameSite}(?:;|$)`));
+    const me = await app.fetch(new Request(origin + "/console/api/me", { headers: { cookie } }));
+    assert.equal(me.status, 200);
+    assert.equal((await me.json()).key.key_id, "sk-console");
+
+    const logout = await app.fetch(new Request(origin + "/console/logout", {
+      method: "POST", headers: { ...headers, cookie }
+    }));
+    assert.equal(logout.status, 200);
+    const cleared = logout.headers.get("set-cookie");
+    assert.match(cleared, /Max-Age=0(?:;|$)/);
+    assert.equal(/;\s*Secure(?:;|$)/i.test(cleared), secure);
+    assert.match(cleared, new RegExp(`;\\s*SameSite=${sameSite}(?:;|$)`));
+    const expired = await app.fetch(new Request(origin + "/console/api/me", { headers: { cookie } }));
+    assert.equal(expired.status, 401);
+  });
+}
+
 test("a bad key is refused and the API requires the cookie", async () => {
   const { app } = await consoleGateway();
   const bad = await app.fetch(new Request("http://gw/console/auth", {
