@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from "$lib/api";
   import { session } from "$lib/state/session.svelte";
   import Starfield from "$lib/components/Starfield.svelte";
 
@@ -16,7 +17,7 @@
     busy = true;
     error = null;
     try {
-      const res = await fetch(`/console/redeem-api?token=${encodeURIComponent(t)}`, {
+      const res = await apiFetch(`/console/redeem-api?token=${encodeURIComponent(t)}`, {
         credentials: "same-origin"
       });
       const body = await res.json().catch(() => null);
@@ -59,7 +60,7 @@
     busy = true;
     error = null;
     try {
-      const res = await fetch("/console/redeem-api", {
+      const res = await apiFetch("/console/redeem-api", {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "same-origin",
@@ -67,7 +68,7 @@
       });
       const body = await res.json().catch(() => null);
       if (res.ok && body?.ok) {
-        const me = await fetch("/console/api/me", { credentials: "same-origin" });
+        const me = await apiFetch("/console/api/me", { credentials: "same-origin" });
         if (me.ok) {
           const info = await me.json();
           session.set({ state: "signed-in", keyName: info.key?.name ?? "API key" });

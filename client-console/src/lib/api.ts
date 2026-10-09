@@ -1,8 +1,19 @@
 // Thin fetch wrappers for the purpose-built client API. Every call rides the
 // HttpOnly session cookie; nothing here ever touches an sk- key.
+//
+// When VITE_API_BASE is set (Pages-hosted build), calls go cross-origin to the
+// edge Worker with credentials included; the Worker sets a SameSite=None
+// session cookie for that. Otherwise everything is same-origin (the Worker
+// serves the console itself at /console).
+
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) || "";
+
+export function apiFetch(path: string, init?: RequestInit) {
+  return fetch(API_BASE + path, { ...init, credentials: "include" });
+}
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { credentials: "same-origin", ...init });
+  const res = await fetch(API_BASE + path, { credentials: "include", ...init });
   if (res.status === 401) {
     location.assign("/console/signin");
     throw new Error("session expired");

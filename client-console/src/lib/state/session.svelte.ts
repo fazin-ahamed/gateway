@@ -1,3 +1,4 @@
+import { apiFetch } from "../api";
 // Client session state. The API key is exchanged once for an HttpOnly
 // cookie; after that the browser never holds the secret. All /console/api
 // calls ride the cookie.
@@ -25,7 +26,7 @@ export async function loadSession(): Promise<void> {
   if (inFlight) return inFlight;
   inFlight = (async () => {
     try {
-      const res = await fetch("/console/api/me", { credentials: "same-origin" });
+      const res = await apiFetch("/console/api/me", { credentials: "same-origin" });
       if (res.ok) {
         const me = await res.json();
         current = { state: "signed-in", keyName: me.key?.name ?? "API key" };

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from "$lib/api";
   import { onMount } from "svelte";
   import { api, fmtInt, fmtUsd, fmtMs, type Activity, type Limits, type RequestDetail } from "$lib/api";
   import UsageChart from "$lib/components/UsageChart.svelte";
@@ -38,8 +39,8 @@
       const [act, lim, used, list] = await Promise.all([
         api.activity(h),
         api.limits(),
-        fetch(`/console/api/usage?days=${days}${keyFilter !== "all" ? `&key_id=${encodeURIComponent(keyFilter)}` : ""}`, { credentials: "same-origin" }).then((r) => r.json()),
-        fetch(`/console/api/requests?days=${days}&limit=25${keyFilter !== "all" ? `&key_id=${encodeURIComponent(keyFilter)}` : ""}`, { credentials: "same-origin" }).then((r) => r.json())
+        apiFetch(`/console/api/usage?days=${days}${keyFilter !== "all" ? `&key_id=${encodeURIComponent(keyFilter)}` : ""}`, { credentials: "same-origin" }).then((r) => r.json()),
+        apiFetch(`/console/api/requests?days=${days}&limit=25${keyFilter !== "all" ? `&key_id=${encodeURIComponent(keyFilter)}` : ""}`, { credentials: "same-origin" }).then((r) => r.json())
       ]);
       if (mine !== request) return;
       activity = act;

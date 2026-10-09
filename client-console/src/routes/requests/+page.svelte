@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from "$lib/api";
   import { onMount } from "svelte";
   import { api, fmtInt, fmtMs, fmtUsd, type RequestDetail } from "$lib/api";
   import RequestDrawer from "$lib/components/RequestDrawer.svelte";
@@ -34,7 +35,7 @@
     if (keyFilter !== "all") params.set("key_id", keyFilter);
     if (search.trim()) params.set("request_id", search.trim());
     try {
-      const res = await fetch(`/console/api/requests?${params}`, { credentials: "same-origin" });
+      const res = await apiFetch(`/console/api/requests?${params}`, { credentials: "same-origin" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = await res.json();
       rows = body.requests;

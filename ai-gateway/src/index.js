@@ -54,6 +54,15 @@ app.use("/*", async (c, next) => {
   await ensureRegistrySeed(c);
   await next();
 });
+// The Pages-hosted console (fazin-gateway.pages.dev / fazin-gateway.is-a.dev)
+// calls the console API cross-origin when the API rides the Worker origin.
+app.use("/console/*", cors({
+  origin: (o) => (/^https:\/\/(fazin-gateway\.(pages\.dev|is-a\.dev)|[a-z0-9]+\.fazin-gateway\.pages\.dev)$/.test(o) ? o : null),
+  allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
+  exposeHeaders: ["x-request-id"],
+  credentials: true
+}));
 app.use("/v1/*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
@@ -1106,7 +1115,12 @@ async function issueSessionCookie(c, ownerId) {
   const expiresAt = new Date(Date.now() + CONSOLE_SESSION_HOURS * 3600000).toISOString();
   await c.env.DB.prepare("DELETE FROM console_sessions WHERE expires_at <= ?").bind(nowIso()).run();
   await c.env.DB.prepare("INSERT INTO console_sessions (token_hash, key_id, expires_at, created_at) VALUES (?,?,?,?)").bind(await sha256hex(session), ownerId, expiresAt, nowIso()).run();
-  c.header("Set-Cookie", CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=Lax; HttpOnly");
+  // The Pages-hosted console calls this Worker cross-origin with credentials,
+  // so the session cookie must be SameSite=None (which requires Secure).
+  // Same-origin deployments (the Worker serving /console itself) keep Lax.
+  const crossOrigin = String(c.req.header("origin") || "") && String(c.req.header("sec-fetch-site") || "") === "cross-site";
+  const cookieSameSite = crossOrigin ? "None" : "Lax";
+  c.header("Set-Cookie", CONSOLE_COOKIE + "=" + encodeURIComponent(session) + "; Path=/console; Max-Age=" + (CONSOLE_SESSION_HOURS * 3600) + "; SameSite=" + cookieSameSite + "; Secure; HttpOnly");
   return c.json({ ok: true });
 }
 

@@ -3,11 +3,32 @@
   // (scripts/build-edge.mjs) from src/ with the consumer-web GLM bridge
   // excluded from the bundle; the Node rollback runtime (server/server.mjs +
   // src/index.js) is untouched by this config.
+  //
+  // Assets: the SvelteKit console (client-console/build) is served by Workers
+  // Static Assets. not_found_handling=single-page-application serves the SPA
+  // shell for client-side routes; run_worker_first guarantees every API route
+  // (v1, console API, auth, admin, health) hits the Worker first.
   "name": "horizon-edge",
   "main": ".edge-build/index.js",
   "workers_dev": true,
   "preview_urls": true,
   "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": ".edge-assets/",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/v1/*",
+      "/console/api/*",
+      "/console/auth",
+      "/console/account",
+      "/console/logout",
+      "/console/redeem-api",
+      "/console/playground/*",
+      "/admin/*",
+      "/health",
+      "/status"
+    ]
+  },
   "observability": {
     "enabled": true,
     // Free tier: minimal structured logs. 100% head sampling was the Node
@@ -27,7 +48,7 @@
     {
       "binding": "DB",
       "database_name": "horizon-edge",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "955bb1d6-3538-4986-8c81-4ac5d70b535c",
       "migrations_dir": "migrations"
     }
   ],

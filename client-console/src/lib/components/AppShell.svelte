@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from "$lib/api";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import TopBar from "$lib/components/TopBar.svelte";
   import Starfield from "$lib/components/Starfield.svelte";
@@ -21,7 +22,7 @@
   });
 
   async function signOut() {
-    await fetch("/console/logout", { method: "POST", credentials: "same-origin" });
+    await apiFetch("/console/logout", { method: "POST", credentials: "same-origin" });
     signOutLocal();
     location.assign("/console/signin");
   }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from "$lib/api";
   import { onMount } from "svelte";
   import { fmtInt, fmtMs, fmtUsd } from "$lib/api";
 
@@ -23,7 +24,7 @@
     failed = false;
     usage = null;
     try {
-      const res = await fetch(`/console/api/usage?days=${days}`, { credentials: "same-origin" });
+      const res = await apiFetch(`/console/api/usage?days=${days}`, { credentials: "same-origin" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       usage = await res.json();
     } catch {

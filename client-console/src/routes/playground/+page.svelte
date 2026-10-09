@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from "$lib/api";
   import { api, type ConsoleModel, fmtUsd } from "$lib/api";
   import { session } from "$lib/state/session.svelte";
 
@@ -54,7 +55,7 @@
     prompt = "";
     inspector = null;
     try {
-      const res = await fetch("/console/playground/completions", {
+      const res = await apiFetch("/console/playground/completions", {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "same-origin",
@@ -130,7 +131,7 @@
     error = null;
     answers = null;
     try {
-      const res = await fetch("/console/playground/systemone", {
+      const res = await apiFetch("/console/playground/systemone", {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "same-origin",
