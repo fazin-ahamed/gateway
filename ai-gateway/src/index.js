@@ -2,6 +2,8 @@ import { LOGIN_HTML } from "./login.js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
+import { PUBLIC_HTML } from "./public-page.js";
+import { loadPublicOverview } from "./public-overview.js";
 import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
 import { zaiWaf } from "./zai-waf.js";
 import { zaiSessionPoolStatus } from "./zai-session-pool.js";
@@ -655,19 +657,25 @@ async function requireAdmin(c) {
     return c.json({ error: { message: "Admin authentication required", type: "auth_error" } }, 401);
   return null;
 }
-app.get("/", (c) => c.json({
-  service: "ai-gateway",
-  note: "OpenAI-compatible API. Endpoints: /v1/models, /v1/chat/completions, /health."
-}));
+app.get("/", (c) => c.html(PUBLIC_HTML));
+app.get("/public/overview", async (c) => {
+  try {
+    const overview = await loadPublicOverview(c.env.DB, async () => {
+      const rows = await c.env.DB.prepare("SELECT DISTINCT slug FROM model_routes WHERE enabled=1 ORDER BY slug").all();
+      return discoverModels(c, (rows.results || []).map((r) => r.slug));
+    });
+    c.header("Cache-Control", "public, max-age=30");
+    return c.json(overview);
+  } catch (e) {
+    blog("public overview unavailable: " + String(e && e.message || e));
+    c.header("Cache-Control", "no-store");
+    return c.json({ error: { message: "The public overview is temporarily unavailable.", type: "service_unavailable" } }, 503);
+  }
+});
 app.get("/health", (c) => c.json({ ok: true }));
-app.get("/v1/models", async (c) => {
-  const auth = await authClient(c);
-  if (auth instanceof Response)
-    return auth;
-  const { key } = auth;
-  const allowed = await allowedSlugs(c, key);
+async function discoverModels(c, allowed) {
   if (!allowed.length)
-    return c.json({ object: "list", data: [] });
+    return [];
   // Only advertise slugs that can actually be served right now: a slug whose
   // providers are all disabled or all marked down would 503 on use, which is
   // exactly the "client picked a model that fails" trap.
@@ -756,7 +764,13 @@ app.get("/v1/models", async (c) => {
       upstream_model: info.upstream_model,
       capabilities: { choice: true, score: true, noul: true }
     });
-  return c.json({ object: "list", data });
+  return data;
+}
+app.get("/v1/models", async (c) => {
+  const auth = await authClient(c);
+  if (auth instanceof Response)
+    return auth;
+  return c.json({ object: "list", data: await discoverModels(c, await allowedSlugs(c, auth.key)) });
 });
 app.get("/status", async (c) => {
   const denied = await requireAdmin(c);

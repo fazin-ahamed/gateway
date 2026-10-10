@@ -7,10 +7,19 @@ or Svelte server runs in production.
 ## What is where
 
 ```text
+/                 public usage overview and model directory (no sign-in)
+/public/overview  public aggregate snapshot (no auth)
 /console          client console (customers)
 /_gw              admin console (operators, unchanged)
 /v1/*             public API, bearer-key auth
 ```
+
+The root overview is served by the gateway on both Node and Cloudflare
+Workers, independently of the SvelteKit console build. It keeps the
+Astrosphere identity and links to console sign-in. Usage is aggregated
+across retained request-summary records; it is not an account dashboard
+or an uptime monitor. See the [public overview contract](../README.md#public-overview)
+for coverage, caching and disclosure limits.
 
 ## Startup and autostart
 

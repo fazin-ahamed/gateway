@@ -43,15 +43,42 @@ Public defaults live in `.env.example`
 ## API
 
 - `POST /v1/chat/completions` — OpenAI-compatible completions (auth: `Bearer sk-…`)
-- `GET /v1/models` — enabled public slugs
+- `GET /v1/models` - enabled model slugs available to the caller (bearer-key auth)
 - `GET /health`, `GET /status` (admin) — liveness and route inventory
 - `/_gw` — operator console (Overview, Providers, Model routes, Tiers, Keys, Playground, Cache, Prices)
+- `GET /` - public usage overview and searchable model directory; no sign-in
+- `GET /public/overview` - aggregate recorded usage and currently discoverable model metadata; no auth
 
 `model: "auto"` is HORIZON-Ω over **your enabled routes only**. Easy asks
 are one reflex hop. Hard coding compiles TaskIR, injects a worker lens
 (goal/facts/unknowns — not MVC/reroute), and reroutes to an uncorrelated
 family on 5xx. Compaction fires only when input exceeds 82% of the model's
 usable window (context minus output reserve), and keeps tool-call pairs.
+
+## Public overview
+
+Open the gateway's root URL to see recorded input, output and total tokens,
+request counts, seven UTC calendar days of activity, and available chat and
+decision models. Search and capability filters work without signing in.
+The API connection section uses the same host's `/v1` endpoint.
+
+Totals cover the request-summary history retained in the current database,
+not a lifetime guarantee. The snapshot includes the earliest and latest
+recorded request timestamps; empty history is shown as zero usage.
+Total tokens are the recorded total field, which may differ from input plus output.
+
+`GET /public/overview` returns `generated_at`, `service`, `usage`, `activity`
+and `models`. Models use the same enabled-provider, circuit and capability
+rules as authenticated discovery, but omit upstream identities and
+provider details. Decision models advertise their separate endpoint;
+chat-only Auto is included only when enabled and discoverable.
+
+The snapshot is cached for 30 seconds. A data-loading failure returns a
+generic HTTP 503 rather than fabricated zero usage; the page preserves an
+earlier snapshot and offers Retry. Neither the page nor its endpoint
+exposes account/key identifiers, prompts, responses, provider credentials,
+per-client traffic or internal costs. `/v1/*`, `/console` and `/_gw` retain
+their existing authentication.
 
 ## Provider state: enabled vs healthy
 
