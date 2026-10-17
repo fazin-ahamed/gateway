@@ -55,6 +55,43 @@ are one reflex hop. Hard coding compiles TaskIR, injects a worker lens
 family on 5xx. Compaction fires only when input exceeds 82% of the model's
 usable window (context minus output reserve), and keeps tool-call pairs.
 
+### Upstream access errors
+
+If the attempted upstream credentials cannot authenticate or access the selected
+model/group, the gateway tries the remaining configured credentials and routes.
+If none succeeds, the public response is HTTP 502 with `error.type: "upstream_error"`
+and one of these codes:
+
+| `error.code` | Operator action |
+| --- | --- |
+| `upstream_authentication_failed` | Check the API key configured for the upstream route. |
+| `upstream_access_denied` | Check that the upstream API token can access the route's model and token/channel group. |
+
+These errors concern upstream credentials. A missing or invalid gateway-client
+key still returns HTTP 401. Public errors omit upstream names, URLs, group names,
+credentials and upstream request IDs; operator logs retain the upstream diagnosis.
+Unclassified failures no longer claim that the model is experiencing an outage.
+
+A working upstream website account does not prove that its API token has access
+to the same groups. Compare the configured base URL, API token, upstream model
+and token group with a successful request to that upstream API. The gateway does
+not bypass permissions or silently change groups. See the upstream
+[New API group guide](https://docs.newapi.ai/en/docs/guide/feature-guide/admin/group).
+
+Permission denials do not quarantine the whole credential or count as provider
+outages. Invalid credentials can still quarantine their key. Non-transient HTTP
+4xx failures are not retried in place, except recognized HTTP 400 relay failures;
+transient failures retain bounded retries and configured fallbacks.
+
+### Stream completion
+
+An explicit OpenAI `[DONE]` or Anthropic `message_stop` ends the stream and releases
+the upstream connection, even if the upstream keeps its HTTP body open. A clean
+`[DONE]` without a separate finish reason produces a terminal chunk and records
+the final usage as a completed request. Upstream error frames never count as
+successful completions; EOF without a completion signal remains a truncated
+`finish_reason: "length"` response.
+
 ## Public overview
 
 Open the gateway's root URL to see recorded input, output and total tokens,

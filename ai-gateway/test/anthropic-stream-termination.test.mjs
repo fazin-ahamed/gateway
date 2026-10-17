@@ -117,3 +117,29 @@ test("fromAnthropicStreamChunk maps tool_use to tool_calls; unknown stop_reason 
   const stop = fromAnthropicStreamChunk({ type: "message_stop" }, "m");
   assert.equal(stop, null, "message_stop maps to no chunk");
 });
+
+test("message_stop closes and releases an upstream that does not send EOF", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(enc.encode(textDelta("complete") + messageStopFrame() + textDelta("must be ignored")));
+    },
+    cancel() { cancelled = true; }
+  });
+  const res = wrapAnthropicStream({ body }, "claude-x");
+  let timer;
+  try {
+    const frames = dataFrames(await Promise.race([
+      readAll(res),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("message_stop did not terminate the stream")), 2000); })
+    ]));
+    assert.equal(terminals(frames)[0].choices[0].finish_reason, "stop");
+    assert.equal(frames.filter(f => f === "[DONE]").length, 1);
+    assert.match(frames.join(""), /complete/);
+    assert.doesNotMatch(frames.join(""), /must be ignored/);
+    assert.equal(cancelled, true);
+  } finally {
+    clearTimeout(timer);
+    await body.cancel().catch(() => {});
+  }
+});

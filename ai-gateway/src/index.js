@@ -2261,6 +2261,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
   try {
     let lastErr = null;
     let lastErrStatus = null;
+    let lastErrKind = null;
     let lastRetryAfter = null;
     let attempts = 0;
     // Label every request from the canonical Router V2 TaskIR (not just auto
@@ -2341,14 +2342,17 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
           if (!up.ok || !up.body) {
             const txt = await up.text();
-            const why = classifyUpstreamFailure(txt);
+            const why = classifyUpstreamFailure(txt, up.status);
+            lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + why + "]";
+            lastErrStatus = up.status;
+            lastErrKind = why;
+            attempts++;
             _att.why = why;
             blog("FWD FAIL " + route.provider_name + " key=" + k.label + " -> HTTP " + up.status + " [" + why + "] " + String(txt).slice(0, 300));
             // Credential-scoped faults quarantine the key, never the provider.
             if (why === "auth") {
               circuitRecordFail("key", k.keyId, { expiresHintMs: 900 });
               if (orderedKeys.indexOf(k) < orderedKeys.length - 1) {
-                attempts++;
                 continue keyLoop;
               }
               break;
@@ -2356,21 +2360,16 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             if (why === "rate_limit") {
               circuitRecordFail("key", k.keyId, { expiresHintMs: 60 });
               if (orderedKeys.indexOf(k) < orderedKeys.length - 1) {
-                attempts++;
                 continue keyLoop;
               }
               break;
             }
             if (why === "model" || why === "tool_schema" || why === "request_size") {
               if (why === "model") circuitRecordFail("route", route.id);
-              attempts++;
               break;
             }
             // 4xx (except 408) and opaque Relbackend 400s are not provider-health.
             circuitRecordFailure(routeCircuit, { status: up.status, kind: why });
-            lastErr = "provider " + route.provider_name + " -> HTTP " + up.status + " [" + why + "]";
-            lastErrStatus = up.status;
-            attempts++;
             if (shouldRetryHttp(transportAttempt, up.status, why)) {
               blog("FWD RETRY " + route.provider_name + " key=" + k.label + " HTTP " + up.status + " [" + why + "] attempt=" + (transportAttempt + 1));
               continue;
@@ -2452,6 +2451,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           // the public API boundary.
           _att.status = (e && e.status) || 0;
           _att.errKind = (e && e.code) || "transport";
+          lastErrKind = (e && e.code) || "transport";
           if (e instanceof ZaiWebError) {
             // Credential faults quarantine the key; provider faults hit the
             // keyed provider breaker. Route faults hit the route.
@@ -2491,11 +2491,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             }
             break;
           }
+          lastErrStatus = (e && e.status) || 503;
           circuitRecordFailure(routeCircuit, { status: (e && e.status) || 0, kind: "unknown" });
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e) + (e && e.code ? " [" + e.code + "]" : "") + (c.__egressFailure ? " egress=" + c.__egressFailure : ""));
           lastErr = "upstream transport error";
-          if (e && e.status)
-            lastErrStatus = e.status;
           traj.steps.push({ ...baseStep, error: String(e.message || e).slice(0, 300), key: k.label, ms: Date.now() - stepStart });
           attempts++;
           if (shouldRetrySameKey(transportAttempt, e)) {
@@ -2526,10 +2525,13 @@ async function runChatCompletion(c, key, isAdminPlayground) {
     if (autoDecision && shadowRecorded)
       await finishLatencyShadow(c, requestId, { headersMs: null, ttftMs: null, finishedMs: Date.now() - started, cancelled: false });
     blog("TRACE id=" + requestId + " fail attempts=" + attempts + " ms=" + (Date.now() - started) + " err=" + String(lastErr || "no routes"));
-    const finalStatus = lastErrStatus || 503;
+    const upstreamAccessCode = lastErrKind === "permission" ? "upstream_access_denied"
+      : lastErrKind === "auth" ? "upstream_authentication_failed" : null;
+    const accessError = upstreamAccessCode ? publicProviderError({ code: upstreamAccessCode }) : null;
+    const finalStatus = accessError ? accessError.status : (lastErrStatus || 503);
     await recordTrajectory(c, { ...traj, status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null, error: lastErr || "no healthy route succeeded" });
     await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: finalStatus, attempts, latencyMs: Date.now() - started, cacheState: cacheKey ? "MISS" : null });
-    const errBody = lastErrStatus === 504
+    const errBody = accessError ? { error: accessError.error } : lastErrStatus === 504
       ? { error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } }
       : genericUpstreamError();
     const finalHeaders = { "x-gateway-attempts": String(attempts || routes.results.length) };
@@ -3353,7 +3355,7 @@ function wrapAnthropicStream(upReq, model) {
       let sawMessageStop = false; // upstream sent message_stop: the protocol COMPLETED
       const enc = encoder;
       try {
-        for (; ; ) {
+        readLoop: for (; ; ) {
           const { done, value } = await reader.read();
           if (done)
             break;
@@ -3373,8 +3375,11 @@ function wrapAnthropicStream(upReq, model) {
             } catch {
               continue;
             }
-            if (obj && obj.type === "message_stop")
+            if (obj && obj.type === "message_stop") {
               sawMessageStop = true;
+              reader.cancel().catch(() => {});
+              break readLoop;
+            }
             const chunk = fromAnthropicStreamChunk(obj, model);
             if (!chunk)
               continue;
@@ -3408,7 +3413,12 @@ function wrapAnthropicStream(upReq, model) {
         controller.close();
       } catch (e) {
         closeSseGracefully(controller, enc, e);
+      } finally {
+        try { reader.releaseLock(); } catch {}
       }
+    },
+    cancel(reason) {
+      return reader.cancel(reason).catch(() => {});
     }
   }), { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
 }
@@ -3518,12 +3528,12 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       clientCancelled = true;
     }
   });
-  let finishSeen = false; // a forwarded chunk carried a real finish_reason
+  let finishSeen = false; // a finish_reason or a clean protocol completion
   let protocolDoneSeen = false; // the upstream sent an explicit [DONE]
   let truncatedEof = false; // relay closed the tunnel on a non-EOF body read
   const pump = (async () => {
     try {
-      for (;;) {
+      readLoop: for (;;) {
         const { done, value } = await reader.read();
         if (done) {
           // The relay closed the tunnel. A premature upstream EOF (anything
@@ -3544,12 +3554,15 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
           const data = line.slice(5).trim();
           if (data === "[DONE]") {
             protocolDoneSeen = true;
-            continue;
+            reader.cancel().catch(() => {});
+            break readLoop;
           }
           try {
             const obj = JSON.parse(data);
-            if (obj && typeof obj === "object" && obj.error)
-              sawUpstreamError = true; // forwarded failure frame: never stamp a clean stop below
+            if (obj && typeof obj === "object" && obj.error) {
+              sawUpstreamError = true;
+              streamError = "upstream stream error";
+            }
             const u = usageFrom(obj);
             if (u && (u.total_tokens || u.completion_tokens || u.prompt_tokens))
               lastUsage = u;
@@ -3624,6 +3637,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             hasAccumulatedToolCalls(toolCallsBuf),
             cleanProtocolEnd
           );
+          if (cleanProtocolEnd) finishSeen = true;
           const finishChunk = {
             id: "gen-" + requestId,
             object: "chat.completion.chunk",
@@ -3653,6 +3667,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
         closeSseGracefully(controllerRef, enc, e);
     } finally {
       await persistOnce();
+      try { reader.releaseLock(); } catch {}
     }
   });
   const reader2 = new ReadableStream({
@@ -4657,6 +4672,10 @@ function shouldRetryHttp(transportAttempt, status, why) {
   if (NON_RETRYABLE_KINDS.test(kind))
     return false;
   const code = Number(status) || 0;
+  if (kind === "permission" || kind === "auth" || kind === "rate_limit")
+    return false;
+  if (code >= 400 && code < 500 && code !== 408)
+    return code === 400 && kind === "relay";
   if (code === 408 || code >= 500)
     return true;
   return kind === "relay" || kind === "unknown" || kind === "zai_browser";
@@ -4956,6 +4975,8 @@ function classifyAttempt(status, why, errKind) {
     return noimp("caller");
   if (/captcha|credentials|browser_unavailable|config/.test(w))
     return noimp("capability");
+  if (w === "permission")
+    return noimp("auth");
   if (w === "auth")
     return noimp("auth");
   if (w === "rate_limit")
@@ -5300,10 +5321,16 @@ function sanitizeUpstreamResponse(text) {
   return s;
 }
 function genericUpstreamError() {
-  return { error: { message: "The selected model is currently experiencing an outage. Please retry later.", type: "upstream_error" } };
+  return { error: { message: "The gateway could not complete this request. Retry or select another available model.", type: "upstream_error" } };
 }
 function publicProviderError(err) {
   const code = String(err && err.code || "");
+  if (code === "upstream_access_denied") {
+    return { status: 502, error: { message: "The upstream API denied access to the selected model or group. The gateway operator must check this route's API-token permissions.", type: "upstream_error", code } };
+  }
+  if (code === "upstream_authentication_failed") {
+    return { status: 502, error: { message: "The upstream API rejected this route's credentials. The gateway operator must check the configured upstream API key.", type: "upstream_error", code } };
+  }
   if (code === "zai_tools_unsupported") {
     return { status: 400, error: { message: "Tools are not supported by the selected model.", type: "invalid_request_error", code: "unsupported_tools" } };
   }
@@ -5344,8 +5371,14 @@ function isGenericUpstreamErrorResponse(text) {
     return false;
   }
 }
-function classifyUpstreamFailure(body) {
+function classifyUpstreamFailure(body, status) {
   const text = String(body || "").toLowerCase();
+  if (Number(status) === 401)
+    return "auth";
+  if (/无权|无权限|权限不足|permission.?denied|access.?denied|not authori[sz]ed.{0,80}(group|model)/.test(text))
+    return "permission";
+  if (Number(status) === 403)
+    return /invalid.{0,30}(api.?key|credential|token)|unauthenticated/.test(text) ? "auth" : "permission";
   if (/bad (body|url|scheme)|key-mismatch|proxy error|upstream timeout/.test(text))
     return "relay";
   // Relbackend and similar wrappers collapse real upstream failures into a
