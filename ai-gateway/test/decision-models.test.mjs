@@ -50,6 +50,19 @@ test("a noul answer is a probability in [0,1] from either fraction or percent", 
   assert.equal(normalizeNoul(q, {}).probability, null);
 });
 
+test("SubQ wire shapes: type-named noul key and bare number both map", () => {
+  const q = { type: "noul", instructions: "x" };
+  assert.equal(normalizeNoul(q, { noul: 0.9725 }).probability, 0.9725, "SubQ's {noul: p} shape");
+  assert.equal(normalizeNoul(q, 0.5).probability, 0.5, "a bare number");
+  assert.equal(normalizeNoul(q, { noul: 97.25 }).probability, 0.9725, "a percent under the type key");
+});
+
+test("string state is accepted for prose-state providers; empty string is not", () => {
+  assert.equal(validateRequest({ state: "Patient has a fever.", questions: { a: { type: "noul", instructions: "x" } } }), null);
+  assert.match(validateRequest({ state: "  ", questions: { a: { type: "noul", instructions: "x" } } }), /state/);
+  assert.match(validateRequest({ state: 42, questions: { a: { type: "noul", instructions: "x" } } }), /state/);
+});
+
 test("the provider response maps into normalized answers", () => {
   const questions = {
     route: { type: "choice", criteria: { fast: "a", strong: "b" } },

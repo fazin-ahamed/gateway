@@ -48,7 +48,13 @@ export function validateQuestion(name, question) {
 export function validateRequest(body) {
   if (!body || typeof body !== "object")
     return "body must be a JSON object";
-  if (!body.state || typeof body.state !== "object")
+  // State is the situation the decision model reads. Structured state is the
+  // native shape; some providers (SubQ) take a plain prose string instead.
+  // Both forward verbatim; the upstream is the authority on what it accepts.
+  const stateOk =
+    (body.state && typeof body.state === "object") ||
+    (typeof body.state === "string" && body.state.trim().length > 0);
+  if (!stateOk)
     return "state is required";
   const questions = body.questions;
   if (!questions || typeof questions !== "object" || !Object.keys(questions).length)
@@ -103,13 +109,22 @@ export function normalizeScore(question, raw) {
 }
 
 export function normalizeNoul(question, raw) {
-  const value = Number(raw && (raw.probability ?? raw.answer ?? raw.value));
+  // Tolerate every observed wire shape: {probability}, {answer}, {value}, the
+  // type-named key SubQ uses ({noul: 0.87}), and a bare number.
+  let candidate;
+  if (raw && typeof raw === "object")
+    candidate = raw.probability ?? raw.answer ?? raw.value ?? raw.noul;
+  else if (typeof raw === "number")
+    candidate = raw;
+  const value = Number(candidate);
   const probability = Number.isFinite(value) ? clamp01(value > 1 ? value / 100 : value) : null;
   return { type: "noul", probability };
 }
 
 export function normalizeAnswer(question, raw) {
-  if (!question || !raw || typeof raw !== "object") return null;
+  // A bare number is a valid noul/score answer; anything else must be an object.
+  if (!question || raw == null) return null;
+  if (typeof raw !== "object" && typeof raw !== "number") return null;
   const type = String(question.type || "");
   if (type === "choice") return normalizeChoice(question, raw);
   if (type === "score") return normalizeScore(question, raw);
