@@ -110,12 +110,12 @@ async function fixture(t, replies) {
   };
 }
 
-test("off by default: no headers, no learning", async (t) => {
+test("annotate by default: headers report the score, posteriors collect without a toggle", async (t) => {
   const f = await fixture(t, ["not json"]);
   const res = await f.call();
-  assert.equal(res.headers.get("x-gateway-taste"), null);
-  const rows = f.db.prepare("SELECT COUNT(*) n FROM taste_posteriors").first();
-  assert.equal(Number(rows.n), 0);
+  assert.equal(res.headers.get("x-gateway-taste"), "0.50", "annotate reports the score");
+  const rows = await f.db.prepare("SELECT COUNT(*) n FROM taste_posteriors").first();
+  assert.ok(Number(rows.n) > 0, "posteriors collected without any toggle");
 });
 
 test("annotate leaves the body identical, reports headers and learns", async (t) => {

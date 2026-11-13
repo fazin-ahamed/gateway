@@ -3623,7 +3623,7 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             finishReason: streamError || !finishSeen ? "length" : "stop",
             styleRules: await tasteStyleRules(c)
           });
-          await updatePosteriors(c.env.DB, slug, verdict.results);
+          await updatePosteriors(c.env.DB, slug, verdict.results, "", spendAccountId(key) || "");
           noteVerdict(slug, verdict);
         }
       } catch (e) {
@@ -5133,7 +5133,7 @@ async function tasteMode(c) {
   const header = String(c.req.header("x-gateway-taste") || "").toLowerCase();
   if (TASTE_MODES.includes(header))
     return header;
-  const stored = await tasteSetting(c, "taste_layer", "off");
+  const stored = await tasteSetting(c, "taste_layer", "annotate");
   return TASTE_MODES.includes(stored) ? stored : "off";
 }
 async function tasteStyleRules(c) {
@@ -5152,14 +5152,14 @@ async function runChatWithTaste(c, key) {
     // Critique the model's native output, not the repaired copy. The pre-repair
     // body is stashed on the context by runChatCompletion when tool repair ran.
     const originalBody = c.get("tasteOriginalBody") || await res.clone().text();
-    const first = await tasteVerdict(c, payload, originalBody, styleRules, res.headers.get("x-gateway-model"));
+    const first = await tasteVerdict(c, payload, originalBody, styleRules, res.headers.get("x-gateway-model"), key);
     if (!first) return res;
     let chosen = res;
     let verdict = first.verdict;
     let retried = false;
     if (mode === "enforce" && verdict.hard_failed) {
       retried = true;
-      const second = await tasteRetry(c, payload, verdict, styleRules, first.obj.choices[0].message);
+      const second = await tasteRetry(c, payload, verdict, styleRules, first.obj.choices[0].message, key);
       if (second && second.verdict.score > verdict.score) {
         chosen = second.res;
         verdict = second.verdict;
@@ -5177,22 +5177,23 @@ async function runChatWithTaste(c, key) {
     return res;
   }
 }
-async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug) {
+async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug, key) {
   let obj;
   try { obj = JSON.parse(bodyText); } catch { return null; }
   const choice = obj && obj.choices && obj.choices[0];
   if (!choice) return null;
   const verdict = critique({ request: payload, message: choice.message, finishReason: choice.finish_reason, styleRules });
   const slug = String(servedSlug || payload.model || obj.model || "");
-  await updatePosteriors(c.env.DB, slug, verdict.results);
-  noteVerdict(slug, verdict);
+  const accountId = spendAccountId(key) || "";
+  await updatePosteriors(c.env.DB, slug, verdict.results, "", accountId);
+  noteVerdict(slug, verdict, accountId);
   return { verdict, obj };
 }
 // One bounded retry through the normal stack with the critique appended as a
 // system message. The retry carries x-gateway-taste: off, so it cannot recurse.
 // The assistant turn being fixed is forwarded verbatim so the model sees the
 // tool call or JSON it broke; both attempts are billed by the normal stack.
-async function tasteRetry(c, payload, verdict, styleRules, assistantMessage) {
+async function tasteRetry(c, payload, verdict, styleRules, assistantMessage, key) {
   const note = retryCritique(verdict);
   if (!note) return null;
   const headers = new Headers(c.req.raw.headers);
@@ -5208,18 +5209,53 @@ async function tasteRetry(c, payload, verdict, styleRules, assistantMessage) {
   try { ctx = c.executionCtx; } catch { ctx = undefined; }
   const res = await app.fetch(new Request(c.req.url, { method: "POST", headers, body }), c.env, ctx);
   if (res.status !== 200) return null;
-  const again = await tasteVerdict(c, payload, await res.clone().text(), styleRules, res.headers.get("x-gateway-model"));
+  const again = await tasteVerdict(c, payload, await res.clone().text(), styleRules, res.headers.get("x-gateway-model"), key);
   return again ? { res, verdict: again.verdict } : null;
 }
 app.get("/admin/taste", async (c) => {
   const denied = await requireAdmin(c);
   if (denied) return denied;
   return c.json({
-    mode: await tasteSetting(c, "taste_layer", "off"),
+    mode: await tasteSetting(c, "taste_layer", "annotate"),
     style_rules: JSON.parse(await tasteSetting(c, "taste_style_rules", "[]") || "[]"),
     models: await loadTasteReport(c.env.DB),
     recent: recentVerdicts()
   });
+});
+
+// Per-account taste profiles: one row per account with its rule means.
+app.get("/admin/taste/accounts", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const report = await loadTasteReport(c.env.DB);
+  const byAccount = new Map();
+  for (const m of report) {
+    for (const [aid, am] of Object.entries(m.accounts || {})) {
+      const cur = byAccount.get(aid) || { account_id: aid, models: {}, samples: 0 };
+      cur.models[m.slug] = { rules: am.rules, samples: am.samples };
+      cur.samples = Math.max(cur.samples, am.samples);
+      byAccount.set(aid, cur);
+    }
+  }
+  // Merge rules across models for a single per-account view.
+  const accounts = [...byAccount.values()].map((a) => {
+    const rules = {};
+    let num = 0, den = 0;
+    for (const m of Object.values(a.models)) {
+      for (const [rule, rm] of Object.entries(m.rules)) {
+        const cur = rules[rule] || { mean: 0, n: 0, count: 0 };
+        cur.mean += rm.mean;
+        cur.n += rm.n;
+        cur.count++;
+        rules[rule] = cur;
+      }
+    }
+    for (const r of Object.values(rules)) { r.mean = Math.round((r.mean / r.count) * 1000) / 1000; delete r.count; }
+    const w = (r) => (r in { json_valid: 1, json_schema_ok: 1, tool_calls_valid: 1 } ? 2 : 1);
+    for (const [rule, r] of Object.entries(rules)) { num += r.mean * w(rule); den += w(rule); }
+    return { account_id: a.account_id, taste: den ? Math.round((num / den) * 1000) / 1000 : null, samples: a.samples, rules, models: Object.keys(a.models) };
+  });
+  return c.json({ accounts });
 });
 app.post("/admin/taste", async (c) => {
   const denied = await requireAdmin(c);

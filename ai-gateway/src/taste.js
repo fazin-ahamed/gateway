@@ -158,20 +158,20 @@ const ensured = new WeakSet();
 export async function ensureTasteSchema(db) {
   if (!db || ensured.has(db)) return;
   await db.prepare(
-    "CREATE TABLE IF NOT EXISTS taste_posteriors (slug TEXT NOT NULL, rule TEXT NOT NULL, route TEXT NOT NULL DEFAULT '', alpha REAL NOT NULL DEFAULT 1, beta REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY (slug, rule, route))"
+    "CREATE TABLE IF NOT EXISTS taste_posteriors (slug TEXT NOT NULL, rule TEXT NOT NULL, route TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', alpha REAL NOT NULL DEFAULT 1, beta REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY (slug, rule, route, account_id))"
   ).run();
-  // Migrate: SQLite cannot alter a primary key, so an existing (slug, rule)
-  // table must be rebuilt with the route column in the key.
+  // Migrate: SQLite cannot alter a primary key, so an existing table must be
+  // rebuilt with account_id in the key.
   try {
     const cols = await db.prepare("PRAGMA table_info(taste_posteriors)").all();
     const names = (cols.results || []).map((c) => c.name);
-    if (names.length && !names.includes("route")) {
+    if (names.length && !names.includes("account_id")) {
       await db.prepare("ALTER TABLE taste_posteriors RENAME TO taste_posteriors_old").run();
       await db.prepare(
-        "CREATE TABLE taste_posteriors (slug TEXT NOT NULL, rule TEXT NOT NULL, route TEXT NOT NULL DEFAULT '', alpha REAL NOT NULL DEFAULT 1, beta REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY (slug, rule, route))"
+        "CREATE TABLE taste_posteriors (slug TEXT NOT NULL, rule TEXT NOT NULL, route TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', alpha REAL NOT NULL DEFAULT 1, beta REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY (slug, rule, route, account_id))"
       ).run();
       await db.prepare(
-        "INSERT INTO taste_posteriors (slug, rule, route, alpha, beta, updated_at) SELECT slug, rule, '', alpha, beta, updated_at FROM taste_posteriors_old"
+        "INSERT INTO taste_posteriors (slug, rule, route, account_id, alpha, beta, updated_at) SELECT slug, rule, route, '', alpha, beta, updated_at FROM taste_posteriors_old"
       ).run();
       await db.prepare("DROP TABLE taste_posteriors_old").run();
     }
@@ -181,10 +181,11 @@ export async function ensureTasteSchema(db) {
 
 const DECAY_HALF_LIFE_MS = 30 * 86400000; // 30 days
 
-export async function updatePosteriors(db, slug, results, route) {
+export async function updatePosteriors(db, slug, results, route, accountId) {
   if (!slug || !results.length) return;
   await ensureTasteSchema(db);
   route = String(route || "");
+  accountId = String(accountId || "");
   const at = new Date().toISOString();
   // One row per rule per response; style rules fold into a single "style" row.
   const folded = new Map();
@@ -195,8 +196,8 @@ export async function updatePosteriors(db, slug, results, route) {
   }
   for (const [rule, n] of folded) {
     // Decay old evidence toward the prior before adding new observations.
-    const existing = await db.prepare("SELECT alpha, beta, updated_at FROM taste_posteriors WHERE slug=? AND rule=? AND route=?")
-      .bind(slug, rule, route).first();
+    const existing = await db.prepare("SELECT alpha, beta, updated_at FROM taste_posteriors WHERE slug=? AND rule=? AND route=? AND account_id=?")
+      .bind(slug, rule, route, accountId).first();
     let alpha = 1, beta = 1;
     if (existing) {
       const ageMs = Date.now() - new Date(existing.updated_at).getTime();
@@ -208,18 +209,18 @@ export async function updatePosteriors(db, slug, results, route) {
     alpha += n.pass;
     beta += n.fail;
     await db.prepare(
-      "INSERT INTO taste_posteriors (slug, rule, route, alpha, beta, updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(slug, rule, route) DO UPDATE SET alpha=excluded.alpha, beta=excluded.beta, updated_at=excluded.updated_at"
-    ).bind(slug, rule, route, alpha, beta, at).run();
+      "INSERT INTO taste_posteriors (slug, rule, route, account_id, alpha, beta, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(slug, rule, route, account_id) DO UPDATE SET alpha=excluded.alpha, beta=excluded.beta, updated_at=excluded.updated_at"
+    ).bind(slug, rule, route, accountId, alpha, beta, at).run();
   }
 }
 
 // samples are observations beyond the Beta(1,1) prior.
 export async function loadTasteReport(db) {
   await ensureTasteSchema(db);
-  const rows = await db.prepare("SELECT slug, rule, route, alpha, beta FROM taste_posteriors ORDER BY slug, rule, route").all();
+  const rows = await db.prepare("SELECT slug, rule, route, account_id, alpha, beta FROM taste_posteriors ORDER BY slug, rule, route, account_id").all();
   const bySlug = new Map();
   for (const r of rows.results || []) {
-    const m = bySlug.get(r.slug) || { slug: r.slug, rules: {}, routes: {}, num: 0, den: 0, samples: 0 };
+    const m = bySlug.get(r.slug) || { slug: r.slug, rules: {}, routes: {}, accounts: {}, num: 0, den: 0, samples: 0 };
     const n = Number(r.alpha) + Number(r.beta) - 2;
     const mean = Number(r.alpha) / (Number(r.alpha) + Number(r.beta));
     m.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
@@ -228,6 +229,12 @@ export async function loadTasteReport(db) {
       rm.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
       rm.samples = Math.max(rm.samples, n);
       m.routes[r.route] = rm;
+    }
+    if (r.account_id) {
+      const am = m.accounts[r.account_id] || { rules: {}, samples: 0 };
+      am.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
+      am.samples = Math.max(am.samples, n);
+      m.accounts[r.account_id] = am;
     }
     const w = RULES[r.rule] ? RULES[r.rule].weight : 1;
     m.num += mean * w;
@@ -240,15 +247,16 @@ export async function loadTasteReport(db) {
     taste: m.den ? Math.round((m.num / m.den) * 1000) / 1000 : null,
     samples: m.samples,
     rules: m.rules,
-    routes: m.routes
+    routes: m.routes,
+    accounts: m.accounts
   }));
 }
 
 // ---- recent verdicts (in-memory ring, no bodies) ----
 
 const recent = [];
-export function noteVerdict(slug, verdict) {
-  recent.push({ at: new Date().toISOString(), slug, score: verdict.score, violations: verdict.violations.map((v) => v.rule + (v.label ? ":" + v.label : "")) });
+export function noteVerdict(slug, verdict, accountId) {
+  recent.push({ at: new Date().toISOString(), slug, score: verdict.score, violations: verdict.violations.map((v) => v.rule + (v.label ? ":" + v.label : "")), account_id: String(accountId || "") });
   if (recent.length > 200) recent.splice(0, recent.length - 200);
 }
 export function recentVerdicts() {
