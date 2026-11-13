@@ -17,7 +17,7 @@ import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShado
 import { seedModelRegistry, backfillQualityCanonicalIds, loadAliasIndex, resolveCanonicalModel } from "./router/model-registry.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
-import { critique, parseStyleRules, updatePosteriors, loadTasteReport, noteVerdict, recentVerdicts, retryCritique, MODES as TASTE_MODES } from "./taste.js";
+import { critique, parseStyleRules, updatePosteriors, loadTasteReport, loadAccountTaste, recordVerdict, recentVerdictsFor, noteVerdict, recentVerdicts, retryCritique, MODES as TASTE_MODES } from "./taste.js";
 import { repairResponseBody, StreamToolAssembler, getToolRepairStats, resetToolRepairStats } from "./tool-response-repair.js";
 import { repairJson } from "./json-repair.js";
 import { loadSettings as pgLoadSettings, saveSettings as pgSaveSettings, listChats as pgListChats, getChat as pgGetChat, upsertChat as pgUpsertChat, deleteChat as pgDeleteChat, validateChatMessages as pgValidateMessages } from "./playground-store.js";
@@ -1984,6 +1984,35 @@ app.get("/console/api/models", async (c) => {
   return c.json({ data });
 });
 
+// The session's own taste profile: rule means, models, trend, and recent
+// verdicts. Scoped to the account plus every key it owns, because a verdict
+// is recorded under the account id for account-owned keys and under the key
+// id for standalone keys.
+app.get("/console/api/taste", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const ids = [];
+  if (sess.accountId) ids.push(sess.accountId);
+  const scopeIds = await sessionKeyScope(c, sess);
+  for (const id of scopeIds) if (!ids.includes(id)) ids.push(id);
+  if (!ids.length) return c.json({ taste: null, samples: 0, rules: {}, models: {}, trend: [] });
+  const profile = await loadAccountTaste(c.env.DB, ids);
+  return c.json(profile || { taste: null, samples: 0, rules: {}, models: {}, trend: [] });
+});
+
+// The session's recent taste verdicts. Sanitized by construction: time,
+// model, score, and failed rule names only.
+app.get("/console/api/taste/verdicts", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const ids = [];
+  if (sess.accountId) ids.push(sess.accountId);
+  const scopeIds = await sessionKeyScope(c, sess);
+  for (const id of scopeIds) if (!ids.includes(id)) ids.push(id);
+  if (!ids.length) return c.json({ verdicts: [] });
+  return c.json({ verdicts: await recentVerdictsFor(c.env.DB, ids, 30) });
+});
+
 // Request drill-down for the drawer. Body-free facts only: status, timings,
 // tokens, cost. No provider names, no route ids, no raw upstream errors.
 app.get("/console/api/requests/:id", async (c) => {
@@ -3624,7 +3653,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             styleRules: await tasteStyleRules(c)
           });
           await updatePosteriors(c.env.DB, slug, verdict.results, "", spendAccountId(key) || "");
-          noteVerdict(slug, verdict);
+          noteVerdict(slug, verdict, spendAccountId(key) || "");
+          await recordVerdict(c.env.DB, spendAccountId(key) || "", slug, verdict);
         }
       } catch (e) {
         blog("TASTE stream annotate failed open: " + String(e && e.message || e));
@@ -5187,6 +5217,7 @@ async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug, key) {
   const accountId = spendAccountId(key) || "";
   await updatePosteriors(c.env.DB, slug, verdict.results, "", accountId);
   noteVerdict(slug, verdict, accountId);
+  await recordVerdict(c.env.DB, accountId, slug, verdict);
   return { verdict, obj };
 }
 // One bounded retry through the normal stack with the critique appended as a

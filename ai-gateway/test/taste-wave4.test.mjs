@@ -36,12 +36,14 @@ test("decay halves old evidence after the half-life", async () => {
   assert.ok(Number(row.beta) >= 2, "new failure added: beta=" + row.beta);
 });
 
-test("no decay when evidence is fresh", async () => {
+test("fresh evidence decays by less than one part in a million", async () => {
   const db = createDb(":memory:");
   await ensureTasteSchema(db);
   await updatePosteriors(db, "m", [{ rule: "json_valid", pass: true }], "route-a");
   await updatePosteriors(db, "m", [{ rule: "json_valid", pass: true }], "route-a");
   const row = await db.prepare("SELECT alpha, beta FROM taste_posteriors WHERE slug='m' AND rule='json_valid' AND route='route-a'").first();
-  assert.equal(Number(row.alpha), 3, "two passes plus prior 1");
+  // Two passes plus the prior would be exactly 3 with no decay. The elapsed
+  // milliseconds between the calls cost a few nanounits, never a percent.
+  assert.ok(Math.abs(Number(row.alpha) - 3) < 1e-5, "alpha ~ 3: " + row.alpha);
   assert.equal(Number(row.beta), 1, "no failures plus prior 1");
 });

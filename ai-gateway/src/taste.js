@@ -176,7 +176,49 @@ export async function ensureTasteSchema(db) {
       await db.prepare("DROP TABLE taste_posteriors_old").run();
     }
   } catch {}
+  // Persisted verdict history: one small row per response, used for the
+  // per-account trend and the console feed. Same sanitation guarantee as the
+  // posteriors: rule names and a score only, never request or response text.
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS taste_verdicts (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL, score REAL NOT NULL, violations TEXT NOT NULL DEFAULT '')"
+  ).run();
+  await db.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_taste_verdicts_account ON taste_verdicts(account_id, at)"
+  ).run();
   ensured.add(db);
+}
+
+const MAX_VERDICTS_PER_ACCOUNT = 200;
+
+// Persist one verdict for the trend/history views. Fire-and-forget: a failed
+// insert must never break a response.
+export async function recordVerdict(db, accountId, slug, verdict) {
+  if (!db || !slug) return;
+  try {
+    await ensureTasteSchema(db);
+    await db.prepare("INSERT INTO taste_verdicts (at, account_id, slug, score, violations) VALUES (?,?,?,?,?)")
+      .bind(new Date().toISOString(), String(accountId || ""), slug, verdict.score, verdict.violations.map((v) => v.rule + (v.label ? ":" + v.label : "")).join(",")).run();
+    await db.prepare(
+      "DELETE FROM taste_verdicts WHERE account_id=? AND id NOT IN (SELECT id FROM taste_verdicts WHERE account_id=? ORDER BY id DESC LIMIT ?)"
+    ).bind(String(accountId || ""), String(accountId || ""), MAX_VERDICTS_PER_ACCOUNT).run();
+  } catch {}
+}
+
+// Recent persisted verdicts for one or more accounts, newest first.
+export async function recentVerdictsFor(db, accountIds, limit = 30) {
+  if (!db || !accountIds.length) return [];
+  await ensureTasteSchema(db);
+  const marks = accountIds.map(() => "?").join(",");
+  const rows = await db.prepare(
+    `SELECT at, account_id, slug, score, violations FROM taste_verdicts WHERE account_id IN (${marks}) ORDER BY id DESC LIMIT ?`
+  ).bind(...accountIds, limit).all();
+  return (rows.results || []).map((r) => ({
+    at: r.at,
+    account_id: r.account_id,
+    slug: r.slug,
+    score: Number(r.score),
+    violations: String(r.violations || "").split(",").filter(Boolean)
+  }));
 }
 
 const DECAY_HALF_LIFE_MS = 30 * 86400000; // 30 days
@@ -214,6 +256,57 @@ export async function updatePosteriors(db, slug, results, route, accountId) {
   }
 }
 
+// Per-account profile for the console: the account's rule means across
+// models, plus the weighted taste score, plus a trend of recent scores.
+export async function loadAccountTaste(db, accountIds) {
+  if (!db || !accountIds.length) return null;
+  await ensureTasteSchema(db);
+  const marks = accountIds.map(() => "?").join(",");
+  const rows = await db.prepare(
+    `SELECT slug, rule, alpha, beta FROM taste_posteriors WHERE account_id IN (${marks})`
+  ).bind(...accountIds).all();
+  const byRule = new Map();
+  const byModel = new Map();
+  for (const r of rows.results || []) {
+    const n = Number(r.alpha) + Number(r.beta) - 2;
+    const mean = Number(r.alpha) / (Number(r.alpha) + Number(r.beta));
+    const cur = byRule.get(r.rule) || { pass: 0, total: 0 };
+    cur.pass += Number(r.alpha) - 1;
+    cur.total += n;
+    byRule.set(r.rule, cur);
+    const m = byModel.get(r.slug) || { rules: {}, samples: 0 };
+    m.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
+    m.samples = Math.max(m.samples, n);
+    byModel.set(r.slug, m);
+  }
+  const rules = {};
+  let num = 0, den = 0, samples = 0;
+  for (const [rule, cur] of byRule) {
+    const mean = cur.total ? (1 + cur.pass) / (2 + cur.total) : 0.5;
+    // Beta counts decay continuously, so n can sit a hair below the true
+    // integer count. Round for display; the mean uses the raw value.
+    const n = Math.round(cur.total * 1000) / 1000;
+    rules[rule] = { mean: Math.round(mean * 1000) / 1000, n: Math.round(n) };
+    const w = RULES[rule] ? RULES[rule].weight : 1;
+    num += mean * w;
+    den += w;
+    samples = Math.max(samples, cur.total);
+  }
+  samples = Math.round(samples);
+  // Trend: average score per hour over the last 48 hours.
+  const since = new Date(Date.now() - 48 * 3600000).toISOString();
+  const trend = await db.prepare(
+    `SELECT substr(at, 1, 13) AS hour, AVG(score) AS avg_score, COUNT(*) AS n FROM taste_verdicts WHERE account_id IN (${marks}) AND at >= ? GROUP BY hour ORDER BY hour`
+  ).bind(...accountIds, since).all();
+  return {
+    taste: den ? Math.round((num / den) * 1000) / 1000 : null,
+    samples,
+    rules,
+    models: Object.fromEntries(byModel),
+    trend: (trend.results || []).map((r) => ({ hour: r.hour + ":00:00.000Z", score: Math.round(Number(r.avg_score) * 1000) / 1000, n: Number(r.n) }))
+  };
+}
+
 // samples are observations beyond the Beta(1,1) prior.
 export async function loadTasteReport(db) {
   await ensureTasteSchema(db);
@@ -221,18 +314,20 @@ export async function loadTasteReport(db) {
   const bySlug = new Map();
   for (const r of rows.results || []) {
     const m = bySlug.get(r.slug) || { slug: r.slug, rules: {}, routes: {}, accounts: {}, num: 0, den: 0, samples: 0 };
-    const n = Number(r.alpha) + Number(r.beta) - 2;
+    // Decay blurs the discrete observation count by a few nanounits between
+    // calls. Round n for display; the mean uses the raw counts.
+    const n = Math.round((Number(r.alpha) + Number(r.beta) - 2) * 1000) / 1000;
     const mean = Number(r.alpha) / (Number(r.alpha) + Number(r.beta));
-    m.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
+    m.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n: Math.round(n) };
     if (r.route) {
       const rm = m.routes[r.route] || { rules: {}, samples: 0 };
-      rm.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
+      rm.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n: Math.round(n) };
       rm.samples = Math.max(rm.samples, n);
       m.routes[r.route] = rm;
     }
     if (r.account_id) {
       const am = m.accounts[r.account_id] || { rules: {}, samples: 0 };
-      am.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n };
+      am.rules[r.rule] = { mean: Math.round(mean * 1000) / 1000, n: Math.round(n) };
       am.samples = Math.max(am.samples, n);
       m.accounts[r.account_id] = am;
     }
@@ -245,7 +340,7 @@ export async function loadTasteReport(db) {
   return [...bySlug.values()].map((m) => ({
     slug: m.slug,
     taste: m.den ? Math.round((m.num / m.den) * 1000) / 1000 : null,
-    samples: m.samples,
+    samples: Math.round(m.samples),
     rules: m.rules,
     routes: m.routes,
     accounts: m.accounts
