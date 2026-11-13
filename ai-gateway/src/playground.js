@@ -4,47 +4,63 @@ var PLAYGROUND_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Astrosphere Control</title>
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet" />
+<title>Wind Control</title>
+<script>try{var __t=localStorage.getItem("gw-theme");if(!__t)__t=matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";document.documentElement.dataset.theme=__t;}catch(e){}<\/script>
 <style>
+  @font-face{font-family:"Inter";font-weight:100 900;font-style:normal;font-display:swap;src:url(/console/fonts/inter.woff2) format("woff2")}
+  @font-face{font-family:"IBM Plex Mono";font-weight:100 700;font-style:normal;font-display:swap;src:url(/console/fonts/plex-mono.woff2) format("woff2")}
+  /* Wind: HeroUI v3 ocean anatomy ported to plain CSS. Borderless fields,
+     pill controls, surface cards, sky accent; nothing glows. */
   :root{
     color-scheme:dark;
-    /* Deeper OLED ground with a cool cast; surfaces read as machined trays
-       rather than flat panels, so hierarchy comes from light, not borders. */
-    --bg:#070912; --surface:#0e1122; --surface-hi:#1a2039; --surface-deep:#0a0e1c;
-    --line:rgba(148,178,220,.12); --line-hi:rgba(148,178,220,.24);
-    --text:#eef1fb; --muted:#9aa4c6; --muted-dim:#6a749a;
-    --accent:#74a4ff; --accent-dim:#93bbff; --accent-soft:rgba(116,164,255,.12); --ink:#05070f;
-    --good:#57d199; --warn:#f0c065; --bad:#ff7a90;
-    --violet:#a78bfa; --violet-soft:rgba(167,139,250,.12);
-    --r-lg:14px; --radius:10px; --radius-sm:6px; --r-pill:999px;
+    --white:oklch(100% 0 0); --snow:oklch(0.9911 0 0); --eclipse:oklch(0.2103 0.0059 285.89);
+    --bg:oklch(0.14 0.022 236); --surface:oklch(0.215 0.014 236); --surface-hi:oklch(0.262 0.012 240); --surface-deep:oklch(0.28 0.012 238);
+    --line:oklch(0.30 0.012 238); --line-hi:oklch(0.4 0.02 240);
+    --text:var(--snow); --muted:oklch(0.72 0.02 236); --muted-dim:color-mix(in oklab,var(--muted) 70%,transparent);
+    --accent:oklch(0.66 0.17 236); --accent-dim:color-mix(in oklab,var(--accent) 90%,var(--snow) 10%);
+    --accent-soft:color-mix(in oklab,var(--accent) 18%,transparent); --accent-soft-fg:color-mix(in oklab,var(--accent) 70%,var(--snow) 30%);
+    --ink:var(--snow);
+    --cool:var(--accent); --cool-soft:var(--accent-soft);
+    --good:oklch(0.7329 0.1935 150.81); --good-soft:color-mix(in oklab,var(--good) 18%,transparent);
+    --warn:oklch(0.8203 0.1388 76.34); --warn-soft:color-mix(in oklab,var(--warn) 18%,transparent);
+    --bad:oklch(0.594 0.1967 24.63); --bad-soft:color-mix(in oklab,var(--bad) 18%,transparent); --bad-soft-fg:color-mix(in oklab,var(--bad) 70%,var(--snow) 40%);
+    --violet:var(--accent); --violet-soft:var(--accent-soft);
+    --default:oklch(0.28 0.012 238); --default-hover:color-mix(in oklab,var(--default) 96%,var(--snow) 4%);
+    --r-lg:24px; --radius:12px; --radius-sm:8px; --r-pill:999px; --radius-field:18px;
     --w-med:500; --w-bold:600;
-    --mono:ui-monospace,"SF Mono","JetBrains Mono",Consolas,monospace;
-    --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
-    --display:"Fraunces","Iowan Old Style",Palatino,serif;
-    /* Custom spring curves only: no linear, no ease-in-out. */
+    --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Consolas,monospace;
+    --sans:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --display:var(--sans);
     --ease:cubic-bezier(.32,.72,0,1);
-    --ease-out:cubic-bezier(.16,1,.3,1);
-    --dur:180ms;
-    --dur-slow:420ms;
-    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
-    --shadow-lift:0 2px 4px rgba(0,0,0,.45),0 18px 40px -16px rgba(0,0,0,.7);
-    --inset:inset 0 1px 0 rgba(255,255,255,.05);
+    --ease-out:cubic-bezier(.23,1,.32,1);
+    --dur:150ms; --dur-slow:250ms;
+    --track:var(--default); --hatch:color-mix(in oklch,var(--snow) 7%,transparent);
+    --solid:oklch(0.225 0.014 236);
+    --overlay:oklch(0.225 0.014 236);
+    --backdrop:rgba(3,6,14,.6);
+    --shadow:0 0 0 0 transparent inset;
+    --shadow-lift:0 0 1px 0 rgba(255,255,255,.3) inset,0 14px 28px 0 rgba(0,0,0,.5);
+    --inset:none;
+    --surface-shadow:0 0 0 0 transparent inset;
+    --overlay-shadow:0 0 1px 0 rgba(255,255,255,.3) inset;
   }
-
-  /* Ambient depth: two slow radial washes, fixed so they never repaint on
-     scroll, plus a faint grain to kill gradient banding on OLED. */
-  body::before{
-    content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-    background:
-      radial-gradient(900px 520px at 12% -8%, rgba(116,164,255,.12), transparent 62%),
-      radial-gradient(760px 480px at 92% 4%, rgba(167,139,250,.08), transparent 60%);
-  }
-  body::after{
-    content:""; position:fixed; inset:0; z-index:1; pointer-events:none; opacity:.028;
-    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+  :root[data-theme="light"]{
+    color-scheme:light;
+    --bg:oklch(0.975 0.018 232); --surface:var(--white); --surface-hi:oklch(0.957 0.008 236); --surface-deep:oklch(0.94 0.01 236);
+    --line:oklch(0.9 0.012 236); --line-hi:oklch(0.8 0.02 238);
+    --text:var(--eclipse); --muted:oklch(0.52 0.03 240); --muted-dim:color-mix(in oklab,var(--muted) 70%,transparent);
+    --accent:oklch(0.62 0.17 242); --accent-dim:color-mix(in oklab,var(--accent) 90%,var(--snow) 10%);
+    --accent-soft:color-mix(in oklab,var(--accent) 12%,transparent); --accent-soft-fg:color-mix(in oklab,var(--accent) 80%,var(--eclipse) 20%);
+    --ink:var(--eclipse);
+    --default:oklch(0.94 0.01 236); --default-hover:color-mix(in oklab,var(--default) 96%,var(--eclipse) 4%);
+    --bad:oklch(0.6532 0.2328 25.74); --bad-soft:color-mix(in oklab,var(--bad) 12%,transparent); --bad-soft-fg:color-mix(in oklab,var(--bad) 80%,var(--eclipse) 20%);
+    --good-soft:color-mix(in oklab,var(--good) 14%,transparent); --warn-soft:color-mix(in oklab,var(--warn) 16%,transparent);
+    --track:var(--default); --hatch:color-mix(in oklch,var(--eclipse) 8%,transparent);
+    --solid:var(--white); --overlay:var(--white);
+    --backdrop:rgba(24,24,40,.5);
+    --surface-shadow:0 2px 4px 0 rgba(0,0,0,.04),0 1px 2px 0 rgba(0,0,0,.06),0 0 1px 0 rgba(0,0,0,.06);
+    --overlay-shadow:0 2px 8px 0 rgba(0,0,0,.06),0 -6px 12px 0 rgba(0,0,0,.03),0 14px 28px 0 rgba(0,0,0,.08);
+    --shadow-lift:var(--overlay-shadow);
   }
 
   /* --- decision mode ------------------------------------------------- */
@@ -60,7 +76,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     cursor:pointer; transition:color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease);}
   .pg-modes .pg-mode:hover{color:var(--text);}
   .pg-modes .pg-mode.is-on{color:var(--ink); background:var(--accent);
-    box-shadow:0 2px 10px -4px rgba(116,164,255,.7);}
+    box-shadow:0 2px 10px -4px color-mix(in oklch,var(--accent) 40%,transparent);}
   .pg-modes .pg-mode:active{transform:scale(.985);}
   .pg-modes .pg-mode:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
 
@@ -69,7 +85,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     background:linear-gradient(180deg,var(--surface-hi),var(--surface));
     border:1px solid var(--line); box-shadow:var(--shadow),var(--inset);
     animation:pgDecIn var(--dur-slow) var(--ease-out) both;}
-  .pg-dec-card .k{font:600 11px/1 var(--sans); letter-spacing:.08em; text-transform:uppercase;
+  .pg-dec-card .k{font:600 11px/1 var(--sans); letter-spacing:0; 
     color:var(--muted); display:flex; align-items:center; gap:8px; margin-bottom:8px;}
   .pg-dec-choice{font:600 16px/1.3 var(--sans); color:var(--text); margin-bottom:10px;}
   .pg-dec-bar{display:grid; grid-template-columns:minmax(72px,110px) 1fr auto; align-items:center;
@@ -77,10 +93,10 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-dec-bar .lbl{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   .pg-dec-bar .trk{height:6px; border-radius:var(--r-pill); background:var(--surface-deep); overflow:hidden;}
   .pg-dec-bar .trk i{display:block; height:100%; border-radius:var(--r-pill);
-    background:linear-gradient(90deg,var(--accent-dim),var(--accent)); transition:width var(--dur) var(--ease);}
+    background:linear-gradient(90deg,var(--accent-dim),var(--accent));}
   .pg-dec-bar b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; text-align:right; min-width:34px;}
   .pg-dec-track{height:6px; border-radius:var(--r-pill); background:var(--surface-deep); overflow:hidden; margin:2px 0 8px;}
-  .pg-dec-track i{display:block; height:100%; background:linear-gradient(90deg,var(--accent-dim),var(--accent)); transition:width var(--dur) var(--ease);}
+  .pg-dec-track i{display:block; height:100%; background:linear-gradient(90deg,var(--accent-dim),var(--accent));}
   @keyframes pgDecIn{from{opacity:0; transform:translateY(8px) scale(.985);} to{opacity:1; transform:none;}}
 
   @media (prefers-reduced-motion:reduce){
@@ -103,7 +119,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   .tab{display:none}.tab.active{display:block}
   h2.sec{font-size:13px;line-height:1.3;letter-spacing:-.01em;color:var(--text);margin:0 0 10px;font-weight:var(--w-bold)}
   .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:16px;margin-bottom:12px}
-  label{display:block;font-size:10px;line-height:1.2;color:var(--muted);margin:0 0 5px;font-weight:var(--w-med);letter-spacing:.06em}
+  label{display:block;font-size:10px;line-height:1.2;color:var(--muted);margin:0 0 5px;font-weight:var(--w-med);letter-spacing:0;}
   input,select,textarea{width:100%;background:var(--surface-deep);border:1px solid var(--line);color:var(--text);border-radius:var(--radius-sm);padding:8px 10px;font-size:12px;transition:border-color var(--dur) var(--ease)}
   input:hover,select:hover,textarea:hover{border-color:var(--line-hi)} input:focus,select:focus,textarea:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
   input::placeholder,textarea::placeholder{color:var(--muted)} textarea{min-height:100px;resize:vertical;font:11px/1.5 var(--mono)}
@@ -111,23 +127,23 @@ var PLAYGROUND_HTML = `<!doctype html>
   button.act,button.ghost,button.danger{border-radius:var(--radius-sm);cursor:pointer;font-size:11px;font-weight:var(--w-med);letter-spacing:.01em;transition:transform var(--dur) var(--ease),background var(--dur) var(--ease),border-color var(--dur) var(--ease)}
   button.act{background:var(--accent);color:var(--ink);border:1px solid var(--accent);padding:7px 12px}button.act:hover{background:var(--accent-dim);border-color:var(--accent-dim)}button.act:active,button.ghost:active,button.danger:active{transform:scale(.97)}button.act:disabled{opacity:.4;cursor:not-allowed}
   button.ghost{background:transparent;border:1px solid var(--line-hi);color:var(--muted);padding:7px 11px}button.ghost:hover{border-color:var(--accent);color:var(--accent)}
-  button.danger{background:transparent;border:1px solid transparent;color:var(--bad);padding:6px 10px}button.danger:hover{background:rgba(228,91,91,.1);border-color:rgba(228,91,91,.4)}
-  table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#t-list{overflow-x:auto;border-radius:var(--radius-sm)}#t-list table{min-width:880px}th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:middle}th{position:sticky;top:0;background:var(--surface-deep);color:var(--muted);font:9px/1.3 var(--mono);letter-spacing:.08em;text-transform:uppercase}tbody tr:hover{background:var(--surface-deep)}tbody tr:last-child td{border-bottom:0}
+  button.danger{background:transparent;border:1px solid transparent;color:var(--bad);padding:6px 10px}button.danger:hover{background:color-mix(in oklch,var(--bad) 12%,transparent);border-color:color-mix(in oklch,var(--bad) 18%,transparent)}
+  table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#t-list{overflow-x:auto;border-radius:var(--radius-sm)}#t-list table{min-width:880px}th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:middle}th{background:var(--surface-deep);color:var(--muted);font:9px/1.3 var(--mono);letter-spacing:0;text-transform:none}tbody tr:hover{background:var(--surface-deep)}tbody tr:last-child td{border-bottom:0}
   #pr-list{overflow-x:auto}#pr-list tbody tr:hover{background:var(--surface-deep)}
   .price-editor h3.sec{margin:18px 0 8px;font-size:11px;padding-bottom:6px;border-bottom:1px solid var(--line)}.price-editor h3.sec:first-child{margin-top:0}
   .price-editor .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .pe-ov{border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;background:var(--surface-deep)}
   .pe-ov-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
   .pe-add{display:flex;gap:8px;align-items:flex-end;margin-top:8px}.pe-add>div{flex:1}
-  .mono{font-family:var(--mono);font-size:11px;word-break:break-all}.pill{padding:2px 7px;border:1px solid transparent;border-radius:var(--r-pill);font:9px/1.2 var(--mono);letter-spacing:.04em;text-transform:uppercase;display:inline-block}.pill.ok{background:rgba(62,201,140,.12);border-color:rgba(62,201,140,.24);color:var(--good)}.pill.bad{background:rgba(228,91,91,.12);border-color:rgba(228,91,91,.24);color:var(--bad)}.pill.warn{background:rgba(220,174,79,.12);border-color:rgba(220,174,79,.24);color:var(--warn)}.pill.mut{background:rgba(95,109,130,.1);border-color:rgba(95,109,130,.2);color:var(--muted)}.pill.acc{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
-  .stat{position:relative;min-height:88px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px 16px}.stat:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}.stat .k{color:var(--muted);font-size:10px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.stat .v{font:600 22px/1.1 var(--mono);margin-top:10px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}.stat .v.acc{color:var(--accent)}.stat .v.ok{color:var(--good)}.stat .v.bad{color:var(--bad)}
+  .mono{font-family:var(--mono);font-size:11px;word-break:break-all}.pill{padding:2px 7px;border:1px solid transparent;border-radius:var(--r-pill);font:9px/1.2 var(--mono);letter-spacing:0;display:inline-block}.pill.ok{background:color-mix(in oklch,var(--good) 14%,transparent);border-color:color-mix(in oklch,var(--good) 30%,transparent);color:var(--good)}.pill.bad{background:color-mix(in oklch,var(--bad) 18%,transparent);border-color:color-mix(in oklch,var(--bad) 30%,transparent);color:var(--bad)}.pill.warn{background:color-mix(in oklch,var(--warn) 14%,transparent);border-color:color-mix(in oklch,var(--warn) 30%,transparent);color:var(--warn)}.pill.mut{background:color-mix(in oklch,var(--muted) 12%,transparent);border-color:color-mix(in oklch,var(--muted) 24%,transparent);color:var(--muted)}.pill.acc{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .stat{position:relative;min-height:88px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px 16px}.stat:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}.stat .k{color:var(--muted);font-size:10px;font-weight:500;letter-spacing:0;text-transform:none}.stat .v{font:600 22px/1.1 var(--mono);margin-top:10px;font-variant-numeric:tabular-nums;letter-spacing:-.02em;overflow-wrap:anywhere}.stat .v.acc{color:var(--accent)}.stat .v.ok{color:var(--good)}.stat .v.bad{color:var(--bad)}
   .grid{display:grid;gap:12px}.grid.s4{grid-template-columns:repeat(4,minmax(0,1fr))}.grid.s3{grid-template-columns:repeat(3,minmax(0,1fr))}.grid.s2{grid-template-columns:repeat(2,minmax(0,1fr))}
   button:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .toast{position:fixed;right:20px;bottom:20px;background:var(--surface-hi);border:1px solid var(--line-hi);padding:10px 14px;border-radius:6px;opacity:0;transform:translateY(6px);transition:opacity var(--dur) var(--ease),transform var(--dur) var(--ease);pointer-events:none;max-width:340px;z-index:80;font-size:12px}.toast.show{opacity:1;transform:translateY(0)}.toast.err{border-color:var(--bad);color:var(--bad)}.toast.ok{border-color:var(--good)}
   .hint,.small{color:var(--muted);font-size:11px}.hint{margin:10px 0 0;line-height:1.45;max-width:62ch}.small{font-size:10px}
   .skeleton{background:var(--surface-deep);border-radius:4px;animation:pulse 1.4s ease-in-out infinite;opacity:.5}@keyframes pulse{0%,100%{opacity:.3}50%{opacity:.7}}
   .empty{padding:24px 20px;text-align:center;color:var(--muted);font-size:11px;border:1px dashed var(--line-hi);border-radius:var(--radius-sm)}
-  .overlay{position:fixed;inset:0;background:rgba(5,6,9,.82);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:70;padding:20px}.overlay.show{display:flex}.modal{background:var(--surface);border:1px solid var(--line-hi);border-radius:var(--r-lg);padding:20px;width:440px;max-width:100%;max-height:88vh;overflow:auto}.modal.wide{width:min(960px,100%)}.modal h3{margin:0 0 16px;font-size:16px;letter-spacing:-.02em;font-weight:var(--w-bold)}.modal pre{max-height:400px}.msg{display:flex;gap:10px;margin:8px 0}.msg .who{font-weight:var(--w-med);min-width:56px;font-size:11px}.msg.user .who{color:var(--accent)}.msg.assistant .who{color:var(--good)}
+  .overlay{position:fixed;inset:0;background:var(--overlay);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:70;padding:20px}.overlay.show{display:flex}.modal{background:var(--surface);border:1px solid var(--line-hi);border-radius:var(--r-lg);padding:20px;width:440px;max-width:100%;max-height:88vh;overflow:auto}.modal.wide{width:min(960px,100%)}.modal h3{margin:0 0 16px;font-size:16px;letter-spacing:-.02em;font-weight:var(--w-bold)}.modal pre{max-height:400px}.msg{display:flex;gap:10px;margin:8px 0}.msg .who{font-weight:var(--w-med);min-width:56px;font-size:11px}.msg.user .who{color:var(--accent)}.msg.assistant .who{color:var(--good)}
   pre{background:var(--surface-deep);border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;overflow:auto;max-height:320px;font:10.5px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word}.toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}.toolbar .spacer{margin-left:auto}
   .seg{display:inline-flex;border:1px solid var(--line-hi);border-radius:var(--radius-sm);overflow:hidden}.seg button{background:transparent;border:0;color:var(--muted);padding:5px 10px;cursor:pointer;font-size:10px}.seg button.on{background:var(--accent);color:var(--ink)}
   @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
@@ -146,10 +162,10 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-chat-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}
   .pg-messages{flex:1;min-height:280px;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:12px;background:var(--surface-deep)}
   .pg-msg{max-width:78%;padding:12px 14px;border-radius:10px;line-height:1.55}
-  .pg-msg.user{align-self:flex-end;background:rgba(47,212,181,.12);border:1px solid rgba(47,212,181,.28);border-bottom-right-radius:4px}
+  .pg-msg.user{align-self:flex-end;background:var(--accent-soft);border:1px solid var(--line-hi);border-bottom-right-radius:4px}
   .pg-msg.assistant{align-self:flex-start;background:var(--surface-hi);border:1px solid var(--line);border-bottom-left-radius:4px}
   .pg-msg.streaming{border-style:dashed}
-  .pg-msg .who{font:10px/1 var(--mono);letter-spacing:.08em;color:var(--muted);margin-bottom:6px}
+  .pg-msg .who{font:10px/1 var(--mono);letter-spacing:0;color:var(--muted);margin-bottom:6px}
   .pg-msg.user .who{color:var(--accent)}
   .pg-msg.assistant .who{color:var(--good)}
   .pg-body{white-space:pre-wrap;word-break:break-word}
@@ -158,7 +174,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   .pg-composer textarea{flex:1;min-height:52px;max-height:160px;resize:vertical}
   .pg-composer button{flex:0 0 auto;margin-top:0}
   .pg-trace{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:var(--surface)}
-  .pg-trace .k{font:9px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .pg-trace .k{font:9px/1 var(--mono);letter-spacing:0;color:var(--muted)}
   .pg-trace .v{font:12px/1.3 var(--mono);margin-top:4px;word-break:break-all}
   .pg-probe{margin:0;padding:0;overflow:hidden}
   .pg-probe-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line)}
@@ -197,7 +213,7 @@ var PLAYGROUND_HTML = `<!doctype html>
      Credits tab needs no external stylesheet (the admin CSP allows inline
      styles only - no third-party code). */
   .usagebar{display:inline-block;width:96px;height:6px;border-radius:var(--r-pill);background:var(--surface-deep);border:1px solid var(--line);overflow:hidden;vertical-align:middle}
-  .usagebar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent-dim),var(--accent));transition:width var(--dur) var(--ease)}
+  .usagebar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent-dim),var(--accent));}
   .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
   .form-grid .full{grid-column:1/-1}
   .modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
@@ -214,47 +230,206 @@ var PLAYGROUND_HTML = `<!doctype html>
   .tj-bar{display:grid;grid-template-columns:160px 1fr 80px;gap:10px;align-items:center}
   .tj-bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--muted)}
   .tj-bar-track{height:6px;background:var(--surface-deep);border-radius:3px;overflow:hidden}
-  .tj-bar-fill{height:100%;background:var(--accent);border-radius:3px;transition:width var(--dur) var(--ease)}
+  .tj-bar-fill{height:100%;background:var(--accent);border-radius:3px;}
   .tj-bar-val{text-align:right;font-size:10px;color:var(--muted)}
   .tj-pager{display:flex;align-items:center;justify-content:center;gap:14px;padding:14px 0 4px;color:var(--muted)}
-  .tj-pager button:disabled{opacity:.35;cursor:default}
+  .tj-pager button:disabled{background:var(--surface-hi);color:var(--muted-dim);cursor:not-allowed}
   .tj-steps{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0}
   .tj-step{padding:8px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface-deep)}
-  .tj-step.ok{border-color:rgba(62,201,140,.3)}
-  .tj-step.bad{border-color:rgba(228,91,91,.3)}
+  .tj-step.ok{border-color:color-mix(in oklch,var(--good) 30%,transparent)}
+  .tj-step.bad{border-color:color-mix(in oklch,var(--bad) 18%,transparent)}
   .tj-step.mut{border-color:var(--line)}
   .tj-step .k{font-size:11px;font-weight:600}
   .tj-step .v{font-size:9px;color:var(--muted);margin-top:2px}
-  .tj-arrow{color:var(--faint,#4d596a);font-size:12px}
+  .tj-arrow{color:var(--faint,var(--muted-dim));font-size:12px}
   @media (max-width:620px){.tj-bar{grid-template-columns:1fr;gap:4px}.tj-bar-val{text-align:left}}
   .lg-pre{max-height:60vh;font:11px/1.6 var(--mono);background:var(--surface-deep)}
   .lg-ts{color:var(--muted);margin-right:8px;font-size:10px}
   @media (max-width:1100px){.hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.cols2{grid-template-columns:1fr}.filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media (max-width:620px){.hero-stats{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.filter-grid{grid-template-columns:1fr}.pagehead{flex-direction:column;align-items:flex-start}}
+
+  /* ===== Wind layer =====
+     HeroUI anatomy: pill controls and chips, borderless rounded fields,
+     24px surface cards, sm-scale type at 500 weight, status colours as soft
+     fills. Presses answer with scale(.97); hover only on devices that hover. */
+  html{background:var(--bg);overflow-x:clip}
+  body{background:var(--bg);font:14px/1.5 var(--sans);letter-spacing:0;overflow-x:clip;font-feature-settings:"tnum";scrollbar-width:thin;scrollbar-color:color-mix(in oklch,var(--text) 15%,transparent) transparent}
+  body:before,body:after{content:none}
+  header{position:sticky;top:0;z-index:30;height:56px;padding:0 24px;gap:16px;background:color-mix(in oklab,var(--bg) 82%,transparent);border-bottom:0;backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%)}
+  header .brand{font-family:var(--sans);font-weight:600;font-size:17px;letter-spacing:-.02em}
+  header .brand .dot{width:28px;height:28px;border-radius:8px;background:var(--accent);color:var(--ink);font:600 14px/1 var(--sans);box-shadow:none}
+  header .base{padding:6px 12px;border-radius:var(--r-pill);background:var(--default);font:12px/1 var(--mono);color:var(--muted)}
+  header .clock{border-left:0;padding-left:0;color:var(--muted);font:12px/1 var(--mono)}
+  .themebtn{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;border-radius:var(--r-pill);background:transparent;color:var(--muted);cursor:pointer;transition:color var(--dur) var(--ease-out),background-color var(--dur) var(--ease-out)}
+  .themebtn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+  nav{position:fixed;z-index:20;top:56px;bottom:0;left:0;width:224px;padding:12px 10px;display:flex;flex-direction:column;gap:2px;overflow-y:auto;background:transparent;border:0;border-radius:0;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none}
+  nav .navgrp{padding:16px 12px 6px;font:600 11px/1 var(--sans);color:var(--muted-dim);letter-spacing:.02em}
+  nav .navgrp:first-child{padding-top:6px}
+  nav button{position:relative;display:block;width:100%;height:36px;line-height:36px;padding:0 14px;text-align:left;border:0;border-radius:var(--r-pill);background:transparent;color:var(--muted);font-size:14px;font-weight:500;cursor:pointer;transition:color var(--dur) var(--ease-out),background-color var(--dur) var(--ease-out),transform 250ms var(--ease-out)}
+  nav button:active{transform:scale(.98)}
+  nav button.active{background:var(--default);color:var(--text);box-shadow:none}
+  nav button.active:before{content:none}
+  main{margin-left:224px;max-width:1280px;padding:28px 36px 72px}
+  .tab.active{animation:gwtab 200ms var(--ease-out) both}
+  @keyframes gwtab{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  .pagehead h2.sec{font-family:var(--sans);font-weight:600;font-size:26px;letter-spacing:-.02em}
+  .pagehead .sub{font-size:14px;color:var(--muted)}
+  h2.sec{font-size:14px;font-weight:500;letter-spacing:0}
+  .panel,.card,.stat,.routegroup{background:var(--surface);border:0;border-radius:var(--r-lg);box-shadow:var(--surface-shadow);backdrop-filter:none;-webkit-backdrop-filter:none}
+  .routegroup{background:var(--surface-deep)}
+  .panel-h{padding:14px 20px;border-bottom:0}
+  .panel-h h2.sec{font-size:14px}
+  .panel-b{padding:20px}
+  .stat:before{display:none}
+  .stat{min-height:0}
+  .hero-stats{gap:10px}
+  .hero-stats .stat{background:var(--surface);border:0;border-radius:var(--r-lg);min-height:0;padding:14px 18px}
+  .hero-stats .stat+.stat{border-left:0}
+  .hero-stats .stat .k{font:500 14px/1.3 var(--sans);letter-spacing:0;text-transform:none;color:var(--muted)}
+  .hero-stats .stat .v{margin-top:2px;font:600 26px/1.2 var(--mono);letter-spacing:-.01em}
+  label{font-size:13px;font-weight:500;letter-spacing:0;text-transform:none;color:var(--text)}
+  input,select,textarea{background:var(--default);border:0;border-radius:var(--radius-field);padding:9px 12px;font-size:14px;transition:background-color var(--dur) var(--ease-out),box-shadow var(--dur) var(--ease-out)}
+  textarea{font:12px/1.5 var(--mono)}
+  select option{background:var(--solid);color:var(--text)}
+  @media (hover:hover) and (pointer:fine){input:hover,select:hover,textarea:hover{background:var(--default-hover)}}
+  input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:2px;border-color:transparent;box-shadow:none}
+  button:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  button.act,button.ghost,button.danger{font-size:14px;font-weight:500;border-radius:var(--r-pill);transition:transform 250ms var(--ease-out),background-color var(--dur) var(--ease-out),border-color var(--dur) var(--ease-out),color var(--dur) var(--ease-out)}
+  button.act{padding:9px 16px;background:var(--accent);border:0;color:var(--accent-fg,#fff);box-shadow:none}
+  button.act{color:oklch(100% 0 0)}
+  button.ghost{padding:9px 16px;background:var(--default);border:0;color:var(--text);box-shadow:none}
+  button.danger{padding:9px 14px;background:var(--bad-soft);color:var(--bad-soft-fg)}
+  button.act:active,button.ghost:active,button.danger:active,.seg button:active{transform:scale(.97)}
+  button:disabled{background:var(--default);color:var(--muted-dim);cursor:not-allowed;box-shadow:none}
+  @media (hover:hover) and (pointer:fine){
+    nav button:hover{color:var(--text);background:var(--default-hover)}
+    button.act:hover{background:var(--accent-dim)}
+    button.ghost:hover{background:var(--default-hover)}
+    button.danger:hover{background:color-mix(in oklab,var(--bad) 24%,transparent)}
+    .themebtn:hover{color:var(--text);background:var(--default)}
+    table tbody tr:hover{background:var(--default)}
+  }
+  th{font:500 12px/1.3 var(--sans);letter-spacing:0;text-transform:none;color:var(--muted);background:var(--surface-hi);padding:10px 16px}
+  td{padding:12px 16px;border-bottom:1px solid var(--line)}
+  .mono,td.mono,.kvrow .grow.mono{font-family:var(--mono)}
+  .pill{font:500 12px/1.2 var(--mono);letter-spacing:0;text-transform:none;padding:3px 8px;border-radius:var(--r-pill);border:0;background:var(--default);color:var(--muted)}
+  .pill.ok{background:var(--good-soft);color:var(--good)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .pill.bad{background:var(--bad-soft);color:var(--bad-soft-fg)}
+  .seg{padding:3px;gap:2px;border:0;border-radius:var(--r-pill);background:var(--default)}
+  .seg button{border-radius:var(--r-pill);padding:6px 14px;font-size:14px;font-weight:500;color:var(--muted)}
+  .seg button.on{background:var(--solid);color:var(--text);box-shadow:var(--surface-shadow)}
+  .skeleton{position:relative;overflow:hidden;animation:none;opacity:1;background:var(--surface-deep)}
+  .skeleton:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,var(--surface-hi),transparent);transform:translateX(-100%);animation:gwsheen 1.8s cubic-bezier(.77,0,.175,1) infinite}
+  @keyframes gwsheen{to{transform:translateX(100%)}}
+  .toast{background:var(--solid);border:0;border-radius:var(--radius);color:var(--text);box-shadow:var(--shadow-lift);transition:opacity 150ms var(--ease-out),transform 150ms var(--ease-out)}
+  .overlay{background:var(--backdrop);backdrop-filter:none;-webkit-backdrop-filter:none}
+  .modal{background:var(--solid);border:0;border-radius:var(--r-lg);box-shadow:var(--shadow-lift);animation:gwpop 180ms var(--ease-out) both}
+  @keyframes gwpop{from{opacity:0;transform:scale(.97) translateY(4px)}to{opacity:1;transform:none}}
+  .empty{border:0;border-radius:var(--radius);background:var(--surface-deep)}
+
+  /* Budget meter */
+  .rb{min-width:0}
+  .rb-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;font-size:13px;color:var(--muted)}
+  .rb-top b{font:600 22px/1.2 var(--mono);color:var(--text);letter-spacing:-.01em}
+  .rb-top b.out{color:var(--bad-soft-fg)}
+  .rb-track{position:relative;height:24px;margin:10px 0 8px;border:0;border-radius:var(--radius-sm);overflow:hidden;background:repeating-linear-gradient(135deg,var(--hatch) 0 2px,transparent 2px 7px),var(--track)}
+  .rb-track.off{opacity:.55}
+  .rb-track i{position:absolute;inset:0 auto 0 0;min-width:6px;border-radius:var(--radius-sm);background:var(--accent);transform-origin:left center;animation:gwgrow 260ms var(--ease-out) both}
+  .rb-track i.full{background:var(--bad)}
+  .rb-track u{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--text);text-decoration:none}
+  @keyframes gwgrow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+  .rb-sub{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .bd-acct{padding:18px 20px;border-bottom:1px solid var(--line)}
+  .bd-acct:last-child{border-bottom:0}
+  .bd-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+  .bd-head strong{font-size:15px;font-weight:600;letter-spacing:-.01em}
+  .bd-meters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 40px}
+  .bd-edit{display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) auto;gap:10px;align-items:end;margin-top:16px}
+  .bd-credit{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px;font-size:14px;color:var(--muted)}
+  .bd-credit b{font:600 18px/1 var(--mono);color:var(--accent)}
+  .bd-credit button{padding:6px 12px}
+  .switch{position:relative;display:inline-block;width:44px;height:24px;flex:0 0 auto}
+  .switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;cursor:pointer;z-index:1}
+  .switch span{position:absolute;inset:0;border-radius:var(--r-pill);background:var(--default);border:0;transition:background-color 200ms var(--ease-out)}
+  .switch span:after{content:"";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform 200ms var(--ease-out),background-color 200ms var(--ease-out)}
+  .switch input:checked+span{background:var(--accent)}
+  .switch input:checked+span:after{transform:translateX(20px)}
+  .switch input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
+  .rl-head{display:flex;align-items:center;gap:12px}
+  .rl-head .grow{flex:1;min-width:0}
+  .rl-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  .rl-stats div{padding:12px 16px;border:0;border-radius:var(--radius);background:var(--surface-deep)}
+  .rl-stats div+div{border-left:0}
+  .rl-stats b{display:block;font:600 22px/1.2 var(--mono);letter-spacing:-.01em}
+  .rl-stats span{font-size:13px;color:var(--muted)}
+  .rl-bars{display:grid;gap:8px;margin-top:16px}
+  .rl-bar{display:grid;grid-template-columns:150px 1fr 48px;gap:10px;align-items:center;font-size:13px;color:var(--muted)}
+  .rl-bar i{display:block;height:8px;border-radius:var(--radius-sm);background:var(--accent);min-width:2px}
+  .rl-bar em{font:12px var(--mono);font-style:normal;text-align:right;color:var(--text)}
+  .rl-help{font-size:14px;color:var(--muted);margin:0;max-width:70ch;line-height:1.55}
+  .rl-list{display:grid;gap:0;margin-top:12px;font-size:13px}
+  .rl-list div{display:flex;gap:12px;align-items:baseline;padding:8px 0;border-bottom:1px solid var(--line);color:var(--muted)}
+  .rl-list div:last-child{border-bottom:0}
+  .usagebar i,.pg-dec-bar .trk i,.pg-dec-track i,.tj-bar-fill{background:var(--accent)}
+  .pg-modes .pg-mode.is-on{background:var(--solid);color:var(--text);box-shadow:var(--surface-shadow)}
+  .pg-dec-card{background:var(--surface);box-shadow:var(--surface-shadow);border:0}
+  .pg-dec-card .k{letter-spacing:0;text-transform:none}
+  .pg-trace .k{letter-spacing:0;text-transform:none}
+  .pg-msg.user{background:var(--accent-soft);border:0}
+  .pg-messages{background:var(--surface-deep)}
+  .tj-step{background:var(--surface-deep);border:0}
+  @media (max-width:980px){
+    header{padding:0 16px}
+    nav{position:sticky;top:56px;bottom:auto;left:auto;width:100%;flex-direction:row;gap:2px;padding:8px 12px;overflow-x:auto;background:color-mix(in oklab,var(--bg) 92%,transparent);backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%);border-bottom:0}
+    nav .navgrp{display:none}
+    nav button{width:auto;flex:0 0 auto;padding:0 14px}
+    main{margin-left:0;padding:20px 16px 56px}
+    .hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .bd-meters{grid-template-columns:1fr}
+    .bd-edit{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .rl-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .pagehead h2.sec{font-size:22px}
+  }
+  @media (prefers-reduced-transparency:reduce){
+    header,nav{background:var(--bg);backdrop-filter:none;-webkit-backdrop-filter:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .tab.active,.modal{animation:none}
+    .rb-track i{animation:none}
+    .skeleton:after{animation:none}
+    button:active{transform:none!important}
+  }
 </style>
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot">A</span><span>Astrosphere Control</span></div>
+  <div class="brand"><span class="dot">W</span><span>Wind Control</span></div>
   <span class="base" id="base">\u2026</span>
   <span class="clock" id="clock"></span>
+  <button type="button" class="themebtn" id="theme-toggle" aria-label="Switch theme" title="Switch theme"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg></button>
 </header>
 <nav aria-label="Gateway sections">
   <button type="button" data-tab="overview" class="active" aria-current="page">Overview</button>
+  <div class="navgrp">Traffic</div>
   <button type="button" data-tab="providers">Providers</button>
   <button type="button" data-tab="routes">Model routes</button>
   <button type="button" data-tab="tiers">Model tiers</button>
-  <button type="button" data-tab="keys">API keys</button>
-  <button type="button" data-tab="accounts">Accounts</button>
-  <button type="button" data-tab="chat">Playground</button>
-  <button type="button" data-tab="cache">Cache</button>
-  <button type="button" data-tab="prices">Prices</button>
-  <button type="button" data-tab="limits">Limits</button>
-  <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="auto">Auto</button>
   <button type="button" data-tab="proxies">Proxies</button>
-  <button type="button" data-tab="tokens">Device tokens</button>
+  <button type="button" data-tab="limits">Limits</button>
+  <div class="navgrp">Customers</div>
+  <button type="button" data-tab="keys">API keys</button>
+  <button type="button" data-tab="accounts">Accounts</button>
+  <button type="button" data-tab="budgets">Budgets</button>
   <button type="button" data-tab="credits">Credits</button>
+  <button type="button" data-tab="prices">Prices</button>
+  <button type="button" data-tab="tokens">Device tokens</button>
+  <div class="navgrp">Quality</div>
+  <button type="button" data-tab="reliability">Reliability</button>
+  <button type="button" data-tab="cache">Cache</button>
+  <button type="button" data-tab="trajectories">Trajectories</button>
+  <button type="button" data-tab="chat">Playground</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -380,7 +555,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     "instructions": "Does this change require objective verification?"
   }
 }</textarea>
-            <p class="hint">noul needs instructions · choice needs a criteria object (option: why) · score needs a criteria array of labels, lowest to highest.</p>
+            <p class="hint">noul needs instructions; choice needs a criteria object (option: why); score needs a criteria array of labels, lowest to highest.</p>
           </div>
           <div class="small" id="c-route-hint" style="margin-top:6px">Pick a slug to see its last integrity verdict.</div>
           <label class="pg-check" for="c-stream"><input type="checkbox" id="c-stream"> Stream responses</label>
@@ -412,10 +587,10 @@ var PLAYGROUND_HTML = `<!doctype html>
             <div class="empty">Send a message, or verify the slug first.</div>
           </div>
           <div class="pg-trace" id="c-trace">
-            <div><div class="k">Request</div><div class="v" id="c-trace-id">—</div></div>
-            <div><div class="k">Route</div><div class="v" id="c-trace-route">—</div></div>
-            <div><div class="k">Attempts</div><div class="v" id="c-trace-attempts">—</div></div>
-            <div><div class="k">Usage</div><div class="v" id="c-trace-usage">—</div></div>
+            <div><div class="k">Request</div><div class="v" id="c-trace-id">-</div></div>
+            <div><div class="k">Route</div><div class="v" id="c-trace-route">-</div></div>
+            <div><div class="k">Attempts</div><div class="v" id="c-trace-attempts">-</div></div>
+            <div><div class="k">Usage</div><div class="v" id="c-trace-usage">-</div></div>
           </div>
           <div class="pg-composer">
             <textarea id="c-prompt" placeholder="Send a prompt through the gateway…"></textarea>
@@ -591,6 +766,44 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="pagehead"><div><h2 class="sec">Logs</h2><p class="sub">Live request and provider events from this process. In memory only; the ring holds the last 500 lines and resets on restart.</p></div><div class="actions"><label class="pg-check" style="margin:0"><input type="checkbox" id="lg-auto"> Auto</label><button class="ghost" id="lg-refresh">Refresh</button><button class="ghost" id="lg-copy">Copy</button></div></div>
     <div class="panel"><div class="panel-b"><pre id="lg-out" class="lg-pre" style="margin:0"></pre></div></div>
   </section>
+
+  <section class="tab" id="tab-budgets">
+    <div class="pagehead"><div><h2 class="sec">Budgets</h2><p class="sub">Rolling 24 hour and 30 day caps per account, plus prepaid credits that cover a spent window. Windows roll continuously; there is no midnight reset.</p></div></div>
+    <div class="panel">
+      <div class="panel-h"><h2 class="sec">Fallback price</h2><span class="small">Per 1M tokens, for models with no price set</span></div>
+      <div class="panel-b"><div class="bd-edit" style="margin-top:0;grid-template-columns:repeat(2,minmax(0,1fr)) auto">
+        <div><label for="bf-prompt">Input</label><input id="bf-prompt" type="number" min="0" step="0.01"></div>
+        <div><label for="bf-completion">Output</label><input id="bf-completion" type="number" min="0" step="0.01"></div>
+        <button class="act" id="bf-save" type="button">Save price</button>
+      </div></div>
+    </div>
+    <div class="panel"><div class="panel-b flush" id="bd-list"><div class="empty">Loading\u2026</div></div></div>
+  </section>
+
+  <section class="tab" id="tab-reliability">
+    <div class="pagehead"><div><h2 class="sec">Reliability</h2><p class="sub">Built-in tool-call repair and the optional taste layer. Both act on model output after the model has answered.</p></div></div>
+    <div class="panel">
+      <div class="panel-h"><h2 class="sec">Tool-call repair</h2><button class="ghost" id="rl-reset" type="button">Reset counters</button></div>
+      <div class="panel-b">
+        <div class="rl-head"><label class="switch" aria-label="Tool-call repair"><input type="checkbox" id="rl-tr"><span></span></label><div class="grow"><strong id="rl-tr-state">On</strong><div class="small">Fixes malformed JSON, types and names in tool calls for every provider, streaming or not. A call cut off by the length limit is dropped, never completed.</div></div></div>
+        <div class="rl-stats" id="rl-stats" style="margin-top:16px"></div>
+        <div class="rl-bars" id="rl-fixes"></div>
+        <div class="rl-list" id="rl-recent"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-h"><h2 class="sec">Taste layer</h2><div class="seg" id="rl-mode" role="group" aria-label="Taste layer mode"><button type="button" data-mode="off">Off</button><button type="button" data-mode="annotate">Annotate</button><button type="button" data-mode="enforce">Enforce</button></div></div>
+      <div class="panel-b">
+        <p class="rl-help" id="rl-mode-help"></p>
+        <div id="rl-taste" style="margin-top:16px"></div>
+        <h3 class="sec" style="margin:20px 0 6px">Style rules</h3>
+        <p class="small">One per line: a regular expression, or a label and a regular expression separated by a vertical bar. A match lowers the score; it never fails a response.</p>
+        <textarea id="rl-style" rows="4" spellcheck="false" placeholder="em dash | \u2014"></textarea>
+        <div class="form-actions"><button class="act" id="rl-style-save" type="button">Save rules</button></div>
+        <div class="rl-list" id="rl-verdicts"></div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <div class="overlay" id="overlay">
@@ -629,6 +842,159 @@ function setActiveTab(t){
   });
   document.querySelectorAll('.tab').forEach(function(x){x.classList.toggle('active',x.id==='tab-'+t);});
 }
+
+// ---------- theme ----------
+(function(){
+  var btn=document.getElementById('theme-toggle');
+  if(!btn) return;
+  btn.addEventListener('click',function(){
+    var next=document.documentElement.dataset.theme==='light'?'dark':'light';
+    document.documentElement.dataset.theme=next;
+    try{ localStorage.setItem('gw-theme',next); }catch(e){}
+  });
+})();
+
+// ---------- budgets ----------
+function usd(n){ return '$'+(Number(n)||0).toFixed(2); }
+function cdown(s){ s=Math.max(0,Math.round(Number(s)||0)); var d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60); if(d>0) return d+'d '+h+'h'; if(h>0) return h+'h '+m+'m'; return m>0?m+'m':'<1m'; }
+function rbMeter(w){
+  var capped=w.limit_usd!=null;
+  var out=capped&&(w.remaining_usd||0)<=0;
+  var fill=capped&&w.spent_usd>0?Math.min(100,Math.max(2.2,w.spent_usd/w.limit_usd*100)):0;
+  var tick=capped&&w.resets_in_s!=null?Math.min(99,Math.max(1,w.resets_in_s/(w.hours*3600)*100)):null;
+  return '<div class="rb"><div class="rb-top"><span>'+esc(w.label)+'</span><b class="'+(out?'out':'')+'">'+(capped?usd(w.remaining_usd)+' left':'No cap')+'</b></div>'
+    +'<div class="rb-track'+(capped?'':' off')+'">'+(fill?'<i class="'+(out?'full':'')+'" style="width:'+fill+'%"></i>':'')+(tick!=null?'<u style="left:'+tick+'%"></u>':'')+'</div>'
+    +'<div class="rb-sub"><span>'+usd(w.spent_usd)+' spent'+(capped?' of '+usd(w.limit_usd):'')+'</span>'+(w.resets_in_s!=null?'<span>frees in '+cdown(w.resets_in_s)+'</span>':'<span></span>')+'</div></div>';
+}
+function bdBinding(a){
+  if(a.binding==='credits') return '<span class="pill warn">credits covering</span>';
+  if(a.binding==='exhausted') return '<span class="pill bad">blocked</span>';
+  if(a.binding==='window') return '<span class="pill ok">within budget</span>';
+  return '<span class="pill">no cap</span>';
+}
+function bdAccountHtml(a){
+  var id=esc(a.key_id);
+  return '<div class="bd-acct" data-account="'+id+'"><div class="bd-head"><strong>'+esc(a.username)+'</strong>'+bdBinding(a)+'<span class="mono muted2">'+id+'</span></div>'
+    +'<div class="bd-meters">'+(a.windows||[]).map(rbMeter).join('')+'</div>'
+    +'<div class="bd-edit"><div><label>24 hour cap (USD)</label><input type="number" min="0" step="0.01" data-f="daily" value="'+(a.budget_daily_usd==null?'':a.budget_daily_usd)+'" placeholder="no cap"></div>'
+    +'<div><label>30 day cap (USD)</label><input type="number" min="0" step="0.01" data-f="monthly" value="'+(a.budget_monthly_usd==null?'':a.budget_monthly_usd)+'" placeholder="no cap"></div>'
+    +'<div><label>Set credits (USD)</label><input type="number" min="0" step="0.01" data-f="credits" value="'+Number(a.credits_usd||0).toFixed(2)+'"></div>'
+    +'<button class="act" type="button" data-bd="save">Save</button></div>'
+    +'<div class="bd-credit"><span>Credits</span><b>'+usd(a.credits_usd)+'</b><button class="ghost" type="button" data-bd="add" data-amount="10">+10</button><button class="ghost" type="button" data-bd="add" data-amount="50">+50</button><button class="ghost" type="button" data-bd="add" data-amount="100">+100</button><button class="ghost" type="button" data-bd="clear">Clear caps</button></div></div>';
+}
+async function loadBudgets(){
+  var el=document.getElementById('bd-list');
+  var r=await api('/admin/rolling-budgets');
+  if(r.status===404||!r.data){ el.innerHTML='<div class="empty">Rolling budgets are not available on this build.</div>'; return; }
+  document.getElementById('bf-prompt').value=r.data.fallback_price.prompt_per_1m;
+  document.getElementById('bf-completion').value=r.data.fallback_price.completion_per_1m;
+  var list=r.data.accounts||[];
+  el.innerHTML=list.length?list.map(bdAccountHtml).join(''):'<div class="empty">No console accounts yet. Accounts appear once a customer signs in to the console.</div>';
+}
+async function bdPatch(id, body, okMsg){
+  var r=await api('/admin/rolling-budgets/'+encodeURIComponent(id),{method:'POST',body:JSON.stringify(body)});
+  if(r.status!==200){ toast((r.data&&r.data.error&&r.data.error.message)||'Could not save','err'); return false; }
+  toast(okMsg||'Saved','ok');
+  await loadBudgets();
+  return true;
+}
+document.getElementById('bd-list').addEventListener('click',function(e){
+  var b=e.target.closest('button[data-bd]'); if(!b) return;
+  var box=b.closest('.bd-acct'); var id=box.dataset.account;
+  var kind=b.dataset.bd;
+  function val(f){ return box.querySelector('input[data-f="'+f+'"]').value; }
+  if(kind==='save'){
+    var cap=function(v){ return v===''?null:Number(v); };
+    bdPatch(id,{budget_daily_usd:cap(val('daily')),budget_monthly_usd:cap(val('monthly')),credits_usd:Number(val('credits')||0)},'Budget saved');
+  } else if(kind==='add'){
+    bdPatch(id,{credits_add_usd:Number(b.dataset.amount)},'Added $'+b.dataset.amount+' credits');
+  } else if(kind==='clear'){
+    bdPatch(id,{budget_daily_usd:null,budget_monthly_usd:null},'Caps cleared');
+  }
+});
+document.getElementById('bf-save').addEventListener('click',async function(){
+  var r=await api('/admin/rolling-budgets-fallback',{method:'POST',body:JSON.stringify({prompt_per_1m:Number(document.getElementById('bf-prompt').value),completion_per_1m:Number(document.getElementById('bf-completion').value)})});
+  if(r.status===200) toast('Fallback price saved','ok'); else toast((r.data&&r.data.error&&r.data.error.message)||'Could not save','err');
+});
+
+// ---------- reliability ----------
+var TASTE_HELP={
+  off:'Nothing is checked. Responses pass through exactly as the model returned them.',
+  annotate:'Every response is checked and learned from. Headers report the score; the answer is never changed. Streams are checked after they finish.',
+  enforce:'As annotate, plus one retry when a hard rule fails (invalid JSON, a tool call that breaks its schema, an empty or cut-off answer). The better of the two answers is returned. Non-stream requests only.'
+};
+var FIX_LABELS={json_syntax:'JSON syntax',truncated_closed:'Closed truncation',type_coercion:'Type coercion',enum_snap:'Enum spelling',name_alias:'Tool name',unknown_prop_dropped:'Unknown property',required_default:'Required default'};
+function rlSetMode(mode){
+  document.querySelectorAll('#rl-mode button').forEach(function(b){ b.classList.toggle('on',b.dataset.mode===mode); b.setAttribute('aria-pressed',String(b.dataset.mode===mode)); });
+  document.getElementById('rl-mode-help').textContent=TASTE_HELP[mode]||'';
+}
+function rlStyleToText(rules){ return (rules||[]).map(function(r){ return (r.label&&r.label!==r.pattern?r.label+' | ':'')+r.pattern; }).join(NL); }
+function rlTextToStyle(text){
+  return text.split(NL).map(function(l){ return l.trim(); }).filter(Boolean).map(function(l,i){
+    var k=l.indexOf(' | ');
+    var label=k>0?l.slice(0,k).trim():'';
+    var pattern=k>0?l.slice(k+3).trim():l;
+    return {id:(label||'rule-'+(i+1)).slice(0,48),label:label||undefined,pattern:pattern};
+  });
+}
+async function loadReliability(){
+  var tr=await api('/admin/tool-repair');
+  var statsEl=document.getElementById('rl-stats');
+  if(tr.status===404||!tr.data){ statsEl.innerHTML='<div class="empty" style="grid-column:1/-1">Tool-call repair is not available on this build.</div>'; }
+  else {
+    var d=tr.data;
+    document.getElementById('rl-tr').checked=!!d.enabled;
+    document.getElementById('rl-tr-state').textContent=d.enabled?'On':'Off';
+    var t=d.totals||{};
+    statsEl.innerHTML=[['Calls seen',t.calls],['Repaired',t.repaired],['Dropped (cut off)',t.dropped_truncated],['Unrepairable',t.unrepairable]].map(function(x){ return '<div><b>'+fmt(x[1])+'</b><span>'+x[0]+'</span></div>'; }).join('');
+    var by=d.by_fix||{}; var max=Math.max.apply(null,Object.keys(by).map(function(k){return by[k];}).concat([1]));
+    document.getElementById('rl-fixes').innerHTML=Object.keys(FIX_LABELS).map(function(k){ var n=by[k]||0; return '<div class="rl-bar"><span>'+FIX_LABELS[k]+'</span><div><i style="width:'+(n/max*100)+'%"></i></div><em>'+fmt(n)+'</em></div>'; }).join('');
+    var rec=d.recent||[];
+    document.getElementById('rl-recent').innerHTML=rec.length?rec.slice(0,12).map(function(x){ return '<div><span class="mono">'+esc((x.at||'').slice(11,19))+'</span><strong>'+esc(x.tool||'tool')+'</strong><span>'+esc(x.status==='dropped_truncated'?'dropped (cut off)':(x.fixes||[]).join(', ')||x.status)+'</span></div>'; }).join(''):'<div><span>No repairs recorded since the last restart.</span></div>';
+  }
+  var ta=await api('/admin/taste');
+  var tEl=document.getElementById('rl-taste');
+  if(ta.status===404||!ta.data){ tEl.innerHTML='<div class="empty">The taste layer is not available on this build.</div>'; return; }
+  rlSetMode(ta.data.mode||'off');
+  document.getElementById('rl-style').value=rlStyleToText(ta.data.style_rules);
+  var models=ta.data.models||[];
+  tEl.innerHTML=models.length?'<div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>Taste</th><th>Samples</th><th>Rule means</th></tr></thead><tbody>'+models.map(function(m){
+    var routeRows=Object.keys(m.routes||{}).length?'<div class="small" style="margin-top:6px;color:var(--muted)">'+Object.keys(m.routes).map(function(rk){ var rm=m.routes[rk]; return '<div><span class="mono">'+esc(rk)+'</span> '+Object.keys(rm.rules).map(function(k){ return esc(k)+' '+Math.round(rm.rules[k].mean*100)+'%'; }).join(', ')+' (n='+rm.samples+')</div>'; }).join('')+'</div>':'';
+    return '<tr><td class="mono">'+esc(m.slug)+routeRows+'</td><td><b>'+(m.taste==null?'-':Math.round(m.taste*100)+'%')+'</b></td><td>'+fmt(m.samples)+'</td><td class="small">'+Object.keys(m.rules).map(function(k){ return esc(k)+' '+Math.round(m.rules[k].mean*100)+'% (n='+m.rules[k].n+')'; }).join(', ')+'</td></tr>';
+  }).join('')+'</tbody></table></div>':'<div class="empty">No responses checked yet. Switch the layer to annotate to start measuring.</div>';
+  var v=ta.data.recent||[];
+  document.getElementById('rl-verdicts').innerHTML=v.length?v.slice(0,10).map(function(x){ return '<div><span class="mono">'+esc((x.at||'').slice(11,19))+'</span><strong>'+esc(x.slug)+'</strong><span>score '+Number(x.score).toFixed(2)+(x.violations.length?' - '+esc(x.violations.join(', ')):'')+'</span></div>'; }).join(''):'';
+}
+document.getElementById('rl-tr').addEventListener('change',async function(e){
+  var want=e.target.checked;
+  var r=await api('/admin/tool-repair',{method:'POST',body:JSON.stringify({enabled:want})});
+  if(r.status!==200){ e.target.checked=!want; toast('Could not change tool-call repair','err'); return; }
+  document.getElementById('rl-tr-state').textContent=want?'On':'Off';
+  toast('Tool-call repair '+(want?'on':'off'),'ok');
+});
+document.getElementById('rl-reset').addEventListener('click',async function(){ await api('/admin/tool-repair',{method:'POST',body:JSON.stringify({reset:true})}); loadReliability(); });
+document.getElementById('rl-mode').addEventListener('click',async function(e){
+  var b=e.target.closest('button[data-mode]'); if(!b) return;
+  var prev=document.querySelector('#rl-mode button.on');
+  rlSetMode(b.dataset.mode);
+  var r=await api('/admin/taste',{method:'POST',body:JSON.stringify({mode:b.dataset.mode})});
+  if(r.status!==200){ if(prev) rlSetMode(prev.dataset.mode); toast('Could not change the taste layer','err'); return; }
+  toast('Taste layer: '+b.dataset.mode,'ok');
+});
+document.getElementById('rl-style-save').addEventListener('click',async function(){
+  var r=await api('/admin/taste',{method:'POST',body:JSON.stringify({style_rules:rlTextToStyle(document.getElementById('rl-style').value)})});
+  if(r.status===200) toast('Style rules saved','ok'); else toast((r.data&&r.data.error&&r.data.error.message)||'Could not save rules','err');
+});
+
+// Arrow keys move between sections when the nav has focus.
+document.querySelector('nav').addEventListener('keydown',function(e){
+  if(e.key!=='ArrowDown'&&e.key!=='ArrowUp'&&e.key!=='ArrowRight'&&e.key!=='ArrowLeft') return;
+  var i=navButtons.indexOf(document.activeElement); if(i<0) return;
+  e.preventDefault();
+  var n=(e.key==='ArrowDown'||e.key==='ArrowRight')?Math.min(navButtons.length-1,i+1):Math.max(0,i-1);
+  navButtons[n].focus();
+});
+
 async function selectTab(t){
   if(!document.getElementById('tab-'+t)) return;
   setActiveTab(t);
@@ -649,6 +1015,8 @@ async function selectTab(t){
     if(t==='tokens') await loadZaiTokens();
     if(t==='credits') await loadCredits();
     if(t==='logs') await loadLogs();
+    if(t==='budgets') await loadBudgets();
+    if(t==='reliability') await loadReliability();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
 document.querySelector('nav').addEventListener('click',function(e){
@@ -2034,7 +2402,7 @@ async function loadProxies(){
   const rows=(data.proxies||[]);
   if(!rows.length){ listEl.innerHTML='<div class="empty" style="margin:20px">No proxies. Paste some above and Import.</div>'; return; }
   listEl.innerHTML='<div style="padding:8px 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><button class="danger sm" id="px-del-selected" disabled>Delete selected</button> <span class="hint" id="px-sel-count"></span>'+
-    '<span id="px-progress" class="hint" style="display:none;flex:1;min-width:160px"><span id="px-progress-label"></span><span class="px-bar" style="display:block;height:4px;border-radius:3px;background:var(--line,#333);margin-top:4px;overflow:hidden"><span id="px-progress-fill" style="display:block;height:100%;width:0;background:var(--accent,#4ea1ff);transition:width .2s"></span></span></span></div>'+
+    '<span id="px-progress" class="hint" style="display:none;flex:1;min-width:160px"><span id="px-progress-label"></span><span class="px-bar" style="display:block;height:4px;border-radius:3px;background:var(--line,var(--line-hi));margin-top:4px;overflow:hidden"><span id="px-progress-fill" style="display:block;height:100%;width:0;background:var(--accent,var(--cool));transition:width .2s"></span></span></span></div>'+
     '<table class="tbl"><thead><tr><th style="width:28px"><input type="checkbox" id="px-select-all" title="Select all"></th><th>Type</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Fails</th><th>Last test</th><th></th></tr></thead><tbody>'+
     rows.map(function(p){
       const lat=p.last_latency_ms!=null?fmt(p.last_latency_ms)+'ms':'\u2014';
@@ -2579,9 +2947,9 @@ async function loadCredits(){
   const usd=data&&data.total&&data.total.usd||{used:0,available:0};
   const tok=data&&data.total&&data.total.tokens||{used:0,available:0};
   totalEl.innerHTML=
-    '<div class="stat"><div class="k">USD remaining (grand total)</div><div class="v acc">'+money(usd.available)+'</div><div class="sub2">'+money(usd.used)+' spent across all rows</div></div>'
-    +'<div class="stat"><div class="k">Tokens remaining (grand total)</div><div class="v acc">'+fmt(tok.available)+'</div><div class="sub2">'+fmt(tok.used)+' spent across all rows</div></div>'
-    +'<div class="stat"><div class="k">Accounts</div><div class="v">'+((data&&data.rows||[]).filter(function(r){return r.kind==='account';}).length)+'</div><div class="sub2">customers with their own cap</div></div>'
+    '<div class="stat"><div class="k">USD remaining (grand total)</div><div class="v acc">'+(usd.capped_rows?money(usd.available):'No cap')+'</div><div class="sub2">'+money(usd.used)+' spent across all rows'+(usd.capped_rows?'':', none has a USD cap')+'</div></div>'
+    +'<div class="stat"><div class="k">Tokens remaining (grand total)</div><div class="v acc">'+(tok.capped_rows?fmt(tok.available):'No cap')+'</div><div class="sub2">'+fmt(tok.used)+' spent across all rows'+(tok.capped_rows?'':', none has a token cap')+'</div></div>'
+    +'<div class="stat"><div class="k">Accounts</div><div class="v">'+((data&&data.rows||[]).filter(function(r){return r.kind==='account';}).length)+'</div><div class="sub2">customer accounts</div></div>'
     +'<div class="stat"><div class="k">Keys</div><div class="v">'+((data&&data.rows||[]).filter(function(r){return r.kind==='key';}).length)+'</div><div class="sub2">including shared-pool and operator keys</div></div>';
   const rows=(data&&data.rows||[]).map(function(r){
     const who=r.kind==='account'?'account':'key';
@@ -2590,7 +2958,7 @@ async function loadCredits(){
     const active=r.kind==='key'?(r.active?'<span class="pill ok">active</span>':'<span class="pill bad">off</span>'):'';
     const pct=r.quota&&r.quota.total&&r.quota.total>0?Math.max(0,Math.min(100,Math.round(r.quota.available/r.quota.total*100))):null;
     const meter=pct==null?'':'<span class="usagebar" title="'+pct+'% remaining"><i style="width:'+pct+'%"></i></span>';
-    return '<tr><td>'+pill+'</td><td class="mono">'+esc(r.id)+'</td><td>'+esc(r.name||'')+'</td><td style="display:flex;gap:6px;flex-wrap:wrap">'+owner+active+'</td><td class="mono">'+esc(creditQuotaLabel(r.quota))+'</td><td>'+meter+'</td></tr>';
+    return '<tr><td>'+pill+'</td><td class="mono">'+esc(r.id)+'</td><td>'+esc(r.name||'')+'</td><td><div style="display:flex;gap:6px;flex-wrap:wrap">'+owner+active+'</div></td><td class="mono">'+esc(creditQuotaLabel(r.quota))+'</td><td>'+meter+'</td></tr>';
   }).join('') || '<tr><td colspan="6"><div class="empty">No accounts or keys yet. Create one in Accounts or API keys.</div></td></tr>';
   listEl.innerHTML='<table><tr><th>Kind</th><th>Id</th><th>Name</th><th>Scope</th><th>Remaining</th><th>Left</th></tr>'+rows+'</table>';
 }

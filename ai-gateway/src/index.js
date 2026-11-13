@@ -17,6 +17,11 @@ import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShado
 import { seedModelRegistry, backfillQualityCanonicalIds, loadAliasIndex, resolveCanonicalModel } from "./router/model-registry.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
+import { critique, parseStyleRules, updatePosteriors, loadTasteReport, noteVerdict, recentVerdicts, retryCritique, MODES as TASTE_MODES } from "./taste.js";
+import { repairResponseBody, StreamToolAssembler, getToolRepairStats, resetToolRepairStats } from "./tool-response-repair.js";
+import { repairJson } from "./json-repair.js";
+import { loadSettings as pgLoadSettings, saveSettings as pgSaveSettings, listChats as pgListChats, getChat as pgGetChat, upsertChat as pgUpsertChat, deleteChat as pgDeleteChat, validateChatMessages as pgValidateMessages } from "./playground-store.js";
+import { ensureBudgetSchema, loadAccountBudget, rollingStatus, checkAdmission, settleSpend, getFallbackPrice, setFallbackPrice, fallbackCost, parseBudgetPatch, applyBudgetPatch } from "./budgets.js";
 import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
@@ -830,7 +835,7 @@ app.post("/v1/chat/completions", async (c) => {
   const auth = await authClient(c);
   if (auth instanceof Response)
     return auth;
-  return runChatCompletion(c, auth.key, false);
+  return runChatWithTaste(c, auth.key);
 });
 app.post("/admin/playground/completions", async (c) => {
   await ensureUpstreamDispatcher();
@@ -1125,7 +1130,11 @@ async function issueAccountSession(c, account) {
 }
 
 function consoleCookieAttributes(c) {
-  const secure = new URL(c.req.url).protocol === "https:";
+  // Behind a TLS-terminating proxy (Caddy, nginx) the app sees plain http, so
+  // honour X-Forwarded-Proto. A client that spoofs it only makes its own
+  // cookie Secure, which is harmless.
+  const forwarded = String(c.req.header("x-forwarded-proto") || "").split(",")[0].trim().toLowerCase();
+  const secure = new URL(c.req.url).protocol === "https:" || forwarded === "https";
   const crossSite = secure && c.req.header("origin") && c.req.header("sec-fetch-site") === "cross-site";
   return "; Path=/console; SameSite=" + (crossSite ? "None" : "Lax") + (secure ? "; Secure" : "") + "; HttpOnly";
 }
@@ -1198,22 +1207,86 @@ app.post("/console/logout", async (c) => {
   return c.json({ ok: true });
 });
 
+// Resolve the key a playground call should bill: the session key when it is
+// still live, otherwise the account's own active key, the same ownership the
+// models endpoint uses.
+async function playgroundKey(c, sess) {
+  if (sess.keyId) {
+    const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(sess.keyId).first();
+    if (key) return key;
+  }
+  if (sess.accountId)
+    return await c.env.DB.prepare("SELECT * FROM api_keys WHERE (account_id=? OR key_id=?) AND active=1 ORDER BY created_at LIMIT 1").bind(sess.accountId, sess.accountId).first();
+  return null;
+}
 app.post("/console/playground/completions", async (c) => {
   await ensureUpstreamDispatcher();
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
-  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(sess.keyId).first();
+  const key = await playgroundKey(c, sess);
   if (!key)
-    return c.json({ error: { message: "The API key for this session no longer exists.", type: "auth_error" } }, 401);
+    return c.json({ error: { message: "This account has no active API key. Create one under Keys first.", type: "auth_error" } }, 401);
   return runChatCompletion(c, key, false);
 });
+// Playground persistence: settings and saved chats for the signed-in account.
+function playgroundAccountId(sess) {
+  return sess.accountId || sess.keyId;
+}
+app.get("/console/api/playground", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const accountId = playgroundAccountId(sess);
+  return c.json({ settings: await pgLoadSettings(c.env.DB, accountId), chats: await pgListChats(c.env.DB, accountId) });
+});
+app.post("/console/api/playground", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body.settings !== "object" || body.settings === null || Array.isArray(body.settings))
+    return c.json({ error: { message: "settings must be an object" } }, 400);
+  const keys = Object.keys(body.settings);
+  if (keys.length > 50)
+    return c.json({ error: { message: "too many settings keys" } }, 400);
+  await pgSaveSettings(c.env.DB, playgroundAccountId(sess), body.settings);
+  return c.json({ ok: true });
+});
+app.get("/console/api/playground/chats/:id", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const chat = await pgGetChat(c.env.DB, playgroundAccountId(sess), c.req.param("id"));
+  if (!chat)
+    return c.json({ error: { message: "Chat not found" } }, 404);
+  return c.json(chat);
+});
+app.post("/console/api/playground/chats", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => null);
+  const id = body && typeof body.id === "string" && body.id ? body.id.slice(0, 64) : "chat-" + uuid();
+  const v = pgValidateMessages(body && body.messages);
+  if (v.error)
+    return c.json({ error: { message: v.error } }, 400);
+  const chat = await pgUpsertChat(c.env.DB, playgroundAccountId(sess), id, {
+    title: typeof body.title === "string" ? body.title : "",
+    model: typeof body.model === "string" ? body.model.slice(0, 80) : null,
+    messages: v.messages
+  });
+  return c.json(chat, 201);
+});
+app.delete("/console/api/playground/chats/:id", async (c) => {
+  const { denied, sess } = await requireConsoleSession(c);
+  if (denied) return denied;
+  await pgDeleteChat(c.env.DB, playgroundAccountId(sess), c.req.param("id"));
+  return c.json({ deleted: c.req.param("id") });
+});
+
 app.post("/console/playground/systemone", async (c) => {
   await ensureUpstreamDispatcher();
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
-  const key = await c.env.DB.prepare("SELECT * FROM api_keys WHERE key_id=? AND active=1").bind(sess.keyId).first();
+  const key = await playgroundKey(c, sess);
   if (!key)
-    return c.json({ error: { message: "The API key for this session no longer exists.", type: "auth_error" } }, 401);
+    return c.json({ error: { message: "This account has no active API key. Create one under Keys first.", type: "auth_error" } }, 401);
   return runSystemOneDecision(c, key);
 });
 
@@ -1513,6 +1586,7 @@ app.get("/console/api/limits", async (c) => {
       rate: { per_minute: 0, used_this_minute: 0 },
       keys: ownedIds.length,
       budget_scope: scopeNote,
+      rolling: await rollingForAccount(c, sess.accountId),
       models: await modelLimitStatus(c)
     });
   }
@@ -1544,8 +1618,66 @@ app.get("/console/api/limits", async (c) => {
       per_minute: key.request_limit_per_minute == null ? 0 : Number(key.request_limit_per_minute),
       used_this_minute: window ? Number(window.request_count) || 0 : 0
     },
+    rolling: null,
     models: await modelLimitStatus(c)
   });
+});
+
+// Contract shape for the console budget card: windows, credits, the fallback
+// price sentence and which allowance is currently binding.
+async function rollingForAccount(c, accountId) {
+  const status = await rollingStatus(c.env.DB, accountId);
+  if (!status) return null;
+  return { ...status, fallback_price: await getFallbackPrice(c.env.DB) };
+}
+
+// Operator view of every account's rolling budget, plus the fallback price.
+app.get("/admin/rolling-budgets", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  await ensureBudgetSchema(c.env.DB);
+  const rows = await c.env.DB.prepare("SELECT key_id FROM console_accounts ORDER BY username").all();
+  const accounts = [];
+  for (const r of rows.results || [])
+    accounts.push(await adminBudgetRow(c, r.key_id));
+  return c.json({ fallback_price: await getFallbackPrice(c.env.DB), accounts });
+});
+async function adminBudgetRow(c, accountId) {
+  const budget = await loadAccountBudget(c.env.DB, accountId);
+  const status = await rollingStatus(c.env.DB, accountId);
+  return {
+    key_id: budget.key_id,
+    username: budget.username,
+    budget_daily_usd: budget.budget_daily_usd,
+    budget_monthly_usd: budget.budget_monthly_usd,
+    credits_usd: budget.credits_usd,
+    binding: status.binding,
+    windows: status.windows
+  };
+}
+app.post("/admin/rolling-budgets-fallback", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => ({}));
+  const prompt = Number(body && body.prompt_per_1m);
+  const completion = Number(body && body.completion_per_1m);
+  if (!Number.isFinite(prompt) || prompt < 0 || !Number.isFinite(completion) || completion < 0)
+    return c.json({ error: { message: "prompt_per_1m and completion_per_1m must be numbers >= 0" } }, 400);
+  await setFallbackPrice(c.env.DB, { prompt_per_1m: prompt, completion_per_1m: completion });
+  return c.json({ fallback_price: await getFallbackPrice(c.env.DB) });
+});
+app.post("/admin/rolling-budgets/:keyId", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  await ensureBudgetSchema(c.env.DB);
+  const keyId = c.req.param("keyId");
+  if (!await loadAccountBudget(c.env.DB, keyId))
+    return c.json({ error: { message: "Unknown account" } }, 404);
+  const parsed = parseBudgetPatch(await c.req.json().catch(() => null));
+  if (parsed.error)
+    return c.json({ error: { message: parsed.error } }, 400);
+  await applyBudgetPatch(c.env.DB, keyId, parsed.patch);
+  return c.json(await adminBudgetRow(c, keyId));
 });
 
 // The shared pool is a single api_key any operator designates for communal use.
@@ -1717,6 +1849,18 @@ app.get("/console/api/usage", async (c) => {
 
 // The models the signed-in key may call, with the honest Auto envelope and
 // per-model pricing — the same data /v1/models exposes, shaped for the table.
+// What a slug can do beyond chat, from the route's declared kind and the
+// catalogue entry's modalities. "image" means it can generate images (chat
+// models that only SEE images report vision, not image generation).
+function modelKindsOf(route, entry) {
+  const declared = String(route.model_kind || "chat");
+  if (declared !== "chat") return [declared];
+  const kinds = ["chat"];
+  const out = entry && Array.isArray(entry.modalities && entry.modalities.output) ? entry.modalities.output : null;
+  if (out && out.includes("image")) kinds.push("image");
+  if (out && out.includes("video")) kinds.push("video");
+  return kinds;
+}
 app.get("/console/api/models", async (c) => {
   const { denied, sess } = await requireConsoleSession(c);
   if (denied) return denied;
@@ -1779,6 +1923,7 @@ app.get("/console/api/models", async (c) => {
     data.push({
       id: "auto",
       model_kind: "chat",
+      kinds: ["chat"],
       endpoint: "/v1/chat/completions",
       context_window: envelope.context_window,
       max_output_tokens: envelope.max_output_tokens,
@@ -1803,7 +1948,7 @@ app.get("/console/api/models", async (c) => {
     data.push({
       id: slug,
       model_kind: "chat",
-      endpoint: "/v1/chat/completions",
+      kinds: modelKindsOf(r, entry),
       context_window: contextLimit(caps),
       max_output_tokens: outputLimit(caps),
       tools: !!caps.tools,
@@ -1825,6 +1970,7 @@ app.get("/console/api/models", async (c) => {
     data.push({
       id: slug,
       model_kind: "decision",
+      kinds: modelKindsOf(r, null),
       protocol: String(r.wire_format || r.fmt || "systemone"),
       endpoint: "/v1/systemone",
       routing: null,
@@ -2380,7 +2526,7 @@ async function runChatCompletion(c, key, isAdminPlayground) {
             const txt = await up.text();
             const usage = res.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
             const costUsd = await computeCost(c, liveSlug, usage, route.provider_id);
-            const clientTxt = sanitizeClientResponse(txt, liveSlug);
+            let clientTxt = sanitizeClientResponse(txt, liveSlug);
             if (isGenericUpstreamErrorResponse(clientTxt)) {
               _att.why = "malformed";
               blog("FWD MALFORMED " + route.provider_name + " -> " + String(txt).slice(0, 300));
@@ -2401,7 +2547,18 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               _att.tool_valid = deriveToolValidFromToolCalls(_respObj && _respObj.choices && _respObj.choices[0] && _respObj.choices[0].message && _respObj.choices[0].message.tool_calls);
             } catch {
             }
-            await recordUsage(c, key, { ...usage, cost_usd: costUsd });
+            // Repair AFTER the quality evidence above: the route posterior must
+            // learn the model's native tool-call quality, not our fixed-up copy.
+            let _repairFixes = [];
+            if (Array.isArray(payload.tools) && payload.tools.length && clientTxt.includes('"tool_calls"') && await toolRepairEnabled(c)) {
+              // Stash the pre-repair body on the context so the taste layer can
+              // critique the model's native output, not the repaired copy.
+              try { c.set("tasteOriginalBody", clientTxt); } catch {}
+              const repaired = repairResponseBody(clientTxt, payload.tools, liveSlug);
+              clientTxt = repaired.text;
+              _repairFixes = repaired.fixes;
+            }
+            await recordUsage(c, key, { ...usage, cost_usd: costUsd, request_id: requestId });
             await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
             if (cacheKey && isCacheableResponse(clientTxt)) {
               await storeResponseCache(c, {
@@ -2423,6 +2580,8 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               hdrs["x-gateway-horizon"] = String(autoDecision.horizon.speed || "") + "/" + String(autoDecision.horizon.role || "");
             if (cacheKey)
               hdrs["x-gateway-cache"] = cacheMode === "refresh" ? "REFRESH" : "MISS";
+            if (_repairFixes.length)
+              hdrs["x-gateway-tool-repair"] = _repairFixes.join(",");
             blog("TRACE id=" + requestId + " ok provider=" + route.provider_name + " model=" + liveSlug + " key=" + k.label + " rank=" + route.rank + " status=" + up.status + " ms=" + (Date.now() - started) + " tokens=" + usage.total_tokens + " cost=" + costUsd);
             circuitRecordOk("provider", route.provider_id);
             circuitRecordOk("route", route.id);
@@ -3437,6 +3596,11 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   let contentBuf = "";
   let reasoningBuf = "";
   let toolCallsBuf = [];
+  // Tool calls are held back and emitted once, repaired, before the terminal
+  // chunk. toolCallsBuf keeps the model's native output for telemetry.
+  const toolAssembler = StreamToolAssembler.enabledFor(payload && payload.tools) && await toolRepairEnabled(c)
+    ? new StreamToolAssembler(payload.tools, slug)
+    : null;
   const keepAlive = ((promise) => {
     const ctx = c.executionCtx;
     if (ctx && typeof ctx.waitUntil === "function")
@@ -3444,11 +3608,28 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   });
   const persistOnce = (async () => {
     const costUsd = await computeCost(c, slug, lastUsage, route.provider_id);
-    await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd });
+    await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd, request_id: requestId });
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
     // Terminal outcome, computed once and shared by the route_attempts patch
     // and the trajectory dual-write so both telemetry systems agree.
     const outcome = streamTerminalOutcome({ clientCancelled, streamError, finishSeen });
+    if (!clientCancelled) {
+      try {
+        const mode = await tasteMode(c);
+        if (mode !== "off") {
+          const verdict = critique({
+            request: payload,
+            message: { content: contentBuf, tool_calls: toolCallsBuf.filter(Boolean) },
+            finishReason: streamError || !finishSeen ? "length" : "stop",
+            styleRules: await tasteStyleRules(c)
+          });
+          await updatePosteriors(c.env.DB, slug, verdict.results);
+          noteVerdict(slug, verdict);
+        }
+      } catch (e) {
+        blog("TASTE stream annotate failed open: " + String(e && e.message || e));
+      }
+    }
     // Answer-quality evidence for the streamed attempt: structural validity of
     // the tool calls accumulated across chunks. NULL when none were emitted.
     const _streamToolValid = deriveToolValidFromToolCalls(toolCallsBuf);
@@ -3528,6 +3709,17 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       clientCancelled = true;
     }
   });
+  function flushRepairedToolCalls(truncated) {
+    const { calls } = toolAssembler.finish({ truncated });
+    if (!calls.length) return;
+    safeEnqueue("data: " + JSON.stringify({
+      id: "gen-" + requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: slug,
+      choices: [{ index: 0, delta: { tool_calls: calls } }]
+    }) + "\n\n");
+  }
   let finishSeen = false; // a finish_reason or a clean protocol completion
   let protocolDoneSeen = false; // the upstream sent an explicit [DONE]
   let truncatedEof = false; // relay closed the tunnel on a non-EOF body read
@@ -3590,9 +3782,9 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
               if (firstTokenAt === null && (hasContent || hasReasoning || hasToolDelta))
                 firstTokenAt = Date.now();
               if (typeof dc.content === "string" && contentBuf.length < TRAJ_BODY_CAP)
-                contentBuf += dc.content;
+                contentBuf = (contentBuf + dc.content).slice(0, TRAJ_BODY_CAP);
               if (typeof rc === "string" && reasoningBuf.length < TRAJ_BODY_CAP)
-                reasoningBuf += rc;
+                reasoningBuf = (reasoningBuf + rc).slice(0, TRAJ_BODY_CAP);
               if (Array.isArray(dc.tool_calls)) {
                 for (const tc of dc.tool_calls) {
                   if (!tc || typeof tc.index !== "number")
@@ -3606,6 +3798,22 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
                     slot.function.arguments += tc.function.arguments;
                 }
               }
+            }
+            if (toolAssembler) {
+              const finNow = choices && choices[0] && choices[0].finish_reason;
+              if (dc && Array.isArray(dc.tool_calls)) {
+                toolAssembler.ingest(dc.tool_calls);
+                delete dc.tool_calls;
+              }
+              if (finNow && toolAssembler.pending) {
+                flushRepairedToolCalls(finNow === "length");
+              } else if (!finNow && finishSeen && toolAssembler.pending) {
+                // A tool call arrived after finish_reason. The upstream is done;
+                // flush it now. The terminal branch will not run.
+                flushRepairedToolCalls(false);
+              }
+              if (dc && !finNow && Object.keys(dc).length === 0 && !obj.usage)
+                continue;
             }
             if (obj && obj.model && slug)
               obj.model = slug;
@@ -3638,6 +3846,8 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             cleanProtocolEnd
           );
           if (cleanProtocolEnd) finishSeen = true;
+          if (toolAssembler && toolAssembler.pending)
+            flushRepairedToolCalls(!cleanProtocolEnd);
           const finishChunk = {
             id: "gen-" + requestId,
             object: "chat.completion.chunk",
@@ -4866,7 +5076,9 @@ async function computeCost(c, slug, usage, providerId) {
   const hit = matchModelsDevPrice(flattenModelsDevCatalog(catalog), slug);
   if (hit)
     return costFromRates(usage, hit.prompt_per_1m, hit.completion_per_1m, null, null);
-  return 0;
+  // No price row and no catalog match: bill the operator's fallback rate so an
+  // unpriced model cannot spend for free against a rolling budget.
+  return fallbackCost(usage, await getFallbackPrice(c.env.DB));
 }
 async function lookupResponseCache(c, cacheKey) {
   try {
@@ -4900,6 +5112,161 @@ async function storeResponseCache(c, entry) {
 function spendAccountId(key) {
   return (key && (key.account_id || key.key_id)) || null;
 }
+// ---- Optional taste layer (see src/taste.js) ----
+var tasteSettingCache = new WeakMap();
+async function tasteSetting(c, key, dflt) {
+  // Read at most every 5s per database so the off-by-default path costs
+  // nothing measurable on the hot path.
+  let entry = tasteSettingCache.get(c.env.DB);
+  if (!entry || Date.now() - entry.at > 5000) {
+    entry = { at: Date.now(), values: {} };
+    tasteSettingCache.set(c.env.DB, entry);
+  }
+  if (!(key in entry.values))
+    entry.values[key] = await settingValue(c, key, dflt);
+  return entry.values[key];
+}
+function invalidateTasteSettings(c) {
+  tasteSettingCache.delete(c.env.DB);
+}
+async function tasteMode(c) {
+  const header = String(c.req.header("x-gateway-taste") || "").toLowerCase();
+  if (TASTE_MODES.includes(header))
+    return header;
+  const stored = await tasteSetting(c, "taste_layer", "off");
+  return TASTE_MODES.includes(stored) ? stored : "off";
+}
+async function tasteStyleRules(c) {
+  return parseStyleRules(await tasteSetting(c, "taste_style_rules", "[]"));
+}
+async function runChatWithTaste(c, key) {
+  const mode = await tasteMode(c);
+  if (mode === "off")
+    return runChatCompletion(c, key, false);
+  const payload = await c.req.json().catch(() => null);
+  const res = await runChatCompletion(c, key, false);
+  if (!payload || payload.stream || res.status !== 200 || !String(res.headers.get("content-type") || "").includes("json"))
+    return res;
+  try {
+    const styleRules = await tasteStyleRules(c);
+    // Critique the model's native output, not the repaired copy. The pre-repair
+    // body is stashed on the context by runChatCompletion when tool repair ran.
+    const originalBody = c.get("tasteOriginalBody") || await res.clone().text();
+    const first = await tasteVerdict(c, payload, originalBody, styleRules, res.headers.get("x-gateway-model"));
+    if (!first) return res;
+    let chosen = res;
+    let verdict = first.verdict;
+    let retried = false;
+    if (mode === "enforce" && verdict.hard_failed) {
+      retried = true;
+      const second = await tasteRetry(c, payload, verdict, styleRules, first.obj.choices[0].message);
+      if (second && second.verdict.score > verdict.score) {
+        chosen = second.res;
+        verdict = second.verdict;
+      }
+    }
+    const headers = new Headers(chosen.headers);
+    headers.set("x-gateway-taste", verdict.score.toFixed(2));
+    if (verdict.violations.length)
+      headers.set("x-gateway-taste-violations", verdict.violations.map((v) => v.rule).join(","));
+    if (retried)
+      headers.set("x-gateway-taste-retry", "1");
+    return new Response(chosen.body, { status: chosen.status, headers });
+  } catch (e) {
+    blog("TASTE failed open: " + String(e && e.message || e));
+    return res;
+  }
+}
+async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug) {
+  let obj;
+  try { obj = JSON.parse(bodyText); } catch { return null; }
+  const choice = obj && obj.choices && obj.choices[0];
+  if (!choice) return null;
+  const verdict = critique({ request: payload, message: choice.message, finishReason: choice.finish_reason, styleRules });
+  const slug = String(servedSlug || payload.model || obj.model || "");
+  await updatePosteriors(c.env.DB, slug, verdict.results);
+  noteVerdict(slug, verdict);
+  return { verdict, obj };
+}
+// One bounded retry through the normal stack with the critique appended as a
+// system message. The retry carries x-gateway-taste: off, so it cannot recurse.
+// The assistant turn being fixed is forwarded verbatim so the model sees the
+// tool call or JSON it broke; both attempts are billed by the normal stack.
+async function tasteRetry(c, payload, verdict, styleRules, assistantMessage) {
+  const note = retryCritique(verdict);
+  if (!note) return null;
+  const headers = new Headers(c.req.raw.headers);
+  headers.set("x-gateway-taste", "off");
+  headers.set("content-type", "application/json");
+  headers.delete("content-length");
+  const messages = [...(payload.messages || [])];
+  if (assistantMessage)
+    messages.push(assistantMessage);
+  messages.push({ role: "system", content: note });
+  const body = JSON.stringify({ ...payload, messages });
+  let ctx;
+  try { ctx = c.executionCtx; } catch { ctx = undefined; }
+  const res = await app.fetch(new Request(c.req.url, { method: "POST", headers, body }), c.env, ctx);
+  if (res.status !== 200) return null;
+  const again = await tasteVerdict(c, payload, await res.clone().text(), styleRules, res.headers.get("x-gateway-model"));
+  return again ? { res, verdict: again.verdict } : null;
+}
+app.get("/admin/taste", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  return c.json({
+    mode: await tasteSetting(c, "taste_layer", "off"),
+    style_rules: JSON.parse(await tasteSetting(c, "taste_style_rules", "[]") || "[]"),
+    models: await loadTasteReport(c.env.DB),
+    recent: recentVerdicts()
+  });
+});
+app.post("/admin/taste", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => ({}));
+  const upsert = "INSERT INTO gateway_settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at";
+  if (body.mode !== undefined) {
+    if (!TASTE_MODES.includes(body.mode))
+      return c.json({ error: { message: "mode must be one of " + TASTE_MODES.join(", ") } }, 400);
+    await c.env.DB.prepare(upsert).bind("taste_layer", body.mode, nowIso()).run();
+  }
+  if (body.style_rules !== undefined) {
+    if (!Array.isArray(body.style_rules))
+      return c.json({ error: { message: "style_rules must be an array of {id, pattern, flags?, label?}" } }, 400);
+    const valid = parseStyleRules(body.style_rules);
+    if (valid.length !== Math.min(body.style_rules.length, 20))
+      return c.json({ error: { message: "Every style rule needs a pattern (max 200 chars) that compiles as a regular expression" } }, 400);
+    const stored = body.style_rules.slice(0, 20).map((r) => ({ id: r.id, pattern: r.pattern, flags: r.flags, label: r.label }));
+    await c.env.DB.prepare(upsert).bind("taste_style_rules", JSON.stringify(stored), nowIso()).run();
+  }
+  invalidateTasteSettings(c);
+  return c.json({
+    mode: await tasteSetting(c, "taste_layer", "off"),
+    style_rules: JSON.parse(await tasteSetting(c, "taste_style_rules", "[]") || "[]")
+  });
+});
+
+// Tool-call repair is on unless the operator switched it off.
+async function toolRepairEnabled(c) {
+  return (await settingValue(c, "tool_repair", "on")) !== "off";
+}
+app.get("/admin/tool-repair", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  return c.json({ enabled: await toolRepairEnabled(c), ...getToolRepairStats() });
+});
+app.post("/admin/tool-repair", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => ({}));
+  if (typeof body.enabled !== "boolean" && !body.reset)
+    return c.json({ error: { message: "enabled must be a boolean" } }, 400);
+  if (typeof body.enabled === "boolean")
+    await c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('tool_repair', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(body.enabled ? "on" : "off", nowIso()).run();
+  if (body.reset) resetToolRepairStats();
+  return c.json({ enabled: await toolRepairEnabled(c), ...getToolRepairStats() });
+});
 async function recordUsage(c, key, usage) {
   if (!key || !key.key_id)
     return;
@@ -4913,10 +5280,16 @@ async function recordUsage(c, key, usage) {
 
   if (acctId) {
     const owner = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(acctId).first();
-    if (owner)
+    if (owner) {
       await c.env.DB.prepare(
         "UPDATE console_accounts SET used_tokens=used_tokens+?, used_usd=used_usd+? WHERE key_id=?"
       ).bind(usage.total_tokens, usage.cost_usd || 0, acctId).run();
+      try {
+        await settleSpend(c.env.DB, { accountId: acctId, keyId: key.key_id, requestId: usage.request_id, usd: usage.cost_usd || 0 });
+      } catch (e) {
+        blog("ROLLING settle failed: " + String(e && e.message || e));
+      }
+    }
   }
 }
 
@@ -4935,7 +5308,15 @@ async function trajectoriesEnabled(c) {
 }
 function capBody(text) {
   const s = typeof text === "string" ? text : JSON.stringify(text ?? "");
-  return s.length > TRAJ_BODY_CAP ? s.slice(0, TRAJ_BODY_CAP) : s;
+  if (s.length <= TRAJ_BODY_CAP) return s;
+  // Truncating a JSON string mid-token produces invalid JSON. Try to close it
+  // structurally so the stored value still parses; fall back to a safe prefix.
+  const cut = s.slice(0, TRAJ_BODY_CAP);
+  try {
+    const r = repairJson(cut);
+    if (r.ok) return r.text;
+  } catch {}
+  return cut;
 }
 async function recordTrajectory(c, t) {
   try {
@@ -5486,6 +5867,21 @@ async function authClient(c) {
       if (spent >= Number(account.budget_limit))
         return c.json({ error: { message: "Account spend limit reached.", type: "budget_exceeded" } }, 429);
     }
+    // Rolling 24h / 30d windows, with prepaid credits covering a spent window.
+    const admission = await checkAdmission(c.env.DB, capAccountId);
+    if (!admission.allowed) {
+      const blocked = admission.status.windows.find((w) => w.id === admission.window);
+      return c.json({
+        error: {
+          message: `Rolling ${blocked.label.toLowerCase()} budget used up ($${blocked.spent_usd.toFixed(2)} of $${blocked.limit_usd.toFixed(2)}) and no usage credits remain.` + (admission.resets_at ? ` Budget frees up from ${admission.resets_at}.` : ""),
+          type: "budget_exceeded",
+          code: "rolling_budget_exhausted",
+          window: admission.window,
+          resets_at: admission.resets_at,
+          credits_usd: admission.status.credits.balance_usd
+        }
+      }, 429, { "Retry-After": String(admission.retry_after_s) });
+    }
   }
 
 
@@ -5802,7 +6198,10 @@ app.get("/admin/credits", async (c) => {
     // console_accounts uses real NULL. Either shape normalizes to total null,
     // and available must derive from the SAME normalized total so an uncapped
     // row reads total/available null, never a fake zero-remaining.
-    const total = Number.isFinite(raw) && raw > 0 ? raw : null;
+    // Keys an account creates are stored with 1e12 as "no per-key cap" (the
+    // column is NOT NULL), so anything at or above 1e9 is that marker, not a
+    // real allowance. Counting it would add trillions to the grand total.
+    const total = Number.isFinite(raw) && raw > 0 && raw < 1e9 ? raw : null;
     return {
       kind: mode === "tokens" ? "tokens" : "usd",
       total,
@@ -5826,11 +6225,16 @@ app.get("/admin/credits", async (c) => {
       quota: q
     });
   }
-  const total = { usd: { used: 0, available: 0 }, tokens: { used: 0, available: 0 } };
+  const total = { usd: { used: 0, available: 0, capped_rows: 0 }, tokens: { used: 0, available: 0, capped_rows: 0 } };
   for (const r of rows) {
     const bucket = r.quota.kind === "tokens" ? total.tokens : total.usd;
-    bucket.used += r.quota.used;
-    bucket.available += r.quota.available || 0;
+    // An account's usage already includes the spend of the keys it owns, so
+    // owned keys must not be added again to the grand "spent" figure.
+    if (!r.owned_by_account) bucket.used += r.quota.used;
+    if (r.quota.available != null) {
+      bucket.available += r.quota.available;
+      bucket.capped_rows += 1;
+    }
   }
   return c.json({ rows, total });
 });
@@ -8490,7 +8894,7 @@ function adminHtml(html) {
       "cache-control": "no-store",
       // The SPA uses its bundled inline script/style; no third-party code,
       // frames, forms, or network destinations are permitted.
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
       "permissions-policy": "geolocation=(), camera=(), microphone=()"
     }
   });
