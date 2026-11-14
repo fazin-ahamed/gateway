@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wind</title>
+    <meta name="description" content="Wind console: budget, usage, requests, keys, models and the AI playground for your gateway account." />
+    <link rel="preload" href="/console/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
+    <style>/* hallmark: wind · theme: console (by request) · shape: app screen · scope: app · hero-ui v3 ocean anatomy ported, sky accent · fonts: self-hosted Inter, IBM Plex Mono */
+      @font-face { font-family: "Inter"; font-weight: 100 900; font-style: normal; font-display: swap; src: url(/console/fonts/inter.woff2) format("woff2"); }
+      @font-face { font-family: "IBM Plex Mono"; font-weight: 100 700; font-style: normal; font-display: swap; src: url(/console/fonts/plex-mono.woff2) format("woff2"); }
+      :root { --boot-bg: oklch(0.14 0.022 236); }
+      :root[data-theme="light"] { --boot-bg: oklch(0.975 0.018 232); }
+      html, body, #root { height: 100%; margin: 0; overflow-x: clip; background: var(--boot-bg); }
+    </style>
+    <script>
+      try {
+        const saved = localStorage.getItem("wind-theme");
+        const dark = saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      } catch (e) { document.documentElement.dataset.theme = "dark"; }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

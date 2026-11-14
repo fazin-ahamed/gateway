@@ -1,0 +1,179 @@
+@import "tailwindcss";
+
+/* Wind: a HeroUI v3 theme (ocean anatomy from the theming guide) plus this
+   app's component CSS ported from upstream packages/styles/components. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-secondary);
+  --color-overlay: var(--overlay);
+  --color-muted: var(--muted);
+  --color-default: var(--default);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-foreground);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-soft-fg: var(--accent-soft-foreground);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-success-soft-fg: var(--success-soft-foreground);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-warning-soft-fg: var(--warning-soft-foreground);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-danger-soft-fg: var(--danger-soft-foreground);
+  --color-border: var(--border);
+  --color-separator: var(--separator);
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+:root {
+  color-scheme: dark;
+  --white: oklch(100% 0 0);
+  --snow: oklch(0.9911 0 0);
+  --eclipse: oklch(0.2103 0.0059 285.89);
+  --radius: 0.75rem;
+  --field-radius: calc(var(--radius) * 1.5);
+  --radius-2xl: calc(var(--radius) * 2);
+  --radius-3xl: calc(var(--radius) * 3);
+  --ring-offset-width: 2px;
+  --disabled-opacity: 0.5;
+  --cursor-interactive: pointer;
+
+  --accent: oklch(0.66 0.17 236);
+  --accent-foreground: var(--snow);
+  --success: oklch(0.7329 0.1935 150.81);
+  --success-foreground: var(--eclipse);
+
+  --background: oklch(0.14 0.022 236);
+  --foreground: var(--snow);
+  --surface: oklch(0.215 0.014 236);
+  --surface-foreground: var(--foreground);
+  --surface-secondary: oklch(0.262 0.012 240);
+  --surface-tertiary: oklch(0.278 0.01 232);
+  --overlay: oklch(0.225 0.014 236);
+  --overlay-foreground: var(--foreground);
+  --muted: oklch(0.72 0.02 236);
+  --default: oklch(0.28 0.012 238);
+  --default-foreground: var(--snow);
+  --field-background: var(--default);
+  --field-foreground: var(--foreground);
+  --field-placeholder: var(--muted);
+  --field-border: transparent;
+  --warning: oklch(0.8203 0.1388 76.34);
+  --danger: oklch(0.594 0.1967 24.63);
+  --danger-foreground: var(--snow);
+  --segment: oklch(0.4 0.016 240);
+  --segment-foreground: var(--foreground);
+  --border: oklch(0.30 0.012 238);
+  --separator: oklch(0.265 0.012 238);
+  --focus: var(--accent);
+  --backdrop: rgba(3, 6, 14, 0.6);
+  --surface-shadow: 0 0 0 0 transparent inset;
+  --overlay-shadow: 0 0 1px 0 rgba(255, 255, 255, 0.3) inset, 0 14px 28px 0 rgba(0, 0, 0, 0.5);
+  --field-shadow: 0 0 0 0 transparent inset;
+
+  --surface-hover: color-mix(in oklab, var(--surface) 92%, var(--surface-foreground) 8%);
+  --default-hover: color-mix(in oklab, var(--default) 96%, var(--default-foreground) 4%);
+  --accent-hover: color-mix(in oklab, var(--accent) 90%, var(--accent-foreground) 10%);
+  --danger-hover: color-mix(in oklab, var(--danger) 90%, var(--danger-foreground) 10%);
+  --accent-soft: color-mix(in oklab, var(--accent) 18%, transparent);
+  --accent-soft-foreground: color-mix(in oklab, var(--accent) 70%, var(--foreground) 30%);
+  --accent-soft-hover: color-mix(in oklab, var(--accent) 26%, transparent);
+  --danger-soft: color-mix(in oklab, var(--danger) 18%, transparent);
+  --danger-soft-foreground: color-mix(in oklab, var(--danger) 70%, var(--foreground) 40%);
+  --warning-soft: color-mix(in oklab, var(--warning) 18%, transparent);
+  --warning-soft-foreground: color-mix(in oklab, var(--warning) 80%, var(--foreground) 70%);
+  --success-soft: color-mix(in oklab, var(--success) 18%, transparent);
+  --success-soft-foreground: color-mix(in oklab, var(--success) 80%, var(--foreground) 60%);
+  --separator-tertiary: color-mix(in oklab, var(--surface) 81%, var(--surface-foreground) 19%);
+  --track-hatch: color-mix(in oklch, var(--foreground) 7%, transparent);
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-out-fluid: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --background: oklch(0.975 0.018 232);
+  --foreground: var(--eclipse);
+  --surface: var(--white);
+  --surface-foreground: var(--foreground);
+  --surface-secondary: oklch(0.957 0.008 236);
+  --surface-tertiary: oklch(0.942 0.01 236);
+  --overlay: var(--white);
+  --overlay-foreground: var(--foreground);
+  --muted: oklch(0.52 0.03 240);
+  --default: oklch(0.94 0.01 236);
+  --default-foreground: var(--eclipse);
+  --accent: oklch(0.62 0.17 242);
+  --field-background: var(--white);
+  --field-foreground: oklch(0.2103 0.0059 285.89);
+  --warning: oklch(0.7819 0.1585 72.33);
+  --danger: oklch(0.6532 0.2328 25.74);
+  --segment: var(--white);
+  --border: oklch(0.9 0.012 236);
+  --separator: oklch(0.92 0.012 236);
+  --backdrop: rgba(24, 24, 40, 0.5);
+  --surface-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.04), 0 1px 2px 0 rgba(0, 0, 0, 0.06), 0 0 1px 0 rgba(0, 0, 0, 0.06);
+  --overlay-shadow: 0 2px 8px 0 rgba(0, 0, 0, 0.06), 0 -6px 12px 0 rgba(0, 0, 0, 0.03), 0 14px 28px 0 rgba(0, 0, 0, 0.08);
+  --field-shadow: var(--surface-shadow);
+  --track-hatch: color-mix(in oklch, var(--eclipse) 8%, transparent);
+}
+
+html {
+  background: var(--background);
+  overflow-x: clip;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--foreground) 15%, transparent) transparent;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 21px;
+  overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: var(--ring-offset-width) solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection { background: var(--accent-soft); color: var(--accent-soft-foreground); }
+
+/* Skeleton shimmer */
+@keyframes shimmer { to { transform: translateX(100%); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Markdown content in assistant messages */
+.md p { margin: 0 0 10px; }
+.md p:last-child { margin: 0; }
+.md pre {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--default);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+}
+.md code { font-family: var(--font-mono); font-size: 0.92em; }
+.md :not(pre) > code { padding: 2px 5px; border-radius: 6px; background: var(--default); }
+.md ul, .md ol { margin: 6px 0 10px; padding-left: 22px; }
+.md li { margin: 3px 0; }
+.md h1, .md h2, .md h3, .md h4 { margin: 14px 0 8px; font-weight: 600; letter-spacing: -0.01em; }
+.md h1 { font-size: 20px; } .md h2 { font-size: 18px; } .md h3 { font-size: 16px; } .md h4 { font-size: 15px; }
+.md table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+.md th, .md td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--separator); }
+.md th { font-weight: 500; color: var(--muted); }
+.md blockquote { margin: 10px 0; padding: 2px 14px; border-left: 2px solid var(--border); color: var(--muted); }
+.md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.md hr { border: 0; border-top: 1px solid var(--separator); margin: 14px 0; }
