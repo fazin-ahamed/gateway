@@ -17,7 +17,7 @@ import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShado
 import { seedModelRegistry, backfillQualityCanonicalIds, loadAliasIndex, resolveCanonicalModel } from "./router/model-registry.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
 import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
-import { critique, parseStyleRules, updatePosteriors, loadTasteReport, loadAccountTaste, recordVerdict, recentVerdictsFor, noteVerdict, recentVerdicts, retryCritique, MODES as TASTE_MODES } from "./taste.js";
+import { critique, parseStyleRules, updatePosteriors, loadTasteReport, loadAccountTaste, recordVerdict, recentVerdictsFor, noteVerdict, recentVerdicts, retryCritique, judgeWithDecisionModel, mergeJudgeIntoResults, MODES as TASTE_MODES } from "./taste.js";
 import { repairResponseBody, StreamToolAssembler, getToolRepairStats, resetToolRepairStats } from "./tool-response-repair.js";
 import { repairJson } from "./json-repair.js";
 import { loadSettings as pgLoadSettings, saveSettings as pgSaveSettings, listChats as pgListChats, getChat as pgGetChat, upsertChat as pgUpsertChat, deleteChat as pgDeleteChat, validateChatMessages as pgValidateMessages } from "./playground-store.js";
@@ -3652,6 +3652,11 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
             finishReason: streamError || !finishSeen ? "length" : "stop",
             styleRules: await tasteStyleRules(c)
           });
+          // The neural half judges the same response. Best-effort: it adds
+          // judge_* results when a decision route exists, nothing otherwise.
+          const wantsJson = !!(payload && payload.response_format && (payload.response_format.type === "json_object" || payload.response_format.type === "json_schema"));
+          const hasTools = !!(payload && Array.isArray(payload.tools) && payload.tools.length);
+          verdict.results = await applyTasteJudge(c, verdict.results, { responseText: contentBuf, wantsJson, hasTools });
           await updatePosteriors(c.env.DB, slug, verdict.results, "", spendAccountId(key) || "");
           noteVerdict(slug, verdict, spendAccountId(key) || "");
           await recordVerdict(c.env.DB, spendAccountId(key) || "", slug, verdict);
@@ -5169,6 +5174,68 @@ async function tasteMode(c) {
 async function tasteStyleRules(c) {
   return parseStyleRules(await tasteSetting(c, "taste_style_rules", "[]"));
 }
+
+// ---- the neural judging half of taste ----
+// A decision model (SubQ, or the first enabled systemone route) scores each
+// finished response on relevance, instruction-following and tone. Its
+// calibrated probabilities feed the same Beta posteriors as the rule verdicts.
+// Judging is best-effort and runs only when a decision route exists and the
+// operator has not switched it off; it never blocks or breaks a response.
+async function tasteJudgeEnabled(c) {
+  return (await settingValue(c, "taste_judge", "on")) !== "off";
+}
+
+// Build the caller the judge module uses. Returns null when no enabled
+// decision route exists, so judging silently disappears on gateways without
+// one. The caller closes over provider config, keys and egress, so the judge
+// module itself never touches any of that.
+async function tasteJudgeCaller(c) {
+  if (!await tasteJudgeEnabled(c)) return null;
+  const routes = await c.env.DB.prepare(
+    "SELECT mr.*, p.name AS provider_name, p.healthy, p.enabled AS provider_enabled, p.fmt, p.base_url, p.transport, p.proxy_url, p.extra_headers, p.key_strategy FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled=1 AND p.healthy=1 AND p.enabled=1 ORDER BY mr.rank"
+  ).all();
+  const route = (routes.results || []).find((r) => effectiveModelKind(r) === "decision" && isSystemOneFormat(effectiveFormat(r, r)));
+  if (!route) return null;
+  return async ({ state, questions }) => {
+    const keys = await providerKeys(c, route.provider_id);
+    if (!keys.length) return null;
+    const transport = routeTransport(route, c.env);
+    const fetchImpl = transport === "proxy"
+      ? async (url, init) => {
+          const proxy = route.proxy_url || (await resolveActiveEgress(c) || {}).url;
+          if (!proxy) throw new Error("proxy transport but no egress configured");
+          const sep = proxy.includes("?") ? "&" : "?";
+          return fetch(proxy + sep + "url=" + encodeURIComponent(url), { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
+        }
+      : (url, init) => upstreamFetch(c, url, init);
+    const res = await callSystemOne({
+      base: providerBaseFor(route, route),
+      path: decisionPathFor(route, route),
+      model: route.upstream_model || route.slug,
+      state,
+      questions,
+      apiKey: keys[0].key,
+      fetchImpl,
+      timeoutMs: 15000
+    });
+    if (!res.ok) return null;
+    return mapSystemOneResponse({ json: res.json, questions });
+  };
+}
+
+// Run the judge over a finished response and fold its scores into the taste
+// results before the posteriors update. Best-effort: any failure leaves the
+// results untouched.
+async function applyTasteJudge(c, results, { responseText, wantsJson, hasTools }) {
+  try {
+    const caller = await tasteJudgeCaller(c);
+    if (!caller) return results;
+    const judged = await judgeWithDecisionModel({ caller, responseText, wantsJson, hasTools });
+    return mergeJudgeIntoResults(results, judged);
+  } catch {
+    return results;
+  }
+}
 async function runChatWithTaste(c, key) {
   const mode = await tasteMode(c);
   if (mode === "off")
@@ -5207,6 +5274,12 @@ async function runChatWithTaste(c, key) {
     return res;
   }
 }
+function textForJudge(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((p) => (p && (p.text || p.content)) || "").join("");
+  return "";
+}
+
 async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug, key) {
   let obj;
   try { obj = JSON.parse(bodyText); } catch { return null; }
@@ -5215,6 +5288,11 @@ async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug, key) {
   const verdict = critique({ request: payload, message: choice.message, finishReason: choice.finish_reason, styleRules });
   const slug = String(servedSlug || payload.model || obj.model || "");
   const accountId = spendAccountId(key) || "";
+  // The neural half judges the same response. Best-effort and bounded; a slow
+  // or absent judge leaves the symbolic verdict as-is.
+  const wantsJson = !!(payload && payload.response_format && (payload.response_format.type === "json_object" || payload.response_format.type === "json_schema"));
+  const hasTools = !!(payload && Array.isArray(payload.tools) && payload.tools.length);
+  verdict.results = await applyTasteJudge(c, verdict.results, { responseText: textForJudge(choice.message && choice.message.content), wantsJson, hasTools });
   await updatePosteriors(c.env.DB, slug, verdict.results, "", accountId);
   noteVerdict(slug, verdict, accountId);
   await recordVerdict(c.env.DB, accountId, slug, verdict);
@@ -5323,6 +5401,22 @@ app.get("/admin/tool-repair", async (c) => {
   if (denied) return denied;
   return c.json({ enabled: await toolRepairEnabled(c), ...getToolRepairStats() });
 });
+// The neural judging half: on/off. The symbolic taste layer is unaffected.
+app.post("/admin/taste/judge", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => ({}));
+  if (typeof body.enabled !== "boolean")
+    return c.json({ error: { message: "enabled must be a boolean" } }, 400);
+  await c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('taste_judge', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(body.enabled ? "on" : "off", nowIso()).run();
+  return c.json({ enabled: await tasteJudgeEnabled(c) });
+});
+app.get("/admin/taste/judge", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  return c.json({ enabled: await tasteJudgeEnabled(c) });
+});
+
 app.post("/admin/tool-repair", async (c) => {
   const denied = await requireAdmin(c);
   if (denied) return denied;

@@ -28,7 +28,13 @@ export const RULES = {
   json_schema_ok: { hard: true, weight: 2 },
   tool_calls_valid: { hard: true, weight: 2 },
   reasoning_missing: { hard: false, weight: 0.5 },
-  style: { hard: false, weight: 0.25 }
+  style: { hard: false, weight: 0.25 },
+  // The neural half: a decision model scores semantics the symbolic rules
+  // cannot see. Soft and lighter than the structural checks, because a judge
+  // can be wrong where a parser cannot.
+  judge_relevant: { hard: false, weight: 0.75 },
+  judge_instruction_following: { hard: false, weight: 0.75 },
+  judge_tone: { hard: false, weight: 0.5 }
 };
 
 const STYLE_SCAN_LIMIT = 20000;
@@ -372,4 +378,100 @@ export function retryCritique(verdict) {
     tool_calls_valid: "The previous tool call did not match the tool's schema. Call a listed tool with arguments that satisfy its parameters."
   };
   return hard.map((r) => lines[r]).filter(Boolean).join(" ");
+}
+
+// ---- the neural judging half ----
+//
+// The symbolic rules decide what a program can check. A decision model
+// (SubQ, or any systemone provider) judges what they cannot: was the answer
+// actually about the request, did it do what was asked, is the tone right.
+// Its scores are calibrated probabilities, so they feed the SAME Beta
+// posteriors as the rule verdicts - one learned channel, two kinds of signal.
+//
+// The judge sees a sanitized state: a short task summary and the response
+// text. The raw user prompt is never sent upstream, so a conversation's
+// private content never leaves through the judging side door.
+
+export const JUDGE_QUESTIONS = {
+  relevant: {
+    type: "noul",
+    instructions: "Is this a substantive, coherent, on-point response for the kind of task described, rather than a refusal, deflection, boilerplate, or nonsense?",
+    criteria: {
+      true: "Substantive and coherent for the task shape",
+      false: "A refusal, deflection, boilerplate, or incoherent content"
+    }
+  },
+  instruction_following: {
+    type: "noul",
+    instructions: "Given the request shape (format and tool availability), does the response conform: valid structure when structured output was wanted, tool calls well-formed when tools were offered?",
+    criteria: {
+      true: "Conforms to the requested format and tool contract",
+      false: "Wrong format, malformed structure, or ignores the tool contract"
+    }
+  },
+  tone: {
+    type: "noul",
+    instructions: "Is the tone appropriate: professional where needed, not sycophantic, not padded, no filler or boilerplate openers?",
+    criteria: {
+      true: "Appropriate register, concise, no filler",
+      false: "Sycophantic, padded, condescending, or off-register"
+    }
+  }
+};
+
+const JUDGE_PASS_THRESHOLD = 0.5;
+const JUDGE_RESPONSE_CAP = 6000;
+
+// Build the sanitized judging state. The judge gets the response text plus
+// the STRUCTURE of the request (did it want JSON, tools, a format), never the
+// prompt's content words. Relevance is judged on response quality and
+// instruction-following on the shape, so private prompt text never leaves
+// through the judging side door.
+function judgeState({ responseText, wantsJson, hasTools }) {
+  const resp = String(responseText || "").slice(0, JUDGE_RESPONSE_CAP);
+  const shapeParts = [];
+  shapeParts.push(wantsJson ? "structured JSON output was requested" : "free-form text was requested");
+  shapeParts.push(hasTools ? "the task offered tools the answer could call" : "no tools were offered");
+  return {
+    request_shape: shapeParts.join("; "),
+    wants_json: !!wantsJson,
+    has_tools: !!hasTools,
+    response: resp
+  };
+}
+
+// Ask the decision model to score the response. `caller` is injected by the
+// gateway so this module never touches provider config, keys, or egress.
+// Returns { scores: {dim: probability} } or null when the judge is absent or
+// unreachable - judging is best-effort and must never break a response.
+export async function judgeWithDecisionModel({ caller, responseText, wantsJson, hasTools }) {
+  if (typeof caller !== "function") return null;
+  const state = judgeState({ responseText, wantsJson, hasTools });
+  if (!state.response.trim()) return null;
+  let answers;
+  try {
+    answers = await caller({ state, questions: JUDGE_QUESTIONS });
+  } catch {
+    return null;
+  }
+  if (!answers || typeof answers !== "object") return null;
+  const scores = {};
+  for (const dim of Object.keys(JUDGE_QUESTIONS)) {
+    const a = answers[dim];
+    const p = a && typeof a === "object" ? Number(a.probability ?? a.noul) : Number(a);
+    if (Number.isFinite(p)) scores[dim] = Math.max(0, Math.min(1, p > 1 ? p / 100 : p));
+  }
+  return Object.keys(scores).length ? { scores, state } : null;
+}
+
+// Turn judge scores into soft taste results. A score at or above the
+// threshold passes; below it fails. These fold into updatePosteriors exactly
+// like the rule verdicts, so "how often is this model relevant for this
+// account" is measured the same way as "how often is its JSON valid".
+export function mergeJudgeIntoResults(results, judged) {
+  if (!judged || !judged.scores) return results;
+  for (const [dim, p] of Object.entries(judged.scores)) {
+    results.push({ rule: "judge_" + dim, pass: p >= JUDGE_PASS_THRESHOLD, judge_score: Math.round(p * 1000) / 1000 });
+  }
+  return results;
 }
