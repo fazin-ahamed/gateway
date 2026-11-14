@@ -3,11 +3,8 @@ export const PUBLIC_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Astrosphere's public AI gateway overview: recorded token usage, recent activity, and available models.">
-<title>Astrosphere · Gateway overview</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@400;500;600&display=swap" rel="stylesheet">
+<meta name="description" content="Wind's public AI gateway overview: recorded token usage, recent activity, and available models.">
+<title>Wind · Gateway overview</title>
 <style>
 :root{color-scheme:dark;--canvas:#070912;--surface:#0e1122;--surface-subtle:#161b31;--text:#eef1fb;--text-muted:#9aa4c6;--border:#232a46;--border-strong:#6574aa;--accent:#74a4ff;--accent-hover:#93bbff;--accent-soft:#172247;--accent-text:#05070f;--danger:#ff7a90;--font-display:"Fraunces","Iowan Old Style",Palatino,serif;--font-sans:"Source Sans 3","Segoe UI",system-ui,sans-serif;--font-mono:"IBM Plex Mono",ui-monospace,Consolas,monospace}
 :root[data-theme="light"]{color-scheme:light;--canvas:#eef1f9;--surface:#fff;--surface-subtle:#e6ebf6;--text:#101426;--text-muted:#56608a;--border:#d6dcef;--border-strong:#6b769c;--accent:#2f5fd0;--accent-hover:#2450c4;--accent-soft:#e3eafc;--accent-text:#fff;--danger:#c0324a}
@@ -15,6 +12,24 @@ export const PUBLIC_HTML = `<!doctype html>
 @media(max-width:850px){.usage{gap:28px;grid-template-columns:1fr 1fr}.filters{grid-template-columns:1fr 1fr}.filters .field:first-child{grid-column:1/-1}.model-head,.model{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr) minmax(90px,.5fr);gap:16px}.connection{gap:28px}.intro{padding-top:32px}.freshness{text-align:left}}
 @media(max-width:560px){.top{flex-direction:column;align-items:stretch;gap:18px;padding-block:22px}.brand{font-size:24px}.actions{justify-content:space-between}.actions .button{flex:1}.intro{padding-block:30px 24px;gap:20px}.freshness{max-width:none;display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%}.freshness span{margin:0;max-width:210px}.usage{grid-template-columns:1fr;gap:24px;padding-block:24px}.breakdown{gap:18px}.token-total{font-size:clamp(2rem,9vw,3rem)}.section{padding-top:28px}.section-head{gap:8px;margin-bottom:10px}.plot{height:100px}.day-label{font-size:11px}.directory{padding-top:28px;margin-top:24px}.filters{gap:12px}.model-head{display:none}.model{grid-template-columns:1fr;gap:14px;padding:20px 0}.capabilities{gap:6px}.limits{display:flex;flex-wrap:wrap;gap:16px}.limits p+p{margin:0}.connection{grid-template-columns:1fr;gap:26px;margin-top:32px}.daily th,.daily td{padding:10px 4px;font-size:12px}.chart-empty{padding:20px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+
+/* Wind: HeroUI v3 anatomy, same as the console and /_gw. */
+@font-face{font-family:"Inter";font-weight:100 900;font-display:swap;src:url(/console/fonts/inter.woff2) format("woff2")}
+@font-face{font-family:"IBM Plex Mono";font-weight:100 700;font-display:swap;src:url(/console/fonts/plex-mono.woff2) format("woff2")}
+:root{--canvas:oklch(0.14 0.022 236);--surface:oklch(0.215 0.014 236);--surface-subtle:oklch(0.262 0.012 240);--text:oklch(0.9911 0 0);--text-muted:oklch(0.72 0.02 236);--border:oklch(0.30 0.012 238);--border-strong:oklch(0.4 0.02 240);--accent:oklch(0.66 0.17 236);--accent-hover:color-mix(in oklab,var(--accent) 90%,oklch(0.9911 0 0) 10%);--accent-soft:color-mix(in oklab,var(--accent) 18%,transparent);--accent-text:oklch(0.9911 0 0);--danger:oklch(0.594 0.1967 24.63);--cool:var(--accent);--font-display:var(--font-sans);--font-sans:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--font-mono:"IBM Plex Mono",ui-monospace,"SF Mono",Consolas,monospace;--surface-shadow:0 0 0 0 transparent inset;--overlay-shadow:0 0 1px 0 rgba(255,255,255,.3) inset}
+:root[data-theme="light"]{--canvas:oklch(0.975 0.018 232);--surface:oklch(100% 0 0);--surface-subtle:oklch(0.957 0.008 236);--text:oklch(0.2103 0.0059 285.89);--text-muted:oklch(0.52 0.03 240);--border:oklch(0.9 0.012 236);--border-strong:oklch(0.8 0.02 238);--accent:oklch(0.62 0.17 242);--accent-hover:color-mix(in oklab,var(--accent) 90%,oklch(0.9911 0 0) 10%);--accent-soft:color-mix(in oklab,var(--accent) 12%,transparent);--danger:oklch(0.6532 0.2328 25.74);--surface-shadow:0 2px 4px 0 rgba(0,0,0,.04),0 1px 2px 0 rgba(0,0,0,.06),0 0 1px 0 rgba(0,0,0,.06);--overlay-shadow:0 2px 8px 0 rgba(0,0,0,.06),0 -6px 12px 0 rgba(0,0,0,.03),0 14px 28px 0 rgba(0,0,0,.08)}
+html{background:var(--canvas);overflow-x:clip}
+body{background:var(--canvas);font-family:var(--font-sans);overflow-x:clip}
+.brand,h1,h2,.token-total{font-family:var(--font-sans);font-weight:600;letter-spacing:-.02em}
+.token-total,.breakdown dd,.model .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.token-total{color:var(--text)}
+.button{border-radius:999px;border:0;transition:background-color 150ms cubic-bezier(.23,1,.32,1),transform 250ms cubic-bezier(.23,1,.32,1)}
+.button:active{transform:scale(.97)}
+.button.primary{background:var(--accent);color:var(--accent-text)}
+@media (hover:hover) and (pointer:fine){.button.primary:hover{background:var(--accent-hover)}}
+.model,.directory,.connection,.error,.usage,.breakdown>div{border-radius:20px}
+.connection,.error{background:var(--surface);border:0;box-shadow:var(--surface-shadow)}
+.bar{background:var(--accent);border-radius:2px 2px 0 0}
 </style>
 <script>
 try { document.documentElement.dataset.theme = localStorage.getItem('console-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); }
@@ -25,7 +40,7 @@ catch { document.documentElement.dataset.theme = matchMedia('(prefers-color-sche
 <a class="skip" href="#overview">Skip to overview</a>
 <div class="wrap">
 <header class="top">
-<a class="brand" href="/" aria-label="Astrosphere home"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="currentColor"/><ellipse cx="12" cy="12" rx="10" ry="4.2" fill="none" stroke="currentColor" stroke-width="1.3"/><ellipse cx="12" cy="12" rx="10" ry="4.2" fill="none" stroke="currentColor" stroke-width="1.3" transform="rotate(60 12 12)"/></svg>Astrosphere</a>
+<a class="brand" href="/" aria-label="Wind home"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="currentColor"/><ellipse cx="12" cy="12" rx="10" ry="4.2" fill="none" stroke="currentColor" stroke-width="1.3"/><ellipse cx="12" cy="12" rx="10" ry="4.2" fill="none" stroke="currentColor" stroke-width="1.3" transform="rotate(60 12 12)"/></svg>Wind</a>
 <nav class="actions" aria-label="Gateway"><button id="theme" class="button quiet" type="button">Change theme</button><a class="button primary" href="/console/signin">Open console</a></nav>
 </header>
 <main id="overview" tabindex="-1">
@@ -40,7 +55,7 @@ catch { document.documentElement.dataset.theme = matchMedia('(prefers-color-sche
 <section class="directory" aria-labelledby="models-heading"><div class="directory-heading"><h2 id="models-heading">Model directory</h2><p id="model-count" class="muted" role="status">Reading available models…</p></div><div class="filters"><div class="field"><label for="search">Find a model</label><input id="search" type="search" placeholder="Search by model name" autocomplete="off"></div><div class="field"><label for="kind">Model type</label><select id="kind"><option value="all">All types</option><option value="chat">Chat</option><option value="decision">Decision</option></select></div><div class="field"><label for="capability">Capability</label><select id="capability"><option value="all">All capabilities</option><option value="tools">Tools</option><option value="vision">Vision</option><option value="reasoning">Reasoning</option><option value="streaming">Streaming</option><option value="choice">Choice</option><option value="score">Score</option><option value="noul">NOUL</option></select></div></div><div class="model-head" aria-hidden="true"><span>Model and endpoint</span><span>Capabilities</span><span>Token limits</span></div><ul id="models" class="model-list"></ul><p id="model-empty" class="empty" hidden></p></section>
 <section class="connection" aria-labelledby="connection-heading"><div><h2 id="connection-heading">Connect to the gateway</h2><p class="muted">OpenAI-compatible chat API. Requests require an API key.</p><div class="address"><code id="api-base"></code><button id="copy" class="button" type="button">Copy API URL</button></div><p id="copy-note" class="copy-note" role="status"></p></div><div class="privacy"><h2>Public by design</h2><p>Only aggregate recorded usage and model metadata are shown here. Accounts, API keys, request contents, provider details and spending stay private.</p><p style="margin-top:12px">Models reflect the latest configured, healthy routes. Availability can change. Totals cover retained ledger history rather than an unverifiable lifetime count.</p></div></section>
 </main>
-<footer class="footer"><p>Astrosphere · Public gateway overview</p><a href="/health">Gateway liveness endpoint</a></footer>
+<footer class="footer"><p>Wind · Public gateway overview</p><a href="/health">Gateway liveness endpoint</a></footer>
 </div>
 <noscript><p class="wrap">JavaScript is required to load the public overview. The aggregate JSON is available at <a href="/public/overview">/public/overview</a>.</p></noscript>
 <script>

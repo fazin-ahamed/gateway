@@ -363,3 +363,31 @@ export function migrateConsoleAccounts(db) {
     return added;
   }
 }
+
+// Rolling-window budgets: three console_accounts columns plus the append-only
+// spend_events table. schema.sql only creates them on a fresh database, so an
+// existing host DB needs the ALTERs. Idempotent.
+export function migrateRollingBudgets(db) {
+  const added = [];
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS spend_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL,
+      key_id TEXT NOT NULL,
+      request_id TEXT,
+      usd REAL NOT NULL,
+      at TEXT NOT NULL
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_spend_events_account_at ON spend_events(account_id, at)");
+    const cols = new Set(((db.prepare("PRAGMA table_info(console_accounts)").all().results) || []).map((c) => c && c.name));
+    if (cols.size) {
+      if (!cols.has("budget_daily_usd")) { db.exec("ALTER TABLE console_accounts ADD COLUMN budget_daily_usd REAL"); added.push("account.budget_daily_usd"); }
+      if (!cols.has("budget_monthly_usd")) { db.exec("ALTER TABLE console_accounts ADD COLUMN budget_monthly_usd REAL"); added.push("account.budget_monthly_usd"); }
+      if (!cols.has("credits_usd")) { db.exec("ALTER TABLE console_accounts ADD COLUMN credits_usd REAL NOT NULL DEFAULT 0"); added.push("account.credits_usd"); }
+    }
+  } catch (e) {
+    console.warn("[gateway] rolling budget migration skipped:", e.message);
+  }
+  if (added.length) console.warn("[gateway] migration: rolling budgets added " + added.join(", "));
+  return added;
+}

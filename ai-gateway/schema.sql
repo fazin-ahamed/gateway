@@ -142,8 +142,24 @@ CREATE TABLE IF NOT EXISTS console_accounts (
   budget_mode TEXT NOT NULL DEFAULT 'usd',
   budget_limit REAL,
   used_usd REAL NOT NULL DEFAULT 0,
-  used_tokens INTEGER NOT NULL DEFAULT 0
+  used_tokens INTEGER NOT NULL DEFAULT 0,
+  -- Rolling-window caps (24 hours, 30 days) and prepaid credits. NULL cap
+  -- means no cap for that window; credits never reset and only cover spend
+  -- that overruns a capped window. See src/budgets.js.
+  budget_daily_usd REAL,
+  budget_monthly_usd REAL,
+  credits_usd REAL NOT NULL DEFAULT 0
 );
+-- Append-only spend ledger behind the rolling windows. Pruned past 31 days.
+CREATE TABLE IF NOT EXISTS spend_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  key_id TEXT NOT NULL,
+  request_id TEXT,
+  usd REAL NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spend_events_account_at ON spend_events(account_id, at);
 -- Model tiers granted to the whole account. Keys the account creates inherit
 -- these and cannot widen them.
 CREATE TABLE IF NOT EXISTS console_account_tiers (
@@ -673,3 +689,14 @@ CREATE TABLE IF NOT EXISTS zai_conversations (
 );
 CREATE INDEX IF NOT EXISTS idx_zai_conv_match
   ON zai_conversations(tenant_key, user_key, chain_hash, message_count);
+
+-- Optional taste layer: per (model, rule) Beta posterior over "did the
+-- response satisfy this rule". alpha/beta start at 1/1. See src/taste.js.
+CREATE TABLE IF NOT EXISTS taste_posteriors (
+  slug TEXT NOT NULL,
+  rule TEXT NOT NULL,
+  alpha REAL NOT NULL DEFAULT 1,
+  beta REAL NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (slug, rule)
+);
