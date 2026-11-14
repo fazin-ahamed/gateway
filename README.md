@@ -1,467 +1,148 @@
-# AI Gateway
+<div align="center">
 
-OpenAI-compatible AI gateway on Node + SQLite (direct egress, Koyeb WebSocket relay, OCI rollback path) with an operator console and usage accounting. No request or response bodies are ever stored.
+<img src="assets/logo.svg" width="120" alt="Wind gateway logo">
 
-## Layout
+# Wind
 
-- `ai-gateway/` — app source (`src/index.js`, `src/zai-session.js`, `src/zai-models.js`, `src/playground.js`, `src/login.js`, `src/uae-time.js`), SQLite schema, admin console UI
-- `server/` — Node entrypoint (`server.mjs`, `db.mjs`, `import.mjs`), the only deploy target
-- `relay/` — small Go relay for providers that need non-Cloudflare egress
-- `docs/` — request-path and hosting runbooks
+**A self-hosted AI gateway that measures how good its answers actually are.**
+
+OpenAI-compatible, on Node + SQLite, with an operator console, per-account
+budgets, tool-call repair, and a neurosymbolic taste layer that learns which
+models follow the rules - and proves it on your own traffic.
+
+</div>
+
+---
+
+Most gateways route requests and count tokens. This one also asks, of every
+response: *was it valid, did it follow the schema, was it cut off, was it
+actually relevant?* It answers with a deterministic critic for what a program
+can decide, a decision model for the semantics it can't, and per-account Beta
+posteriors that turn those verdicts into a measured, calibrated profile of
+each model's real behavior. No prompt or response text is ever stored to do
+it.
+
+## Why
+
+- **Taste layer.** A symbolic critic checks finished answers (valid JSON when
+  asked, tool calls matching their schema, not empty or truncated, reasoning
+  present when expected, operator style rules). A decision model (SubQ, or any
+  systemone route) scores relevance, instruction-following and tone. Both feed
+  the same Beta posteriors per (model, rule, route, account), so "how often
+  does this model actually comply" is measured, with 30-day decay, never
+  assumed.
+- **Tool-call repair.** Malformed tool calls are repaired for every provider,
+  streaming or not: tolerant JSON repair, type coercion against the advertised
+  schema, enum snapping, name casing. A call cut off by the length limit is
+  never emitted - closing the braces of a half-written edit is how data gets
+  lost.
+- **Per-account budgets.** Rolling 24-hour and 30-day caps plus prepaid
+  credits. Windows are trailing, so spend ages out on its own instead of
+  resetting at midnight.
+- **Model-integrity probes.** Verify a slug actually serves the model it
+  claims, against reference tokenizers and routing fingerprints, so a reseller
+  relaying cheap weights behind a frontier name gets caught.
+- **Privacy by construction.** The taste posteriors and the persisted verdict
+  history store rule names, scores, model, route and account only. Prompts and
+  responses never reach the learning tables.
+
+## The gateway
+
+- **OpenAI-compatible** `POST /v1/chat/completions` and `GET /v1/models`, plus
+  a **decision API** `POST /v1/systemone` for typed questions (choice, score,
+  noul) against decision models.
+- **`model: "auto"`** routes over your enabled routes: easy asks take one
+  reflex hop, hard asks compile a task lens and reroute on failure.
+- **Operator console** at `/_gw`: providers, routes, tiers, keys, budgets,
+  prices, cache, reliability and the taste profile.
+- **Customer console** at `/console`: usage, keys, budgets, models, a
+  playground with streaming reasoning traces, and the account's own taste
+  profile with its verdict trend.
+- **Public overview** at `/`: recorded usage and the model directory with no
+  sign-in, drawn from the body-free request ledger.
 
 ## Quickstart
 
-```sh
-cd relay && go test ./... -short -count=1
-cd ../server && npm install && node --check server.mjs
-```
-
-To run it:
-
-1. `cp .env.example .env` (local only, never commit) and generate values.
-2. `cd server && npm install && node --env-file=../.env server.mjs`
-3. Open `http://<host>:3000/_gw` (on ecli: `http://<allocation-host>:30012/_gw`), sign in with `ADMIN_TOKEN`, add providers, routes, and API keys.
-
-On ecli, leave `sh server/auto-update.sh` running so each push to `main` pulls and restarts (see `docs/ecli-hosting.md`).
-
-First boot applies `ai-gateway/schema.sql` to `./data/gateway.db` automatically.
-
-## Secrets model
-
-| Secret                | Where            | Purpose                              |
-| --------------------- | ---------------- | ------------------------------------ |
-| `ADMIN_TOKEN`         | env              | Admin console password               |
-| `PROVIDER_CRYPTO_KEY` | env              | AES-GCM envelope for provider keys   |
-| `KOYEB_RELAY_SECRET`  | env (both sides) | HMAC auth for the relay tunnel       |
-| Provider API keys     | SQLite (sealed)  | Sealed `enc:v1:` envelopes in the DB |
-
-Public defaults live in `.env.example`
-(`UPSTREAM_APP_TITLE`, `UPSTREAM_HTTP_REFERER`, `RELAY_BACKEND`,
-`KOYEB_RELAY_URL`). Private provider hostnames live in your DB rows or
-`RELAY_PROVIDERS_JSON`, never in this repo.
-
-## API
-
-- `POST /v1/chat/completions` — OpenAI-compatible completions (auth: `Bearer sk-…`)
-- `GET /v1/models` - enabled model slugs available to the caller (bearer-key auth)
-- `GET /health`, `GET /status` (admin) — liveness and route inventory
-- `/_gw` — operator console (Overview, Providers, Model routes, Tiers, Keys, Playground, Cache, Prices)
-- `GET /` - public usage overview and searchable model directory; no sign-in
-- `GET /public/overview` - aggregate recorded usage and currently discoverable model metadata; no auth
-
-`model: "auto"` is HORIZON-Ω over **your enabled routes only**. Easy asks
-are one reflex hop. Hard coding compiles TaskIR, injects a worker lens
-(goal/facts/unknowns — not MVC/reroute), and reroutes to an uncorrelated
-family on 5xx. Compaction fires only when input exceeds 82% of the model's
-usable window (context minus output reserve), and keeps tool-call pairs.
-
-### Upstream access errors
-
-If the attempted upstream credentials cannot authenticate or access the selected
-model/group, the gateway tries the remaining configured credentials and routes.
-If none succeeds, the public response is HTTP 502 with `error.type: "upstream_error"`
-and one of these codes:
-
-| `error.code` | Operator action |
-| --- | --- |
-| `upstream_authentication_failed` | Check the API key configured for the upstream route. |
-| `upstream_access_denied` | Check that the upstream API token can access the route's model and token/channel group. |
-
-These errors concern upstream credentials. A missing or invalid gateway-client
-key still returns HTTP 401. Public errors omit upstream names, URLs, group names,
-credentials and upstream request IDs; operator logs retain the upstream diagnosis.
-Unclassified failures no longer claim that the model is experiencing an outage.
-
-A working upstream website account does not prove that its API token has access
-to the same groups. Compare the configured base URL, API token, upstream model
-and token group with a successful request to that upstream API. The gateway does
-not bypass permissions or silently change groups. See the upstream
-[New API group guide](https://docs.newapi.ai/en/docs/guide/feature-guide/admin/group).
-
-Permission denials do not quarantine the whole credential or count as provider
-outages. Invalid credentials can still quarantine their key. Non-transient HTTP
-4xx failures are not retried in place, except recognized HTTP 400 relay failures;
-transient failures retain bounded retries and configured fallbacks.
-
-### Stream completion
-
-An explicit OpenAI `[DONE]` or Anthropic `message_stop` ends the stream and releases
-the upstream connection, even if the upstream keeps its HTTP body open. A clean
-`[DONE]` without a separate finish reason produces a terminal chunk and records
-the final usage as a completed request. Upstream error frames never count as
-successful completions; EOF without a completion signal remains a truncated
-`finish_reason: "length"` response.
-
-## Public overview
-
-Open the gateway's root URL to see recorded input, output and total tokens,
-request counts, seven UTC calendar days of activity, and available chat and
-decision models. Search and capability filters work without signing in.
-The API connection section uses the same host's `/v1` endpoint.
-
-Totals cover the request-summary history retained in the current database,
-not a lifetime guarantee. The snapshot includes the earliest and latest
-recorded request timestamps; empty history is shown as zero usage.
-Total tokens are the recorded total field, which may differ from input plus output.
-
-`GET /public/overview` returns `generated_at`, `service`, `usage`, `activity`
-and `models`. Models use the same enabled-provider, circuit and capability
-rules as authenticated discovery, but omit upstream identities and
-provider details. Decision models advertise their separate endpoint;
-chat-only Auto is included only when enabled and discoverable.
-
-The snapshot is cached for 30 seconds. A data-loading failure returns a
-generic HTTP 503 rather than fabricated zero usage; the page preserves an
-earlier snapshot and offers Retry. Neither the page nor its endpoint
-exposes account/key identifiers, prompts, responses, provider credentials,
-per-client traffic or internal costs. `/v1/*`, `/console` and `/_gw` retain
-their existing authentication.
-
-## Provider state: enabled vs healthy
-
-Two independent switches on every provider row:
-
-| Flag      | Meaning                                | Effect                                                                                          |
-| --------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `enabled` | Operator off-switch (default on)       | Provider is never routed, never probed by `/status`, and advertises no slugs.                    |
-| `healthy` | Runtime state / manual "mark down"     | Provider is skipped for routing but stays listed and probed, so it can recover or be inspected.   |
-
-Console: **disable** / **enable** is the off-switch (row shows a `DISABLED`
-pill); **mark down** / **mark up** is the health toggle. API:
-`POST /admin/providers/:id/disable`, `POST /admin/providers/:id/enable`, or
-`PATCH /admin/providers/:id` with `{"enabled":false}`.
-
-`GET /v1/models` lists only slugs that can actually be served right now — a
-slug whose providers are all disabled or all down is withheld instead of being
-advertised and then 503ing on use. Routing a withheld slug returns 503 with
-`code: "provider_disabled"` when a disabled provider is the reason, so the
-cause is visible in the error rather than only in the console.
-
-Migration: `providers.enabled` is in `schema.sql` (fresh installs) and is added
-by an idempotent `ALTER TABLE` on Node boot, so an existing `data/gateway.db`
-picks it up on the next start with no manual step.
-
-## Account invite migrations
-
-New-account invites reserve an account ID before registration. Their token
-rows therefore cannot require an existing API key or account. On Node startup,
-the account migration rebuilds legacy token tables that still enforce that
-foreign key, preserving pending and consumed links in a transaction.
-Foreign-key enforcement remains enabled for the database.
-
-Deploy and restart the Node server to apply this migration before creating
-account links. Repeated starts leave the migrated token table unchanged.
-
-## Provider formats
-
-The admin UI exposes normal API providers plus three Z.AI consumer transports.
-
-| `fmt` | Upstream | Credential |
-| --- | --- | --- |
-| `openai` | `{base_url}/chat/completions` | API key via `Authorization: Bearer …` |
-| `anthropic` | `{base_url}/messages` | API key via `x-api-key` |
-| `zaiminted` | chat.z.ai pure HTTP — **recommended** | Z.AI session token; gateway mints a fresh CAPTCHA proof from the local device-token store |
-| `zaiwebbrowser` | real chat.z.ai Chromium page — fallback/debug | Z.AI session token |
-| `zaiweb` | chat.z.ai pure HTTP with caller-supplied proof | Z.AI session token + fresh `captcha_verify_param` per completion |
-
-### Z.ai web chat — session, models, and transport
-
-`zaiweb` runs against a real session object (`src/zai-session.js`) rather than a
-hand-pasted JWT:
-
-- **Guest bootstrap** — `GET /` (warm cookies + discover the frontend build) →
-  `POST /api/v1/auths/guest` → `GET /api/v1/auths/`. An account token in the
-  provider key is validated first and preferred; guest is the fallback.
-- **Cookie jar** — every `Set-Cookie` from warm, auth, completion, upload,
-  and delete is retained and replayed, which is what the edge expects.
-- **Single-flight refresh** — concurrent requests share one refresh; a 401
-  mid-flight invalidates, refreshes once, and replays the completion.
-- **Rotation** — a token the site rotates during a request is adopted and
-  returned as the provider key's new value, so a stored credential never keeps
-  a token the site already retired.
-- **Live models** (`src/zai-models.js`) — `GET /api/models` with the session's
-  cookies decides which models the account can actually use. A model the
-  account cannot see is reported `available: false` and the router skips it;
-  the static table is fallback metadata only.
-- **Chat lifecycle** — chat IDs are client-generated UUIDs, matching GLM-Free-API.
-  A pool of ready IDs is maintained locally; an ID only materializes upstream
-  when the completion references it. The used chat is deleted after the stream
-  drains, so history never accumulates or stacks on re-sent client context.
-- **Failure classification** — an edge/WAF block (`code: "zai_waf"`) is
-  process-wide and fails fast before image upload or CAPTCHA-token consumption.
-  Proof-infrastructure failures on `zaiminted` may use Chromium as a secondary
-  fallback; confirmed WAF/model/request failures do not.
-- **Persist** — the cookie jar, token, and frontend version are mirrored to
-  `<db-dir>/zai-sessions.json` (override with `ZAI_SESSION_STORE`) so a
-  restart does not re-bootstrap every guest.
-- **Chrome TLS** — optional helper in `relay/cmd/zaihttp`. Run
-  `go run .` there and set `ZAI_UTLS_PROXY=http://127.0.0.1:8477` so signed
-  chat.z.ai calls present a Chrome ClientHello instead of Node's.
-
-`captcha_verify_param` is still required per completion on the signed path;
-it is issued once and cannot be reused.
-
-### Z.ai web chat — pure HTTP (`zaiminted`, recommended)
-
-The primary automatic Z.AI path follows the serving lifecycle proven by
-GLM-Free-API. Chromium is not in the normal request path.
-
-```text
-OpenAI request
-  -> live Z.AI model/capability check
-  -> optional image upload to /api/v1/files/
-  -> acquire local throwaway chat UUID
-  -> take/prefetch a harvested Aliyun device token
-  -> InitCaptchaV3 + VerifyCaptchaV3
-  -> fresh captcha_verify_param
-  -> one signed POST /api/v2/chat/completions
-  -> normalize SSE / tools / reasoning
-  -> DELETE /api/v1/chats/<uuid>
-```
-
-The key details are intentional:
-
-- There is **no `POST /api/v1/chats/new` before a completion**. Z.AI chat IDs
-  are client-generated UUIDs and materialize when the completion first uses
-  them. This avoids changing session/WAF state between CAPTCHA minting and the
-  single-use completion.
-- HTTP uses the public model id such as `glm-5.3-flash`; `x-preview-l` is
-  treated only as the browser/UI alias.
-- The completion body is intentionally minimal: `model`, `chat_id`,
-  `messages`, `signature_prompt`, `stream`,
-  `captcha_verify_param`, `features`, plus optional `files` and
-  `mcp_servers`.
-- A tiny CAPTCHA cache keeps fresh proofs while the route is active and pauses
-  after inactivity. Device tokens are single-use and consumed FIFO from the
-  gateway SQLite database, matching GLM-Free-API. The old newline token file
-  is automatically imported whenever the DB queue is empty and then cleared.
-- WAF state is checked **before** image upload or consuming a device token.
-- Every used chat is throwaway and best-effort deleted after the response
-  finishes. The local chat-id pool costs no upstream warmup.
-- `advancedSearch: true` maps to Z.AI's top-level
-  `mcp_servers:["advanced-search"]`. Normal `webSearch`/`search` maps to
-  `auto_web_search`. Both are disabled when caller-provided tools activate
-  the gateway agent shim, avoiding two competing action channels.
-- OpenAI tools still use our gateway-specific agent shim and **schema/hashline
-  Tool Repair Layer**; that work is not replaced by the reference transport.
-- Vision is real attachment upload now: image parts are uploaded to
-  `/api/v1/files/`, their `image_url` values are rewritten to the returned
-  file ids, and web-client-style `files[]` entries are attached. Remote image
-  downloads are protected by a public-IP/DNS SSRF guard, connection-time IP
-  pinning (DNS rebinding safe), and a streaming byte limit.
-
-Setup on the serving host:
-
-1. Put the Z.AI session token in the provider credential:
-   `{"token":"<chat.z.ai localStorage token>"}`.
-2. Harvest device tokens on any browser-capable machine:
-   ```sh
-   node scripts/harvest-zai-tokens.mjs --token "<chat.z.ai token>" --count 300
-   ```
-3. Copy the token file to the gateway host (default
-   `./data/zai-device-tokens.txt`). On the next proof request it is imported
-   into the gateway's SQLite `zai_device_tokens` FIFO and cleared. You can
-   later refill the same file path; it will be imported again when the DB queue
-   runs dry.
-4. Set your own `ZAI_CAPTCHA_ACCESS_KEY`,
-   `ZAI_CAPTCHA_SECRET_KEY`, and `ZAI_CAPTCHA_SCENE_ID`; the repository
-   deliberately ships no shared CAPTCHA credentials.
-5. Add the **Z.AI web chat — recommended (pure HTTP)** preset.
-
-This serving path needs **no apt packages, Xvfb, Playwright, or Chromium**, so it
-fits restricted ecli/AIO eggs. Browser work is only needed for harvesting.
-
-### Z.ai web chat — browser fallback (`zaiwebbrowser`)
-
-The Chromium implementation remains as a secondary transport and debugging
-reference. It is no longer the preferred automatic serving path.
-
-- It drives the real page so the page mints its own CAPTCHA proof.
-- Warm contexts are retained across Z.AI token rotation and cold-page
-  navigation is retried internally.
-- It needs a usable Chromium/Playwright runtime and consumes substantially more
-  memory than the pure-HTTP path.
-- `zaiminted` may try this fallback only for proof-infrastructure failures
-  such as an empty token store or unavailable CAPTCHA configuration. Set
-  `ZAI_BROWSER_FALLBACK=0` to disable that behavior.
-- Confirmed WAF blocks, model errors, request errors, and image requests do not
-  fall back to Chromium.
-
-### Z.ai web chat — caller proof (`zaiweb`)
-
-This is the manual/debug version of the same pure-HTTP engine. Instead of
-minting the CAPTCHA proof itself, it accepts a fresh `captcha_verify_param`
-from `x-zai-captcha` or the request body. The completion wire, throwaway-chat
-lifecycle, live model checks, SSE normalization, tools, search, and vision path
-are otherwise the same.
-
-### Model-integrity probes
-
-A gateway trusts its `model_routes`: nothing today checks that the provider
-behind a slug actually serves the model that slug claims. Resellers advertise
-frontier names (Claude Opus, GPT-5.x, Grok, GLM…) while answering with cheaper
-open weights, and the `model` field in a response proves nothing.
-
-**Model routes → verify** on a slug (or `POST /admin/providers/:id/integrity`
-with `{ "slug": "openai/gpt-4o" }`) probes that route only. Provider-level
-verify still exists and probes the first enabled route.
-
-| Verdict | Meaning |
-| --- | --- |
-| `CONSISTENT WITH CLAIM` | no contradiction found |
-| `TOKENIZER MISMATCH` | measured tokenizer contradicts the claim |
-| `MULTI-MODEL RELAY` | one endpoint answers unrelated model slugs — a reseller |
-| `STACK LEAK` | serving stack named a different model (`response.model` or a limit error) |
-| `INCONCLUSIVE` | auth/rate/transport blocked the probe; **not** evidence of faking |
-| `UNVERIFIED` | nothing measurable (no usage field, no `/tokenize`, unknown slug) |
-
-What it measures, in order of strength:
-
-1. **`/tokenize` raw token IDs** — compared for equality against reference
-   tokenizers. An exact match is identity, not a guess.
-2. **Token-count slope** — `usage.prompt_tokens` across growing prompts, matched
-   against 12 reference families (OpenAI o200k/cl100k/p50k/r50k/gpt2, Qwen,
-   GLM-5, DeepSeek, Llama 3, Mistral, Kimi K2.6, MiniMax). A fit worse than 6%
-   is reported as unverified rather than naming the least-bad family. Gemini
-   and Claude have no public tokenizer, so those slugs stay unverified on the
-   fingerprint path.
-3. **Routing** — six unrelated slugs; three or more answering is a relay.
-4. **Stack leak** — `response.model` that does not echo the request, or a
-   `max_tokens` rejection that names a different id. Echoes count as no evidence.
-5. **Output ceiling** — absurd `max_tokens` rejection; scored only when the
-   error names a cap or id. Silent clamp is recorded, not scored.
-6. **Knowledge horizon** — dated trivia vs the advertised family's training
-   window. Soft: two late facts (or two early misses) before it warns.
-7. **Declared-limit breach** — a prompt past the context the claim advertises.
-8. **Identity and determinism** — self-reported name (promptable, warn only)
-   and temperature 0 reproducibility.
-
-Playground **Verify this slug** runs the same probe against the selected model
-only. Stack-leak, ceiling, and cutoff probes follow
-[truemodel](https://github.com/pavandoescode/truemodel) (MIT).
-
-Reference token data is **precomputed and committed**
-(`ai-gateway/src/modelprobe-refs.js`): the probe text and sizes are constants, so
-every reference count and ID sequence is a constant too. That is why the probes
-run with no tokenizer dependency — `hono` stays the only package. Regenerate
-after changing the probe text:
+Requires Node 22.5 or newer (the gateway uses the built-in `node:sqlite`).
 
 ```sh
-python3 scripts/build-modelprobe-refs.py > ai-gateway/src/modelprobe-refs.js
+git clone <this-repo> && cd gateway
+cp .env.example .env            # fill in the two secrets below
+
+cd server && npm install --omit=dev
+cd ../ai-gateway && npm install --omit=dev
+cd ../wind-console && npm install && npm run build
+
+cd ../server && node --experimental-sqlite server.mjs
 ```
 
-Results persist in `provider_probe_runs` (latest verdict per slug + provider),
-surface on Model routes, the Playground integrity panel, and
-`GET /admin/integrity`, and feed the auto-router: a slug whose latest verdict
-is a relay, a mismatch, or a stack leak has its health score scaled to 0.35.
-It is a penalty, not a ban — you can still call the slug deliberately.
+Then:
 
-### Using an OpenAI-compatible bridge instead
+1. Open `http://localhost:3000/_gw` and sign in with `ADMIN_TOKEN`.
+2. Add a provider and a model route, then create an API key.
+3. Open `http://localhost:3000/console` with that key.
 
-If you would rather not run a browser, any OpenAI-compatible bridge for
-chat.z.ai works as a plain `openai` provider — point `base_url` at it and use
-the bridge's own token as the credential. A preset is not needed; the
-**Custom / other provider** option in the console covers it. Such bridges mint
-the CAPTCHA proof themselves, which is efficient, but it means a third-party
-process (and whatever credentials it ships) sits in your request path, so run
-one you build or trust locally rather than a public instance.
+Generate secrets with `openssl rand -base64 36`.
 
-**Providers → Add provider** opens with a **Preset** picker. A preset fills the
-name, base URL, format and transport, retargets the credential hint, and offers
-the usual model routes; every field stays editable before saving, and choosing
-*Custom / other provider* clears the form back to blank.
+| Secret | Purpose |
+| --- | --- |
+| `ADMIN_TOKEN` | Operator console password |
+| `PROVIDER_CRYPTO_KEY` | AES-GCM envelope that seals provider keys in SQLite |
 
-| Preset         | Result                                                                                              |
-| -------------- | --------------------------------------------------------------------------------------------------- |
-| `zai-minted`  | **recommended** `zaiminted` pure-HTTP provider on `https://chat.z.ai`; automatic fresh proofs, throwaway chats, tools/vision/search |
-| `zai-browser` | `zaiwebbrowser` Chromium fallback/debug transport |
-| `zai-web` | `zaiweb` manual caller-proof version of the same pure-HTTP engine |
-| `zai-api`      | Standard API-key provider on `https://api.z.ai/api/paas/v4`, routes `z-ai/glm-4.6` + `z-ai/glm-4.5` |
+Keep `PROVIDER_CRYPTO_KEY` safe. Losing it makes every sealed provider key
+unreadable.
 
-Route seeding never repoints a live slug: a preset only adds routes for slugs
-that have no enabled route yet, and reports the rest as kept. Custom /
-other provider is not a catalog id: the console omits `preset` and
-`POST /admin/providers` with `"preset":"custom"` uses the normal create path
-(default format `openai`). Typed route slugs still seed. API:
-`GET /admin/provider-presets`, and
-`POST /admin/providers {"preset":"zai-web","api_key":"…"}` (add
-`seed_routes:false` for the provider alone, or `routes:[{slug,upstream_model}]`
-to override the preset's list).
+## Deploy
 
-### Z.ai web chat (`zaiweb`)
+One Node process plus SQLite; no separate database, cache or frontend server.
 
-The consumer site (chat.z.ai) is not an API: it authenticates with a session
-JWT from the browser's Local Storage and requires a short-lived CAPTCHA proof
-on each completion. This provider speaks that protocol from the server.
+- **Free 24/7 hosting** (Oracle Cloud Always Free, with a domain and free TLS
+  via Caddy): [docs/FREE-HOSTING.md](docs/FREE-HOSTING.md)
+- **Panel / SFTP hosts** (like the Node startup panel): main file
+  `server/server.mjs`, runtime Node 24, persistent writable disk, and SSE
+  streaming with no proxy buffering. See the same doc.
+- **Cloudflare Workers + D1**, a zero-server second deployment:
+  `ai-gateway/wrangler.jsonc`.
 
-Model routes to create (slug → `upstream_model`):
+For streaming, the proxy in front must not buffer. With Caddy, keep
+`flush_interval -1`.
 
-| Public slug (suggested) | `upstream_model` | Thinking | Vision | Tools | Tier note                     |
-| ----------------------- | ---------------- | -------- | ------ | ----- | ----------------------------- |
-| `z-ai/glm-5.3-flash`    | `glm-5.3-flash`  | yes      | yes    | yes*  | reachable on guest sessions   |
-| `z-ai/glm-5.3`          | `glm-5.3`        | yes      | live catalog | yes* | signed-in accounts only       |
-| `z-ai/glm-5.2`          | `glm-5.2`        | yes      | live catalog | yes* | signed-in accounts only       |
+## Docs
 
-\* Caller tools are gateway-emulated through the Z.AI agent shim and Tool Repair Layer, not native OpenAI tool fields upstream.
+| Document | Covers |
+| --- | --- |
+| [docs/FREE-HOSTING.md](docs/FREE-HOSTING.md) | Free hosting, TLS, keeping the instance alive |
+| [docs/PROVIDERS.md](docs/PROVIDERS.md) | Provider wire formats, Z.AI transports, integrity probes |
+| [docs/current-request-path.md](docs/current-request-path.md) | The request lifecycle through the gateway |
+| [docs/ecli-hosting.md](docs/ecli-hosting.md) | Panel-based hosting specifics |
+| [docs/client-console.md](docs/client-console.md) | The console build |
 
-Getting the credential:
+## Layout
 
-1. Sign in at chat.z.ai in a browser.
-2. Open DevTools → Application → Local Storage → `https://chat.z.ai` → copy
-   the `token` value (a JWT).
-3. Send one message, then in DevTools → Network find the `POST` to
-   `/api/v2/chat/completions`, and copy `captcha_verify_param` out of its
-   request body.
-4. In the console: **Providers → Add provider**, leave the preset on *Z.AI web
-   chat*, paste both values as JSON into **Credential**, and save. The preset
-   fills the name, base URL, `zaiweb` format, direct transport, and the two
-   model routes. Verify with the **test** button afterwards
-   (`POST /admin/providers/:id/test`).
+| Path | Role |
+| --- | --- |
+| `ai-gateway/` | Shared application (`src/index.js`, taste, repair, decision), schema, tests |
+| `server/` | Node entrypoint (`server.mjs`, `db.mjs`, migrations) - the deploy target |
+| `wind-console/` | The React customer console, built into `client-console/build` |
+| `relay/` | Optional Go egress relay for providers that need it |
+| `docs/` | Runbooks and reference |
 
-Behavior and limits:
+## Development
 
-- Model access is per account tier, not per gateway. A signed-out/guest
-  `chat.z.ai` session may only reach `glm-5.3-flash` (`x-preview-l`); asking
-  for `glm-5.3`/`glm-5.2` on such an account returns
-  "Model not available for current user level" surfaced as a typed 502
-  (`zai_stream_error`). Add routes only for models your account actually
-  serves — the preset ships `z-ai/glm-5.3-flash` as primary for that reason.
-- The session JWT carries no expiry, but the **captcha proof is issued per
-  completion and single-use**: the first completion consumes it and later ones
-  fail with `Captcha verification failed` (typed 502 `zai_stream_error`).
-  There is no way to store a working proof, because it changes every time. So
-  the provider key only needs the `token`, and each caller passes a fresh proof
-  per request:
+```sh
+cd ai-gateway
+node --test test/*.test.mjs     # the full suite
+npm run check                   # syntax-check the worker bundle
+```
 
-  ```sh
-  curl -sS http://<host>:3000/v1/chat/completions \
-    -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
-    -H "x-zai-captcha: <fresh captcha_verify_param>" \
-    -d '{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}'
-  ```
+The test suite covers the taste layer (symbolic critique, judge integration,
+per-account posteriors), tool-call repair (JSON repair, schema coercion,
+stream assembly), budgets, decision models, and the console API.
 
-  Precedence is header → request body → stored credential, so a stored value
-  still works exactly once for a smoke test. Missing proof returns a typed 503
-  (`zai_captcha`) naming the header. Treat this provider as a bursty,
-  captcha-gated route; an API-key provider has no such limitation.
-  Thinking is always on (the consumer models expose no non-thinking mode).
-  `reasoning_effort` (`low`/`medium`/`high`/`max`) is forwarded; `glm-5.2`
-  has no `low`, so it clamps to `high`. Reasoning arrives as
-  `reasoning_content` deltas.
-- OpenAI `tools` are not forwarded to chat.z.ai. They are folded into a
-  user-only agent prompt; the model emits `<<<TOOL_CALL>>>` blocks, which
-  the gateway converts to native OpenAI `tool_calls` (streamed incrementally).
-- Vision requests use the reference attachment pipeline: upload to
-  `/api/v1/files/`, rewrite the message image reference to the returned file
-  id, and attach `files[]`. Models that do not advertise image input are
-  rejected before completion.
-- `transport` must be `auto` or `direct`; the signed session cannot survive a
-  relay hop, so `koyeb`/`oci` are rejected with a 400 (`zai_transport`).
-- Captcha proofs are short-lived. When one expires the route fails with a
-  typed 503 (`zai_captcha`) naming the fix, and never trips the provider
-  circuit breaker.
-- chat.z.ai rotates the session cookie on each chat creation; the gateway
-  re-seals and stores the rotated token (keeping the other credential fields),
-  so a long-lived route survives rotation.
-- Usage is estimated (chat.z.ai reports none): ~4 chars/token on input, ~3
-  chars/token on output, plus a per-image allowance.
+---
+
+<div align="center">
+
+Self-hosted. Your keys, your data, your measurements.
+
+</div>
