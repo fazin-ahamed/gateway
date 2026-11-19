@@ -1,14 +1,6 @@
 #!/usr/bin/env node
-// Verifies the built Worker bundle (.edge-build/) is free of the consumer-web
-// bridge and Node-only modules, then boots it under Miniflare (real workerd +
-// real D1) and exercises the M1 smoke surface:
-//   - GET /health                              -> 200 {ok:true}
-//   - GET /v1/models without auth              -> 401
-//   - /admin/zai/* and /admin/proxies*         -> 404 (routes stripped)
-//   - POST /admin/accounts (admin token)       -> 201 invite (real D1 write)
-//   - legacy zai-format provider: config preserved, never dispatched,
-//     rejection is sanitized (no provider identity leaks)
-//   - hot auth query uses the primary-key index (query plan check)
+// Verifies the built Worker bundle (.edge-build/) is free of Node-only
+// modules, then applies the D1 migrations to a scratch local database.
 // Exits non-zero on any failure. Run: npm run verify:edge
 
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -24,12 +16,6 @@ if (!existsSync(join(build, "index.js"))) {
 }
 
 // 1. Static scan: no Node-only module may appear anywhere in the bundle.
-const FORBIDDEN = [
-  "zaiweb.js", "zaibrowser.js", "zai-session.js", "zai-stream.js",
-  "zai-models.js", "zai-agent.js", "zai-conversation-cache.js",
-  "zai-vision.js", "zai-tokens.js", "zai-session-pool.js",
-  "zai-captcha.js", "zai-captcha-cache.js", "zai-waf.js",
-];
 const FORBIDDEN_TEXT = [
   "node:fs", "node:child_process", "node:sqlite", "node:dns", "node:net",
   "node:http", "node:https", "node:zlib", 'import("undici")',
@@ -46,17 +32,8 @@ function walk(dir, visit) {
 }
 walk(build, (p) => {
   const text = readFileSync(p, "utf8");
-  for (const f of FORBIDDEN) {
-    if (p.endsWith("/" + f)) failures.push("bundled Node-only module: " + f);
-  }
   for (const t of FORBIDDEN_TEXT) {
     if (text.includes(t)) failures.push("forbidden text " + JSON.stringify(t) + " in " + p.slice(build.length));
-  }
-  // The runtime/zai-stubs.js import is the replacement itself; strip it,
-  // then any remaining ./...zai... import is a real bridge dependency.
-  const importScan = text.replace(/from\s+["'][^"']*runtime\/zai-stubs\.js["']/g, "");
-  if (/from\s+["']\.[^"']*zai[^"']*["']/.test(importScan)) {
-    failures.push("zai module import in " + p.slice(build.length));
   }
 });
 

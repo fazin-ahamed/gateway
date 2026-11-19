@@ -39,8 +39,8 @@ test("POST /admin/proxies/test streams one result event per proxy plus start/don
   const bad = seedProxy(db, { host: "bad.example" });
   // Mock the uTLS helper: /healthz online, /check-egress verdict by host.
   const realFetch = globalThis.fetch;
-  const prev = process.env.ZAI_UTLS_PROXY;
-  process.env.ZAI_UTLS_PROXY = "http://127.0.0.1:8477";
+  const prev = process.env.UTLS_PROXY_URL;
+  process.env.UTLS_PROXY_URL = "http://127.0.0.1:8477";
   globalThis.fetch = async (url, init) => {
     const u = String(url);
     if (u.endsWith("/healthz")) return new Response('{"ok":true}', { status: 200 });
@@ -82,7 +82,7 @@ test("POST /admin/proxies/test streams one result event per proxy plus start/don
     assert.equal(goodRow.status, "healthy");
   } finally {
     globalThis.fetch = realFetch;
-    if (prev === undefined) delete process.env.ZAI_UTLS_PROXY; else process.env.ZAI_UTLS_PROXY = prev;
+    if (prev === undefined) delete process.env.UTLS_PROXY_URL; else process.env.UTLS_PROXY_URL = prev;
   }
 });
 
@@ -90,8 +90,8 @@ test("POST /admin/proxies/test non-stream still returns a JSON summary", async (
   const { app, db } = await seededApp();
   seedProxy(db, { host: "one.example" });
   const realFetch = globalThis.fetch;
-  const prev = process.env.ZAI_UTLS_PROXY;
-  process.env.ZAI_UTLS_PROXY = "http://127.0.0.1:8477";
+  const prev = process.env.UTLS_PROXY_URL;
+  process.env.UTLS_PROXY_URL = "http://127.0.0.1:8477";
   globalThis.fetch = async (url) => {
     const u = String(url);
     if (u.endsWith("/healthz")) return new Response('{"ok":true}', { status: 200 });
@@ -108,7 +108,7 @@ test("POST /admin/proxies/test non-stream still returns a JSON summary", async (
     assert.deepEqual(body, { tested: 1, healthy: 1, dead: 0 });
   } finally {
     globalThis.fetch = realFetch;
-    if (prev === undefined) delete process.env.ZAI_UTLS_PROXY; else process.env.ZAI_UTLS_PROXY = prev;
+    if (prev === undefined) delete process.env.UTLS_PROXY_URL; else process.env.UTLS_PROXY_URL = prev;
   }
 });
 

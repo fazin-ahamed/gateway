@@ -1,0 +1,155 @@
+// Unit tests for the D1 HTTP client (server/d1.mjs) using a stubbed global
+// fetch. No real network calls: every request is captured and answered with
+// canned Cloudflare response shapes.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createD1Db } from "../../server/d1.mjs";
+
+const ENV = {
+  CLOUDFLARE_API_TOKEN: "tok-123",
+  CLOUDFLARE_ACCOUNT_ID: "acct-abc",
+  D1_DATABASE_ID: "db-uuid",
+};
+const BASE = "https://api.cloudflare.com/client/v4/accounts/acct-abc/d1/database/db-uuid";
+
+function okQueryResult(rows, meta = {}) {
+  return { success: true, result: [{ results: rows, success: true, meta }] };
+}
+
+function stubFetch(handler) {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const call = { url: String(url), init };
+    try { call.body = JSON.parse(init.body); } catch { call.body = init.body; }
+    calls.push(call);
+    return handler(call);
+  };
+  return {
+    calls,
+    restore() { globalThis.fetch = original; },
+    async json(status, payload) {
+      return { status, json: async () => payload, text: async () => JSON.stringify(payload) };
+    },
+  };
+}
+
+async function withDb(handler, fn) {
+  const s = stubFetch(handler);
+  try {
+    return await fn(createD1Db(ENV), s.calls);
+  } finally {
+    s.restore();
+  }
+}
+
+test("prepare().bind() posts to /query with sql, params, and bearer auth", async () => {
+  await withDb(
+    (call) => ({ status: 200, json: async () => okQueryResult([{ id: 7, slug: "gpt" }]) }),
+    async (db, calls) => {
+      const row = await db.prepare("SELECT id, slug FROM model_routes WHERE id = ?").bind(7).first();
+      assert.deepEqual(row, { id: 7, slug: "gpt" });
+      const call = calls[0];
+      assert.ok(call.url.startsWith(BASE + "/query"), "URL should hit /query: " + call.url);
+      assert.equal(call.init.headers.authorization, "Bearer tok-123");
+      assert.equal(call.init.headers["content-type"], "application/json");
+      assert.equal(call.body.sql, "SELECT id, slug FROM model_routes WHERE id = ?");
+      assert.deepEqual(call.body.params, [7]);
+    }
+  );
+});
+
+test("first() returns null when no rows; all() returns {results}; run() maps meta", async () => {
+  await withDb(
+    (call) => {
+      if (call.body.sql.includes("COUNT")) return { status: 200, json: async () => okQueryResult([]) };
+      if (call.body.sql.startsWith("SELECT")) return { status: 200, json: async () => okQueryResult([{ n: 2 }, { n: 5 }]) };
+      return { status: 200, json: async () => okQueryResult([], { changes: 3, last_row_id: 42 }) };
+    },
+    async (db) => {
+      assert.equal(await db.prepare("SELECT COUNT(*) n FROM t WHERE k=?").bind("nope").first(), null);
+      const all = await db.prepare("SELECT n FROM t").all();
+      assert.deepEqual(all, { results: [{ n: 2 }, { n: 5 }] });
+      const run = await db.prepare("INSERT INTO t (x) VALUES (?)").bind(1).run();
+      assert.deepEqual(run, { meta: { changes: 3, last_row_id: 42 } });
+    }
+  );
+});
+
+test("Cloudflare error shape throws Error with code attached", async () => {
+  await withDb(
+    () => ({ status: 400, json: async () => ({ success: false, errors: [{ code: 7500, message: "no such table" }] }) }),
+    async (db) => {
+      await assert.rejects(
+        () => db.prepare("SELECT 1").all(),
+        (e) => e.message === "no such table" && e.code === 7500
+      );
+    }
+  );
+});
+
+test("exec posts to /raw with the sql body", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => ({ success: true, result: [{ success: true }] }) }),
+    async (db, calls) => {
+      await db.exec("CREATE TABLE t (id INTEGER); CREATE INDEX i ON t(id);");
+      const call = calls[0];
+      assert.ok(call.url.endsWith("/raw"), "exec should POST /raw: " + call.url);
+      assert.equal(call.body.sql, "CREATE TABLE t (id INTEGER); CREATE INDEX i ON t(id);");
+      assert.ok(!call.body.batch && !call.body.params);
+    }
+  );
+});
+
+test("batch posts {batch:[{sql,params}]} to /raw and maps results", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => ({ success: true, result: [{ results: [{ a: 1 }], success: true, meta: { changes: 1 } }, { results: [], success: true, meta: {} }] }) }),
+    async (db, calls) => {
+      const out = await db.batch([{ sql: "INSERT INTO t VALUES (?)", params: [1] }, { sql: "SELECT 1" }]);
+      assert.deepEqual(out, [
+        { results: [{ a: 1 }], meta: { changes: 1 } },
+        { results: [], meta: {} },
+      ]);
+      assert.ok(calls[0].url.endsWith("/raw"));
+      assert.deepEqual(calls[0].body.batch, [{ sql: "INSERT INTO t VALUES (?)", params: [1] }, { sql: "SELECT 1", params: [] }]);
+    }
+  );
+});
+
+test("PRAGMA table_info is sent as-is to /query and rows are mapped", async () => {
+  await withDb(
+    (call) => ({ status: 200, json: async () => okQueryResult([{ cid: 0, name: "id", type: "INTEGER", notnull: 0, dflt_value: null, pk: 1 }]) }),
+    async (db, calls) => {
+      const cols = await db.prepare("PRAGMA table_info(providers)").all();
+      assert.equal(cols.results[0].name, "id");
+      const call = calls[0];
+      assert.ok(call.url.startsWith(BASE + "/query"));
+      assert.equal(call.body.sql, "PRAGMA table_info(providers)");
+      assert.deepEqual(call.body.params, []);
+    }
+  );
+});
+
+test("PRAGMA table_info falls back to pragma_table_info() when D1 rejects it", async () => {
+  await withDb(
+    (call) => {
+      if (call.body.sql.startsWith("PRAGMA")) {
+        return { status: 400, json: async () => ({ success: false, errors: [{ code: 7500, message: "unsupported statement" }] }) };
+      }
+      assert.ok(call.body.sql.includes("FROM pragma_table_info(providers)"), "fallback SQL: " + call.body.sql);
+      return { status: 200, json: async () => okQueryResult([{ cid: 2, name: "enabled", type: "INTEGER", notnull: 1, dflt_value: 1, pk: 0 }]) };
+    },
+    async (db) => {
+      const cols = await db.prepare("PRAGMA table_info(providers)").all();
+      assert.equal(cols.results[0].name, "enabled");
+      assert.equal(cols.results[0].dflt_value, 1);
+    }
+  );
+});
+
+test("createD1Db throws when env is incomplete", () => {
+  assert.throws(() => createD1Db({}), /CLOUDFLARE_API_TOKEN/);
+  assert.throws(() => createD1Db({ CLOUDFLARE_API_TOKEN: "t" }), /CLOUDFLARE_ACCOUNT_ID/);
+  assert.throws(() => createD1Db({ CLOUDFLARE_API_TOKEN: "t", CLOUDFLARE_ACCOUNT_ID: "a" }), /D1_DATABASE_ID/);
+});

@@ -423,7 +423,6 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="budgets">Budgets</button>
   <button type="button" data-tab="credits">Credits</button>
   <button type="button" data-tab="prices">Prices</button>
-  <button type="button" data-tab="tokens">Device tokens</button>
   <div class="navgrp">Quality</div>
   <button type="button" data-tab="reliability">Reliability</button>
   <button type="button" data-tab="detection">Detection</button>
@@ -714,7 +713,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="panel"><div class="panel-h"><h2 class="sec">Recent requests</h2></div><div class="panel-b flush" id="tj-list"></div></div>
   </section>
   <section class="tab" id="tab-proxies">
-    <div class="pagehead"><div><h2 class="sec">Proxies</h2><p class="sub">Egress inventory for the Z.AI uTLS helper. Credentials are sealed in SQLite and never leave the server. Testing verifies a real HTTPS tunnel against a neutral destination \u2014 it never touches Z.AI.</p></div><div class="actions"><label class="pg-check" style="margin:0" title="Auto: gateway picks the best healthy proxy and keeps it sticky. Manual: uses ZAI_EGRESS_PROXY."><input type="checkbox" id="px-auto"> Auto-select</label><button class="ghost" id="px-test-all">Test all</button><button class="ghost" id="px-test-failed">Retest failed</button><button class="danger" id="px-remove-dead">Remove dead</button></div></div>
+    <div class="pagehead"><div><h2 class="sec">Proxies</h2><p class="sub">Egress inventory for the uTLS helper. Credentials are sealed in SQLite and never leave the server. Testing verifies a real HTTPS tunnel against a neutral destination.</p></div><div class="actions"><label class="pg-check" style="margin:0" title="Auto: gateway picks the best healthy proxy and keeps it sticky. Manual: uses the helper's configured proxy."><input type="checkbox" id="px-auto"> Auto-select</label><button class="ghost" id="px-test-all">Test all</button><button class="ghost" id="px-test-failed">Retest failed</button><button class="danger" id="px-remove-dead">Remove dead</button></div></div>
     <div id="px-active" class="hint" style="margin:0 0 10px"></div>
     <div id="px-helper" class="hint" style="margin:0 0 10px"></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Import</h2></div><div class="panel-b">
@@ -740,19 +739,6 @@ var PLAYGROUND_HTML = `<!doctype html>
     <div class="hero-stats" id="px-stats"></div>
     <div class="panel"><div class="panel-h"><h2 class="sec">Pool</h2></div><div class="panel-b flush" id="px-list"></div></div>
   </section>
-  <section class="tab" id="tab-tokens">
-    <div class="pagehead"><div><h2 class="sec">Z.AI device tokens</h2><p class="sub">Single-use Aliyun device tokens consumed as CAPTCHA proofs are minted. The SQLite FIFO is the live queue; the legacy .txt file is fallback only. Token values are never displayed.</p></div></div>
-    <div class="hero-stats" id="zt-stats"></div>
-    <div class="panel"><div class="panel-h"><h2 class="sec">Refill</h2></div><div class="panel-b">
-      <textarea id="zt-import" rows="4" placeholder="one device token per line" style="width:100%;font-family:monospace;font-size:12px"></textarea>
-      <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
-        <button class="act" id="zt-import-btn">Add tokens</button>
-        <label class="ghost" style="margin:0;cursor:pointer">Load .txt<input type="file" id="zt-file" accept=".txt,text/plain" style="display:none"></label>
-        <span id="zt-msg" class="hint" style="margin:0"></span>
-      </div>
-    </div></div>
-  </section>
-
   <section class="tab" id="tab-credits">
     <div class="pagehead"><div><h2 class="sec">Credits</h2><p class="sub">Remaining allocation across every account and key this gateway enforces. Totals add the remainders of capped rows; uncapped rows contribute usage only, because an infinite cap has no remainder.</p></div></div>
     <div id="credits-root">
@@ -1124,7 +1110,6 @@ async function selectTab(t){
     if(t==='auto') await loadAutoSettings();
     if(t==='trajectories') await loadTrajectories();
     if(t==='proxies') await loadProxies();
-    if(t==='tokens') await loadZaiTokens();
     if(t==='credits') await loadCredits();
     if(t==='logs') await loadLogs();
     if(t==='budgets') await loadBudgets();
@@ -1266,7 +1251,7 @@ function applyHeaderPreset(v){
   delete v.header_preset; return v;
 }
 var HEADER_PRESET_OPTIONS=[{value:'none',label:'No preset'},{value:'openrouter',label:'OpenRouter app headers'},{value:'claudecode',label:'Claude Code beta'},{value:'anthropicbeta',label:'Anthropic prompt-caching beta'},{value:'harness',label:'Harness fingerprint (omp / Claude Code)'},{value:'custom',label:'Custom only'}];
-var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'},{value:'zaiminted',label:'Z.ai web chat (recommended pure HTTP)'},{value:'zaiwebbrowser',label:'Z.ai web chat (browser fallback)'},{value:'zaiweb',label:'Z.ai web chat (manual caller proof)'}];
+var PROVIDER_FMT_OPTIONS=[{value:'openai',label:'OpenAI compatible'},{value:'anthropic',label:'Anthropic'}];
 // Applies a provider preset to the open provider form: fills the copy the
 // preset owns and reveals the route fields, so a known upstream is two clicks
 // in the console instead of a hand-typed base_url + fmt + slugs.
@@ -2506,7 +2491,7 @@ async function loadProxies(){
   const activeEl=document.getElementById('px-active');
   if(activeEl){
     if(data.mode==='auto') activeEl.innerHTML=data.active?('Active egress: <span class="mono">'+esc(data.active)+'</span> (sticky until it fails)'):'Auto-select on \u2014 no healthy proxy yet; test the pool.';
-    else activeEl.textContent='Manual: using ZAI_EGRESS_PROXY from the environment.';
+    else activeEl.textContent='Manual: using the helper\u2019s own configured proxy.';
   }
   const helperEl=document.getElementById('px-helper');
   if(helperEl){
@@ -2670,45 +2655,6 @@ document.getElementById('px-list').addEventListener('click',function(e){
   const d=e.target.closest('button[data-px-del]'); if(d){ confirmAction('Delete proxy','Remove this proxy from the pool?','Delete',async function(){ await api('/admin/proxies/delete',{method:'POST',body:JSON.stringify({ids:[Number(d.dataset.pxDel)]})}); loadProxies(); }); return; }
 });
 
-// ---------- Z.AI DEVICE TOKENS ----------
-async function loadZaiTokens(){
-  const statsEl=document.getElementById('zt-stats'); if(!statsEl) return;
-  paintSkeleton(statsEl,'stats');
-  let data; try{ data=(await api('/admin/zai/device-tokens/status')).data; }catch(e){ statsEl.innerHTML='<div class="empty">Could not load token status: '+esc(e.message)+'</div>'; return; }
-  const available=Number(data&&data.available||0);
-  const band=available===0?{t:'Empty',c:'warn'}:(data&&data.low?{t:'Low',c:'warn'}:{t:'Healthy',c:'ok'});
-  const stats=[
-    {k:'Available',v:fmt(available),c:band.c,s:'in FIFO'},
-    {k:'CAPTCHA proofs',v:fmt(Number(data&&data.captcha_ready||0)),s:'cached'},
-    {k:'Status',v:band.t,c:band.c,s:data&&data.low?'refill soon':'ok'}
-  ];
-  statsEl.innerHTML=stats.map(function(s){return '<div class="stat"><div class="k">'+esc(s.k)+'</div><div class="v '+(s.c||'')+'">'+esc(s.v)+'</div><div class="sub2">'+esc(s.s||'')+'</div></div>';}).join('');
-}
-async function submitZaiTokens(text){
-  const msg=document.getElementById('zt-msg');
-  const body=String(text||'').trim();
-  if(!body){ if(msg) msg.textContent='Paste or load some tokens first.'; return; }
-  if(msg) msg.textContent='Importing...';
-  try{
-    const res=await api('/admin/zai/device-tokens/import',{method:'POST',body:JSON.stringify({tokens:body})});
-    const d=res.data||{};
-    if(msg) msg.textContent='Accepted '+fmt(d.accepted||0)+', '+fmt(d.duplicates||0)+' duplicate, '+fmt(d.invalid||0)+' invalid \u2014 '+fmt(d.available||0)+' available.';
-    const ta=document.getElementById('zt-import'); if(ta) ta.value='';
-    await loadZaiTokens();
-  }catch(e){ if(msg) msg.textContent='Import failed: '+e.message; }
-}
-document.addEventListener('click',function(e){
-  if(e.target&&e.target.id==='zt-import-btn'){ const ta=document.getElementById('zt-import'); submitZaiTokens(ta?ta.value:''); }
-});
-document.addEventListener('change',function(e){
-  if(e.target&&e.target.id==='zt-file'){
-    const f=e.target.files&&e.target.files[0]; if(!f) return;
-    const reader=new FileReader();
-    reader.onload=function(){ const ta=document.getElementById('zt-import'); if(ta) ta.value=String(reader.result||''); };
-    reader.readAsText(f);
-    e.target.value='';
-  }
-});
 
 // ---------- TRAJECTORIES ----------
 let tjOffset=0; const tjLimit=25;

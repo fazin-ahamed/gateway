@@ -16,7 +16,7 @@ const testConfig = join(build, "wrangler.test.jsonc");
 
 let portCounter = 31400;
 
-export function bootEdge({ legacyZai = false } = {}) {
+export function bootEdge() {
   if (!existsSync(join(build, "index.js")) || !existsSync(testConfig)) {
     throw new Error("edge bundle missing - run `npm run build:edge` first");
   }
@@ -24,7 +24,6 @@ export function bootEdge({ legacyZai = false } = {}) {
   const port = portCounter++;
   const run = (args) => execFileSync("npx", ["wrangler", ...args, "--persist-to", state, "--config", testConfig], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   run(["d1", "migrations", "apply", "horizon-edge", "--local"]);
-  if (legacyZai) seedLegacyZai(state);
 
   const child = spawn("npx", ["wrangler", "dev", "--local", "--persist-to", state, "--config", testConfig, "--port", String(port), "--ip", "127.0.0.1"], { cwd: root, stdio: ["ignore", "ignore", "pipe"] });
   const base = "http://127.0.0.1:" + port;
@@ -52,10 +51,3 @@ export function bootEdge({ legacyZai = false } = {}) {
   };
 }
 
-function seedLegacyZai(state) {
-  const cmd = (sql) => execFileSync("npx", ["wrangler", "d1", "execute", "horizon-edge", "--local", "--persist-to", state, "--config", testConfig, "--command", sql], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  cmd("INSERT INTO providers (name, base_url, fmt, created_at) VALUES ('Legacy ZAI','https://chat.z.ai','zaiweb','2026-10-08T00:00:00Z')");
-  cmd("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES ((SELECT id FROM providers WHERE name='Legacy ZAI'),'sealed:x','legacy',1,'2026-10-08T00:00:00Z')");
-  cmd("INSERT INTO model_routes (slug, provider_id, upstream_model, rank, enabled) VALUES ('glm-legacy',(SELECT id FROM providers WHERE name='Legacy ZAI'),'glm-5.3',1,1)");
-  cmd("INSERT INTO api_keys (key_id,name,budget_mode,budget_limit,allowed_models,created_at,updated_at) VALUES ('sk-zai-legacy','zai legacy','usd',5,'glm-legacy','2026-10-08T00:00:00Z','2026-10-08T00:00:00Z')");
-}

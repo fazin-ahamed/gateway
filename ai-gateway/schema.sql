@@ -353,13 +353,6 @@ CREATE TABLE IF NOT EXISTS model_usage (
   PRIMARY KEY (slug, kind, bucket)
 );
 
--- Single-use Aliyun device tokens for the canonical pure-HTTP Z.AI transport.
--- FIFO consumption mirrors GLM-Free-API and prevents token reuse.
-CREATE TABLE IF NOT EXISTS zai_device_tokens (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  token TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL
-);
 
 -- Router V2 posteriors. Shadow path writes nothing yet; table exists so a
 -- later live cutover has somewhere to persist Beta(α,β) route health.
@@ -429,8 +422,6 @@ CREATE INDEX IF NOT EXISTS idx_route_attempts_route_time ON route_attempts(route
 CREATE INDEX IF NOT EXISTS idx_route_attempts_provider_time ON route_attempts(provider_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_route_attempts_model_task_time ON route_attempts(public_slug, task_type, started_at);
 CREATE INDEX IF NOT EXISTS idx_route_attempts_request ON route_attempts(request_id);
-CREATE INDEX IF NOT EXISTS idx_zai_device_tokens_fifo
-  ON zai_device_tokens(id);
 
 -- Quality observations: evidence about the ANSWER itself, kept strictly
 -- separate from the operational outcomes in route_attempts/router_stats.
@@ -660,35 +651,6 @@ CREATE TABLE IF NOT EXISTS latency_shadow_decisions (
   created_at TEXT NOT NULL,
   finished_at TEXT
 );
-
--- chat.z.ai conversation affinity: one row per logical conversation the
--- gateway holds open on an upstream chat_id, so a continuation can send only
--- the new turns instead of the whole history. Body-free — the actual messages
--- live in the request and the trajectory store, never here. Only the rolling
--- chain hash and the committed prefix length are kept, scoped per tenant so
--- conversations are never matched across API keys. Written by the incremental
--- session path, which is off by default (ZAI_INCREMENTAL_SESSIONS).
-CREATE TABLE IF NOT EXISTS zai_conversations (
-  id TEXT PRIMARY KEY,
-  tenant_key TEXT NOT NULL,
-  user_key TEXT,
-  contract_hash TEXT NOT NULL,
-  provider_id INTEGER NOT NULL,
-  provider_key_id INTEGER NOT NULL,
-  canonical_model_id TEXT,
-  upstream_chat_id TEXT NOT NULL,
-  message_count INTEGER NOT NULL,
-  chain_hash TEXT NOT NULL,
-  revision INTEGER NOT NULL DEFAULT 0,
-  state TEXT NOT NULL DEFAULT 'ready',
-  lease_id TEXT,
-  lease_expires_at TEXT,
-  created_at TEXT NOT NULL,
-  last_used_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_zai_conv_match
-  ON zai_conversations(tenant_key, user_key, chain_hash, message_count);
 
 -- Optional taste layer: per (model, rule) Beta posterior over "did the
 -- response satisfy this rule". alpha/beta start at 1/1. See src/taste.js.

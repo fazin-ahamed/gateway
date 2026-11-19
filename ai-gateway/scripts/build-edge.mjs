@@ -4,14 +4,12 @@
 // The Node entrypoint (server/server.mjs + src/index.js) stays authoritative
 // and runnable for rollback. This script:
 //   1. copies src/ -> .edge-build/src/ (minus Node-only modules),
-//   2. rewrites five zai imports in the copied index.js to runtime/zai-stubs.js
-//      (isZai*Format -> false: no consumer-web route is ever dispatched),
-//   3. rewrites ../../server/tool-loop-guard.mjs to the pure copy in runtime/,
-//   4. replaces the dynamic `await import("undici")` with a null-resolving
+//   2. rewrites ../../server/tool-loop-guard.mjs to the pure copy in runtime/,
+//   3. replaces the dynamic `await import("undici")` with a null-resolving
 //      stub (Workers has no undici; the dispatcher is Node-only tuning),
-//   5. strips the /admin/proxies*, /admin/egress/test, /admin/zai* route
-//      blocks (bridge-owned surfaces; absent => 404 on the Worker),
-//   6. emits .edge-build/index.js re-exporting runtime/edge.js default.
+//   4. strips the /admin/proxies* + /admin/egress/test route blocks
+//      (Node-host surfaces; absent => 404 on the Worker),
+//   5. emits .edge-build/index.js re-exporting runtime/edge.js default.
 //
 // scripts/verify-edge-bundle.mjs then scans the output for forbidden modules.
 
@@ -27,15 +25,9 @@ const serverRoot = join(root, "..", "server");
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 
-// 1. Copy src/, excluding Node-only bridge modules and the runtime dir itself.
-const NODE_ONLY = new Set([
-  "zaiweb.js", "zaibrowser.js", "zai-session.js", "zai-stream.js",
-  "zai-models.js", "zai-agent.js", "zai-conversation-cache.js",
-  "zai-vision.js", "zai-tokens.js", "zai-session-pool.js",
-  "zai-captcha.js", "zai-captcha-cache.js", "zai-waf.js",
-]);
-// Agent-side tooling dirs (SWE verifier, skill loader, profiles) are Node-only
-// and unreachable from the request path.
+// 1. Copy src/, excluding the runtime dir itself. Agent-side tooling dirs
+// (SWE verifier, skill loader, profiles) are Node-only and unreachable from
+// the request path.
 const NODE_ONLY_DIRS = ["swe", "skills", "profiles"];
 cpSync(src, join(out, "src"), {
   recursive: true,
@@ -47,8 +39,7 @@ cpSync(src, join(out, "src"), {
     // is Node-only and unreachable from the request path; excluded so the
     // bundle scan stays honest about what the Worker actually loads.
     if (NODE_ONLY_DIRS.some((d) => rel === d || rel.startsWith(d + "/"))) return false;
-    const base = rel.split("/").pop();
-    return !NODE_ONLY.has(base);
+    return true;
   },
 });
 cpSync(join(src, "runtime"), join(out, "src", "runtime"), { recursive: true });
@@ -57,7 +48,7 @@ let guard = readFileSync(join(serverRoot, "tool-loop-guard.mjs"), "utf8");
 guard = guard.replace('"../ai-gateway/src/tool-repair.js"', '"../tool-repair.js"');
 if (!guard.includes('"../tool-repair.js"')) throw new Error("build-edge: tool-loop-guard import rewrite failed");
 writeFileSync(join(out, "src", "runtime", "tool-loop-guard.mjs"), guard);
-for (const f of ["edge.js", "zai-stubs.js", "tool-loop-guard.mjs"]) {
+for (const f of ["edge.js", "tool-loop-guard.mjs"]) {
   if (!existsSync(join(out, "src", "runtime", f))) throw new Error("build-edge: runtime/" + f + " missing from bundle");
 }
 
@@ -65,28 +56,11 @@ for (const f of ["edge.js", "zai-stubs.js", "tool-loop-guard.mjs"]) {
 const idxPath = join(out, "src", "index.js");
 let idx = readFileSync(idxPath, "utf8");
 
-const ZAI_IMPORTS = [
-  'import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";',
-  'import { zaiWaf } from "./zai-waf.js";',
-  'import { zaiSessionPoolStatus } from "./zai-session-pool.js";',
-  'import { peekDeviceTokens, appendDeviceTokens } from "./zai-tokens.js";',
-  'import { zaiCaptchaCacheStatus } from "./zai-captcha-cache.js";',
-];
-const STUB_IMPORT = 'import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError, zaiWaf, zaiSessionPoolStatus, peekDeviceTokens, appendDeviceTokens, zaiCaptchaCacheStatus } from "./runtime/zai-stubs.js";';
-for (const line of ZAI_IMPORTS) {
-  if (!idx.includes(line)) throw new Error("build-edge: zai import line not found (index.js changed?): " + line.slice(0, 60));
-  idx = idx.replace(line, "");
-}
 idx = idx.replace(
   'import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";',
   'import { normalizeTerminalFinishReason } from "./runtime/tool-loop-guard.mjs";'
 );
 if (!idx.includes("./runtime/tool-loop-guard.mjs")) throw new Error("build-edge: tool-loop-guard import rewrite failed");
-idx = idx.replace(STUB_IMPORT, ""); // idempotence guard (not present yet)
-idx = idx.replace(
-  'import { LOGIN_HTML } from "./login.js";',
-  STUB_IMPORT + '\nimport { LOGIN_HTML } from "./login.js";'
-);
 
 // 4. undici dispatcher: Node-only tuning, absent on Workers. Replace the
 //    dynamic import with a null-resolving one-liner (guard stays, no-op).
@@ -115,30 +89,15 @@ idx = cutBlock(
   'app.get("/admin/proxies", async (c) => {',
   'async function applyProxyResult'
 );
-// /admin/zai/* block: from the diagnose comment up to the trajectories purge
-// route (which follows the device-tokens import handler).
-idx = cutBlock(
-  idx,
-  '// Live Z.AI diagnostic. Runs the real warm + session-acquire phases through',
-  '// ---- Trajectory exporters ----'
-);
 
 writeFileSync(idxPath, idx);
 
 // 6. Top-level entry: wrangler `main` points here.
 writeFileSync(join(out, "index.js"), 'export { default } from "./src/runtime/edge.js";\n');
 
-// Sanity: the Worker bundle must not reference excluded modules.
-const forbidden = ["zaiweb.js", "zaibrowser.js", "zai-session.js", "zai-tokens.js", "zai-captcha.js", "zai-vision.js", "zai-session-pool.js", "zai-waf.js", "zai-stream.js", "zai-models.js", "zai-agent.js"];
-const bad = [];
-for (const f of forbidden) {
-  const probe = join(out, "src", f);
-  if (existsSync(probe)) bad.push(f);
-}
-if (bad.length) throw new Error("build-edge: excluded modules still present: " + bad.join(", "));
 
 console.log("edge bundle built:", join(out, "index.js"));
-console.log("routes stripped: /admin/proxies*, /admin/egress/test, /admin/zai/*");
+console.log("routes stripped: /admin/proxies*, /admin/egress/test");
 
 // 7. Local dev test config (workerd smoke). Generated here because build-edge
 //    wipes .edge-build/ on every run; generating it in the same step keeps

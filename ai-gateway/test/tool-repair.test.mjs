@@ -8,7 +8,6 @@ import {
   inspectToolSurface,
   repairToolCall
 } from "../src/tool-repair.js";
-import { AgentStreamInterceptor, buildAgentPrompt, parseAgentToolCalls } from "../src/zai-agent.js";
 import { guardOpenAiSse, repairEditToolArguments } from "../../server/tool-loop-guard.mjs";
 
 const hashTools = [
@@ -129,15 +128,6 @@ test("global policy is injected only when useful and does not fabricate hashline
   assert.match(generic.messages[0].content, /do NOT fabricate hash anchors/);
 });
 
-test("ZAI prompt regenerates repair policy without duplicating global wrapper", () => {
-  const payload = applyToolRepairPolicyToPayload({
-    messages: [{ role: "user", content: "edit a.js" }],
-    tools: hashTools
-  });
-  const prompt = buildAgentPrompt(payload.messages, hashTools);
-  assert.match(prompt, /<tool_repair_policy mode="hashline">/);
-  assert.doesNotMatch(prompt, /<gateway_tool_repair>/);
-});
 
 test("preserves main's bare hashline patch shorthand and compatibility helper", () => {
   const bare = "[src/a.js#4:ab]\\nPUT 4.=4:new";
@@ -197,35 +187,6 @@ test("ordinary edit-style stream can carry bare hashline shorthand safely", asyn
   assert.deepEqual(JSON.parse(calls[0].function.arguments), { input: normalized });
 });
 
-test("non-stream ZAI agent call repairs hashline aliases", () => {
-  const text = '<<<TOOL_CALL>>>\n{"name":"HashlineEdit","arguments":{"path":"src/a.js","line_hashes":"4:ab","text":"new"}}\n<<<END_TOOL_CALL>>>';
-  const calls = parseAgentToolCalls(text, hashTools);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].function.name, "hashline_edit");
-  assert.deepEqual(JSON.parse(calls[0].function.arguments), {
-    filePath: "src/a.js",
-    lineHashes: "4:ab",
-    content: "new"
-  });
-});
-
-test("ZAI streaming buffers safety-sensitive hashline edit until complete", () => {
-  const upstream = '<<<TOOL_CALL>>>\n{"name":"HashlineEdit","arguments":{"path":"src/a.js","line_hashes":"4:ab","text":"new"}}\n<<<END_TOOL_CALL>>>';
-  const inceptor = new AgentStreamInterceptor(hashTools);
-  const all = [];
-  let emittedEarly = false;
-  for (let i = 0; i < upstream.length; i += 9) {
-    const part = upstream.slice(i, i + 9);
-    const parsed = inceptor.feed(part);
-    if (!upstream.slice(0, i + part.length).includes("END_TOOL_CALL") && parsed.toolCalls.length) emittedEarly = true;
-    all.push(...parsed.toolCalls);
-  }
-  all.push(...inceptor.finish().toolCalls);
-  assert.equal(emittedEarly, false);
-  assert.equal(all.length, 1);
-  assert.equal(all[0].function.name, "hashline_edit");
-  assert.equal(JSON.parse(all[0].function.arguments).lineHashes, "4:ab");
-});
 
 function sse(frames) {
   const enc = new TextEncoder();

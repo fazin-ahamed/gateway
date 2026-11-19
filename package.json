@@ -1,0 +1,10 @@
+{
+  "name": "gateway",
+  "private": true,
+  "type": "module",
+  "comment": "Root install for hosts that run a single npm install at the repo root (Wispbyte-style panels). server/server.mjs and ai-gateway/src/index.js both resolve hono from here: ESM walks up from the importing file to the root node_modules. The JS_FILE for such panels is server/server.mjs.",
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.6.0"
+  }
+}

@@ -40,11 +40,11 @@ INSERT OR IGNORE INTO model_aliases
 VALUES
   ('glm-5.3-flash',      'glm-5.3-flash', 'public_slug',   NULL, 1.0, 'seed',             '2026-01-01T00:00:00.000Z'),
   ('z-ai/glm-5.3-flash', 'glm-5.3-flash', 'public_slug',   NULL, 1.0, 'seed',             '2026-01-01T00:00:00.000Z'),
-  ('x-preview-l',        'glm-5.3-flash', 'wire_model',    NULL, 1.0, 'seed:zaiweb',      '2026-01-01T00:00:00.000Z'),
-  ('GLM-5.3-Flash',      'glm-5.3-flash', 'provider_alias', NULL, 1.0, 'seed:zai-models',  '2026-01-01T00:00:00.000Z'),
-  ('glm-5-3-flash',      'glm-5.3-flash', 'legacy_alias',  NULL, 1.0, 'seed:zai-models',  '2026-01-01T00:00:00.000Z'),
+  ('x-preview-l',        'glm-5.3-flash', 'wire_model',    NULL, 1.0, 'seed:registry',      '2026-01-01T00:00:00.000Z'),
+  ('GLM-5.3-Flash',      'glm-5.3-flash', 'provider_alias', NULL, 1.0, 'seed:registry',  '2026-01-01T00:00:00.000Z'),
+  ('glm-5-3-flash',      'glm-5.3-flash', 'legacy_alias',  NULL, 1.0, 'seed:registry',  '2026-01-01T00:00:00.000Z'),
   ('glm-5.3',            'glm-5.3',       'public_slug',   NULL, 1.0, 'seed',             '2026-01-01T00:00:00.000Z'),
   ('z-ai/glm-5.3',       'glm-5.3',       'public_slug',   NULL, 1.0, 'seed',             '2026-01-01T00:00:00.000Z'),
-  ('GLM-5.3',            'glm-5.3',       'provider_alias', NULL, 1.0, 'seed:zai-models',  '2026-01-01T00:00:00.000Z'),
+  ('GLM-5.3',            'glm-5.3',       'provider_alias', NULL, 1.0, 'seed:registry',  '2026-01-01T00:00:00.000Z'),
   ('glm-5.2',            'glm-5.2',       'public_slug',   NULL, 1.0, 'seed',             '2026-01-01T00:00:00.000Z'),
   ('z-ai/glm-5.2',       'glm-5.2',       'public_slug',   NULL, 1.0, 'seed',             '2026-01-01T00:00:00.000Z');

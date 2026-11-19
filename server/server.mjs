@@ -11,16 +11,15 @@ import { serve } from "@hono/node-server";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
+import { createD1Db } from "./d1.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
 import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries, migrateConsoleAccounts, migrateRollingBudgets } from "./migrations.mjs";
-import { configureSessionStore } from "../ai-gateway/src/zai-session.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const DB_PATH = process.env.DB_PATH || "./data/gateway.db";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const PROVIDER_CRYPTO_KEY = process.env.PROVIDER_CRYPTO_KEY || "";
-const ZAI_SESSION_STORE_KEY = process.env.ZAI_SESSION_STORE_KEY || PROVIDER_CRYPTO_KEY || ADMIN_TOKEN;
 const KOYEB_RELAY_SECRET = process.env.KOYEB_RELAY_SECRET || "";
 const KOYEB_RELAY_URL = process.env.KOYEB_RELAY_URL || "";
 const RELAY_BACKEND = process.env.RELAY_BACKEND || "koyeb";
@@ -30,12 +29,13 @@ const UPSTREAM_TIMEOUT_MS = process.env.UPSTREAM_TIMEOUT_MS || "";
 
 if (!ADMIN_TOKEN) console.warn("[gateway] ADMIN_TOKEN is empty: admin login is disabled.");
 if (!PROVIDER_CRYPTO_KEY) console.warn("[gateway] PROVIDER_CRYPTO_KEY is empty: sealed provider keys cannot be opened.");
-if (!ZAI_SESSION_STORE_KEY) console.warn("[gateway] no ZAI session-store encryption key: session persistence is disabled.");
-const db = createDb(DB_PATH);
-configureSessionStore(process.env.ZAI_SESSION_STORE || join(dirname(DB_PATH), "zai-sessions.json"), ZAI_SESSION_STORE_KEY);
+const D1_CONFIGURED = !!(process.env.D1_DATABASE_ID && process.env.CLOUDFLARE_API_TOKEN && process.env.CLOUDFLARE_ACCOUNT_ID);
+const db = D1_CONFIGURED
+  ? (console.log("[gateway] D1 datastore:", process.env.D1_DATABASE_ID), createD1Db(process.env))
+  : createDb(DB_PATH);
 try {
   const schema = readFileSync(new URL("../ai-gateway/schema.sql", import.meta.url), "utf8");
-  db.exec(schema);
+  await db.exec(schema);
 } catch (e) {
   console.warn("[gateway] schema auto-apply skipped:", e.message);
 }

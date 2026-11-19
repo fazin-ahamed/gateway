@@ -11,7 +11,7 @@ test("openCapsule keeps the handoff fields and drops nothing into prose", () => 
     goal: "stop the leak",
     hypothesis: "the catch emits the raw frame",
     filesInspected: ["src/index.js"],
-    filesChanged: ["src/zaiweb.js"],
+    filesChanged: ["src/index.js"],
     tests: ["node --test test/stream-termination.test.mjs"],
     failure: "frame still contains upstream_socket_closed",
     ruledOut: ["the relay close path"],
@@ -19,7 +19,7 @@ test("openCapsule keeps the handoff fields and drops nothing into prose", () => 
   });
   assert.equal(capsule.status, "open");
   assert.equal(capsule.goal, "stop the leak");
-  assert.deepEqual(capsule.filesChanged, ["src/zaiweb.js"]);
+  assert.deepEqual(capsule.filesChanged, ["src/index.js"]);
   assert.deepEqual(capsule.unknowns, ["whether the guard catch emits too"]);
 });
 
@@ -72,13 +72,13 @@ test("sealCapsule marks only a verified outcome as done", () => {
 test("renderCapsule omits empty sections and keeps every filled one", () => {
   const text = renderCapsule(sealCapsule(openCapsule({
     goal: "stop the leak",
-    filesChanged: ["src/zaiweb.js"],
+    filesChanged: ["src/index.js"],
     failure: "frame still contains upstream_socket_closed",
     ruledOut: ["the relay close path"]
   }), "failed"));
   assert.match(text, /^status: failed/);
   assert.match(text, /goal: stop the leak/);
-  assert.match(text, /files changed:\n- src\/zaiweb\.js/);
+  assert.match(text, /files changed:\n- src\/index\.js/);
   assert.match(text, /failure: frame still contains upstream_socket_closed/);
   assert.match(text, /ruled out:\n- the relay close path/);
   assert.equal(text.includes("hypothesis"), false);

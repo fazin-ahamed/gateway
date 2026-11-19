@@ -97,12 +97,9 @@ test("non-provider-health failures do not trip the provider breaker", () => {
     { status: 413, kind: "request_size" },
     { status: 400, kind: "relay" },
     { status: 400, kind: "unknown" },
-    { status: 503, kind: "zai_model_unavailable" },
-    { status: 503, kind: "zai_browser_unavailable" },
-    { status: 503, kind: "zai_transport" },
-    { status: 503, kind: "zai_tokens" },
-    { status: 503, kind: "zai_captcha_config" },
-    { status: 503, kind: "zai_http_fallback_failed" }
+    { status: 503, kind: "model_unavailable" },
+    { status: 503, kind: "transport" },
+    { status: 503, kind: "credentials" }
   ];
   failures.forEach((f, i) => withFakeNow(i * 1000, () => t.circuitRecordFailure("p", f)));
   assert.equal(withFakeNow(10_000, () => t.circuitOpen("p")), false);
@@ -445,10 +442,8 @@ test("outer SSE guard never exposes raw source exception text", async () => {
 test("typed provider errors are converted to gateway-owned provider-neutral public errors", () => {
   assert.equal(typeof t.publicProviderError, "function");
   const cases = [
-    { status: 403, code: "zai_waf", message: "Z.ai edge rejected https://chat.z.ai/secret SECRET_PROVIDER_RELbackend" },
-    { status: 401, code: "zai_auth", message: "provider Z.AI credential rejected" },
-    { status: 400, code: "zai_tools_unsupported", message: "Z.ai consumer models do not accept caller-supplied tools" },
-    { status: 400, code: "zai_vision_unsupported", message: "Z.ai web transports do not upload images" }
+    { status: 403, code: "upstream_access_denied", message: "denied SECRET_PROVIDER_RELbackend" },
+    { status: 401, code: "upstream_authentication_failed", message: "provider credential rejected" }
   ];
   for (const input of cases) {
     const out = t.publicProviderError(input);
@@ -458,16 +453,14 @@ test("typed provider errors are converted to gateway-owned provider-neutral publ
     assert.doesNotMatch(encoded, /z\.ai|chat\.z\.ai|relbackend|SECRET_PROVIDER|provider\s+Z/i);
     assert.doesNotMatch(encoded, /zai_/i, "public error codes must not reveal the provider adapter");
   }
-  assert.deepEqual(t.publicProviderError(cases[2]), {
-    status: 400,
-    error: { message: "Tools are not supported by the selected model.", type: "invalid_request_error", code: "unsupported_tools" }
+  assert.deepEqual(t.publicProviderError(cases[0]), {
+    status: 502,
+    error: { message: "The upstream API denied access to the selected model or group. The gateway operator must check this route's API-token permissions.", type: "upstream_error", code: "upstream_access_denied" }
   });
-  assert.deepEqual(t.publicProviderError(cases[3]), {
-    status: 400,
-    error: { message: "Image input is not supported by the selected model.", type: "invalid_request_error", code: "unsupported_image_input" }
+  assert.deepEqual(t.publicProviderError(cases[1]), {
+    status: 502,
+    error: { message: "The upstream API rejected this route's credentials. The gateway operator must check the configured upstream API key.", type: "upstream_error", code: "upstream_authentication_failed" }
   });
-  assert.equal(t.publicProviderError(cases[0]).status, 503);
-  assert.equal(t.publicProviderError(cases[1]).status, 503);
 });
 test("stream terminal outcome: incomplete is an operational failure, cancel never trains, dual-write agrees", () => {
   const cancelled = t.streamTerminalOutcome({ clientCancelled: true, streamError: null, finishSeen: false });

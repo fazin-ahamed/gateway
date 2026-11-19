@@ -4,11 +4,6 @@ import { cors } from "hono/cors";
 import { PLAYGROUND_HTML } from "./playground.js";
 import { PUBLIC_HTML } from "./public-page.js";
 import { loadPublicOverview } from "./public-overview.js";
-import { callZaiBrowser, callZaiMinted, callZaiWeb, diagnoseZai, isZaiBrowserFormat, isZaiMintedFormat, isZaiWebFormat, modelCatalogEntry, validateZaiWebKey, withRotatedToken, ZaiWebError } from "./zaiweb.js";
-import { zaiWaf } from "./zai-waf.js";
-import { zaiSessionPoolStatus } from "./zai-session-pool.js";
-import { peekDeviceTokens, appendDeviceTokens } from "./zai-tokens.js";
-import { zaiCaptchaCacheStatus } from "./zai-captcha-cache.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1, shadowV2, loadV2World, ROUTER_V2_MODE, shouldShadow } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
@@ -75,7 +70,7 @@ app.use("/console/*", cors({
 app.use("/v1/*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
-  allowHeaders: ["Content-Type", "Authorization", "x-api-key", "x-request-id", "x-gateway-cache", "x-gateway-cache-ttl", "x-zai-captcha"],
+  allowHeaders: ["Content-Type", "Authorization", "x-api-key", "x-request-id", "x-gateway-cache", "x-gateway-cache-ttl"],
   exposeHeaders: ["x-request-id", "x-gateway-cache", "x-gateway-used-usd", "x-gateway-used-tokens", "x-gateway-route", "x-gateway-attempts", "x-gateway-model", "x-gateway-horizon"]
 }));
 var encoder = new TextEncoder();
@@ -2503,19 +2498,10 @@ async function runChatCompletion(c, key, isAdminPlayground) {
         previousRealRouteId = route.id;
         const _att = { recorded: false, success: 0, status: null, why: null, errKind: null, headers: null, ttft: null, prompt: 0, completion: 0, cost: null };
         try {
-          // Stable Z.AI session/browser identity must be server-controlled and
-          // credential-specific. Never derive pool identity from JWT claims.
-          const attemptRoute = isZaiWebFormat(route.fmt)
-            ? { ...route, zai_session_key: "provider:" + route.provider_id + ":key:" + k.keyId }
-            : route;
-          const res = await forwardToProvider(c, attemptRoute, k.key, payload, isStream, requestId);
+          const res = await forwardToProvider(c, route, k.key, payload, isStream, requestId);
           const up = res.response;
           _att.headers = Date.now() - _attStart;
           _att.status = up.status;
-          // chat.z.ai retires its session cookie as it issues a new one; keep
-          // the stored secret current so the route survives past the rotation.
-          if (res.recovered && res.recovered !== k.key && k.keyId)
-            await updateProviderKeySecret(c, k.keyId, withRotatedToken(k.key, res.recovered));
           await c.env.DB.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(up.status, nowIso(), route.provider_id).run();
           if (!up.ok || !up.body) {
             const txt = await up.text();
@@ -2654,45 +2640,6 @@ async function runChatCompletion(c, key, isAdminPlayground) {
           _att.status = (e && e.status) || 0;
           _att.errKind = (e && e.code) || "transport";
           lastErrKind = (e && e.code) || "transport";
-          if (e instanceof ZaiWebError) {
-            // Credential faults quarantine the key; provider faults hit the
-            // keyed provider breaker. Route faults hit the route.
-            if (e.status === 401 || e.status === 403) {
-              circuitRecordFail("key", k.keyId, { expiresHintMs: 900 });
-              attempts++;
-              continue keyLoop;
-            }
-            if (e.status === 429) {
-              circuitRecordFail("key", k.keyId, { expiresHintMs: 60 });
-              attempts++;
-              continue keyLoop;
-            }
-            if (e.status === 404) {
-              circuitRecordFail("route", route.id);
-              attempts++;
-              break;
-            }
-            if (e.status >= 500)
-              circuitRecordFailure(routeCircuit, { status: e.status, kind: e.code });
-            if (Number(e.retryAfterSec) > 0)
-              lastRetryAfter = Math.max(Number(lastRetryAfter) || 0, Math.ceil(Number(e.retryAfterSec)));
-            blog("FWD ZAI " + route.provider_name + " -> " + e.status + " " + e.code + " " + e.message);
-            traj.steps.push({ ...baseStep, error: e.code, key: k.label, http: e.status, ms: Date.now() - stepStart });
-            if (e.status < 500) {
-              const pub = publicProviderError(e);
-              await recordTrajectory(c, { ...traj, status: "fail", httpStatus: pub.status, provider: route.provider_name, rank: route.rank, attempts: attempts + 1, latencyMs: Date.now() - started, error: e.code + ": " + e.message });
-              await finishRequestSummary(c.env.DB, requestId, { status: "fail", httpStatus: pub.status, attempts: attempts + 1, latencyMs: Date.now() - started });
-              return c.json({ error: pub.error }, pub.status, { "x-gateway-attempts": String(attempts + 1) });
-            }
-            attempts++;
-            lastErr = "provider " + route.provider_name + " -> " + e.code;
-            lastErrStatus = e.status === 504 ? 504 : 503;
-            if (shouldRetryHttp(transportAttempt, e.status, e.code)) {
-              blog("FWD RETRY " + route.provider_name + " key=" + k.label + " zai HTTP " + e.status + " attempt=" + (transportAttempt + 1));
-              continue;
-            }
-            break;
-          }
           lastErrStatus = (e && e.status) || 503;
           circuitRecordFailure(routeCircuit, { status: (e && e.status) || 0, kind: "unknown" });
           blog("FWD CATCH " + route.provider_name + " key=" + k.label + " -> " + String(e && e.message || e) + (e && e.code ? " [" + e.code + "]" : "") + (c.__egressFailure ? " egress=" + c.__egressFailure : ""));
@@ -2772,35 +2719,8 @@ function stripHistoricalReasoning(payload) {
 }
 async function forwardToProvider(c, route, apiKey, payload, isStream, requestId) {
   const fmt2 = (route.fmt || "openai").toLowerCase();
-  // Auto proxy-pool: resolve the sticky egress once per request for Z.AI
-  // routes (the only traffic that goes through the uTLS helper). Cached and
-  // sticky, so warmup/auth/captcha/completion/delete share one identity.
-  if (isZaiMintedFormat(fmt2) || isZaiBrowserFormat(fmt2) || isZaiWebFormat(fmt2)) {
-    try { c.zaiEgress = await resolveActiveEgress(c); } catch { c.zaiEgress = null; }
-  }
-  if (isZaiMintedFormat(fmt2)) {
-    if (route.transport && route.transport !== "auto" && route.transport !== "direct")
-      throw new ZaiWebError(400, 'Z.AI minted routes must use direct transport (transport="' + route.transport + '").', "zai_transport");
-    blog("FWD zaiminted model=" + (route.upstream_model || (payload && payload.model)));
-    return callZaiMinted(c, route, apiKey, payload, isStream, (url, init) => upstreamFetch(c, url, init));
-  }
-  if (isZaiBrowserFormat(fmt2)) {
-    if (route.transport && route.transport !== "auto" && route.transport !== "direct")
-      throw new ZaiWebError(400, 'Z.AI browser routes must use direct transport (transport="' + route.transport + '"); the browser runs on the gateway host.', "zai_transport");
-    blog("FWD zaibrowser model=" + (route.upstream_model || (payload && payload.model)));
-    return callZaiBrowser(c, route, apiKey, payload, isStream);
-  }
-  // Z.ai consumer web chat is signed-HTTP only: it talks to chat.z.ai with a
-  // session JWT, not to a base_url. Relays would strip the session, so it is
-  // clamped to direct egress rather than silently failing through a tunnel.
-  if (isZaiWebFormat(fmt2)) {
-    if (route.transport && route.transport !== "auto" && route.transport !== "direct")
-      throw new ZaiWebError(400, 'Z.ai web-chat routes must use direct transport (transport="' + route.transport + '").', "zai_transport");
-    blog("FWD zaiweb model=" + (route.upstream_model || (payload && payload.model)));
-    return callZaiWeb(c, route, apiKey, payload, isStream, (url, init) => upstreamFetch(c, url, init));
-  }
-  // Non-Z.AI paths forward the caller's messages to the provider; scrub any
-  // stale cross-model private reasoning first (the Z.AI shim already strips it).
+  // All paths forward the caller's messages to the provider; scrub any
+  // stale cross-model private reasoning first.
   // A provider that genuinely needs its own opaque reasoning artifact for
   // continuation opts out EXPLICITLY via route.preserve_reasoning — the default
   // cross-model path never carries another model's hidden reasoning.
@@ -2944,11 +2864,9 @@ function koyebCfg(env) {
     secret: String(env && env.KOYEB_RELAY_SECRET || "")
   };
 }
-// Runtime-dependent: the Node host serves consumer-web formats through the
-// bridge; the edge build rewrites this to the formats its transports support
-// (see runtime/zai-stubs.js). Validation, listing, and dispatch all consult
-// it, so an excluded format can never be created, advertised, or dialed there.
-var PROVIDER_FORMATS = (globalThis.HORIZON_SUPPORTED_FORMATS || ["openai", "anthropic", "zaiweb", "zaiwebbrowser", "zaiminted"]);
+// Supported provider wire formats. Validation, listing, and dispatch all
+// consult it, so an unsupported format can never be created or dialed.
+var PROVIDER_FORMATS = (globalThis.HORIZON_SUPPORTED_FORMATS || ["openai", "anthropic"]);
 function normalizeProviderFormat(value, fallback) {
   const fmt2 = String(value == null ? "" : value).trim().toLowerCase();
   if (!fmt2)
@@ -4543,14 +4461,9 @@ function hasImageContent(payload) {
 // native ceilings come from the canonical registry: a reseller slug that
 // models.dev has never heard of still inherits its model's real limits.
 // The catalog only fills what the registry doesn't record — vision, tools,
-// modalities — and a Z.AI consumer route uses its local table for those,
-// since it has no models.dev row at all.
+// modalities.
 function capabilityEntryForRoute(route, catalogById, canonical) {
-  let entry = null;
-  if (route && isZaiWebFormat(route.fmt))
-    entry = modelCatalogEntry(route.upstream_model, route.fmt) || null;
-  if (!entry)
-    entry = catalogById && route ? matchModelsDevPrice(catalogById, route.slug) : null;
+  const entry = catalogById && route ? matchModelsDevPrice(catalogById, route.slug) : null;
   return applyRouteCapability(entry, route, canonical);
 }
 
@@ -4720,22 +4633,6 @@ async function pickAutoModel(c, payload, key) {
   }
   if (!enabled.length)
     return null;
-  const routes2 = await c.env.DB.prepare(
-    `SELECT mr.slug, p.fmt, MIN(mr.upstream_model) AS upstream_model
-     FROM model_routes mr JOIN providers p ON p.id=mr.provider_id
-     WHERE mr.enabled=1 AND p.enabled=1 AND COALESCE(mr.model_kind,'chat')='chat' GROUP BY mr.slug`
-  ).all();
-  const overlay = new Map();
-  for (const r of routes2.results || []) {
-    if (!isZaiWebFormat(r.fmt))
-      continue;
-    const local = modelCatalogEntry(r.upstream_model, r.fmt);
-    // Local capability row keyed by the public slug: models.dev carries no
-    // chat.z.ai consumer entries, so without this the router would treat the
-    // route as unknown (permissive) instead of gating tools/vision/context.
-    if (local)
-      overlay.set(r.slug, local);
-  }
   const health = await routerHealth(c);
   const healthBySlug = new Map(health.map((h) => [h.slug, h]));
   const cx = promptComplexity(payload);
@@ -4753,7 +4650,7 @@ async function pickAutoModel(c, payload, key) {
     need = Math.min(6, Math.max(need, 2.4));
   const candidates = [];
   for (const r of enabled) {
-    const entry = overlay.get(r.slug) || capabilityEntryForRoute({ slug: r.slug }, byId);
+    const entry = capabilityEntryForRoute({ slug: r.slug }, byId);
     const mult = Number(cfg.overrides[r.slug]);
     let q = qualityPrior(entry, r.slug);
     if (Number.isFinite(mult) && mult > 0)
@@ -4866,7 +4763,6 @@ async function pickAutoModel(c, payload, key) {
         allowed,
         excluded: cfg.excluded,
         catalogById: byId,
-        overlay,
         circuitOpen,
         keyCircuitOpen: (keyId) => circuitOpen("key", keyId),
         priceResolver
@@ -4931,9 +4827,7 @@ async function pickAutoModel(c, payload, key) {
 // Host/config 503s cannot recover on retry: Chromium missing a display,
 // a model the account cannot see, a dead session, a bad transport.
 var SAME_KEY_ATTEMPTS = 3;
-// Fatal config errors shouldn't retry, but transient zai_browser page load hiccups can self-heal on retry.
-// zai_completion 500s are Z.AI payload/TLS rejects; retrying burns another single-use CAPTCHA.
-var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed|zai_model\b|zai_completion|zai_unreachable|zai_stream_error/;
+var NON_RETRYABLE_KINDS = /browser_unavailable|model_unavailable|credentials|captcha|transport|tokens|fallback_failed/;
 function shouldRetrySameKey(transportAttempt, err) {
   return transportAttempt < SAME_KEY_ATTEMPTS - 1 && isRetryableTransportError(err);
 }
@@ -4950,7 +4844,7 @@ function shouldRetryHttp(transportAttempt, status, why) {
     return code === 400 && kind === "relay";
   if (code === 408 || code >= 500)
     return true;
-  return kind === "relay" || kind === "unknown" || kind === "zai_browser";
+  return kind === "relay" || kind === "unknown";
 }
 var MODELS_DEV_CACHE_MS = 3600000;
 var modelsDevCache = { at: 0, catalog: null };
@@ -5994,38 +5888,10 @@ function publicProviderError(err) {
   if (code === "upstream_authentication_failed") {
     return { status: 502, error: { message: "The upstream API rejected this route's credentials. The gateway operator must check the configured upstream API key.", type: "upstream_error", code } };
   }
-  if (code === "zai_tools_unsupported") {
-    return { status: 400, error: { message: "Tools are not supported by the selected model.", type: "invalid_request_error", code: "unsupported_tools" } };
-  }
-  if (code === "zai_vision_unsupported") {
-    return { status: 400, error: { message: "Image input is not supported by the selected model.", type: "invalid_request_error", code: "unsupported_image_input" } };
-  }
-  if (code === "zai_captcha") {
-    return { status: 503, error: { message: "This route needs a fresh captcha proof. Send one per request, or use a transport that acquires it automatically.", type: "unsupported_feature", code: "captcha_required" } };
-  }
-  if (code === "zai_tokens" || code === "zai_captcha_config" || code === "zai_http_fallback_failed") {
-    return { status: 503, error: { message: "The selected route is temporarily unavailable. Please retry later or use another enabled route.", type: "service_unavailable", code: "route_unavailable" } };
-  }
-  if (code === "zai_credentials" || code === "zai_browser_unavailable" || code === "zai_model" || code === "zai_model_unavailable") {
-    return { status: 503, error: { message: "The selected model is not available on this route right now.", type: "model_unavailable", code: "model_unavailable" } };
-  }
-  if (code === "zai_waf") {
-    return { status: 503, error: { message: "The upstream edge challenged this request. Please retry shortly.", type: "service_busy", code: "upstream_challenged" } };
-  }
-  if (code === "zai_no_prompt") {
-    return { status: 400, error: { message: "At least one user message is required.", type: "invalid_request_error", code: "empty_prompt" } };
-  }
   if (Number(err && err.status) === 504) {
     return { status: 504, error: { message: "The selected model did not respond in time. Please retry.", type: "upstream_error", code: "upstream_timeout" } };
   }
   return { status: 503, error: genericUpstreamError().error };
-}
-// Codes whose failures belong to the caller's request, not provider health:
-// they may reach the client and never open a provider breaker.
-function isPublicRequestProviderError(err) {
-  const code = String(err && err.code || "");
-  return code === "zai_tools_unsupported" || code === "zai_vision_unsupported" || code === "zai_no_prompt" ||
-    code === "zai_captcha" || code === "zai_tokens" || code === "zai_captcha_config" || code === "zai_http_fallback_failed";
 }
 function isGenericUpstreamErrorResponse(text) {
   try {
@@ -6837,51 +6703,6 @@ app.get("/admin/proxy-health", async (c) => {
 // from the console without hand-copying slugs and model ids.
 var PROVIDER_PRESETS = [
   {
-    id: "zai-minted",
-    label: "Z.AI web chat — recommended (pure HTTP)",
-    summary: "GLM-Free-API-style pure HTTP transport: pre-minted Aliyun proofs, throwaway chat UUIDs, session cleanup, vision upload, tools and search. No browser or OS packages on the serving host.",
-    fmt: "zaiminted",
-    name: "Z.AI web chat (pure HTTP)",
-    base_url: "https://chat.z.ai",
-    transport: "direct",
-    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — captcha is minted automatically',
-    credential_format: "provider_credential",
-    routes: [
-      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
-      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
-    ]
-  },
-  {
-    id: "zai-browser",
-    label: "Z.AI web chat — browser fallback",
-    summary: "Fallback/debug transport. Drives the real chat.z.ai page in Chromium when the pure-HTTP proof path is unavailable. More resource-heavy and less reliable on restricted hosts.",
-    fmt: "zaiwebbrowser",
-    name: "Z.AI web chat (browser)",
-    base_url: "https://chat.z.ai",
-    transport: "direct",
-    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — no captcha needed',
-    credential_format: "provider_credential",
-    routes: [
-      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
-      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
-    ]
-  },
-  {
-    id: "zai-web",
-    label: "Z.AI web chat (chat.z.ai, no API key)",
-    summary: "Manual pure-HTTP debug path. Same reference wire as the recommended transport, but the caller supplies a fresh captcha_verify_param per completion. Gateway-emulated tools remain supported.",
-    fmt: "zaiweb",
-    name: "Z.AI web chat",
-    base_url: "https://chat.z.ai",
-    transport: "direct",
-    credential_hint: 'Paste {"token":"<chat.z.ai localStorage token>"} — the captcha proof changes every completion, so send it per request as the x-zai-captcha header',
-    credential_format: "provider_credential",
-    routes: [
-      { slug: "z-ai/glm-5.3-flash", upstream_model: "glm-5.3-flash" },
-      { slug: "z-ai/glm-5.3", upstream_model: "glm-5.3" }
-    ]
-  },
-  {
     id: "zai-api",
     label: "Z.AI API key (api.z.ai)",
     summary: "Standard GLM API on an API key, OpenAI-compatible, tools supported.",
@@ -7045,7 +6866,7 @@ app.patch("/admin/providers/:id", async (c) => {
   if (b.fmt !== void 0) {
     try {
       sets.push("fmt=?");
-      binds.push(normalizeProviderFormat(b.fmt, "zaiweb"));
+      binds.push(normalizeProviderFormat(b.fmt, "openai"));
     } catch (e) {
       return c.json({ error: { message: e.message } }, 400);
     }
@@ -7120,10 +6941,6 @@ app.post("/admin/providers/:id/test", async (c) => {
   const keys = await providerKeys(c, id);
   if (!keys.length)
     return c.json({ ok: false, error: "provider has no usable key", key_label: null }, 200);
-  if (isZaiWebFormat(provider.fmt)) {
-    const result = await validateZaiWebKey(keys[0].key, fetch);
-    return c.json({ ok: result.ok, status: result.status, error: result.error, key_label: keys[0].label, fmt: provider.fmt }, 200);
-  }
   // Any other provider gets a real reachability check against its own base_url,
   // so the button means something for every format instead of only chat.z.ai.
   const route = await c.env.DB.prepare("SELECT * FROM model_routes WHERE provider_id=? ORDER BY rank LIMIT 1").bind(id).first();
@@ -7357,8 +7174,6 @@ app.post("/admin/providers/:id/integrity", async (c) => {
   const provider = await c.env.DB.prepare("SELECT * FROM providers WHERE id=?").bind(id).first();
   if (!provider)
     return c.json({ error: { message: "provider not found" } }, 404);
-  if (isZaiWebFormat(provider.fmt))
-    return c.json({ error: { message: "the z.ai consumer transports are not OpenAI-compatible endpoints; integrity probing does not apply" } }, 400);
   const keys = await providerKeys(c, id);
   if (!keys.length)
     return c.json({ error: { message: "provider has no usable key" } }, 400);
@@ -8202,7 +8017,7 @@ app.get("/admin/router/agent-loop", async (c) => {
 // ---- Proxy pool: egress inventory + connectivity testing ----
 // Credentials are sealed with the same providerCryptoKey machinery as provider
 // keys and are NEVER returned to the browser. Batch testing runs server-side
-// through the loopback zaihttp /check-egress against a fixed neutral target.
+// through the loopback uTLS helper /check-egress against a fixed neutral target.
 var PROXY_DEAD_THRESHOLD = 3;
 // Rank order for both the pool table and auto-selection: healthy first, then
 // lowest measured latency, then most proven successes. untested rides ahead of
@@ -8226,25 +8041,22 @@ var ACTIVE_EGRESS_TTL_MS = 30000;
 async function resolveActiveEgress(c) {
   const mode = await settingValue(c, "proxy_egress_mode", "manual");
   if (mode !== "auto") {
-    if (c) c.zaiEgressId = null;
+    if (c) c.egressId = null;
     return null;
   }
   // Bind the proxy identity onto THIS request. A concurrent request may
   // re-select a different sticky egress before this one fails, so failure
   // attribution must use the id this request actually dialed, not the global.
-  const bind = (url) => { if (c) c.zaiEgressId = activeEgress.id; return url; };
+  const bind = (url) => { if (c) c.egressId = activeEgress.id; return url; };
   const now = Date.now();
-  // WAF-blocked is NOT transport-dead: the proxy may be perfectly healthy
-  // for other destinations. Exclude it from Z.AI auto-selection only.
-  const wafBlocked = (id) => zaiWaf.isBlocked(id == null ? "direct" : "proxy:" + id);
-  // Sticky TTL: drop the sticky pick if ITS breaker just opened, rather than
-  // keep routing onto a blocked egress for up to 30s.
-  if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS && !wafBlocked(activeEgress.id))
+  // Sticky TTL: keep the pick while it is still fresh rather than re-select
+  // on every request.
+  if (activeEgress.url && now - activeEgress.at < ACTIVE_EGRESS_TTL_MS)
     return bind(activeEgress.url);
   const rows = await c.env.DB.prepare(
     "SELECT id, scheme, host, port, username, password_enc, status, last_latency_ms, success_count FROM proxy_pool WHERE enabled=1 AND status='healthy'"
   ).all();
-  const candidates = (rows.results || []).slice().filter((r) => !wafBlocked(r.id)).sort(compareProxyRank);
+  const candidates = (rows.results || []).slice().sort(compareProxyRank);
   // Keep the current sticky pick if it is still a healthy, unblocked candidate.
   if (activeEgress.id != null) {
     const keep = candidates.find((r) => r.id === activeEgress.id);
@@ -8282,7 +8094,7 @@ function __resetActiveEgress() { activeEgress = { id: null, url: null, at: 0 }; 
 async function noteEgressFailure(c, failureClass) {
   // Prefer the proxy this request actually bound; fall back to the global
   // sticky id only if the request was not stamped (older call paths).
-  const id = (c && c.zaiEgressId != null) ? c.zaiEgressId : activeEgress.id;
+  const id = (c && c.egressId != null) ? c.egressId : activeEgress.id;
   if (id == null)
     return;
   try {
@@ -8295,10 +8107,9 @@ async function noteEgressFailure(c, failureClass) {
   if (activeEgress.id === id)
     __resetActiveEgress();
 }
-// The uTLS helper lives at ZAI_UTLS_PROXY when auto-update injected it, else at
-// the conventional ZAI_HTTP_ADDR. Discover it by health rather than assuming
-// its absence from a missing env var — a missing var must not read as "helper
-// offline" when the process is in fact up on the default port.
+// The uTLS helper is discovered by health on the conventional local port,
+// so a missing env var must not read as "helper offline" when the process
+// is in fact up on the default port.
 async function helperHealthCheck(base) {
   if (!base) return false;
   try {
@@ -8311,9 +8122,9 @@ async function helperHealthCheck(base) {
     return false;
   }
 }
-async function zaiHelperBase() {
-  const configured = String(process.env.ZAI_UTLS_PROXY || "").trim();
-  const fallback = process.env.ZAI_HTTP_ADDR ? "http://" + String(process.env.ZAI_HTTP_ADDR).trim() : "http://127.0.0.1:8477";
+async function helperBase() {
+  const configured = String(process.env.UTLS_PROXY_URL || "").trim();
+  const fallback = process.env.UTLS_PROXY_URL ? null : "http://127.0.0.1:8477";
   for (const base of [configured, fallback]) {
     if (base && await helperHealthCheck(base))
       return base.replace(/\/+$/, "");
@@ -8368,7 +8179,7 @@ app.get("/admin/proxies", async (c) => {
       if (row) active = maskProxyRow(row).endpoint;
     }
   }
-  const helper = await zaiHelperBase();
+  const helper = await helperBase();
   return c.json({ proxies: list.map(maskProxyRow), total: list.length, counts, mode, active, helper: { online: !!helper, base: helper } });
 });
 app.post("/admin/proxies/mode", async (c) => {
@@ -8404,7 +8215,7 @@ app.post("/admin/egress/test", async (c) => {
   const url = String(b.url || "").trim();
   if (!/^https:\/\//i.test(url))
     return c.json({ error: { message: "url must be an https:// URL" } }, 400);
-  const base = await zaiHelperBase();
+  const base = await helperBase();
   if (!base)
     return c.json({ error: { message: "uTLS helper offline; cannot run egress test" } }, 503);
   // Resolve the proxy: a pool id, an inline proxy URL, or none (direct).
@@ -8522,9 +8333,9 @@ app.post("/admin/proxies/test", async (c) => {
   } catch {
     b = {};
   }
-  const base = await zaiHelperBase();
+  const base = await helperBase();
   if (!base)
-    return c.json({ error: { message: "uTLS helper offline; start zaihttp (ZAI_HTTP_ADDR / ZAI_UTLS_PROXY) to test egress" } }, 503);
+    return c.json({ error: { message: "uTLS helper offline" } }, 503);
   const concurrency = Math.min(50, Math.max(1, Number(b.concurrency) || 20));
   const timeoutMs = Math.min(20000, Math.max(1000, Number(b.timeout_ms) || 10000));
   let where = "enabled=1";
@@ -8640,140 +8451,6 @@ async function applyProxyResult(c, id, result) {
   ).bind(consec, status, result.failure_class || "request_failed", now, now, id).run();
   return { status, last_latency_ms: null, consecutive_failures: consec, last_failure_class: result.failure_class || "request_failed", last_checked_at: now };
 }
-// Live Z.AI diagnostic. Runs the real warm + session-acquire phases through
-// the same uTLS helper + egress the request path uses, and reports each step's
-// status/timing so a failing route can be diagnosed without shell access.
-// Credentials are never returned — only presence, source, redacted userId.
-app.get("/admin/zai/diagnose", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied)
-    return denied;
-  await ensureUpstreamDispatcher();
-  const slug = String(c.req.query("slug") || "").trim();
-  // Find a Z.AI route: the requested slug, else the first enabled zai* route.
-  const rows = await c.env.DB.prepare(
-    `SELECT mr.slug, mr.upstream_model, mr.provider_id, p.name AS provider_name, p.fmt, p.transport
-     FROM model_routes mr JOIN providers p ON p.id=mr.provider_id
-     WHERE mr.enabled=1 AND p.enabled=1 AND p.fmt IN ('zaiminted','zaiweb','zaiwebbrowser')` +
-     (slug ? " AND mr.slug=?" : "") + " ORDER BY mr.rank LIMIT 1"
-  ).bind(...(slug ? [slug] : [])).all();
-  const route = (rows.results || [])[0];
-  if (!route)
-    return c.json({ error: { message: slug ? ("no enabled Z.AI route for slug " + slug) : "no enabled Z.AI route found" } }, 404);
-  route.zai_session_key = "provider:" + route.provider_id + ":diag";
-  // Resolve the sealed credential for this provider, same as the live path.
-  let rawKey = "";
-  try {
-    const keys = await providerKeys(c, route.provider_id);
-    rawKey = (keys[0] && keys[0].key) || "";
-  } catch (e) {
-    return c.json({ error: { message: "could not load provider credential: " + String(e.message || e) } }, 500);
-  }
-  // Pin the same egress the live path would use (auto-pool or env), so the
-  // probe reflects reality.
-  try { c.zaiEgress = await resolveActiveEgress(c); } catch { c.zaiEgress = null; }
-  c.upstreamFetch = (url, init) => upstreamFetch(c, url, init);
-  const report = await diagnoseZai(c, route, rawKey, {});
-  report.helper_online = !!(await zaiHelperBase());
-  return c.json(report);
-});
-// Z.AI egress health: WAF breaker state (blocked/probing/backoff) plus the
-// bounded-reuse session pool status. Admin-only; leaks no credentials, only
-// operational counters. Cheap — no upstream calls.
-app.get("/admin/zai/status", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied)
-    return denied;
-  const waf = zaiWaf.status();
-  return c.json({
-    waf: {
-      blocked: waf.blocked,
-      anyProbing: waf.anyProbing,
-      blockedEgresses: waf.blockedEgresses || [],
-      egresses: waf.egresses || []
-    },
-    sessions: zaiSessionPoolStatus()
-  });
-});
-// Z.AI device-token pool: operational refill visibility + live import into the
-// canonical SQLite FIFO (zai_device_tokens). Tokens are single-use Aliyun
-// device tokens consumed as CAPTCHA proofs are minted. Admin-only; token VALUES
-// are never returned by either endpoint — only counts.
-var LOW_TOKEN_THRESHOLD = 25;
-function zaiTokenStorePath(c) {
-  return (c && c.env && c.env.ZAI_TOKEN_STORE) || undefined;
-}
-function captchaProofsReady() {
-  try {
-    return (zaiCaptchaCacheStatus() || []).reduce((n, cache) => n + (Number(cache.ready) || 0), 0);
-  } catch {
-    return 0;
-  }
-}
-app.get("/admin/zai/device-tokens/status", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied)
-    return denied;
-  const available = await peekDeviceTokens(zaiTokenStorePath(c), c.env.DB);
-  return c.json({
-    available,
-    captcha_ready: captchaProofsReady(),
-    low: available < LOW_TOKEN_THRESHOLD
-  });
-});
-// Accepts a JSON token array (`{"tokens":[...]}`) or a newline-delimited string
-// (`{"tokens":"a\nb"}` or a raw text body). Inserts directly into the FIFO; the
-// table's UNIQUE(token) constraint dedupes against existing rows. Counts:
-//   invalid    = submitted entries that are empty after trimming (non-tokens)
-//   duplicates = repeats within the batch PLUS entries already in the store
-//   accepted   = genuinely new rows (measured by the store count delta)
-// Token format is opaque, so validation is only "non-empty after trim" — the
-// same contract the token store itself applies; no admin-only length rules.
-app.post("/admin/zai/device-tokens/import", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied)
-    return denied;
-  let raw;
-  const ctype = String(c.req.header("content-type") || "");
-  if (ctype.includes("application/json")) {
-    let body;
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: { message: "Invalid JSON body" } }, 400);
-    }
-    raw = body && body.tokens != null ? body.tokens : body;
-  } else {
-    raw = await c.req.text();
-  }
-  // A raw text body may have a trailing newline; trimming first avoids counting
-  // that as an invalid empty entry. Array entries are coerced/trimmed the same.
-  const list = Array.isArray(raw) ? raw : String(raw || "").trim().split(/[\r\n]+/);
-  const unique = [];
-  const seen = new Set();
-  let invalid = 0;
-  let batchDuplicates = 0;
-  for (const item of list) {
-    const t = String(item == null ? "" : item).trim();
-    if (!t) { invalid++; continue; }
-    if (seen.has(t)) { batchDuplicates++; continue; }
-    seen.add(t);
-    unique.push(t);
-  }
-  const before = await peekDeviceTokens(zaiTokenStorePath(c), c.env.DB);
-  if (unique.length)
-    await appendDeviceTokens(unique, zaiTokenStorePath(c), c.env.DB);
-  const after = await peekDeviceTokens(zaiTokenStorePath(c), c.env.DB);
-  const accepted = after - before;
-  // Repeats inside the batch + tokens already present both count as duplicates.
-  const existingDuplicates = unique.length - accepted;
-  return c.json({
-    accepted,
-    duplicates: batchDuplicates + existingDuplicates,
-    invalid,
-    available: after
-  });
-});
 // ---- Trajectory exporters ----
 // Each ok request/response pair becomes a training example. The request
 // already carries the full multi-turn conversation (agents resend history
@@ -9218,7 +8895,7 @@ function clientResponseHeaders(upstreamHeaders, streaming = false) {
     "cache-control": streaming ? "no-cache, no-store" : "no-store"
   };
 }
-export const __test = { recordUsage, __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, slugSelectionMode, reorderRoutesByMode, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, isPublicRequestProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
+export const __test = { recordUsage, __setModelsDevCache, decisionSnapshot, shadowAttemptFields, stripHistoricalReasoning, closeSseGracefully, wrapAnthropicStream, fromAnthropicStreamChunk, sanitizeClientResponse, safeSseData, sealProviderKey, openProviderKey, stableJson, isCacheableRequest, responseCacheKey, isCacheableResponse, normalizeRequestLimit, normalizeKeyExpiry, isKeyExpired, splitModelSlugs, effectiveModelSlugs, cacheCoalesceDelayMs, classifyUpstreamFailure, isGenericUpstreamErrorResponse, routeTransport, normalizeTransport, transportLabel, koyebCfg, flattenModelsDevCatalog, matchModelsDevPrice, qualityPrior, promptComplexity, analyzeRequest, entryCapabilities, pickAutoModel, slugSelectionMode, reorderRoutesByMode, normalizeProviderFormat, routerHealth, __resetRouterHealthCache, isLuxuryFlagship, isWorkhorse, buildWorldModel, compactMessages, applyAutoHarness, planHorizon, renderHorizonState, usableContextWindow, isRetryableTransportError, sseUpstreamDisconnect, sanitizeUpstreamResponse, sanitizeRequest, circuitOpen, circuitRecord, circuitKey, circuitRecordFailure, circuitSnapshot, __resetCircuitState, publicProviderError, orderKeys, shouldRetrySameKey, shouldRetryHttp, SAME_KEY_ATTEMPTS, genericUpstreamError, costFromRates, priceFromRow, numOrNull, routeReliability, reflexPick, ROUTE_RELIABILITY_FLOOR, REFLEX_LATENCY_SLA_MS, computeCost, lookupPriceRow, __resetPricesSchema, classifyAttempt, recordRouteAttempt, updateRouterStat, streamTerminalOutcome, applyProxyResult, compareProxyRank, resolveActiveEgress, __resetActiveEgress, noteEgressFailure };
 export function createApp(env) {
   if (!env) return app;
   return { fetch: (req, ctx) => app.fetch(req, env, ctx) };

@@ -11,7 +11,7 @@
 //   4. known catalog mapping (canonical_models.id direct match, or catalog_id alias)
 //   5. unresolved raw identity -> null (caller falls back to "raw:" + upstream)
 
-// Known explicit seed data — migrated out of zai-models.js / zaiweb.js so the
+// Known explicit seed data (migrated out of the former consumer-web catalog) so the
 // relationship exists as data in one authoritative registry.
 export const SEED_CANONICAL_MODELS = [
   {
@@ -43,9 +43,9 @@ export const SEED_CANONICAL_MODELS = [
 export const SEED_MODEL_ALIASES = [
   { alias: "glm-5.3-flash",      canonical_model_id: "glm-5.3-flash", alias_type: "public_slug",    provider_id: null, confidence: 1.0, source: "seed" },
   { alias: "z-ai/glm-5.3-flash", canonical_model_id: "glm-5.3-flash", alias_type: "public_slug",    provider_id: null, confidence: 1.0, source: "seed" },
-  { alias: "x-preview-l",        canonical_model_id: "glm-5.3-flash", alias_type: "wire_model",      provider_id: null, confidence: 1.0, source: "seed:zaiweb" },
-  { alias: "GLM-5.3-Flash",      canonical_model_id: "glm-5.3-flash", alias_type: "provider_alias",  provider_id: null, confidence: 1.0, source: "seed:zai-models" },
-  { alias: "glm-5-3-flash",      canonical_model_id: "glm-5.3-flash", alias_type: "legacy_alias",    provider_id: null, confidence: 1.0, source: "seed:zai-models" },
+  { alias: "x-preview-l",        canonical_model_id: "glm-5.3-flash", alias_type: "wire_model",      provider_id: null, confidence: 1.0, source: "seed:registry" },
+  { alias: "GLM-5.3-Flash",      canonical_model_id: "glm-5.3-flash", alias_type: "provider_alias",  provider_id: null, confidence: 1.0, source: "seed:registry" },
+  { alias: "glm-5-3-flash",      canonical_model_id: "glm-5.3-flash", alias_type: "legacy_alias",    provider_id: null, confidence: 1.0, source: "seed:registry" },
 
   { alias: "glm-5.3",            canonical_model_id: "glm-5.3",       alias_type: "public_slug",    provider_id: null, confidence: 1.0, source: "seed" },
   { alias: "z-ai/glm-5.3",       canonical_model_id: "glm-5.3",       alias_type: "public_slug",    provider_id: null, confidence: 1.0, source: "seed" },
@@ -56,7 +56,7 @@ export const SEED_MODEL_ALIASES = [
 ];
 
 // Pure in-memory maps built from the static seed so code paths without a DB
-// handle (zaiweb request prep, zai-models live-catalog lookup) ask the
+// handle (canonical id resolution) ask the
 // registry's seed instead of hardcoding their own duplicate mappings.
 const SEED_BY_ALIAS = new Map();
 const SEED_BY_CANONICAL = new Map();
@@ -67,13 +67,13 @@ for (const a of SEED_MODEL_ALIASES) {
   SEED_BY_CANONICAL.set(a.canonical_model_id, list);
 }
 
-// Pure: wire/opaque name -> canonical id from seed (used by zaiweb unprefixedModelId)
+// Pure: wire/opaque name -> canonical id from seed (used by wire-model resolution)
 export function seedWireToCanonical(name) {
   if (!name) return null;
   return SEED_BY_ALIAS.get(String(name).trim().toLowerCase()) || null;
 }
 
-// Pure: any alias -> all sibling spellings sharing that canonical (used by zai-models modelAliases)
+// Pure: any alias -> all sibling spellings sharing that canonical (used by sibling-alias lookup)
 export function seedAliasFamily(name) {
   const raw = String(name || "").trim();
   if (!raw) return [];

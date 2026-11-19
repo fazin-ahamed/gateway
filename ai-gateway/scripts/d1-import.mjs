@@ -58,7 +58,7 @@ console.log("size:", (sizeBytes / 1024 / 1024).toFixed(2), "MB,", tables.length,
 
 const SKIP_ON_EDGE = new Set([
   // Agent-side / Node-only state, never part of the gateway's serving truth.
-  "zai_device_tokens", "zai_sessions", "proxy_pool",
+  "zai_conversations", "zai_device_tokens", "proxy_pool",
 ]);
 
 // Telemetry (route_attempts, quality_observations, router_stats, reflex_*,
@@ -85,22 +85,6 @@ for (const t of tables) {
   } catch { counts[t] = -1; }
 }
 
-// Consumer-web (bridge-only) configuration: preserved but flagged.
-const zaiFmts = ("zaiweb", "zaiwebbrowser", "zaiminted");
-let zaiProviders = [];
-try {
-  zaiProviders = db.prepare("SELECT id, name, fmt FROM providers WHERE fmt IN ('zaiweb','zaiwebbrowser','zaiminted')").all();
-} catch {}
-let zaiRoutes = [];
-try {
-  zaiRoutes = db.prepare("SELECT mr.slug, p.name FROM model_routes mr JOIN providers p ON p.id=mr.provider_id WHERE p.fmt IN ('zaiweb','zaiwebbrowser','zaiminted')").all();
-} catch {}
-if (zaiProviders.length || zaiRoutes.length) {
-  console.log("\nconsumer-web (bridge-only) configuration - preserved but NOT servable on Cloudflare:");
-  for (const p of zaiProviders) console.log("  provider:", p.name, "(" + p.fmt + ")");
-  for (const r of zaiRoutes) console.log("  route:", r.slug, "->", r.name);
-  console.log("  (the edge build refuses to advertise or dispatch these; re-point the public slug at a supported API provider to restore it)");
-}
 
 // Sealed credential readability (informational, read-only).
 if (tables.includes("provider_keys") && counts["provider_keys"] > 0) {
