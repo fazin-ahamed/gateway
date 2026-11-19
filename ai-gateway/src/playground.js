@@ -17,7 +17,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     --bg:oklch(0.14 0.022 236); --surface:oklch(0.215 0.014 236); --surface-hi:oklch(0.262 0.012 240); --surface-deep:oklch(0.28 0.012 238);
     --line:oklch(0.30 0.012 238); --line-hi:oklch(0.4 0.02 240);
     --text:var(--snow); --muted:oklch(0.72 0.02 236); --muted-dim:color-mix(in oklab,var(--muted) 70%,transparent);
-    --accent:oklch(0.66 0.17 236); --accent-dim:color-mix(in oklab,var(--accent) 90%,var(--snow) 10%);
+    --accent:oklch(0.66 0.17 236); --accent-dim:color-mix(in oklab,var(--accent) 90%,var(--snow) 10%); --accent-fg:oklch(0.98 0.01 240);
     --accent-soft:color-mix(in oklab,var(--accent) 18%,transparent); --accent-soft-fg:color-mix(in oklab,var(--accent) 70%,var(--snow) 30%);
     --ink:var(--snow);
     --cool:var(--accent); --cool-soft:var(--accent-soft);
@@ -49,7 +49,7 @@ var PLAYGROUND_HTML = `<!doctype html>
     --bg:oklch(0.975 0.018 232); --surface:var(--white); --surface-hi:oklch(0.957 0.008 236); --surface-deep:oklch(0.94 0.01 236);
     --line:oklch(0.9 0.012 236); --line-hi:oklch(0.8 0.02 238);
     --text:var(--eclipse); --muted:oklch(0.52 0.03 240); --muted-dim:color-mix(in oklab,var(--muted) 70%,transparent);
-    --accent:oklch(0.62 0.17 242); --accent-dim:color-mix(in oklab,var(--accent) 90%,var(--snow) 10%);
+    --accent:oklch(0.62 0.17 242); --accent-dim:color-mix(in oklab,var(--accent) 90%,var(--snow) 10%); --accent-fg:oklch(0.98 0.01 240);
     --accent-soft:color-mix(in oklab,var(--accent) 12%,transparent); --accent-soft-fg:color-mix(in oklab,var(--accent) 80%,var(--eclipse) 20%);
     --ink:var(--eclipse);
     --default:oklch(0.94 0.01 236); --default-hover:color-mix(in oklab,var(--default) 96%,var(--eclipse) 4%);
@@ -295,8 +295,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:2px;border-color:transparent;box-shadow:none}
   button:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   button.act,button.ghost,button.danger{font-size:14px;font-weight:500;border-radius:var(--r-pill);transition:transform 250ms var(--ease-out),background-color var(--dur) var(--ease-out),border-color var(--dur) var(--ease-out),color var(--dur) var(--ease-out)}
-  button.act{padding:9px 16px;background:var(--accent);border:0;color:var(--accent-fg,#fff);box-shadow:none}
-  button.act{color:oklch(100% 0 0)}
+  button.act{padding:9px 16px;background:var(--accent);border:0;color:var(--accent-fg);box-shadow:none}
   button.ghost{padding:9px 16px;background:var(--default);border:0;color:var(--text);box-shadow:none}
   button.danger{padding:9px 14px;background:var(--bad-soft);color:var(--bad-soft-fg)}
   button.act:active,button.ghost:active,button.danger:active,.seg button:active{transform:scale(.97)}
@@ -352,7 +351,7 @@ var PLAYGROUND_HTML = `<!doctype html>
   .switch{position:relative;display:inline-block;width:44px;height:24px;flex:0 0 auto}
   .switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;cursor:pointer;z-index:1}
   .switch span{position:absolute;inset:0;border-radius:var(--r-pill);background:var(--default);border:0;transition:background-color 200ms var(--ease-out)}
-  .switch span:after{content:"";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform 200ms var(--ease-out),background-color 200ms var(--ease-out)}
+  .switch span:after{content:"";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:var(--accent-fg);transition:transform 200ms var(--ease-out),background-color 200ms var(--ease-out)}
   .switch input:checked+span{background:var(--accent)}
   .switch input:checked+span:after{transform:translateX(20px)}
   .switch input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
@@ -427,9 +426,12 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="tokens">Device tokens</button>
   <div class="navgrp">Quality</div>
   <button type="button" data-tab="reliability">Reliability</button>
+  <button type="button" data-tab="detection">Detection</button>
   <button type="button" data-tab="cache">Cache</button>
   <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="chat">Playground</button>
+  <div class="navgrp">System</div>
+  <button type="button" data-tab="storage">Storage</button>
   <button type="button" data-tab="logs">Logs</button>
 </nav>
 <main>
@@ -792,7 +794,7 @@ var PLAYGROUND_HTML = `<!doctype html>
       </div>
     </div>
     <div class="panel">
-      <div class="panel-h"><h2 class="sec">Taste layer</h2><div class="seg" id="rl-mode" role="group" aria-label="Taste layer mode"><button type="button" data-mode="off">Off</button><button type="button" data-mode="annotate">Annotate</button><button type="button" data-mode="enforce">Enforce</button></div></div>
+      <div class="panel-h"><h2 class="sec">Taste layer</h2><div style="display:flex;gap:12px;align-items:center"><label class="switch" aria-label="Neural judge" title="Score relevance, instruction-following and tone with a decision model"><input type="checkbox" id="rl-judge"><span></span></label><div class="seg" id="rl-mode" role="group" aria-label="Taste layer mode"><button type="button" data-mode="off">Off</button><button type="button" data-mode="annotate">Annotate</button><button type="button" data-mode="enforce">Enforce</button></div></div></div>
       <div class="panel-b">
         <p class="rl-help" id="rl-mode-help"></p>
         <div id="rl-taste" style="margin-top:16px"></div>
@@ -801,6 +803,36 @@ var PLAYGROUND_HTML = `<!doctype html>
         <textarea id="rl-style" rows="4" spellcheck="false" placeholder="em dash | \u2014"></textarea>
         <div class="form-actions"><button class="act" id="rl-style-save" type="button">Save rules</button></div>
         <div class="rl-list" id="rl-verdicts"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-detection">
+    <div class="pagehead"><div><h2 class="sec">Detection</h2><p class="sub">Usage patterns that look like model distillation or limit bypass. Passive only: it records and surfaces, it never blocks a request. Evidence is counts and rates, never prompt or response text.</p></div></div>
+    <div class="hero-stats" id="dt-stats"></div>
+    <div class="panel">
+      <div class="panel-h"><h2 class="sec">Active signals</h2><div class="seg" id="dt-filter" role="group" aria-label="Filter by kind"><button type="button" data-kind="" class="on">All</button><button type="button" data-kind="distillation">Distillation</button><button type="button" data-kind="bypass">Bypass</button></div></div>
+      <div class="panel-b flush" id="dt-list"><div class="empty">Loading…</div></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-storage">
+    <div class="pagehead"><div><h2 class="sec">Storage</h2><p class="sub">Optional backup of the database and taste data to an S3-compatible bucket (Backblaze B2). A backup path, not the live store: the gateway always reads and writes SQLite locally.</p></div></div>
+    <div class="panel">
+      <div class="panel-h"><h2 class="sec">S3 bucket</h2><button class="ghost" id="st-test" type="button">Test connection</button></div>
+      <div class="panel-b">
+        <div id="st-status" style="margin-bottom:14px"></div>
+        <p class="small">Configure with environment variables, never here, so the keys cannot be read back out of the admin API:</p>
+        <pre class="lg-pre" style="margin-top:10px">S3_ENDPOINT=https://s3.&lt;region&gt;.backblazeb2.com
+S3_REGION=&lt;region&gt;
+S3_BUCKET=&lt;bucket&gt;
+S3_ACCESS_KEY_ID=&lt;key id&gt;
+S3_SECRET_ACCESS_KEY=&lt;application key&gt;</pre>
+        <div class="form-actions" style="margin-top:16px">
+          <button class="act" id="st-enable" type="button">Enable backups</button>
+          <button class="ghost" id="st-archive" type="button">Back up now</button>
+        </div>
+        <div id="st-out" style="margin-top:14px"></div>
       </div>
     </div>
   </section>
@@ -956,6 +988,7 @@ async function loadReliability(){
   var tEl=document.getElementById('rl-taste');
   if(ta.status===404||!ta.data){ tEl.innerHTML='<div class="empty">The taste layer is not available on this build.</div>'; return; }
   rlSetMode(ta.data.mode||'off');
+  document.getElementById('rl-judge').checked=ta.data.judge!==false;
   document.getElementById('rl-style').value=rlStyleToText(ta.data.style_rules);
   var models=ta.data.models||[];
   tEl.innerHTML=models.length?'<div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>Taste</th><th>Samples</th><th>Rule means</th></tr></thead><tbody>'+models.map(function(m){
@@ -973,6 +1006,12 @@ document.getElementById('rl-tr').addEventListener('change',async function(e){
   toast('Tool-call repair '+(want?'on':'off'),'ok');
 });
 document.getElementById('rl-reset').addEventListener('click',async function(){ await api('/admin/tool-repair',{method:'POST',body:JSON.stringify({reset:true})}); loadReliability(); });
+document.getElementById('rl-judge').addEventListener('change',async function(e){
+  var want=e.target.checked;
+  var r=await api('/admin/taste/judge',{method:'POST',body:JSON.stringify({enabled:want})});
+  if(r.status!==200){ e.target.checked=!want; toast('Could not change the neural judge','err'); return; }
+  toast('Neural judge '+(want?'on':'off'),'ok');
+});
 document.getElementById('rl-mode').addEventListener('click',async function(e){
   var b=e.target.closest('button[data-mode]'); if(!b) return;
   var prev=document.querySelector('#rl-mode button.on');
@@ -984,6 +1023,79 @@ document.getElementById('rl-mode').addEventListener('click',async function(e){
 document.getElementById('rl-style-save').addEventListener('click',async function(){
   var r=await api('/admin/taste',{method:'POST',body:JSON.stringify({style_rules:rlTextToStyle(document.getElementById('rl-style').value)})});
   if(r.status===200) toast('Style rules saved','ok'); else toast((r.data&&r.data.error&&r.data.error.message)||'Could not save rules','err');
+});
+
+// ---------- Detection (passive) ----------
+var dtKind='';
+function sevChip(sev){ var cls=sev==='high'?'bad':sev==='medium'?'warn':'mut'; return '<span class="pill '+cls+'">'+sev+'</span>'; }
+async function loadDetection(){
+  var r=await api('/admin/detection'+(dtKind?('?kind='+dtKind):''));
+  var d=r.data||{feed:[],summary:[]};
+  var stats=document.getElementById('dt-stats');
+  var sum=d.summary||[];
+  var dist=sum.filter(function(s){return s.kind==='distillation';}).length;
+  var byp=sum.filter(function(s){return s.kind==='bypass';}).length;
+  var high=sum.filter(function(s){return s.severity==='high';}).length;
+  stats.innerHTML=[
+    ['Accounts with signals',sum.length],
+    ['Distillation',dist],
+    ['Bypass',byp],
+    ['High severity',high]
+  ].map(function(x){ return '<div class="stat"><div class="k">'+x[0]+'</div><div class="v'+(x[3]&&x[0]==='High severity'?' bad':'')+'">'+fmt(x[1])+'</div></div>'; }).join('');
+  var feed=d.feed||[];
+  var list=document.getElementById('dt-list');
+  if(!feed.length){ list.innerHTML='<div class="empty">No detection events yet. Ordinary usage produces none.</div>'; return; }
+  list.innerHTML='<table><thead><tr><th>Time</th><th>Account</th><th>Kind</th><th>Severity</th><th>Score</th><th>Evidence</th></tr></thead><tbody>'+feed.map(function(ev){
+    var facts=Object.keys(ev.facts||{}).map(function(k){ return esc(k.replace(/_/g,' '))+' '+esc(String(ev.facts[k])); }).join(', ')||'-';
+    return '<tr><td class="mono">'+esc((ev.at||'').slice(5,19).replace('T',' '))+'</td><td class="mono">'+esc(ev.account_id||'-')+'</td><td>'+esc(ev.kind)+'</td><td>'+sevChip(ev.severity)+'</td><td class="mono">'+Number(ev.score).toFixed(2)+'</td><td class="small">'+facts+'</td></tr>';
+  }).join('')+'</tbody></table>';
+}
+document.getElementById('dt-filter').addEventListener('click',function(e){
+  var b=e.target.closest('button[data-kind]'); if(!b) return;
+  document.querySelectorAll('#dt-filter button').forEach(function(x){ x.classList.toggle('on',x===b); });
+  dtKind=b.dataset.kind; loadDetection();
+});
+
+// ---------- Storage (optional S3 backup) ----------
+async function loadStorage(){
+  var r=await api('/admin/storage');
+  var d=r.data||{};
+  var el=document.getElementById('st-status');
+  var en=document.getElementById('st-enable');
+  if(!d.configured){
+    el.innerHTML='<div class="empty">Not configured. Set the environment variables below and restart, then enable backups.</div>';
+    en.disabled=true;
+  } else {
+    el.innerHTML='<div class="bd-edit" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:0">'
+      +'<div><label>Bucket</label><div class="mono">'+esc(d.bucket||'-')+'</div></div>'
+      +'<div><label>Region</label><div class="mono">'+esc(d.region||'-')+'</div></div>'
+      +'<div><label>Endpoint</label><div class="mono">'+esc(d.endpoint||'-')+'</div></div>'
+      +'<div><label>Prefix</label><div class="mono">'+esc(d.prefix||'-')+'</div></div></div>';
+    en.disabled=false;
+    en.textContent=d.enabled?'Disable backups':'Enable backups';
+    en.classList.toggle('act',!d.enabled);
+    en.classList.toggle('danger',!!d.enabled);
+  }
+}
+document.getElementById('st-enable').addEventListener('click',async function(){
+  var cur=(await api('/admin/storage')).data||{};
+  var want=!cur.enabled;
+  var r=await api('/admin/storage',{method:'POST',body:JSON.stringify({enabled:want})});
+  if(r.status===200){ toast('Backups '+(want?'on':'off'),'ok'); loadStorage(); }
+  else toast((r.data&&r.data.error&&r.data.error.message)||'Could not change storage','err');
+});
+document.getElementById('st-test').addEventListener('click',async function(){
+  var out=document.getElementById('st-out'); out.innerHTML='<div class="empty">Testing…</div>';
+  var r=await api('/admin/storage',{method:'POST',body:JSON.stringify({test:true})});
+  var p=r.data&&r.data.probe;
+  out.innerHTML=p?('<div class="'+(p.ok?'ok':'bad')+'">'+(p.ok?'Bucket reachable':'Could not reach the bucket')+': '+esc(p.detail||'')+'</div>'):'<div class="bad">'+esc((r.data&&r.data.error&&r.data.error.message)||'Storage is not configured')+'</div>';
+});
+document.getElementById('st-archive').addEventListener('click',async function(){
+  var out=document.getElementById('st-out'); out.innerHTML='<div class="empty">Backing up…</div>';
+  var r=await api('/admin/storage/archive',{method:'POST'});
+  var d=r.data||{};
+  if(d.ok){ out.innerHTML='<div class="ok">Backed up '+d.archived.length+' objects:<br><span class="mono small">'+d.archived.map(esc).join('<br>')+'</span></div>'; toast('Backup complete','ok'); }
+  else out.innerHTML='<div class="bad">Backup failed: '+esc(d.error||'unknown')+'</div>';
 });
 
 // Arrow keys move between sections when the nav has focus.
@@ -1017,6 +1129,8 @@ async function selectTab(t){
     if(t==='logs') await loadLogs();
     if(t==='budgets') await loadBudgets();
     if(t==='reliability') await loadReliability();
+    if(t==='detection') await loadDetection();
+    if(t==='storage') await loadStorage();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
 document.querySelector('nav').addEventListener('click',function(e){

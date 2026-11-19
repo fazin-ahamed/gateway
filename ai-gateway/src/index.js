@@ -20,6 +20,8 @@ import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { critique, parseStyleRules, updatePosteriors, loadTasteReport, loadAccountTaste, recordVerdict, recentVerdictsFor, noteVerdict, recentVerdicts, retryCritique, judgeWithDecisionModel, mergeJudgeIntoResults, MODES as TASTE_MODES } from "./taste.js";
 import { repairResponseBody, StreamToolAssembler, getToolRepairStats, resetToolRepairStats } from "./tool-response-repair.js";
 import { repairJson } from "./json-repair.js";
+import { observeRequest, loadDetectionFeed, loadDetectionSummary, ensureDetectionSchema } from "./detection.js";
+import { storageConfigured, storageTest, storageArchive } from "./storage.js";
 import { loadSettings as pgLoadSettings, saveSettings as pgSaveSettings, listChats as pgListChats, getChat as pgGetChat, upsertChat as pgUpsertChat, deleteChat as pgDeleteChat, validateChatMessages as pgValidateMessages } from "./playground-store.js";
 import { ensureBudgetSchema, loadAccountBudget, rollingStatus, checkAdmission, settleSpend, getFallbackPrice, setFallbackPrice, fallbackCost, parseBudgetPatch, applyBudgetPatch } from "./budgets.js";
 import { parseProxyImport } from "./proxy-parse.js";
@@ -2588,6 +2590,18 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               _repairFixes = repaired.fixes;
             }
             await recordUsage(c, key, { ...usage, cost_usd: costUsd, request_id: requestId });
+            // Passive detection: body-free facts only, never blocks the request.
+            try {
+              await observeRequest(c.env.DB, {
+                accountId: spendAccountId(key) || "",
+                keyId: key && key.key_id,
+                model: liveSlug,
+                promptChars: 0,
+                ok: 1,
+                status: up.status,
+                ip: String(c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "").split(",")[0].trim()
+              });
+            } catch {}
             await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
             if (cacheKey && isCacheableResponse(clientTxt)) {
               await storeResponseCache(c, {
@@ -3638,6 +3652,19 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   const persistOnce = (async () => {
     const costUsd = await computeCost(c, slug, lastUsage, route.provider_id);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd, request_id: requestId });
+    // Passive detection: body-free facts only, never blocks the request.
+    try {
+      const outcome0 = streamTerminalOutcome({ clientCancelled, streamError, finishSeen });
+      await observeRequest(c.env.DB, {
+        accountId: spendAccountId(key) || "",
+        keyId: key && key.key_id,
+        model: slug,
+        promptChars: 0,
+        ok: outcome0.success ? 1 : 0,
+        status: outcome0.http_status || 0,
+        ip: String(c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "").split(",")[0].trim()
+      });
+    } catch {}
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
     // Terminal outcome, computed once and shared by the route_attempts patch
     // and the trajectory dual-write so both telemetry systems agree.
@@ -5326,6 +5353,7 @@ app.get("/admin/taste", async (c) => {
   if (denied) return denied;
   return c.json({
     mode: await tasteSetting(c, "taste_layer", "annotate"),
+    judge: await tasteJudgeEnabled(c),
     style_rules: JSON.parse(await tasteSetting(c, "taste_style_rules", "[]") || "[]"),
     models: await loadTasteReport(c.env.DB),
     recent: recentVerdicts()
@@ -5396,6 +5424,99 @@ app.post("/admin/taste", async (c) => {
 async function toolRepairEnabled(c) {
   return (await settingValue(c, "tool_repair", "on")) !== "off";
 }
+// ---- Passive detection: the operator's feed. Read-only, never enforcement. ----
+app.get("/admin/detection", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const kind = c.req.query("kind") || null;
+  const accountId = c.req.query("account_id") || null;
+  const limit = Math.min(500, Number(c.req.query("limit")) || 100);
+  return c.json({
+    feed: await loadDetectionFeed(c.env.DB, { limit, kind, accountId }),
+    summary: await loadDetectionSummary(c.env.DB)
+  });
+});
+// Per-account drill-down.
+app.get("/admin/detection/:accountId", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const accountId = String(c.req.param("accountId"));
+  return c.json({
+    account_id: accountId,
+    feed: await loadDetectionFeed(c.env.DB, { accountId, limit: 200 }),
+    summary: (await loadDetectionSummary(c.env.DB)).filter((s) => s.account_id === accountId)
+  });
+});
+
+// ---- Optional S3/Backblaze storage: config, test, enable, status. ----
+// Secrets come from env, never from the request body, so the admin API cannot
+// be used to read them back out.
+app.get("/admin/storage", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const cfg = storageConfigured(c.env);
+  return c.json({
+    enabled: (await settingValue(c, "storage_archive", "off")) === "on",
+    configured: !!cfg,
+    endpoint: cfg ? cfg.endpoint.replace(/^(https?:\/\/)?([^/]+).*/, "$2") : null,
+    bucket: cfg ? cfg.bucket : null,
+    region: cfg ? cfg.region : null,
+    prefix: cfg ? cfg.prefix : null
+  });
+});
+app.post("/admin/storage", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const body = await c.req.json().catch(() => ({}));
+  if (typeof body.enabled === "boolean") {
+    if (body.enabled && !storageConfigured(c.env))
+      return c.json({ error: { message: "Set S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY in the environment first." } }, 400);
+    await c.env.DB.prepare("INSERT INTO gateway_settings (key, value, updated_at) VALUES ('storage_archive', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at").bind(body.enabled ? "on" : "off", nowIso()).run();
+  }
+  if (body.test) {
+    const cfg = storageConfigured(c.env);
+    if (!cfg) return c.json({ error: { message: "Storage is not configured." } }, 400);
+    const probe = await storageTest(cfg);
+    return c.json({ enabled: (await settingValue(c, "storage_archive", "off")) === "on", configured: true, probe });
+  }
+  return c.json({ enabled: (await settingValue(c, "storage_archive", "off")) === "on", configured: !!storageConfigured(c.env) });
+});
+// Manual archive trigger: snapshot the DB + taste data to the bucket now.
+app.post("/admin/storage/archive", async (c) => {
+  const denied = await requireAdmin(c);
+  if (denied) return denied;
+  const cfg = storageConfigured(c.env);
+  if (!cfg) return c.json({ error: { message: "Storage is not configured." } }, 400);
+  const out = await runStorageArchive(c, cfg);
+  return c.json(out);
+});
+
+async function runStorageArchive(c, cfg) {
+  const results = { ok: true, archived: [] };
+  try {
+    const { gzipSync } = await import("node:zlib");
+    // The live SQLite file, snapshotted through the engine so it is consistent.
+    const dbPath = c.env.DB_PATH || (c.env.DB && c.env.DB._path) || null;
+    if (dbPath) {
+      const { readFileSync } = await import("node:fs");
+      const bytes = readFileSync(dbPath);
+      const r = await storageArchive(cfg, "db", gzipSync(bytes), "application/gzip");
+      if (r.ok) results.archived.push(r.key); else { results.ok = false; results.error = r.detail; }
+    }
+    // The taste data as JSON: posteriors + recent verdicts, sanitized by
+    // construction (no prompt or response text is in these tables).
+    const posteriors = await c.env.DB.prepare("SELECT * FROM taste_posteriors").all();
+    const verdicts = await c.env.DB.prepare("SELECT * FROM taste_verdicts ORDER BY id DESC LIMIT 5000").all();
+    const payload = JSON.stringify({ generated_at: new Date().toISOString(), posteriors: posteriors.results || [], verdicts: verdicts.results || [] });
+    const r2 = await storageArchive(cfg, "taste", gzipSync(Buffer.from(payload)), "application/gzip");
+    if (r2.ok) results.archived.push(r2.key); else { results.ok = false; results.error = results.error || r2.detail; }
+  } catch (e) {
+    results.ok = false;
+    results.error = String(e && e.message || e);
+  }
+  return results;
+}
+
 app.get("/admin/tool-repair", async (c) => {
   const denied = await requireAdmin(c);
   if (denied) return denied;
