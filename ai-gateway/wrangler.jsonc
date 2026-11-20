@@ -49,8 +49,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "horizon-edge",
-      "database_id": "955bb1d6-3538-4986-8c81-4ac5d70b535c",
+      "database_name": "gateway-main",
+      "database_id": "caa5453d-6b0d-4cec-aa0b-e9599f244ce3",
       "migrations_dir": "migrations"
     }
   ],
