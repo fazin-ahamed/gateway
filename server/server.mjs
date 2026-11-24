@@ -219,3 +219,19 @@ serve({
   keepAliveTimeout: 7200000,
   maxRequestBodySize: 32 * 1024 * 1024,
 });
+
+// D1 mode batches telemetry writes in memory (server/d1.mjs). Drain the queue
+// before a redeploy or Ctrl-C takes the process, bounded so a wedged D1
+// cannot hold the shutdown open.
+if (D1_CONFIGURED && typeof db.flush === "function") {
+  let draining = false;
+  const drain = (signal) => {
+    if (draining) return;
+    draining = true;
+    Promise.race([db.flush(), new Promise((r) => setTimeout(r, 3000))])
+      .catch(() => {})
+      .finally(() => process.exit(signal === "SIGINT" ? 130 : 0));
+  };
+  process.on("SIGTERM", () => drain("SIGTERM"));
+  process.on("SIGINT", () => drain("SIGINT"));
+}

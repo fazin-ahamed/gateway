@@ -153,3 +153,133 @@ test("createD1Db throws when env is incomplete", () => {
   assert.throws(() => createD1Db({ CLOUDFLARE_API_TOKEN: "t" }), /CLOUDFLARE_ACCOUNT_ID/);
   assert.throws(() => createD1Db({ CLOUDFLARE_API_TOKEN: "t", CLOUDFLARE_ACCOUNT_ID: "a" }), /D1_DATABASE_ID/);
 });
+
+// ---- round-trip reduction: read cache + write-behind batching ----
+
+test("config SELECTs are served from the TTL cache; request-scoped tables never are", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => okQueryResult([{ n: 1 }]) }),
+    async (db, calls) => {
+      const q = () => db.prepare("SELECT slug FROM model_routes WHERE slug=?").bind("a").first();
+      await q(); await q(); await q();
+      assert.equal(calls.length, 1, "three identical config reads cost one HTTP call");
+      await db.prepare("SELECT * FROM api_keys WHERE key_id=?").bind("k").first();
+      await db.prepare("SELECT * FROM api_keys WHERE key_id=?").bind("k").first();
+      assert.equal(calls.length, 3, "api_keys (balance, rate state) is never cached");
+    }
+  );
+});
+
+test("a cached row mutated by the caller does not poison later hits", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => okQueryResult([{ slug: "a" }]) }),
+    async (db) => {
+      const q = () => db.prepare("SELECT slug FROM model_routes").first();
+      const r = await q();
+      r.slug = "mutated";
+      assert.equal((await q()).slug, "a");
+    }
+  );
+});
+
+test("an admin write to a config table invalidates the cache", async () => {
+  await withDb(
+    (call) => ({ status: 200, json: async () => okQueryResult([{ v: 1 }], { changes: 1 }) }),
+    async (db, calls) => {
+      const q = () => db.prepare("SELECT slug FROM model_routes").first();
+      await q(); await q();
+      assert.equal(calls.length, 1);
+      await db.prepare("UPDATE model_routes SET rank=? WHERE slug=?").bind(1, "a").run();
+      await q();
+      assert.equal(calls.length, 3, "write + re-read after invalidation");
+    }
+  );
+});
+
+test("telemetry writes are batched into one /raw call and flushed on demand", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => ({ success: true, result: [] }) }),
+    async (db, calls) => {
+      for (let i = 0; i < 5; i++) {
+        const r = await db.prepare("INSERT INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)").bind("s", "tokens", "b" + i, i).run();
+        assert.equal(r.meta.changes, 1);
+      }
+      await db.prepare("UPDATE router_stats SET n=n+1 WHERE id=?").bind(1).run();
+      assert.equal(calls.length, 0, "nothing hits the network until the flush");
+      await db.flush();
+      assert.equal(calls.length, 1);
+      assert.ok(calls[0].url.endsWith("/raw"));
+      assert.equal(calls[0].body.batch.length, 6);
+      assert.deepEqual(calls[0].body.batch[0].params, ["s", "tokens", "b0", 0]);
+    }
+  );
+});
+
+test("a read of a table with queued writes flushes first (read-your-writes)", async () => {
+  await withDb(
+    (call) => ({ status: 200, json: async () => call.url.endsWith("/raw") ? { success: true, result: [] } : okQueryResult([{ n: 1 }]) }),
+    async (db, calls) => {
+      await db.prepare("INSERT OR IGNORE INTO request_summaries (request_id) VALUES (?)").bind("r1").run();
+      await db.prepare("SELECT COUNT(*) AS n FROM request_summaries").first();
+      assert.equal(calls.length, 2);
+      assert.ok(calls[0].url.endsWith("/raw"), "queued insert lands before the read");
+      assert.ok(calls[1].url.endsWith("/query"));
+    }
+  );
+});
+
+test("money and DELETE writes stay synchronous and report real meta", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => okQueryResult([], { changes: 3, last_row_id: 9 }) }),
+    async (db, calls) => {
+      const spend = await db.prepare("UPDATE api_keys SET used_usd=used_usd+? WHERE key_id=?").bind(1, "k").run();
+      assert.equal(calls.length, 1, "api_keys update is awaited, not deferred");
+      assert.deepEqual(spend.meta, { changes: 3, last_row_id: 9 });
+      const purge = await db.prepare("DELETE FROM trajectories").run();
+      assert.equal(calls.length, 2);
+      assert.equal(purge.meta.changes, 3);
+      const att = await db.prepare("INSERT INTO route_attempts (a) VALUES (?)").bind(1).run();
+      assert.equal(att.meta.last_row_id, 9, "route_attempts last_row_id feeds quality observations");
+    }
+  );
+});
+
+test("the per-request provider status stamp is deferred, and does not flush the config cache", async () => {
+  await withDb(
+    (call) => ({ status: 200, json: async () => call.url.endsWith("/raw") ? { success: true, result: [] } : okQueryResult([{ id: 1 }]) }),
+    async (db, calls) => {
+      const read = () => db.prepare("SELECT id FROM providers WHERE id=?").bind(1).first();
+      await read();
+      await db.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(200, "t", 1).run();
+      // Admin edits (name, enabled) are not deferred: they return meta.changes.
+      await read();
+      assert.equal(calls.length, 2, "one providers read + one flush for the queued stamp; second read is cached");
+      assert.ok(calls[1].url.endsWith("/raw"));
+    }
+  );
+});
+
+test("a failed batch retries each statement alone so one bad row cannot drop the rest", async () => {
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await withDb(
+      (call) => {
+        if (call.url.endsWith("/raw")) return { status: 400, json: async () => ({ success: false, errors: [{ code: 1, message: "batch failed" }] }) };
+        if (call.body.params[0] === "bad") return { status: 400, json: async () => ({ success: false, errors: [{ code: 2, message: "constraint" }] }) };
+        return { status: 200, json: async () => okQueryResult([], { changes: 1 }) };
+      },
+      async (db, calls) => {
+        await db.prepare("INSERT INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)").bind("good1", "t", "b", 1).run();
+        await db.prepare("INSERT INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)").bind("bad", "t", "b", 1).run();
+        await db.prepare("INSERT INTO model_usage (slug, kind, bucket, value) VALUES (?,?,?,?)").bind("good2", "t", "b", 1).run();
+        await db.flush();
+        const solo = calls.filter((c) => c.url.endsWith("/query")).map((c) => c.body.params[0]);
+        assert.deepEqual(solo, ["good1", "bad", "good2"]);
+        assert.equal(db.stats.dropped, 1);
+      }
+    );
+  } finally {
+    console.warn = origWarn;
+  }
+});

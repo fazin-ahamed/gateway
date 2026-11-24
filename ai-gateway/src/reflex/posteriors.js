@@ -29,10 +29,16 @@ const SCHEMA = [
 
 export const REFLEX_SCHEMA = SCHEMA;
 
+// One DDL per db handle: observeReflex calls this on every request, and on D1
+// each statement is an HTTPS round trip.
+const ensured = new WeakSet();
+
 export async function migrateReflexPosteriors(db) {
   if (!db || typeof db.prepare !== "function") return false;
+  if (ensured.has(db)) return true;
   try {
     await db.prepare(SCHEMA).run();
+    ensured.add(db);
     return true;
   } catch (e) {
     return false;

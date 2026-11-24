@@ -420,20 +420,21 @@ function periodStartUtcIso(period, now = /* @__PURE__ */ new Date()) {
     d = 1;
   return new Date(Date.UTC(y, m, d) - GATEWAY_TZ_OFFSET_MIN * 60000).toISOString();
 }
-// Live usage for a slug/kind/period straight from per-request trajectories,
-// so caps count everything captured this period - including spend from
-// before the limit was set. Cache hits are free and excluded.
+// Live usage for a slug/kind/period straight from the request ledger, so caps
+// count everything served this period - including spend from before the limit
+// was set - and keep working with trajectory capture off. Cache hits are free
+// and excluded; the in-flight request's own pending row is not usage yet.
 async function periodUsage(c, slug, kind, period) {
   const start = periodStartUtcIso(period);
   if (kind === "requests") {
     const row = await c.env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM trajectories WHERE slug=? AND created_at>=? AND cache_state IS NULL"
+      "SELECT COUNT(*) AS n FROM request_summaries WHERE public_slug=? AND created_at>=? AND cache_state IS NULL AND status!='pending'"
     ).bind(slug, start).first();
     return Number(row && row.n) || 0;
   }
   const col = kind === "tokens" ? "total_tokens" : "cost_usd";
   const row = await c.env.DB.prepare(
-    "SELECT COALESCE(SUM(" + col + "),0) AS v FROM trajectories WHERE slug=? AND created_at>=? AND cache_state IS NULL"
+    "SELECT COALESCE(SUM(" + col + "),0) AS v FROM request_summaries WHERE public_slug=? AND created_at>=? AND cache_state IS NULL AND status!='pending'"
   ).bind(slug, start).first();
   return Number(row && row.v) || 0;
 }
