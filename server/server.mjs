@@ -15,7 +15,13 @@ import { createD1Db } from "./d1.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
 import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries, migrateConsoleAccounts, migrateRollingBudgets } from "./migrations.mjs";
 
-const PORT = Number(process.env.PORT || 3000);
+// Hosts that cannot inject environment variables (panels with a fixed set of
+// startup fields) read them from a .env file at the repo root instead. Real
+// environment variables still win: loadEnvFile never overwrites existing ones.
+try { process.loadEnvFile(new URL("../.env", import.meta.url)); } catch (e) { if (e.code !== "ENOENT") console.warn("[gateway] .env not loaded:", e.message); }
+
+// SERVER_PORT is what Pterodactyl-based panels (Wispbyte and similar) export for the allocated port.
+const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const DB_PATH = process.env.DB_PATH || "./data/gateway.db";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
