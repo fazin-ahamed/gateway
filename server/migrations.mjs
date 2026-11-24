@@ -137,37 +137,6 @@ export function migrateLatencyShadow(db) {
   }
 }
 
-// New table, created on databases that predate it. Off-by-default path writes
-// it; creating it early is harmless and keeps the shape ready.
-export function migrateZaiConversations(db) {
-  try {
-    db.exec(`CREATE TABLE IF NOT EXISTS zai_conversations (
-      id TEXT PRIMARY KEY,
-      tenant_key TEXT NOT NULL,
-      user_key TEXT,
-      contract_hash TEXT NOT NULL,
-      provider_id INTEGER NOT NULL,
-      provider_key_id INTEGER NOT NULL,
-      canonical_model_id TEXT,
-      upstream_chat_id TEXT NOT NULL,
-      message_count INTEGER NOT NULL,
-      chain_hash TEXT NOT NULL,
-      revision INTEGER NOT NULL DEFAULT 0,
-      state TEXT NOT NULL DEFAULT 'ready',
-      lease_id TEXT,
-      lease_expires_at TEXT,
-      created_at TEXT NOT NULL,
-      last_used_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    )`);
-    db.exec("CREATE INDEX IF NOT EXISTS idx_zai_conv_match ON zai_conversations(tenant_key, user_key, chain_hash, message_count)");
-    return true;
-  } catch (e) {
-    console.warn("[gateway] zai conversations migration skipped:", e.message);
-    return false;
-  }
-}
-
 // model_routes becomes typed: a decision model is an ordinary route that
 // answers a structured endpoint, not a second routing system. Existing
 // databases keep the old shape because CREATE TABLE IF NOT EXISTS is a no-op,

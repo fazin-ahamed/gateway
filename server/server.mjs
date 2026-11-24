@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { createDb } from "./db.mjs";
 import { createD1Db } from "./d1.mjs";
 import { guardToolLoopResponse } from "./tool-loop-guard.mjs";
-import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateZaiConversations, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries, migrateConsoleAccounts, migrateRollingBudgets } from "./migrations.mjs";
+import { migratePrices, migrateQualityIdentity, migrateRouteAttemptsV2, migrateLatencyShadow, migrateModelRouteKinds, migrateConsoleSessions, migrateRequestSummaries, migrateConsoleAccounts, migrateRollingBudgets } from "./migrations.mjs";
 
 // Hosts that cannot inject environment variables (panels with a fixed set of
 // startup fields) read them from a .env file at the repo root instead. Real
@@ -39,67 +39,83 @@ const D1_CONFIGURED = !!(process.env.D1_DATABASE_ID && process.env.CLOUDFLARE_AP
 const db = D1_CONFIGURED
   ? (console.log("[gateway] D1 datastore:", process.env.D1_DATABASE_ID), createD1Db(process.env))
   : createDb(DB_PATH);
+if (D1_CONFIGURED) {
+  // Fail fast with a readable reason: a rejected token otherwise surfaces later
+  // as an unhandled rejection on the first request that touches the database.
+  try {
+    await db.prepare("SELECT 1 AS ok").first();
+  } catch (e) {
+    console.error("[gateway] D1 is configured but rejected the credentials: " + e.message + (e.code ? " (code " + e.code + ")" : ""));
+    console.error("[gateway] Check CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, and that CLOUDFLARE_API_TOKEN has Account > D1 > Edit.");
+    process.exit(1);
+  }
+}
 try {
   const schema = readFileSync(new URL("../ai-gateway/schema.sql", import.meta.url), "utf8");
   await db.exec(schema);
 } catch (e) {
   console.warn("[gateway] schema auto-apply skipped:", e.message);
 }
-// Migrations for DBs created before the (slug, kind, period) limit shape.
-// into the new shape (preserving old rows as requests/minute + tokens/day).
-try {
-  const cols = db.prepare("PRAGMA table_info(model_limits)").all();
-  if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "kind")) {
-    const old = db.prepare("SELECT slug, requests_per_minute, max_total_tokens, updated_at FROM model_limits").all().results || [];
-    db.exec("DROP TABLE model_limits");
-    db.exec("CREATE TABLE model_limits (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL, kind TEXT NOT NULL, period TEXT NOT NULL, limit_value REAL NOT NULL, updated_at TEXT NOT NULL, UNIQUE(slug, kind, period))");
-    for (const row of old) {
-      if (row.requests_per_minute) db.prepare("INSERT OR IGNORE INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)").bind(row.slug, "requests", "minute", row.requests_per_minute, row.updated_at).run();
-      if (row.max_total_tokens) db.prepare("INSERT OR IGNORE INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)").bind(row.slug, "tokens", "day", row.max_total_tokens, row.updated_at).run();
+// Legacy in-place migrations exist for old local SQLite files whose tables predate later
+// columns. They are synchronous, and several use BEGIN/SAVEPOINT, which cannot span
+// separate D1 HTTP requests. A D1 database is created from schema.sql plus the wrangler
+// migrations, so it never needs them.
+if (!D1_CONFIGURED) {
+  // Migrations for DBs created before the (slug, kind, period) limit shape.
+  // into the new shape (preserving old rows as requests/minute + tokens/day).
+  try {
+    const cols = db.prepare("PRAGMA table_info(model_limits)").all();
+    if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "kind")) {
+      const old = db.prepare("SELECT slug, requests_per_minute, max_total_tokens, updated_at FROM model_limits").all().results || [];
+      db.exec("DROP TABLE model_limits");
+      db.exec("CREATE TABLE model_limits (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL, kind TEXT NOT NULL, period TEXT NOT NULL, limit_value REAL NOT NULL, updated_at TEXT NOT NULL, UNIQUE(slug, kind, period))");
+      for (const row of old) {
+        if (row.requests_per_minute) db.prepare("INSERT OR IGNORE INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)").bind(row.slug, "requests", "minute", row.requests_per_minute, row.updated_at).run();
+        if (row.max_total_tokens) db.prepare("INSERT OR IGNORE INTO model_limits (slug, kind, period, limit_value, updated_at) VALUES (?,?,?,?,?)").bind(row.slug, "tokens", "day", row.max_total_tokens, row.updated_at).run();
+      }
+      console.warn("[gateway] migrated model_limits to (slug,kind,period):", old.length, "rows");
     }
-    console.warn("[gateway] migrated model_limits to (slug,kind,period):", old.length, "rows");
+  } catch (e) {
+    console.warn("[gateway] model_limits migration skipped:", e.message);
   }
-} catch (e) {
-  console.warn("[gateway] model_limits migration skipped:", e.message);
+  // Operator off-switch: providers created before this column existed were all
+  // implicitly enabled. Guarded by pragma_table_info because a duplicate ADD
+  // COLUMN raises in SQLite.
+  try {
+    const cols = db.prepare("PRAGMA table_info(providers)").all();
+    if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "enabled")) {
+      db.exec("ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1");
+      console.warn("[gateway] migration: added providers.enabled");
+    }
+  } catch (e) {
+    console.warn("[gateway] providers.enabled migration skipped:", e.message);
+  }
+  // Multi-key providers: add key_strategy column and seed provider_keys
+  // from the legacy single api_key column when the pool is empty.
+  try {
+    const cols = db.prepare("PRAGMA table_info(providers)").all();
+    if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "key_strategy")) {
+      db.exec("ALTER TABLE providers ADD COLUMN key_strategy TEXT NOT NULL DEFAULT 'round_robin'");
+      console.warn("[gateway] added providers.key_strategy");
+    }
+    const seeded = db.prepare("SELECT p.id, p.api_key FROM providers p WHERE p.api_key IS NOT NULL AND p.api_key <> '' AND NOT EXISTS (SELECT 1 FROM provider_keys pk WHERE pk.provider_id=p.id)").all().results || [];
+    for (const row of seeded) {
+      db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(row.id, row.api_key, "primary", new Date().toISOString().replace(".000", "")).run();
+    }
+    if (seeded.length)
+      console.warn("[gateway] seeded provider_keys from legacy api_key:", seeded.length, "providers");
+  } catch (e) {
+    console.warn("[gateway] provider_keys migration skipped:", e.message);
+  }
+  migrateQualityIdentity(db);
+  migrateRouteAttemptsV2(db);
+  migrateLatencyShadow(db);
+  migrateModelRouteKinds(db);
+  migrateConsoleSessions(db);
+  migrateRequestSummaries(db);
+  migrateConsoleAccounts(db);
+  migrateRollingBudgets(db);
 }
-// Operator off-switch: providers created before this column existed were all
-// implicitly enabled. Guarded by pragma_table_info because a duplicate ADD
-// COLUMN raises in SQLite.
-try {
-  const cols = db.prepare("PRAGMA table_info(providers)").all();
-  if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "enabled")) {
-    db.exec("ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1");
-    console.warn("[gateway] migration: added providers.enabled");
-  }
-} catch (e) {
-  console.warn("[gateway] providers.enabled migration skipped:", e.message);
-}
-// Multi-key providers: add key_strategy column and seed provider_keys
-// from the legacy single api_key column when the pool is empty.
-try {
-  const cols = db.prepare("PRAGMA table_info(providers)").all();
-  if (cols.results && cols.results.length && !cols.results.some((c) => c.name === "key_strategy")) {
-    db.exec("ALTER TABLE providers ADD COLUMN key_strategy TEXT NOT NULL DEFAULT 'round_robin'");
-    console.warn("[gateway] added providers.key_strategy");
-  }
-  const seeded = db.prepare("SELECT p.id, p.api_key FROM providers p WHERE p.api_key IS NOT NULL AND p.api_key <> '' AND NOT EXISTS (SELECT 1 FROM provider_keys pk WHERE pk.provider_id=p.id)").all().results || [];
-  for (const row of seeded) {
-    db.prepare("INSERT INTO provider_keys (provider_id, api_key, label, enabled, created_at) VALUES (?,?,?,1,?)").bind(row.id, row.api_key, "primary", new Date().toISOString().replace(".000", "")).run();
-  }
-  if (seeded.length)
-    console.warn("[gateway] seeded provider_keys from legacy api_key:", seeded.length, "providers");
-} catch (e) {
-  console.warn("[gateway] provider_keys migration skipped:", e.message);
-}
-migrateQualityIdentity(db);
-migrateRouteAttemptsV2(db);
-migrateLatencyShadow(db);
-migrateZaiConversations(db);
-migrateModelRouteKinds(db);
-migrateConsoleSessions(db);
-migrateRequestSummaries(db);
-migrateConsoleAccounts(db);
-migrateRollingBudgets(db);
 const env = {
   DB: db,
   ADMIN_TOKEN,
