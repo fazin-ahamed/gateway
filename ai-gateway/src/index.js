@@ -15,10 +15,9 @@ import { applyToolRepairPolicyToPayload } from "./tool-repair.js";
 import { critique, parseStyleRules, updatePosteriors, loadTasteReport, loadAccountTaste, recordVerdict, recentVerdictsFor, noteVerdict, recentVerdicts, retryCritique, judgeWithDecisionModel, mergeJudgeIntoResults, MODES as TASTE_MODES } from "./taste.js";
 import { repairResponseBody, StreamToolAssembler, getToolRepairStats, resetToolRepairStats } from "./tool-response-repair.js";
 import { repairJson } from "./json-repair.js";
-import { observeRequest, loadDetectionFeed, loadDetectionSummary, ensureDetectionSchema } from "./detection.js";
 import { storageConfigured, storageTest, storageArchive } from "./storage.js";
 import { loadSettings as pgLoadSettings, saveSettings as pgSaveSettings, listChats as pgListChats, getChat as pgGetChat, upsertChat as pgUpsertChat, deleteChat as pgDeleteChat, validateChatMessages as pgValidateMessages } from "./playground-store.js";
-import { ensureBudgetSchema, loadAccountBudget, rollingStatus, checkAdmission, settleSpend, getFallbackPrice, setFallbackPrice, fallbackCost, parseBudgetPatch, applyBudgetPatch } from "./budgets.js";
+import { ensureBudgetSchema, loadAccountBudget, rollingStatus, checkAdmissionFor, settleSpend, getFallbackPrice, setFallbackPrice, fallbackCost, parseBudgetPatch, applyBudgetPatch } from "./budgets.js";
 import { parseProxyImport } from "./proxy-parse.js";
 import { exportVeyDataset } from "./export/vey-serve.js";
 import { migrateReflexPosteriors, observePosterior } from "./reflex/posteriors.js";
@@ -2577,18 +2576,6 @@ async function runChatCompletion(c, key, isAdminPlayground) {
               _repairFixes = repaired.fixes;
             }
             await recordUsage(c, key, { ...usage, cost_usd: costUsd, request_id: requestId });
-            // Passive detection: body-free facts only, never blocks the request.
-            try {
-              await observeRequest(c.env.DB, {
-                accountId: spendAccountId(key) || "",
-                keyId: key && key.key_id,
-                model: liveSlug,
-                promptChars: 0,
-                ok: 1,
-                status: up.status,
-                ip: String(c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "").split(",")[0].trim()
-              });
-            } catch {}
             await recordModelUsage(c, liveSlug, usage.total_tokens, costUsd);
             if (cacheKey && isCacheableResponse(clientTxt)) {
               await storeResponseCache(c, {
@@ -3571,19 +3558,6 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
   const persistOnce = (async () => {
     const costUsd = await computeCost(c, slug, lastUsage, route.provider_id);
     await recordUsage(c, key, { ...lastUsage, cost_usd: costUsd, request_id: requestId });
-    // Passive detection: body-free facts only, never blocks the request.
-    try {
-      const outcome0 = streamTerminalOutcome({ clientCancelled, streamError, finishSeen });
-      await observeRequest(c.env.DB, {
-        accountId: spendAccountId(key) || "",
-        keyId: key && key.key_id,
-        model: slug,
-        promptChars: 0,
-        ok: outcome0.success ? 1 : 0,
-        status: outcome0.http_status || 0,
-        ip: String(c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "").split(",")[0].trim()
-      });
-    } catch {}
     await recordModelUsage(c, slug, lastUsage.total_tokens, costUsd);
     // Terminal outcome, computed once and shared by the route_attempts patch
     // and the trajectory dual-write so both telemetry systems agree.
@@ -3635,10 +3609,11 @@ async function handleStream(c, upReq, key, slug, route, requestId, payload, star
       if (outcome.observe) {
         try {
           const scopeId = "route:" + (route.id ?? "?");
-          await updateRouterStat(c, "route", scopeId, "", outcome.success === 1, attLatency, costUsd);
-          if (extra.attemptTaskType)
-            await updateRouterStat(c, "route_task", scopeId, extra.attemptTaskType, outcome.success === 1, attLatency, costUsd);
-          await observeReflex(c, route.id, extra.attemptTaskType || "", outcome.success === 1, attLatency, costUsd);
+          await Promise.all([
+            updateRouterStat(c, "route", scopeId, "", outcome.success === 1, attLatency, costUsd),
+            extra.attemptTaskType ? updateRouterStat(c, "route_task", scopeId, extra.attemptTaskType, outcome.success === 1, attLatency, costUsd) : null,
+            observeReflex(c, route.id, extra.attemptTaskType || "", outcome.success === 1, attLatency, costUsd)
+          ]);
         } catch (e) {
           blog("route_attempt stream posterior failed: " + String(e.message || e));
         }
@@ -5215,9 +5190,13 @@ async function tasteVerdict(c, payload, bodyText, styleRules, servedSlug, key) {
   const wantsJson = !!(payload && payload.response_format && (payload.response_format.type === "json_object" || payload.response_format.type === "json_schema"));
   const hasTools = !!(payload && Array.isArray(payload.tools) && payload.tools.length);
   verdict.results = await applyTasteJudge(c, verdict.results, { responseText: textForJudge(choice.message && choice.message.content), wantsJson, hasTools });
-  await updatePosteriors(c.env.DB, slug, verdict.results, "", accountId);
+  // Posteriors and the verdict log are independent tables; persist both in one
+  // wave rather than two sequential awaits.
+  await Promise.all([
+    updatePosteriors(c.env.DB, slug, verdict.results, "", accountId),
+    recordVerdict(c.env.DB, accountId, slug, verdict)
+  ]);
   noteVerdict(slug, verdict, accountId);
-  await recordVerdict(c.env.DB, accountId, slug, verdict);
   return { verdict, obj };
 }
 // One bounded retry through the normal stack with the critique appended as a
@@ -5319,30 +5298,6 @@ app.post("/admin/taste", async (c) => {
 async function toolRepairEnabled(c) {
   return (await settingValue(c, "tool_repair", "on")) !== "off";
 }
-// ---- Passive detection: the operator's feed. Read-only, never enforcement. ----
-app.get("/admin/detection", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied) return denied;
-  const kind = c.req.query("kind") || null;
-  const accountId = c.req.query("account_id") || null;
-  const limit = Math.min(500, Number(c.req.query("limit")) || 100);
-  return c.json({
-    feed: await loadDetectionFeed(c.env.DB, { limit, kind, accountId }),
-    summary: await loadDetectionSummary(c.env.DB)
-  });
-});
-// Per-account drill-down.
-app.get("/admin/detection/:accountId", async (c) => {
-  const denied = await requireAdmin(c);
-  if (denied) return denied;
-  const accountId = String(c.req.param("accountId"));
-  return c.json({
-    account_id: accountId,
-    feed: await loadDetectionFeed(c.env.DB, { accountId, limit: 200 }),
-    summary: (await loadDetectionSummary(c.env.DB)).filter((s) => s.account_id === accountId)
-  });
-});
-
 // ---- Optional S3/Backblaze storage: config, test, enable, status. ----
 // Secrets come from env, never from the request body, so the admin API cannot
 // be used to read them back out.
@@ -5456,11 +5411,12 @@ async function recordUsage(c, key, usage) {
   const acctId = spendAccountId(key);
 
   if (acctId) {
-    const owner = await c.env.DB.prepare("SELECT key_id FROM console_accounts WHERE key_id=?").bind(acctId).first();
-    if (owner) {
-      await c.env.DB.prepare(
-        "UPDATE console_accounts SET used_tokens=used_tokens+?, used_usd=used_usd+? WHERE key_id=?"
-      ).bind(usage.total_tokens, usage.cost_usd || 0, acctId).run();
+    // One conditional UPDATE replaces the owner-existence probe: zero changed
+    // rows means this id is not a console account, so nothing else to settle.
+    const upd = await c.env.DB.prepare(
+      "UPDATE console_accounts SET used_tokens=used_tokens+?, used_usd=used_usd+? WHERE key_id=?"
+    ).bind(usage.total_tokens, usage.cost_usd || 0, acctId).run();
+    if (Number(upd && upd.meta && upd.meta.changes) > 0) {
       try {
         await settleSpend(c.env.DB, { accountId: acctId, keyId: key.key_id, requestId: usage.request_id, usd: usage.cost_usd || 0 });
       } catch (e) {
@@ -5687,10 +5643,13 @@ async function recordRouteAttempt(c, a) {
     if ((a.success || a.health_impact) && !a.deferPosterior) {
       const ok = !!a.success;
       const scopeId = "route:" + (a.route_id ?? "?");
-      await updateRouterStat(c, "route", scopeId, "", ok, a.latency_ms, a.actual_cost_usd);
-      if (a.task_type)
-        await updateRouterStat(c, "route_task", scopeId, a.task_type, ok, a.latency_ms, a.actual_cost_usd);
-      await observeReflex(c, a.route_id, a.task_type, ok, a.latency_ms, a.actual_cost_usd);
+      // Three independent posterior rows (route, route_task, reflex): distinct
+      // lock keys and tables, so persist them in one wave, not three awaits.
+      await Promise.all([
+        updateRouterStat(c, "route", scopeId, "", ok, a.latency_ms, a.actual_cost_usd),
+        a.task_type ? updateRouterStat(c, "route_task", scopeId, a.task_type, ok, a.latency_ms, a.actual_cost_usd) : null,
+        observeReflex(c, a.route_id, a.task_type, ok, a.latency_ms, a.actual_cost_usd)
+      ]);
     }
     // Quality observations are a separate channel from the operational
     // posterior: only attempts carrying real answer evidence emit anything,
@@ -6010,14 +5969,23 @@ async function authClient(c) {
   // The console_accounts row is the authority; without one, no cap applies.
   const capAccountId = spendAccountId(key);
   if (capAccountId) {
-    const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit, used_usd, used_tokens FROM console_accounts WHERE key_id=?").bind(capAccountId).first();
+    // One read carries both the hard spend-limit columns and the rolling-window
+    // columns, so the two budget checks share it instead of querying twice.
+    const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit, used_usd, used_tokens, budget_daily_usd, budget_monthly_usd, credits_usd FROM console_accounts WHERE key_id=?").bind(capAccountId).first();
     if (account && account.budget_limit != null) {
       const spent = account.budget_mode === "tokens" ? Number(account.used_tokens) || 0 : Number(account.used_usd) || 0;
       if (spent >= Number(account.budget_limit))
         return c.json({ error: { message: "Account spend limit reached.", type: "budget_exceeded" } }, 429);
     }
     // Rolling 24h / 30d windows, with prepaid credits covering a spent window.
-    const admission = await checkAdmission(c.env.DB, capAccountId);
+    // Reuse the row above; no cap configured and no credits means the window
+    // queries are skipped entirely inside windowStatuses.
+    const admission = await checkAdmissionFor(c.env.DB, account && {
+      key_id: capAccountId,
+      budget_daily_usd: account.budget_daily_usd,
+      budget_monthly_usd: account.budget_monthly_usd,
+      credits_usd: account.credits_usd
+    });
     if (!admission.allowed) {
       const blocked = admission.status.windows.find((w) => w.id === admission.window);
       return c.json({

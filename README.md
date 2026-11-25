@@ -42,9 +42,13 @@ it.
 - **Model-integrity probes.** Verify a slug actually serves the model it
   claims, against reference tokenizers and routing fingerprints, so a reseller
   relaying cheap weights behind a frontier name gets caught.
-- **Privacy by construction.** The taste posteriors and the persisted verdict
-  history store rule names, scores, model, route and account only. Prompts and
-  responses never reach the learning tables.
+- **Optional S3 backup.** Snapshot the database and taste data to a
+  Backblaze B2 (or any S3-compatible) bucket on a schedule, so a reclaimed
+  host does not take the measurements with it. Off by default; a backup path,
+  not the live store.
+- **Privacy by construction.** The taste posteriors and the verdict history
+  store rule names, scores, counts, model, route and account only. Prompts
+  and responses never reach either of them.
 
 ## The gateway
 

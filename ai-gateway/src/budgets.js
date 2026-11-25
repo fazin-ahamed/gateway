@@ -67,20 +67,38 @@ export async function loadAccountBudget(db, accountId) {
   };
 }
 
-// Spent and reset time for one window.
-async function windowSpend(db, accountId, hours, nowMs) {
-  const since = new Date(nowMs - hours * HOUR_MS).toISOString();
+// Spent and reset time for both windows in one indexed pass. The two SUMs
+// differ only by their cutoff, so a single scan over (account_id, at) with a
+// conditional aggregate replaces two round trips on the hot path.
+async function windowSpends(db, accountId, nowMs) {
+  const oldest = new Date(nowMs - Math.max(...WINDOWS.map((w) => w.hours)) * HOUR_MS).toISOString();
   const row = await db.prepare(
-    "SELECT COALESCE(SUM(usd),0) AS spent, MIN(CASE WHEN usd > 0 THEN at END) AS first_at FROM spend_events WHERE account_id=? AND at > ?"
-  ).bind(accountId, since).first();
-  return { spent: money(row && row.spent), firstAt: row && row.first_at ? String(row.first_at) : null };
+    "SELECT " + WINDOWS.map((w) => {
+      const cutoff = new Date(nowMs - w.hours * HOUR_MS).toISOString();
+      return `COALESCE(SUM(CASE WHEN at > '${cutoff}' THEN usd END),0) AS spent_${w.id}, ` +
+        `MIN(CASE WHEN at > '${cutoff}' AND usd > 0 THEN at END) AS first_${w.id}`;
+    }).join(", ") + " FROM spend_events WHERE account_id=? AND at > ?"
+  ).bind(accountId, oldest).first();
+  return Object.fromEntries(WINDOWS.map((w) => [w.id, {
+    spent: money(row && row["spent_" + w.id]),
+    firstAt: row && row["first_" + w.id] ? String(row["first_" + w.id]) : null
+  }]));
 }
 
 export async function windowStatuses(db, budget, nowMs = Date.now()) {
+  // No caps configured and no credits to cover an overshoot: the windows are
+  // all "uncapped, unlimited", so skip the spend scan entirely.
+  if (WINDOWS.every((w) => capOf(budget, w.column) == null) && !(budget.credits_usd > 0)) {
+    return WINDOWS.map((w) => ({
+      id: w.id, label: w.label, hours: w.hours,
+      limit_usd: null, spent_usd: 0, remaining_usd: null, resets_at: null, resets_in_s: null
+    }));
+  }
+  const spends = await windowSpends(db, budget.key_id, nowMs);
   const out = [];
   for (const w of WINDOWS) {
     const limit = capOf(budget, w.column);
-    const { spent, firstAt } = await windowSpend(db, budget.key_id, w.hours, nowMs);
+    const { spent, firstAt } = spends[w.id];
     let resetsAt = null;
     let resetsIn = null;
     if (firstAt && spent > 0) {
@@ -110,8 +128,9 @@ export function bindingOf(windows, credits) {
   return credits > 0 ? "credits" : "exhausted";
 }
 
-export async function rollingStatus(db, accountId, nowMs = Date.now()) {
-  const budget = await loadAccountBudget(db, accountId);
+// Status from an already-loaded budget row, so the auth path can reuse the
+// account it read for the spend-limit check instead of re-querying it.
+export async function rollingStatusFor(db, budget, nowMs = Date.now()) {
   if (!budget) return null;
   const windows = await windowStatuses(db, budget, nowMs);
   return {
@@ -122,10 +141,13 @@ export async function rollingStatus(db, accountId, nowMs = Date.now()) {
   };
 }
 
-// Decide whether the next request may start. Accounts with no cap set are
-// never blocked here, whatever their credit balance.
-export async function checkAdmission(db, accountId, nowMs = Date.now()) {
-  const status = await rollingStatus(db, accountId, nowMs);
+export async function rollingStatus(db, accountId, nowMs = Date.now()) {
+  return rollingStatusFor(db, await loadAccountBudget(db, accountId), nowMs);
+}
+
+// Decide whether the next request may start from a preloaded budget row.
+export async function checkAdmissionFor(db, budget, nowMs = Date.now()) {
+  const status = await rollingStatusFor(db, budget, nowMs);
   if (!status || status.binding === "none" || status.binding === "window" || status.binding === "credits")
     return { allowed: true, status };
   const blocked = status.windows
@@ -138,6 +160,10 @@ export async function checkAdmission(db, accountId, nowMs = Date.now()) {
     resets_at: blocked.resets_at,
     retry_after_s: Math.max(1, blocked.resets_in_s ?? 60)
   };
+}
+
+export async function checkAdmission(db, accountId, nowMs = Date.now()) {
+  return checkAdmissionFor(db, await loadAccountBudget(db, accountId), nowMs);
 }
 
 // Record spend and move any overshoot onto credits. Overflow is measured

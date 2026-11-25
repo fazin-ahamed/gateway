@@ -242,24 +242,34 @@ export async function updatePosteriors(db, slug, results, route, accountId) {
     if (r.pass) cur.pass++; else cur.fail++;
     folded.set(r.rule, cur);
   }
-  for (const [rule, n] of folded) {
-    // Decay old evidence toward the prior before adding new observations.
-    const existing = await db.prepare("SELECT alpha, beta, updated_at FROM taste_posteriors WHERE slug=? AND rule=? AND route=? AND account_id=?")
-      .bind(slug, rule, route, accountId).first();
+  const rules = [...folded.keys()];
+  // Read every rule's current posterior up front (concurrently), then write.
+  // Each (slug, rule, route, account) key is distinct, so batching the reads
+  // before the writes preserves the read-modify-write semantics of the old
+  // per-rule loop while collapsing N sequential round trips into one wave.
+  const existing = await Promise.all(rules.map((rule) =>
+    Promise.resolve(
+      db.prepare("SELECT alpha, beta, updated_at FROM taste_posteriors WHERE slug=? AND rule=? AND route=? AND account_id=?")
+        .bind(slug, rule, route, accountId).first()
+    ).catch(() => null)
+  ));
+  await Promise.all(rules.map((rule, i) => {
+    const prev = existing[i];
+    const n = folded.get(rule);
     let alpha = 1, beta = 1;
-    if (existing) {
-      const ageMs = Date.now() - new Date(existing.updated_at).getTime();
+    if (prev) {
+      const ageMs = Date.now() - new Date(prev.updated_at).getTime();
       const halfLives = ageMs / DECAY_HALF_LIFE_MS;
       const decay = Math.pow(0.5, halfLives);
-      alpha = 1 + (Number(existing.alpha) - 1) * decay;
-      beta = 1 + (Number(existing.beta) - 1) * decay;
+      alpha = 1 + (Number(prev.alpha) - 1) * decay;
+      beta = 1 + (Number(prev.beta) - 1) * decay;
     }
     alpha += n.pass;
     beta += n.fail;
-    await db.prepare(
+    return Promise.resolve(db.prepare(
       "INSERT INTO taste_posteriors (slug, rule, route, account_id, alpha, beta, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(slug, rule, route, account_id) DO UPDATE SET alpha=excluded.alpha, beta=excluded.beta, updated_at=excluded.updated_at"
-    ).bind(slug, rule, route, accountId, alpha, beta, at).run();
-  }
+    ).bind(slug, rule, route, accountId, alpha, beta, at).run()).catch(() => {});
+  }));
 }
 
 // Per-account profile for the console: the account's rule means across

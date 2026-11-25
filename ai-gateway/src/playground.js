@@ -425,7 +425,6 @@ var PLAYGROUND_HTML = `<!doctype html>
   <button type="button" data-tab="prices">Prices</button>
   <div class="navgrp">Quality</div>
   <button type="button" data-tab="reliability">Reliability</button>
-  <button type="button" data-tab="detection">Detection</button>
   <button type="button" data-tab="cache">Cache</button>
   <button type="button" data-tab="trajectories">Trajectories</button>
   <button type="button" data-tab="chat">Playground</button>
@@ -793,14 +792,6 @@ var PLAYGROUND_HTML = `<!doctype html>
     </div>
   </section>
 
-  <section class="tab" id="tab-detection">
-    <div class="pagehead"><div><h2 class="sec">Detection</h2><p class="sub">Usage patterns that look like model distillation or limit bypass. Passive only: it records and surfaces, it never blocks a request. Evidence is counts and rates, never prompt or response text.</p></div></div>
-    <div class="hero-stats" id="dt-stats"></div>
-    <div class="panel">
-      <div class="panel-h"><h2 class="sec">Active signals</h2><div class="seg" id="dt-filter" role="group" aria-label="Filter by kind"><button type="button" data-kind="" class="on">All</button><button type="button" data-kind="distillation">Distillation</button><button type="button" data-kind="bypass">Bypass</button></div></div>
-      <div class="panel-b flush" id="dt-list"><div class="empty">Loading…</div></div>
-    </div>
-  </section>
 
   <section class="tab" id="tab-storage">
     <div class="pagehead"><div><h2 class="sec">Storage</h2><p class="sub">Optional backup of the database and taste data to an S3-compatible bucket (Backblaze B2). A backup path, not the live store: the gateway always reads and writes SQLite locally.</p></div></div>
@@ -1011,37 +1002,6 @@ document.getElementById('rl-style-save').addEventListener('click',async function
   if(r.status===200) toast('Style rules saved','ok'); else toast((r.data&&r.data.error&&r.data.error.message)||'Could not save rules','err');
 });
 
-// ---------- Detection (passive) ----------
-var dtKind='';
-function sevChip(sev){ var cls=sev==='high'?'bad':sev==='medium'?'warn':'mut'; return '<span class="pill '+cls+'">'+sev+'</span>'; }
-async function loadDetection(){
-  var r=await api('/admin/detection'+(dtKind?('?kind='+dtKind):''));
-  var d=r.data||{feed:[],summary:[]};
-  var stats=document.getElementById('dt-stats');
-  var sum=d.summary||[];
-  var dist=sum.filter(function(s){return s.kind==='distillation';}).length;
-  var byp=sum.filter(function(s){return s.kind==='bypass';}).length;
-  var high=sum.filter(function(s){return s.severity==='high';}).length;
-  stats.innerHTML=[
-    ['Accounts with signals',sum.length],
-    ['Distillation',dist],
-    ['Bypass',byp],
-    ['High severity',high]
-  ].map(function(x){ return '<div class="stat"><div class="k">'+x[0]+'</div><div class="v'+(x[3]&&x[0]==='High severity'?' bad':'')+'">'+fmt(x[1])+'</div></div>'; }).join('');
-  var feed=d.feed||[];
-  var list=document.getElementById('dt-list');
-  if(!feed.length){ list.innerHTML='<div class="empty">No detection events yet. Ordinary usage produces none.</div>'; return; }
-  list.innerHTML='<table><thead><tr><th>Time</th><th>Account</th><th>Kind</th><th>Severity</th><th>Score</th><th>Evidence</th></tr></thead><tbody>'+feed.map(function(ev){
-    var facts=Object.keys(ev.facts||{}).map(function(k){ return esc(k.replace(/_/g,' '))+' '+esc(String(ev.facts[k])); }).join(', ')||'-';
-    return '<tr><td class="mono">'+esc((ev.at||'').slice(5,19).replace('T',' '))+'</td><td class="mono">'+esc(ev.account_id||'-')+'</td><td>'+esc(ev.kind)+'</td><td>'+sevChip(ev.severity)+'</td><td class="mono">'+Number(ev.score).toFixed(2)+'</td><td class="small">'+facts+'</td></tr>';
-  }).join('')+'</tbody></table>';
-}
-document.getElementById('dt-filter').addEventListener('click',function(e){
-  var b=e.target.closest('button[data-kind]'); if(!b) return;
-  document.querySelectorAll('#dt-filter button').forEach(function(x){ x.classList.toggle('on',x===b); });
-  dtKind=b.dataset.kind; loadDetection();
-});
-
 // ---------- Storage (optional S3 backup) ----------
 async function loadStorage(){
   var r=await api('/admin/storage');
@@ -1114,7 +1074,6 @@ async function selectTab(t){
     if(t==='logs') await loadLogs();
     if(t==='budgets') await loadBudgets();
     if(t==='reliability') await loadReliability();
-    if(t==='detection') await loadDetection();
     if(t==='storage') await loadStorage();
   }catch(e){ toast('Could not load '+t+': '+e.message,'err'); }
 }
