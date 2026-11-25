@@ -244,17 +244,18 @@ test("money and DELETE writes stay synchronous and report real meta", async () =
   );
 });
 
-test("the per-request provider status stamp is deferred, and does not flush the config cache", async () => {
+test("provider status stamps do not flush route reads, but status reads still settle", async () => {
   await withDb(
     (call) => ({ status: 200, json: async () => call.url.endsWith("/raw") ? { success: true, result: [] } : okQueryResult([{ id: 1 }]) }),
     async (db, calls) => {
-      const read = () => db.prepare("SELECT id FROM providers WHERE id=?").bind(1).first();
-      await read();
+      await db.prepare("SELECT id FROM providers WHERE id=?").bind(1).first();
       await db.prepare("UPDATE providers SET last_status=?, last_checked=? WHERE id=?").bind(200, "t", 1).run();
-      // Admin edits (name, enabled) are not deferred: they return meta.changes.
-      await read();
-      assert.equal(calls.length, 2, "one providers read + one flush for the queued stamp; second read is cached");
+      await db.prepare("SELECT id FROM providers WHERE id=?").bind(1).first();
+      assert.equal(calls.length, 1, "the cached route read does not wait for an unrelated health timestamp");
+      await db.prepare("SELECT last_status FROM providers WHERE id=?").bind(1).first();
+      assert.equal(calls.length, 3, "a read that names last_status flushes the stamp, then queries");
       assert.ok(calls[1].url.endsWith("/raw"));
+      assert.ok(calls[2].url.endsWith("/query"));
     }
   );
 });
@@ -282,4 +283,20 @@ test("a failed batch retries each statement alone so one bad row cannot drop the
   } finally {
     console.warn = origWarn;
   }
+});
+
+test("the result-free taste verdict prune joins the write batch", async () => {
+  await withDb(
+    () => ({ status: 200, json: async () => ({ success: true, result: [] }) }),
+    async (db, calls) => {
+      await db.prepare(
+        "DELETE FROM taste_verdicts WHERE account_id=? AND id NOT IN (SELECT id FROM taste_verdicts WHERE account_id=? ORDER BY id DESC LIMIT ?)"
+      ).bind("a", "a", 200).run();
+      assert.equal(calls.length, 0, "the prune result is unused, so no immediate round trip");
+      await db.flush();
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].body.batch.length, 1);
+      assert.ok(calls[0].body.batch[0].sql.startsWith("DELETE FROM taste_verdicts"));
+    }
+  );
 });

@@ -29,8 +29,7 @@ const CACHEABLE_TABLES = new Set([
 
 // Fire-and-forget telemetry: INSERT/UPDATE statements whose run() result is
 // never consumed by the caller (meta.changes/last_row_id are ignored for
-// these tables; DELETE is never deferred because purge endpoints report
-// meta.changes). Money (api_keys, console_accounts, spend_events) and
+// these tables). Money (api_keys, console_accounts, spend_events) and
 // route_attempts (its last_row_id feeds quality observations) stay sync.
 const DEFERRED_TABLES = new Set([
   "model_usage", "trajectories", "request_summaries", "router_stats",
@@ -41,11 +40,15 @@ const DEFERRED_TABLES = new Set([
 // it does not clear the read cache: it touches only last_status/last_checked,
 // which no cached SELECT reads (routing reads healthy/enabled/fmt/...).
 const PROVIDER_STATUS_PREFIX = "UPDATE providers SET last_status=";
+// recordVerdict never reads this DELETE's result. Other DELETEs stay sync
+// because admin purge endpoints report meta.changes to the operator.
+const TASTE_VERDICT_PRUNE_PREFIX = "DELETE FROM taste_verdicts WHERE account_id=? AND id NOT IN";
 
 // Admin edits to `providers` return meta.changes (404 on zero), so only the
 // per-request status stamp is deferred.
 function isDeferred(sql, target) {
-  if (!target || DELETE_RE.test(sql)) return false;
+  if (!target) return false;
+  if (DELETE_RE.test(sql)) return sql.startsWith(TASTE_VERDICT_PRUNE_PREFIX);
   return DEFERRED_TABLES.has(target) || sql.startsWith(PROVIDER_STATUS_PREFIX);
 }
 
@@ -261,13 +264,23 @@ export function createD1Db(env = process.env) {
   }
 
   async function readThrough(sql, params) {
+    const useCache = cacheable(sql);
+    const key = useCache ? cacheKey(sql, params) : null;
+    // A surviving cache hit is already consistent with queued writes: deferred
+    // writes to config tables invalidate it. The provider last_status stamp is
+    // the one exception, so reads naming those columns still settle first.
+    const readsProviderStatus = /\blast_(?:status|checked)\b/.test(sql);
+    if (useCache && !readsProviderStatus) {
+      const hit = cache.get(key);
+      if (hit && hit.expires > Date.now()) {
+        stats.cacheHits++;
+        return JSON.parse(hit.json);
+      }
+    }
     // Read-your-writes: a queued write to a table this SELECT reads must be
-    // visible, so flush before the cache lookup (a cache entry can predate a
-    // queued write only for the providers last_status update, which by
-    // construction never touches columns a cached read uses).
+    // visible before a miss reaches D1. Non-cached reads always take this path.
     await settle(readTables(sql));
-    if (cacheable(sql)) {
-      const key = cacheKey(sql, params);
+    if (useCache) {
       const hit = cache.get(key);
       if (hit && hit.expires > Date.now()) {
         stats.cacheHits++;

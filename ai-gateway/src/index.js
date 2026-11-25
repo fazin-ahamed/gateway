@@ -7,7 +7,7 @@ import { loadPublicOverview } from "./public-overview.js";
 import { planHorizon, renderHorizonState, isTinySlug, usableContextWindow } from "./horizon.js";
 import { shadowFromV1, shadowV2, loadV2World, ROUTER_V2_MODE, shouldShadow } from "./router/index.js";
 import { compileTaskIR } from "./router/task-ir.js";
-import { seedBeta, lcb as betaLcb, observe as betaObserve } from "./router/posterior.js";
+import { seedBeta, lcb as betaLcb } from "./router/posterior.js";
 import { deriveToolValidFromToolCalls, emitQualityObservations, loadQualityShadow, rebuildQualityStats } from "./router/quality.js";
 import { seedModelRegistry, backfillQualityCanonicalIds, loadAliasIndex, resolveCanonicalModel } from "./router/model-registry.js";
 import { normalizeTerminalFinishReason } from "../../server/tool-loop-guard.mjs";
@@ -5409,8 +5409,10 @@ async function recordUsage(c, key, usage) {
   // falls back to the key's own id in the legacy shape; the console_accounts
   // row is the authority on whether that id names an account.
   const acctId = spendAccountId(key);
+  const ownershipKnown = typeof c.get === "function" && c.get("consoleAccountId") === acctId;
+  const accountExists = ownershipKnown ? !!c.get("consoleAccount") : true;
 
-  if (acctId) {
+  if (acctId && accountExists) {
     // One conditional UPDATE replaces the owner-existence probe: zero changed
     // rows means this id is not a console account, so nothing else to settle.
     const upd = await c.env.DB.prepare(
@@ -5536,44 +5538,34 @@ function streamTerminalOutcome({ clientCancelled, streamError, finishSeen }) {
     return { success: 0, failure_class: "stream_incomplete", observe: true, health_impact: 1, trajectory_status: "fail", http_status: 500 };
   return { success: 1, failure_class: "success", observe: true, health_impact: 1, trajectory_status: "ok", http_status: 200 };
 }
-var routerStatLocks = new Map();
-function withRouterStatLock(lockKey, fn) {
-  const prev = routerStatLocks.get(lockKey) || Promise.resolve();
-  const next = prev.then(fn, fn);
-  const settled = next.then(() => {}, () => {});
-  routerStatLocks.set(lockKey, settled);
-  // Drop the settled tail so the map does not retain a resolved promise per
-  // key forever; only clear it if no newer observation has queued behind us.
-  settled.finally(() => {
-    if (routerStatLocks.get(lockKey) === settled)
-      routerStatLocks.delete(lockKey);
-  });
-  return next;
-}
-// Persisted Beta(alpha,beta) posterior per scope, updated only by operational
-// outcomes. Time-decayed via the same observe() the shadow router uses. The
-// read-modify-write is serialized per (scope|scope_id|task_type) so concurrent
-// requests cannot lose an observation. router_stats is a derived cache;
-// route_attempts is the immutable source of truth if a rebuild is ever needed.
+// One atomic upsert replaces a read-modify-write and its process-local lock.
+// The SQL applies the same three-day half-life toward Beta(8,2), then adds the
+// observation and advances the two EMAs. Concurrent requests therefore cannot
+// lose an observation, and a warm request spends no SELECT on this path.
+const ROUTER_STAT_DECAY = "power(0.5, MAX(0, julianday(excluded.updated_at) - COALESCE(julianday(updated_at), julianday(excluded.updated_at))) / 3)";
 async function updateRouterStat(c, scope, scopeId, taskType, success, latencyMs, costUsd) {
-  const tt = taskType || "";
-  return withRouterStatLock(scope + "|" + scopeId + "|" + tt, async () => {
-    try {
-      const row = await c.env.DB.prepare("SELECT success_alpha, failure_beta, latency_ema, cost_ema, updated_at FROM router_stats WHERE scope=? AND scope_id=? AND task_type=?").bind(scope, scopeId, tt).first();
-      const seed = seedBeta("route");
-      const prev = row
-        ? { alpha: Number(row.success_alpha) || seed.alpha, beta: Number(row.failure_beta) || seed.beta, updatedAt: Date.parse(row.updated_at) || Date.now(), kind: "route" }
-        : { ...seed, updatedAt: Date.now(), kind: "route" };
-      const next = betaObserve(prev, !!success);
-      const lat = Number(latencyMs);
-      const cost = Number(costUsd);
-      const emaL = row && row.latency_ema != null && Number.isFinite(lat) ? 0.8 * Number(row.latency_ema) + 0.2 * lat : (Number.isFinite(lat) ? lat : (row ? row.latency_ema : null));
-      const emaC = row && row.cost_ema != null && Number.isFinite(cost) ? 0.8 * Number(row.cost_ema) + 0.2 * cost : (Number.isFinite(cost) ? cost : (row ? row.cost_ema : null));
-      await c.env.DB.prepare("INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(scope, scope_id, task_type) DO UPDATE SET success_alpha=excluded.success_alpha, failure_beta=excluded.failure_beta, latency_ema=excluded.latency_ema, cost_ema=excluded.cost_ema, updated_at=excluded.updated_at").bind(scope, scopeId, tt, next.alpha, next.beta, emaL == null ? null : emaL, emaC == null ? null : emaC, nowIso()).run();
-    } catch (e) {
-      blog("router_stats update failed: " + String(e.message || e));
-    }
-  });
+  try {
+    const tt = taskType || "";
+    const seed = seedBeta("route");
+    const lat = Number(latencyMs);
+    const cost = Number(costUsd);
+    await c.env.DB.prepare(
+      "INSERT INTO router_stats (scope, scope_id, task_type, success_alpha, failure_beta, latency_ema, cost_ema, updated_at) VALUES (?,?,?,?,?,?,?,?) " +
+      "ON CONFLICT(scope, scope_id, task_type) DO UPDATE SET " +
+      `success_alpha=${seed.alpha}+(success_alpha-${seed.alpha})*${ROUTER_STAT_DECAY}+?, ` +
+      `failure_beta=${seed.beta}+(failure_beta-${seed.beta})*${ROUTER_STAT_DECAY}+?, ` +
+      "latency_ema=CASE WHEN excluded.latency_ema IS NULL THEN latency_ema WHEN latency_ema IS NULL THEN excluded.latency_ema ELSE 0.8*latency_ema+0.2*excluded.latency_ema END, " +
+      "cost_ema=CASE WHEN excluded.cost_ema IS NULL THEN cost_ema WHEN cost_ema IS NULL THEN excluded.cost_ema ELSE 0.8*cost_ema+0.2*excluded.cost_ema END, " +
+      "updated_at=excluded.updated_at"
+    ).bind(
+      scope, scopeId, tt,
+      seed.alpha + (success ? 1 : 0), seed.beta + (success ? 0 : 1),
+      Number.isFinite(lat) ? lat : null, Number.isFinite(cost) ? cost : null, nowIso(),
+      success ? 1 : 0, success ? 0 : 1
+    ).run();
+  } catch (e) {
+    blog("router_stats update failed: " + String(e.message || e));
+  }
 }
 
 // ReflexCore sees the same operational outcomes router_stats does: one sample
@@ -5972,6 +5964,11 @@ async function authClient(c) {
     // One read carries both the hard spend-limit columns and the rolling-window
     // columns, so the two budget checks share it instead of querying twice.
     const account = await c.env.DB.prepare("SELECT budget_mode, budget_limit, used_usd, used_tokens, budget_daily_usd, budget_monthly_usd, credits_usd FROM console_accounts WHERE key_id=?").bind(capAccountId).first();
+    // recordUsage runs after the response on this same context. Tell it whether
+    // the account exists so standalone API keys do not issue a second, doomed
+    // console_accounts write for ownership they already resolved here.
+    c.set("consoleAccountId", capAccountId);
+    c.set("consoleAccount", account || null);
     if (account && account.budget_limit != null) {
       const spent = account.budget_mode === "tokens" ? Number(account.used_tokens) || 0 : Number(account.used_usd) || 0;
       if (spent >= Number(account.budget_limit))

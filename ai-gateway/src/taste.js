@@ -227,7 +227,8 @@ export async function recentVerdictsFor(db, accountIds, limit = 30) {
   }));
 }
 
-const DECAY_HALF_LIFE_MS = 30 * 86400000; // 30 days
+const DECAY_HALF_LIFE_DAYS = 30;
+const TASTE_DECAY = `power(0.5, MAX(0, julianday(excluded.updated_at) - COALESCE(julianday(updated_at), julianday(excluded.updated_at))) / ${DECAY_HALF_LIFE_DAYS})`;
 
 export async function updatePosteriors(db, slug, results, route, accountId) {
   if (!slug || !results.length) return;
@@ -242,34 +243,19 @@ export async function updatePosteriors(db, slug, results, route, accountId) {
     if (r.pass) cur.pass++; else cur.fail++;
     folded.set(r.rule, cur);
   }
-  const rules = [...folded.keys()];
-  // Read every rule's current posterior up front (concurrently), then write.
-  // Each (slug, rule, route, account) key is distinct, so batching the reads
-  // before the writes preserves the read-modify-write semantics of the old
-  // per-rule loop while collapsing N sequential round trips into one wave.
-  const existing = await Promise.all(rules.map((rule) =>
+  // Decay and increment inside SQLite. Besides removing one SELECT per rule,
+  // this makes concurrent responses additive instead of last-writer-wins.
+  await Promise.all([...folded].map(([rule, n]) =>
     Promise.resolve(
-      db.prepare("SELECT alpha, beta, updated_at FROM taste_posteriors WHERE slug=? AND rule=? AND route=? AND account_id=?")
-        .bind(slug, rule, route, accountId).first()
-    ).catch(() => null)
+      db.prepare(
+        "INSERT INTO taste_posteriors (slug, rule, route, account_id, alpha, beta, updated_at) VALUES (?,?,?,?,?,?,?) " +
+        "ON CONFLICT(slug, rule, route, account_id) DO UPDATE SET " +
+        `alpha=1+(alpha-1)*${TASTE_DECAY}+?, ` +
+        `beta=1+(beta-1)*${TASTE_DECAY}+?, ` +
+        "updated_at=excluded.updated_at"
+      ).bind(slug, rule, route, accountId, 1 + n.pass, 1 + n.fail, at, n.pass, n.fail).run()
+    ).catch(() => {})
   ));
-  await Promise.all(rules.map((rule, i) => {
-    const prev = existing[i];
-    const n = folded.get(rule);
-    let alpha = 1, beta = 1;
-    if (prev) {
-      const ageMs = Date.now() - new Date(prev.updated_at).getTime();
-      const halfLives = ageMs / DECAY_HALF_LIFE_MS;
-      const decay = Math.pow(0.5, halfLives);
-      alpha = 1 + (Number(prev.alpha) - 1) * decay;
-      beta = 1 + (Number(prev.beta) - 1) * decay;
-    }
-    alpha += n.pass;
-    beta += n.fail;
-    return Promise.resolve(db.prepare(
-      "INSERT INTO taste_posteriors (slug, rule, route, account_id, alpha, beta, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(slug, rule, route, account_id) DO UPDATE SET alpha=excluded.alpha, beta=excluded.beta, updated_at=excluded.updated_at"
-    ).bind(slug, rule, route, accountId, alpha, beta, at).run()).catch(() => {});
-  }));
 }
 
 // Per-account profile for the console: the account's rule means across
